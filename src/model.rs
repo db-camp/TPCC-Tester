@@ -1,4 +1,8 @@
-use crate::connection::cursor::SqlParam;
+use std::fmt::Write as FmtWrite;
+
+pub trait ToCsvRow {
+    fn to_csv_row(&self, buf: &mut String);
+}
 
 // ─── Warehouse ──────────────────────────────────────────
 
@@ -14,19 +18,11 @@ pub struct Warehouse {
     pub w_ytd: f64,
 }
 
-impl Warehouse {
-    pub fn to_sql_params(&self) -> Vec<SqlParam> {
-        vec![
-            SqlParam::Int(self.w_id as i64),
-            SqlParam::Str(self.w_name.clone()),
-            SqlParam::Str(self.w_street_1.clone()),
-            SqlParam::Str(self.w_street_2.clone()),
-            SqlParam::Str(self.w_city.clone()),
-            SqlParam::Str(self.w_state.clone()),
-            SqlParam::Str(self.w_zip.clone()),
-            SqlParam::Float(self.w_tax),
-            SqlParam::Float(self.w_ytd),
-        ]
+impl ToCsvRow for Warehouse {
+    fn to_csv_row(&self, buf: &mut String) {
+        let _ = writeln!(buf, "{},{},{},{},{},{},{},{},{}",
+            self.w_id, self.w_name, self.w_street_1, self.w_street_2,
+            self.w_city, self.w_state, self.w_zip, self.w_tax, self.w_ytd);
     }
 }
 
@@ -46,21 +42,11 @@ pub struct District {
     pub d_next_o_id: i32,
 }
 
-impl District {
-    pub fn to_sql_params(&self) -> Vec<SqlParam> {
-        vec![
-            SqlParam::Int(self.d_id as i64),
-            SqlParam::Int(self.d_w_id as i64),
-            SqlParam::Str(self.d_name.clone()),
-            SqlParam::Str(self.d_street_1.clone()),
-            SqlParam::Str(self.d_street_2.clone()),
-            SqlParam::Str(self.d_city.clone()),
-            SqlParam::Str(self.d_state.clone()),
-            SqlParam::Str(self.d_zip.clone()),
-            SqlParam::Float(self.d_tax),
-            SqlParam::Float(self.d_ytd),
-            SqlParam::Int(self.d_next_o_id as i64),
-        ]
+impl ToCsvRow for District {
+    fn to_csv_row(&self, buf: &mut String) {
+        let _ = writeln!(buf, "{},{},{},{},{},{},{},{},{},{},{}",
+            self.d_id, self.d_w_id, self.d_name, self.d_street_1, self.d_street_2,
+            self.d_city, self.d_state, self.d_zip, self.d_tax, self.d_ytd, self.d_next_o_id);
     }
 }
 
@@ -90,31 +76,14 @@ pub struct Customer {
     pub c_data: String,
 }
 
-impl Customer {
-    pub fn to_sql_params(&self) -> Vec<SqlParam> {
-        vec![
-            SqlParam::Int(self.c_id as i64),
-            SqlParam::Int(self.c_d_id as i64),
-            SqlParam::Int(self.c_w_id as i64),
-            SqlParam::Str(self.c_first.clone()),
-            SqlParam::Str(self.c_middle.clone()),
-            SqlParam::Str(self.c_last.clone()),
-            SqlParam::Str(self.c_street_1.clone()),
-            SqlParam::Str(self.c_street_2.clone()),
-            SqlParam::Str(self.c_city.clone()),
-            SqlParam::Str(self.c_state.clone()),
-            SqlParam::Str(self.c_zip.clone()),
-            SqlParam::Str(self.c_phone.clone()),
-            SqlParam::Str(self.c_since.clone()),
-            SqlParam::Str(self.c_credit.clone()),
-            SqlParam::Float(self.c_credit_lim),
-            SqlParam::Float(self.c_discount),
-            SqlParam::Float(self.c_balance),
-            SqlParam::Float(self.c_ytd_payment),
-            SqlParam::Int(self.c_payment_cnt as i64),
-            SqlParam::Int(self.c_delivery_cnt as i64),
-            SqlParam::Str(self.c_data.clone()),
-        ]
+impl ToCsvRow for Customer {
+    fn to_csv_row(&self, buf: &mut String) {
+        let _ = writeln!(buf, "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.c_id, self.c_d_id, self.c_w_id, self.c_first, self.c_middle, self.c_last,
+            self.c_street_1, self.c_street_2, self.c_city, self.c_state, self.c_zip,
+            self.c_phone, self.c_since, self.c_credit, self.c_credit_lim, self.c_discount,
+            self.c_balance, self.c_ytd_payment, self.c_payment_cnt, self.c_delivery_cnt,
+            self.c_data);
     }
 }
 
@@ -128,15 +97,10 @@ pub struct Item {
     pub i_data: String,
 }
 
-impl Item {
-    pub fn to_sql_params(&self) -> Vec<SqlParam> {
-        vec![
-            SqlParam::Int(self.i_id as i64),
-            SqlParam::Int(self.i_im_id as i64),
-            SqlParam::Str(self.i_name.clone()),
-            SqlParam::Float(self.i_price),
-            SqlParam::Str(self.i_data.clone()),
-        ]
+impl ToCsvRow for Item {
+    fn to_csv_row(&self, buf: &mut String) {
+        let _ = writeln!(buf, "{},{},{},{},{}",
+            self.i_id, self.i_im_id, self.i_name, self.i_price, self.i_data);
     }
 }
 
@@ -162,27 +126,13 @@ pub struct Stock {
     pub s_data: String,
 }
 
-impl Stock {
-    pub fn to_sql_params(&self) -> Vec<SqlParam> {
-        vec![
-            SqlParam::Int(self.s_i_id as i64),
-            SqlParam::Int(self.s_w_id as i64),
-            SqlParam::Int(self.s_quantity as i64),
-            SqlParam::Str(self.s_dist_01.clone()),
-            SqlParam::Str(self.s_dist_02.clone()),
-            SqlParam::Str(self.s_dist_03.clone()),
-            SqlParam::Str(self.s_dist_04.clone()),
-            SqlParam::Str(self.s_dist_05.clone()),
-            SqlParam::Str(self.s_dist_06.clone()),
-            SqlParam::Str(self.s_dist_07.clone()),
-            SqlParam::Str(self.s_dist_08.clone()),
-            SqlParam::Str(self.s_dist_09.clone()),
-            SqlParam::Str(self.s_dist_10.clone()),
-            SqlParam::Int(self.s_ytd as i64),
-            SqlParam::Int(self.s_order_cnt as i64),
-            SqlParam::Int(self.s_remote_cnt as i64),
-            SqlParam::Str(self.s_data.clone()),
-        ]
+impl ToCsvRow for Stock {
+    fn to_csv_row(&self, buf: &mut String) {
+        let _ = writeln!(buf, "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.s_i_id, self.s_w_id, self.s_quantity,
+            self.s_dist_01, self.s_dist_02, self.s_dist_03, self.s_dist_04, self.s_dist_05,
+            self.s_dist_06, self.s_dist_07, self.s_dist_08, self.s_dist_09, self.s_dist_10,
+            self.s_ytd, self.s_order_cnt, self.s_remote_cnt, self.s_data);
     }
 }
 
@@ -199,18 +149,11 @@ pub struct Orders {
     pub o_all_local: i32,
 }
 
-impl Orders {
-    pub fn to_sql_params(&self) -> Vec<SqlParam> {
-        vec![
-            SqlParam::Int(self.o_id as i64),
-            SqlParam::Int(self.o_d_id as i64),
-            SqlParam::Int(self.o_w_id as i64),
-            SqlParam::Int(self.o_c_id as i64),
-            SqlParam::Str(self.o_entry_d.clone()),
-            SqlParam::Int(self.o_carrier_id as i64),
-            SqlParam::Int(self.o_ol_cnt as i64),
-            SqlParam::Int(self.o_all_local as i64),
-        ]
+impl ToCsvRow for Orders {
+    fn to_csv_row(&self, buf: &mut String) {
+        let _ = writeln!(buf, "{},{},{},{},{},{},{},{}",
+            self.o_id, self.o_d_id, self.o_w_id, self.o_c_id,
+            self.o_entry_d, self.o_carrier_id, self.o_ol_cnt, self.o_all_local);
     }
 }
 
@@ -222,13 +165,9 @@ pub struct NewOrder {
     pub no_w_id: i32,
 }
 
-impl NewOrder {
-    pub fn to_sql_params(&self) -> Vec<SqlParam> {
-        vec![
-            SqlParam::Int(self.no_o_id as i64),
-            SqlParam::Int(self.no_d_id as i64),
-            SqlParam::Int(self.no_w_id as i64),
-        ]
+impl ToCsvRow for NewOrder {
+    fn to_csv_row(&self, buf: &mut String) {
+        let _ = writeln!(buf, "{},{},{}", self.no_o_id, self.no_d_id, self.no_w_id);
     }
 }
 
@@ -245,18 +184,11 @@ pub struct History {
     pub h_data: String,
 }
 
-impl History {
-    pub fn to_sql_params(&self) -> Vec<SqlParam> {
-        vec![
-            SqlParam::Int(self.h_c_id as i64),
-            SqlParam::Int(self.h_c_d_id as i64),
-            SqlParam::Int(self.h_c_w_id as i64),
-            SqlParam::Int(self.h_d_id as i64),
-            SqlParam::Int(self.h_w_id as i64),
-            SqlParam::Str(self.h_date.clone()),
-            SqlParam::Float(self.h_amount),
-            SqlParam::Str(self.h_data.clone()),
-        ]
+impl ToCsvRow for History {
+    fn to_csv_row(&self, buf: &mut String) {
+        let _ = writeln!(buf, "{},{},{},{},{},{},{},{}",
+            self.h_c_id, self.h_c_d_id, self.h_c_w_id, self.h_d_id, self.h_w_id,
+            self.h_date, self.h_amount, self.h_data);
     }
 }
 
@@ -275,19 +207,11 @@ pub struct OrderLine {
     pub ol_dist_info: String,
 }
 
-impl OrderLine {
-    pub fn to_sql_params(&self) -> Vec<SqlParam> {
-        vec![
-            SqlParam::Int(self.ol_o_id as i64),
-            SqlParam::Int(self.ol_d_id as i64),
-            SqlParam::Int(self.ol_w_id as i64),
-            SqlParam::Int(self.ol_number as i64),
-            SqlParam::Int(self.ol_i_id as i64),
-            SqlParam::Int(self.ol_supply_w_id as i64),
-            SqlParam::Str(self.ol_delivery_d.clone()),
-            SqlParam::Int(self.ol_quantity as i64),
-            SqlParam::Float(self.ol_amount),
-            SqlParam::Str(self.ol_dist_info.clone()),
-        ]
+impl ToCsvRow for OrderLine {
+    fn to_csv_row(&self, buf: &mut String) {
+        let _ = writeln!(buf, "{},{},{},{},{},{},{},{},{},{}",
+            self.ol_o_id, self.ol_d_id, self.ol_w_id, self.ol_number, self.ol_i_id,
+            self.ol_supply_w_id, self.ol_delivery_d, self.ol_quantity, self.ol_amount,
+            self.ol_dist_info);
     }
 }

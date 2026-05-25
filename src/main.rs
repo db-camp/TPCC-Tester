@@ -91,8 +91,9 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Init
     if config.init {
+        let csv_path = config.csv_path.clone().expect("--csv-path required with --init");
         info!("初始化 TPC-C 数据库 (scale_factor={})", config.scale_factor);
-        let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
+        let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor, csv_path);
         ldr.create_tables().await?;
         ldr.create_indexes().await?;
         ldr.load_all_data().await?;
@@ -123,6 +124,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         result.print_report();
     }
 
+    cursor.close().await;
     Ok(())
 }
 
@@ -250,5 +252,6 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     info!("   诊断完成");
     info!("========================================");
 
+    cursor.close().await;
     Ok(())
 }

@@ -1,26 +1,33 @@
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::time::Instant;
+
 use tracing::{debug, error, info, warn};
 
-use crate::connection::cursor::{RmdbCursor, SqlParam};
+use crate::connection::cursor::RmdbCursor;
 use crate::data_gen::*;
 use crate::error::TpccError;
+use crate::model::ToCsvRow;
 
 pub struct Loader<'a> {
     cursor: &'a mut RmdbCursor,
     scale_factor: i32,
+    csv_path: String,
 }
 
 impl<'a> Loader<'a> {
-    pub fn new(cursor: &'a mut RmdbCursor, scale_factor: i32) -> Self {
+    pub fn new(cursor: &'a mut RmdbCursor, scale_factor: i32, csv_path: String) -> Self {
         Self {
             cursor,
             scale_factor,
+            csv_path,
         }
     }
 
     pub async fn create_tables(&mut self) -> Result<(), TpccError> {
         info!("[建表] 读取 sql/create_tables.sql ...");
-        let sql = std::fs::read_to_string("sql/create_tables.sql")
+        let sql = fs::read_to_string("sql/create_tables.sql")
             .map_err(|e| TpccError::Io(e))?;
 
         let stmts: Vec<&str> = sql.split(';').filter(|s| !s.trim().is_empty()).collect();
@@ -45,7 +52,7 @@ impl<'a> Loader<'a> {
 
     pub async fn create_indexes(&mut self) -> Result<(), TpccError> {
         info!("[建索引] 读取 sql/create_index.sql ...");
-        let sql = std::fs::read_to_string("sql/create_index.sql")
+        let sql = fs::read_to_string("sql/create_index.sql")
             .map_err(|e| TpccError::Io(e))?;
 
         let stmts: Vec<&str> = sql.split(';').filter(|s| !s.trim().is_empty()).collect();
@@ -64,77 +71,69 @@ impl<'a> Loader<'a> {
     }
 
     pub async fn load_all_data(&mut self) -> Result<(), TpccError> {
-        info!("[数据加载] 开始加载 TPC-C 数据 (scale_factor={})", self.scale_factor);
+        let csv_dir = &self.csv_path;
+        let local_dir = Path::new(csv_dir);
+
+        fs::create_dir_all(local_dir)
+            .map_err(|e| TpccError::Io(e))?;
+
+        info!("[数据加载] 生成 CSV 到 {csv_dir}, 然后 LOAD 导入 (scale_factor={})", self.scale_factor);
         let gen = TpccDataGen::new(self.scale_factor);
+        let start = Instant::now();
 
-        // Load in correct order
-        self.load_table("warehouse", &gen.generate_warehouses().iter().map(|w| w.to_sql_params()).collect::<Vec<_>>(), 9).await?;
-        self.load_table("district", &gen.generate_districts().iter().map(|d| d.to_sql_params()).collect::<Vec<_>>(), 11).await?;
-        self.load_table("item", &gen.generate_items().iter().map(|i| i.to_sql_params()).collect::<Vec<_>>(), 5).await?;
-        self.load_table("customer", &gen.generate_customers().iter().map(|c| c.to_sql_params()).collect::<Vec<_>>(), 21).await?;
-        self.load_table("stock", &gen.generate_stock().iter().map(|s| s.to_sql_params()).collect::<Vec<_>>(), 17).await?;
-        self.load_table("orders", &gen.generate_orders().iter().map(|o| o.to_sql_params()).collect::<Vec<_>>(), 8).await?;
-        self.load_table("new_orders", &gen.generate_new_orders().iter().map(|n| n.to_sql_params()).collect::<Vec<_>>(), 3).await?;
-        self.load_table("history", &gen.generate_history().iter().map(|h| h.to_sql_params()).collect::<Vec<_>>(), 8).await?;
-        self.load_table("order_line", &gen.generate_order_lines().iter().map(|ol| ol.to_sql_params()).collect::<Vec<_>>(), 10).await?;
+        self.write_csv_and_load("warehouse", &gen.generate_warehouses()).await?;
+        self.write_csv_and_load("district", &gen.generate_districts()).await?;
+        self.write_csv_and_load("item", &gen.generate_items()).await?;
+        self.write_csv_and_load("customer", &gen.generate_customers()).await?;
+        self.write_csv_and_load("stock", &gen.generate_stock()).await?;
+        self.write_csv_and_load("orders", &gen.generate_orders()).await?;
+        self.write_csv_and_load("new_orders", &gen.generate_new_orders()).await?;
+        self.write_csv_and_load("history", &gen.generate_history()).await?;
+        self.write_csv_and_load("order_line", &gen.generate_order_lines()).await?;
 
-        info!("[数据加载] 全部数据加载完成");
+        info!("[数据加载] 全部加载完成 ({:.2}s)", start.elapsed().as_secs_f64());
         self.verify_counts().await?;
         Ok(())
     }
 
-    async fn load_table(
+    async fn write_csv_and_load<T: ToCsvRow>(
         &mut self,
         table_name: &str,
-        rows: &[Vec<SqlParam>],
-        col_count: usize,
+        rows: &[T],
     ) -> Result<(), TpccError> {
-        let total = rows.len();
+        let csv_path = Path::new(&self.csv_path).join(format!("{table_name}.csv"));
+        let csv_file = csv_path.to_string_lossy();
         let start = Instant::now();
-        info!("[表加载] {table_name}: 开始加载 {total} 行...");
 
-        let placeholders = (0..col_count).map(|_| "?").collect::<Vec<_>>().join(", ");
-        let insert_sql = format!("INSERT INTO {table_name} VALUES ({placeholders})");
+        info!("[CSV] {table_name}: 生成 {} 行...", rows.len());
 
-        let mut loaded = 0usize;
-        let mut failed = 0usize;
+        let file = File::create(&csv_path)
+            .map_err(|e| TpccError::Io(e))?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        let mut buf = String::with_capacity(512);
 
-        for (i, params) in rows.iter().enumerate() {
-            match self.cursor.execute_update(&insert_sql, params).await {
-                Ok(_) => {
-                    loaded += 1;
-                }
-                Err(e) => {
-                    failed += 1;
-                    if failed <= 5 {
-                        warn!(
-                            "[表加载] {table_name} 第 {} 行 INSERT 失败: {e}",
-                            i + 1
-                        );
-                    }
-                }
-            }
-
-            // Progress reporting for large tables
-            let done = i + 1;
-            if total >= 10000 && done % 10000 == 0 {
-                let pct = (done as f64 / total as f64) * 100.0;
-                let elapsed = start.elapsed().as_secs_f64();
-                info!(
-                    "[表加载] {table_name}: {done}/{total} ({pct:.1}%) - {elapsed:.1}s"
-                );
-            }
+        for row in rows {
+            buf.clear();
+            row.to_csv_row(&mut buf);
+            writer.write_all(buf.as_bytes())
+                .map_err(|e| TpccError::Io(e))?;
         }
+        writer.flush().map_err(|e| TpccError::Io(e))?;
 
-        let elapsed = start.elapsed().as_secs_f64();
-        if failed > 0 {
-            warn!(
-                "[表加载] {table_name}: {loaded}/{total} 行已加载, {failed} 行失败 ({elapsed:.2}s)"
-            );
-        } else {
-            info!(
-                "[表加载] {table_name}: {loaded}/{total} 行已加载 ({elapsed:.2}s)"
-            );
+        let gen_time = start.elapsed().as_secs_f64();
+        info!("[CSV] {table_name}: CSV 写入完成 ({gen_time:.2}s), 发送 LOAD 命令...");
+
+        let load_sql = format!("load {csv_file} into {table_name}");
+        match self.cursor.execute_update(&load_sql, &[]).await {
+            Ok(_) => {
+                let total_time = start.elapsed().as_secs_f64();
+                info!("[CSV] {table_name}: LOAD 完成 (总计 {total_time:.2}s)");
+            }
+            Err(e) => {
+                error!("[CSV] {table_name}: LOAD 失败: {e}");
+                error!("[CSV] 命令: {load_sql}");
+                return Err(e);
+            }
         }
 
         Ok(())

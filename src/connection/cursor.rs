@@ -9,7 +9,6 @@ pub enum SqlParam {
     Int(i64),
     Float(f64),
     Str(String),
-    Null,
 }
 
 impl SqlParam {
@@ -21,14 +20,12 @@ impl SqlParam {
                 let escaped = v.replace('\'', "''");
                 format!("'{escaped}'")
             }
-            SqlParam::Null => "NULL".to_string(),
         }
     }
 }
 
 /// Parsed query result: column names + data rows.
 pub struct QueryResult {
-    pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
 }
 
@@ -83,10 +80,7 @@ impl RmdbCursor {
 
         // Check for error or empty
         if response.starts_with("Error") || response.is_empty() {
-            return Ok(QueryResult {
-                columns: vec![],
-                rows: vec![],
-            });
+            return Ok(QueryResult { rows: vec![] });
         }
 
         // Parse pipe-delimited response
@@ -114,13 +108,9 @@ impl RmdbCursor {
     fn parse_response(response: &str) -> Result<QueryResult, TpccError> {
         let lines: Vec<&str> = response.trim().split('\n').collect();
         if lines.is_empty() {
-            return Ok(QueryResult {
-                columns: vec![],
-                rows: vec![],
-            });
+            return Ok(QueryResult { rows: vec![] });
         }
 
-        // Find header line (starts with |)
         let mut header_idx = None;
         for (i, line) in lines.iter().enumerate() {
             if line.starts_with('|') {
@@ -131,22 +121,14 @@ impl RmdbCursor {
 
         let header_idx = match header_idx {
             Some(idx) => idx,
-            None => {
-                return Ok(QueryResult {
-                    columns: vec![],
-                    rows: vec![],
-                })
-            }
+            None => return Ok(QueryResult { rows: vec![] }),
         };
 
-        // Parse column names from header
-        let columns: Vec<String> = lines[header_idx]
+        let col_count = lines[header_idx]
             .split('|')
             .filter(|s| !s.trim().is_empty())
-            .map(|s| s.trim().to_string())
-            .collect();
+            .count();
 
-        // Parse data rows
         let mut rows = Vec::new();
         for line in &lines[header_idx + 1..] {
             if line.starts_with('|') {
@@ -155,24 +137,23 @@ impl RmdbCursor {
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.trim().to_string())
                     .collect();
-                if values.len() == columns.len() {
+                if values.len() == col_count {
                     rows.push(values);
                 } else {
                     warn!(
                         "行列数不匹配: 期望 {} 列, 实际 {} 列, 原始行: {line}",
-                        columns.len(),
+                        col_count,
                         values.len()
                     );
                 }
             }
         }
 
-        Ok(QueryResult { columns, rows })
+        Ok(QueryResult { rows })
     }
 
-    /// Convenience: execute and return the underlying client for reuse.
-    pub fn into_client(self) -> RmdbClient {
-        self.client
+    pub async fn close(self) {
+        self.client.close().await;
     }
 
     /// Get mutable reference to client (for ping, etc.).

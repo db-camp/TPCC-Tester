@@ -22,8 +22,8 @@
 
 3. **运行**:
    ```bash
-   # 初始化数据库（建表+加载数据）
-   ./target/release/tpcc-tester --init -s 1
+   # 初始化数据库（生成 CSV + LOAD 批量导入）
+   ./target/release/tpcc-tester --init --csv-path /path/to/csv -s 1
 
    # 运行一致性检查
    ./target/release/tpcc-tester --check -s 1
@@ -38,6 +38,20 @@
    ./target/release/tpcc-tester --diagnose
    ```
 
+## 数据加载方式
+
+`--init` 使用 CSV + LOAD 方式导入数据：
+
+1. 生成 TPC-C 标准数据到 `--csv-path` 指定的目录（9 个 CSV 文件）
+2. 通过 rmdb 的 `load <file> into <table>` 命令批量导入
+
+`--csv-path` 必须是 **rmdb 服务端能访问到的路径**（tpcc-tester 和 rmdb 需在同一台机器或共享文件系统）。
+
+```bash
+# 示例：scale_factor=5，CSV 生成到 /tmp/tpcc_data/
+./target/release/tpcc-tester --init --csv-path /tmp/tpcc_data -s 5
+```
+
 ## 命令行参数
 
 ```
@@ -46,6 +60,7 @@ Options:
       --host <HOST>        RMDB 服务地址 [default: 127.0.0.1]
       --port <PORT>        RMDB 服务端口 [default: 8765]
       --init               初始化数据库（建表+加载数据）
+      --csv-path <PATH>    CSV 文件路径 (rmdb 服务端可访问), --init 时必须指定
       --check              运行一致性检查
       --stats              显示各表行数统计
       --benchmark          运行并发基准测试

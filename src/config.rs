@@ -16,7 +16,7 @@ pub struct Config {
     pub port: u16,
 
     /// 初始化数据库（建表+加载数据）
-    #[arg(long)]
+    #[arg(long, requires = "csv_path")]
     pub init: bool,
 
     /// 运行一致性检查
@@ -46,6 +46,10 @@ pub struct Config {
     /// 事务概率 [NewOrder Payment Delivery OrderStatus StockLevel]
     #[arg(long = "txn-probs", num_args = 5, default_values_t = vec![0.45, 0.43, 0.04, 0.04, 0.04])]
     pub txn_probs: Vec<f64>,
+
+    /// CSV 文件路径 (rmdb 服务端可访问), --init 时必须指定
+    #[arg(long = "csv-path", requires = "init")]
+    pub csv_path: Option<String>,
 
     /// 运行数据库兼容性诊断
     #[arg(long)]
