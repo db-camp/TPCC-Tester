@@ -101,7 +101,9 @@ impl<'a> Loader<'a> {
         table_name: &str,
         rows: &[T],
     ) -> Result<(), TpccError> {
-        let csv_path = Path::new(&self.csv_path).join(format!("{table_name}.csv"));
+        let csv_dir = Path::new(&self.csv_path).canonicalize()
+            .map_err(|e| TpccError::Io(e))?;
+        let csv_path = csv_dir.join(format!("{table_name}.csv"));
         let csv_file = csv_path.to_string_lossy();
         let start = Instant::now();
 
@@ -111,6 +113,9 @@ impl<'a> Loader<'a> {
             .map_err(|e| TpccError::Io(e))?;
         let mut writer = BufWriter::with_capacity(1024 * 1024, file);
         let mut buf = String::with_capacity(512);
+
+        writeln!(writer, "{}", T::csv_header())
+            .map_err(|e| TpccError::Io(e))?;
 
         for row in rows {
             buf.clear();

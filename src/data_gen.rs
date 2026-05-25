@@ -333,7 +333,7 @@ impl TpccDataGen {
                         h_c_w_id: w_id,
                         h_d_id: d_id,
                         h_w_id: w_id,
-                        h_date: Self::gen_timestamp(),
+                        h_datetime: Self::gen_timestamp(),
                         h_amount: 10.0,
                         h_data: "Initial deposit".to_string(),
                     });
