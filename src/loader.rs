@@ -101,8 +101,9 @@ impl<'a> Loader<'a> {
         table_name: &str,
         rows: &[T],
     ) -> Result<(), TpccError> {
-        let csv_dir = Path::new(&self.csv_path).canonicalize()
-            .map_err(|e| TpccError::Io(e))?;
+        let raw_dir = Path::new(&self.csv_path);
+        std::fs::create_dir_all(raw_dir).map_err(TpccError::Io)?;
+        let csv_dir = raw_dir.canonicalize().map_err(TpccError::Io)?;
         let csv_path = csv_dir.join(format!("{table_name}.csv"));
         let csv_file = csv_path.to_string_lossy();
         let start = Instant::now();
