@@ -23,9 +23,17 @@ pub struct Config {
     #[arg(long)]
     pub init: bool,
 
+    /// 保持 RMDB output.txt 写入开启
+    #[arg(long = "keep-output-file")]
+    pub keep_output_file: bool,
+
     /// 运行一致性检查
     #[arg(long)]
     pub check: bool,
+
+    /// 一致性检查期望已提交 NewOrder 数
+    #[arg(long = "expected-new-orders")]
+    pub expected_new_orders: Option<i64>,
 
     /// 显示各表行数统计
     #[arg(long)]

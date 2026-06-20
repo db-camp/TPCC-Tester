@@ -1,18 +1,25 @@
 use tracing::{error, info, warn};
 
 use crate::connection::cursor::{RmdbCursor, SqlParam};
+use crate::data_gen::{DISTRICTS_PER_WAREHOUSE, ORDERS_PER_DISTRICT};
 use crate::error::TpccError;
 
 pub struct ConsistencyChecker<'a> {
     cursor: &'a mut RmdbCursor,
     scale_factor: i32,
+    expected_new_orders: Option<i64>,
 }
 
 impl<'a> ConsistencyChecker<'a> {
-    pub fn new(cursor: &'a mut RmdbCursor, scale_factor: i32) -> Self {
+    pub fn new(
+        cursor: &'a mut RmdbCursor,
+        scale_factor: i32,
+        expected_new_orders: Option<i64>,
+    ) -> Self {
         Self {
             cursor,
             scale_factor,
+            expected_new_orders,
         }
     }
 
@@ -23,23 +30,23 @@ impl<'a> ConsistencyChecker<'a> {
 
         let mut all_passed = true;
 
-        // Check 1: Table row counts
-        if !self.check_table_counts().await? {
-            all_passed = false;
-        }
-
-        // Check 2: District-Order consistency
+        // Rule 1: District, orders and new_orders maxima stay aligned.
         if !self.check_district_order_consistency().await? {
             all_passed = false;
         }
 
-        // Check 3: NewOrder continuity
+        // Rule 2: new_orders has no gaps per warehouse/district.
         if !self.check_new_orders_consistency().await? {
             all_passed = false;
         }
 
-        // Check 4: OrderLine consistency
+        // Rule 3: orders.o_ol_cnt matches order_line row count.
         if !self.check_order_line_consistency().await? {
+            all_passed = false;
+        }
+
+        // Rule 4: orders count equals initial orders plus committed NewOrder count.
+        if !self.check_orders_count().await? {
             all_passed = false;
         }
 
@@ -92,54 +99,8 @@ impl<'a> ConsistencyChecker<'a> {
         Ok(())
     }
 
-    async fn check_table_counts(&mut self) -> Result<bool, TpccError> {
-        info!("[检查 1/4] 表行数检查");
-
-        let sf = self.scale_factor as i64;
-        let expected: Vec<(&str, i64)> = vec![
-            ("warehouse", sf),
-            ("district", sf * 10),
-            ("item", 100_000),
-            ("customer", sf * 10 * 3000),
-            ("stock", sf * 100_000),
-            ("orders", sf * 10 * 3000),
-            ("order_line", sf * 10 * 3000 * 10),
-            ("new_orders", sf * 10 * 900),
-            ("history", sf * 10 * 3000),
-        ];
-
-        let mut all_ok = true;
-        for (table, exp) in &expected {
-            let sql = format!("SELECT COUNT(*) FROM {table}");
-            match self.cursor.execute(&sql, &[]).await {
-                Ok(result) => {
-                    if let Some(row) = result.rows.first() {
-                        if let Some(val) = row.first() {
-                            let actual: i64 = val.parse().unwrap_or(0);
-                            if actual == *exp {
-                                info!("  {table:>15}: {actual}/{exp} PASS");
-                            } else {
-                                error!(
-                                    "  {table:>15}: {actual}/{exp} FAIL (差异: {})",
-                                    actual - exp
-                                );
-                                all_ok = false;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("  {table:>15}: 查询失败 FAIL - {e}");
-                    error!("  建议: 请检查 INSERT 语句是否正确执行，可使用 --stats 查看各表行数");
-                    all_ok = false;
-                }
-            }
-        }
-        Ok(all_ok)
-    }
-
     async fn check_district_order_consistency(&mut self) -> Result<bool, TpccError> {
-        info!("[检查 2/4] District-Order 一致性 (d_next_o_id - 1 == MAX(o_id) == MAX(no_o_id))");
+        info!("[检查 1/4] District-Order 一致性 (d_next_o_id - 1 == MAX(o_id) == MAX(no_o_id))");
 
         let mut all_ok = true;
 
@@ -215,8 +176,7 @@ impl<'a> ConsistencyChecker<'a> {
                     }
                 };
 
-                let consistent =
-                    d_next_o_id - 1 == max_o_id && d_next_o_id - 1 == max_no_o_id;
+                let consistent = d_next_o_id - 1 == max_o_id && d_next_o_id - 1 == max_no_o_id;
 
                 if !consistent {
                     error!(
@@ -237,7 +197,7 @@ impl<'a> ConsistencyChecker<'a> {
     }
 
     async fn check_new_orders_consistency(&mut self) -> Result<bool, TpccError> {
-        info!("[检查 3/4] NewOrder 连续性 (COUNT == MAX - MIN + 1)");
+        info!("[检查 2/4] NewOrder 连续性 (COUNT == MAX - MIN + 1)");
 
         let mut all_ok = true;
 
@@ -315,7 +275,7 @@ impl<'a> ConsistencyChecker<'a> {
     }
 
     async fn check_order_line_consistency(&mut self) -> Result<bool, TpccError> {
-        info!("[检查 4/4] OrderLine 一致性 (SUM(o_ol_cnt) == COUNT(ol_o_id))");
+        info!("[检查 3/4] OrderLine 一致性 (SUM(o_ol_cnt) == COUNT(ol_o_id))");
 
         let mut all_ok = true;
 
@@ -377,5 +337,46 @@ impl<'a> ConsistencyChecker<'a> {
             info!("  OrderLine 一致性检查 PASS");
         }
         Ok(all_ok)
+    }
+
+    async fn check_orders_count(&mut self) -> Result<bool, TpccError> {
+        info!("[检查 4/4] Orders 总数 (COUNT(*) == 初始订单数 + NewOrder 成功数)");
+
+        let Some(committed_new_orders) = self.expected_new_orders else {
+            warn!("  未提供 --expected-new-orders，跳过 Orders 总数检查");
+            return Ok(true);
+        };
+
+        let result = self
+            .cursor
+            .execute("SELECT COUNT(*) FROM orders", &[])
+            .await;
+        let count_orders: i64 = match result {
+            Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
+            Ok(_) => {
+                error!("  Orders COUNT(*) 查询结果为空");
+                return Ok(false);
+            }
+            Err(e) => {
+                error!("  Orders COUNT(*) 查询失败: {e}");
+                return Ok(false);
+            }
+        };
+
+        let initial_orders =
+            self.scale_factor as i64 * DISTRICTS_PER_WAREHOUSE as i64 * ORDERS_PER_DISTRICT as i64;
+        let expected = initial_orders + committed_new_orders;
+        if count_orders == expected {
+            info!("  Orders 总数检查 PASS: {count_orders}/{expected}");
+            return Ok(true);
+        }
+
+        error!(
+            "  FAIL: COUNT(orders)={count_orders}, initial_orders={initial_orders}, committed_new_orders={committed_new_orders}, expected={expected}"
+        );
+        error!(
+            "  建议: 检查 NewOrder 是否完整插入 orders，或 benchmark 成功数统计是否与数据状态一致"
+        );
+        Ok(false)
     }
 }

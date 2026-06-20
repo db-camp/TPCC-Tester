@@ -77,6 +77,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     info!("连接 RMDB: {}:{} ...", config.host, config.port);
     let client = RmdbClient::connect(&config.host, config.port).await?;
     let mut cursor = RmdbCursor::new(client);
+    maybe_disable_output_file(&config, &mut cursor).await?;
 
     // Ping test
     match cursor.client_mut().ping().await {
@@ -105,7 +106,11 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Check
     if config.check {
-        let mut chk = checker::ConsistencyChecker::new(&mut cursor, config.scale_factor);
+        let mut chk = checker::ConsistencyChecker::new(
+            &mut cursor,
+            config.scale_factor,
+            config.expected_new_orders,
+        );
         let all_passed = chk.run_all_checks().await?;
         if !all_passed {
             error!("一致性检查未全部通过");
@@ -115,7 +120,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Stats
     if config.stats {
-        let mut chk = checker::ConsistencyChecker::new(&mut cursor, config.scale_factor);
+        let mut chk = checker::ConsistencyChecker::new(&mut cursor, config.scale_factor, None);
         chk.show_stats().await?;
     }
 
@@ -127,6 +132,21 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         result.print_report();
     }
 
+    Ok(())
+}
+
+async fn maybe_disable_output_file(
+    config: &Config,
+    cursor: &mut RmdbCursor,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if config.keep_output_file {
+        return Ok(());
+    }
+
+    info!("发送 set output_file off，关闭 RMDB output.txt 写入");
+    cursor
+        .execute_update_raw("set output_file off", &[])
+        .await?;
     Ok(())
 }
 
@@ -148,6 +168,7 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
         }
     };
     let mut cursor = RmdbCursor::new(client);
+    maybe_disable_output_file(config, &mut cursor).await?;
 
     // 2. Basic SQL
     info!("[2/6] 基础 SQL 能力检测");

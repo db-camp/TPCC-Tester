@@ -53,8 +53,12 @@ impl RmdbCursor {
     }
 
     /// Build final SQL string with parameter substitution.
-    fn build_query(sql: &str, params: &[SqlParam]) -> String {
-        let mut query = format!("{sql};");
+    fn build_query(sql: &str, params: &[SqlParam], append_semicolon: bool) -> String {
+        let mut query = if append_semicolon {
+            format!("{sql};")
+        } else {
+            sql.to_string()
+        };
         for param in params {
             let literal = param.to_sql_literal();
             // Replace first occurrence of ? with the literal value
@@ -65,13 +69,25 @@ impl RmdbCursor {
         query
     }
 
+    async fn execute_update_query(&mut self, query: String) -> Result<(), TpccError> {
+        trace!("执行更新: {query}");
+
+        let response = self.client.send_cmd(&query).await?;
+
+        if response.starts_with("abort") {
+            return Err(TpccError::Abort(response.trim().to_string()));
+        }
+
+        Ok(())
+    }
+
     /// Execute a SQL statement and return parsed results.
     pub async fn execute(
         &mut self,
         sql: &str,
         params: &[SqlParam],
     ) -> Result<QueryResult, TpccError> {
-        let query = Self::build_query(sql, params);
+        let query = Self::build_query(sql, params, true);
         trace!("执行 SQL: {query}");
 
         let response = self.client.send_cmd(&query).await?;
@@ -99,16 +115,18 @@ impl RmdbCursor {
         sql: &str,
         params: &[SqlParam],
     ) -> Result<(), TpccError> {
-        let query = Self::build_query(sql, params);
-        trace!("执行更新: {query}");
+        let query = Self::build_query(sql, params, true);
+        self.execute_update_query(query).await
+    }
 
-        let response = self.client.send_cmd(&query).await?;
-
-        if response.starts_with("abort") {
-            return Err(TpccError::Abort(response.trim().to_string()));
-        }
-
-        Ok(())
+    /// Execute a statement without adding the trailing semicolon.
+    pub async fn execute_update_raw(
+        &mut self,
+        sql: &str,
+        params: &[SqlParam],
+    ) -> Result<(), TpccError> {
+        let query = Self::build_query(sql, params, false);
+        self.execute_update_query(query).await
     }
 
     fn parse_response(response: &str) -> Result<QueryResult, TpccError> {

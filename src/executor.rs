@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::task::JoinSet;
@@ -47,11 +47,20 @@ impl BenchmarkExecutor {
             cancelled: AtomicBool::new(false),
         });
 
+        let start_time = Instant::now();
+        let cancelled_at = Arc::new(Mutex::new(None::<Instant>));
+
         // Ctrl+C handler
         let cancel_counters = counters.clone();
+        let cancel_time = cancelled_at.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("收到 Ctrl+C 信号，正在优雅关闭...");
+            if let Ok(mut guard) = cancel_time.lock() {
+                if guard.is_none() {
+                    *guard = Some(Instant::now());
+                }
+            }
             cancel_counters.cancelled.store(true, Ordering::Relaxed);
         });
 
@@ -80,7 +89,6 @@ impl BenchmarkExecutor {
             }
         });
 
-        let start_time = Instant::now();
         let mut join_set = JoinSet::new();
 
         // Per-thread timing data
@@ -200,13 +208,19 @@ impl BenchmarkExecutor {
             }
         }
 
-        let total_duration = start_time.elapsed().as_secs_f64();
+        let total_duration = cancelled_at
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .map(|instant| instant.duration_since(start_time).as_secs_f64())
+            .unwrap_or_else(|| start_time.elapsed().as_secs_f64());
         counters.cancelled.store(true, Ordering::Relaxed);
         let _ = progress_handle.await;
 
         // Collect results
         let all_results = thread_results.lock().await;
-        let flat: Vec<(TransactionType, f64, bool)> = all_results.iter().flat_map(|v| v.iter().copied()).collect();
+        let flat: Vec<(TransactionType, f64, bool)> =
+            all_results.iter().flat_map(|v| v.iter().copied()).collect();
 
         // Build result
         let total_committed = counters.total_committed.load(Ordering::Relaxed) as usize;
