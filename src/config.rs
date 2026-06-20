@@ -15,7 +15,11 @@ pub struct Config {
     #[arg(long, default_value_t = 8765)]
     pub port: u16,
 
-    /// 初始化数据库（建表+加载数据）
+    /// 创建 TPC-C 表和索引
+    #[arg(long = "create-schema")]
+    pub create_schema: bool,
+
+    /// 加载 TPC-C 初始数据
     #[arg(long)]
     pub init: bool,
 
@@ -32,7 +36,7 @@ pub struct Config {
     pub benchmark: bool,
 
     /// 并发线程数
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 16)]
     pub threads: usize,
 
     /// 每线程事务数
@@ -40,11 +44,11 @@ pub struct Config {
     pub transactions: usize,
 
     /// 读写比例 0.0-1.0
-    #[arg(long = "rw-ratio", default_value_t = 1.0)]
+    #[arg(long = "rw-ratio", default_value_t = 0.9130434782608695)]
     pub rw_ratio: f64,
 
-    /// 事务概率 [NewOrder Payment Delivery OrderStatus StockLevel]
-    #[arg(long = "txn-probs", num_args = 5, default_values_t = vec![0.45, 0.43, 0.04, 0.04, 0.04])]
+    /// 事务概率 [NewOrder Payment OrderStatus Delivery StockLevel]
+    #[arg(long = "txn-probs", num_args = 5, default_values_t = vec![10.0, 10.0, 1.0, 1.0, 1.0])]
     pub txn_probs: Vec<f64>,
 
     /// 运行数据库兼容性诊断

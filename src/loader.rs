@@ -1,9 +1,15 @@
+use std::fs::{create_dir_all, File};
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::connection::cursor::{RmdbCursor, SqlParam};
 use crate::data_gen::*;
 use crate::error::TpccError;
+
+const TABLE_DATA_DIR_FROM_TESTER: &str = "../src/test/performance_test/table_data";
+const TABLE_DATA_DIR_FROM_DATABASE: &str = "../src/test/performance_test/table_data";
 
 pub struct Loader<'a> {
     cursor: &'a mut RmdbCursor,
@@ -20,16 +26,21 @@ impl<'a> Loader<'a> {
 
     pub async fn create_tables(&mut self) -> Result<(), TpccError> {
         info!("[建表] 读取 sql/create_tables.sql ...");
-        let sql = std::fs::read_to_string("sql/create_tables.sql")
-            .map_err(|e| TpccError::Io(e))?;
+        let sql = std::fs::read_to_string("sql/create_tables.sql").map_err(|e| TpccError::Io(e))?;
 
         let stmts: Vec<&str> = sql.split(';').filter(|s| !s.trim().is_empty()).collect();
         for (i, stmt) in stmts.iter().enumerate() {
             let stmt = stmt.trim();
-            debug!("[建表] 执行语句 {}: {}...", i + 1, &stmt[..stmt.len().min(60)]);
+            debug!(
+                "[建表] 执行语句 {}: {}...",
+                i + 1,
+                &stmt[..stmt.len().min(60)]
+            );
             match self.cursor.execute_update(stmt, &[]).await {
                 Ok(_) => {}
-                Err(TpccError::Abort(msg)) if msg.contains("already exists") || msg.contains("table already exists") => {
+                Err(TpccError::Abort(msg))
+                    if msg.contains("already exists") || msg.contains("table already exists") =>
+                {
                     warn!("[建表] 表已存在，如需重新初始化请先手动删除: {msg}");
                 }
                 Err(e) => {
@@ -45,8 +56,7 @@ impl<'a> Loader<'a> {
 
     pub async fn create_indexes(&mut self) -> Result<(), TpccError> {
         info!("[建索引] 读取 sql/create_index.sql ...");
-        let sql = std::fs::read_to_string("sql/create_index.sql")
-            .map_err(|e| TpccError::Io(e))?;
+        let sql = std::fs::read_to_string("sql/create_index.sql").map_err(|e| TpccError::Io(e))?;
 
         let stmts: Vec<&str> = sql.split(';').filter(|s| !s.trim().is_empty()).collect();
         for (i, stmt) in stmts.iter().enumerate() {
@@ -64,80 +74,255 @@ impl<'a> Loader<'a> {
     }
 
     pub async fn load_all_data(&mut self) -> Result<(), TpccError> {
-        info!("[数据加载] 开始加载 TPC-C 数据 (scale_factor={})", self.scale_factor);
+        info!(
+            "[数据加载] 开始生成 CSV 并通过 load 导入 TPC-C 数据 (scale_factor={})",
+            self.scale_factor
+        );
         let gen = TpccDataGen::new(self.scale_factor);
+        let csv_dir = Path::new(TABLE_DATA_DIR_FROM_TESTER);
+        // RMDB switches its working directory to the database directory after open_db().
+        let load_dir = TABLE_DATA_DIR_FROM_DATABASE;
+        create_dir_all(csv_dir)?;
 
-        // Load in correct order
-        self.load_table("warehouse", &gen.generate_warehouses().iter().map(|w| w.to_sql_params()).collect::<Vec<_>>(), 9).await?;
-        self.load_table("district", &gen.generate_districts().iter().map(|d| d.to_sql_params()).collect::<Vec<_>>(), 11).await?;
-        self.load_table("item", &gen.generate_items().iter().map(|i| i.to_sql_params()).collect::<Vec<_>>(), 5).await?;
-        self.load_table("customer", &gen.generate_customers().iter().map(|c| c.to_sql_params()).collect::<Vec<_>>(), 21).await?;
-        self.load_table("stock", &gen.generate_stock().iter().map(|s| s.to_sql_params()).collect::<Vec<_>>(), 17).await?;
-        self.load_table("orders", &gen.generate_orders().iter().map(|o| o.to_sql_params()).collect::<Vec<_>>(), 8).await?;
-        self.load_table("new_orders", &gen.generate_new_orders().iter().map(|n| n.to_sql_params()).collect::<Vec<_>>(), 3).await?;
-        self.load_table("history", &gen.generate_history().iter().map(|h| h.to_sql_params()).collect::<Vec<_>>(), 8).await?;
-        self.load_table("order_line", &gen.generate_order_lines().iter().map(|ol| ol.to_sql_params()).collect::<Vec<_>>(), 10).await?;
+        self.write_and_load_table(
+            csv_dir,
+            load_dir,
+            "warehouse",
+            &[
+                "w_id",
+                "w_name",
+                "w_street_1",
+                "w_street_2",
+                "w_city",
+                "w_state",
+                "w_zip",
+                "w_tax",
+                "w_ytd",
+            ],
+            gen.generate_warehouses()
+                .into_iter()
+                .map(|w| w.to_sql_params()),
+        )
+        .await?;
+        self.write_and_load_table(
+            csv_dir,
+            load_dir,
+            "district",
+            &[
+                "d_id",
+                "d_w_id",
+                "d_name",
+                "d_street_1",
+                "d_street_2",
+                "d_city",
+                "d_state",
+                "d_zip",
+                "d_tax",
+                "d_ytd",
+                "d_next_o_id",
+            ],
+            gen.generate_districts()
+                .into_iter()
+                .map(|d| d.to_sql_params()),
+        )
+        .await?;
+        self.write_and_load_table(
+            csv_dir,
+            load_dir,
+            "item",
+            &["i_id", "i_im_id", "i_name", "i_price", "i_data"],
+            gen.generate_items().into_iter().map(|i| i.to_sql_params()),
+        )
+        .await?;
+        self.write_and_load_table(
+            csv_dir,
+            load_dir,
+            "customer",
+            &[
+                "c_id",
+                "c_d_id",
+                "c_w_id",
+                "c_first",
+                "c_middle",
+                "c_last",
+                "c_street_1",
+                "c_street_2",
+                "c_city",
+                "c_state",
+                "c_zip",
+                "c_phone",
+                "c_since",
+                "c_credit",
+                "c_credit_lim",
+                "c_discount",
+                "c_balance",
+                "c_ytd_payment",
+                "c_payment_cnt",
+                "c_delivery_cnt",
+                "c_data",
+            ],
+            gen.generate_customers()
+                .into_iter()
+                .map(|c| c.to_sql_params()),
+        )
+        .await?;
+        self.write_and_load_table(
+            csv_dir,
+            load_dir,
+            "stock",
+            &[
+                "s_i_id",
+                "s_w_id",
+                "s_quantity",
+                "s_dist_01",
+                "s_dist_02",
+                "s_dist_03",
+                "s_dist_04",
+                "s_dist_05",
+                "s_dist_06",
+                "s_dist_07",
+                "s_dist_08",
+                "s_dist_09",
+                "s_dist_10",
+                "s_ytd",
+                "s_order_cnt",
+                "s_remote_cnt",
+                "s_data",
+            ],
+            gen.generate_stock().into_iter().map(|s| s.to_sql_params()),
+        )
+        .await?;
+        self.write_and_load_table(
+            csv_dir,
+            load_dir,
+            "orders",
+            &[
+                "o_id",
+                "o_d_id",
+                "o_w_id",
+                "o_c_id",
+                "o_entry_d",
+                "o_carrier_id",
+                "o_ol_cnt",
+                "o_all_local",
+            ],
+            gen.generate_orders().into_iter().map(|o| o.to_sql_params()),
+        )
+        .await?;
+        self.write_and_load_table(
+            csv_dir,
+            load_dir,
+            "new_orders",
+            &["no_o_id", "no_d_id", "no_w_id"],
+            gen.generate_new_orders()
+                .into_iter()
+                .map(|n| n.to_sql_params()),
+        )
+        .await?;
+        self.write_and_load_table(
+            csv_dir,
+            load_dir,
+            "history",
+            &[
+                "h_c_id", "h_c_d_id", "h_c_w_id", "h_d_id", "h_w_id", "h_date", "h_amount",
+                "h_data",
+            ],
+            gen.generate_history()
+                .into_iter()
+                .map(|h| h.to_sql_params()),
+        )
+        .await?;
+        self.write_and_load_table(
+            csv_dir,
+            load_dir,
+            "order_line",
+            &[
+                "ol_o_id",
+                "ol_d_id",
+                "ol_w_id",
+                "ol_number",
+                "ol_i_id",
+                "ol_supply_w_id",
+                "ol_delivery_d",
+                "ol_quantity",
+                "ol_amount",
+                "ol_dist_info",
+            ],
+            gen.generate_order_lines()
+                .into_iter()
+                .map(|ol| ol.to_sql_params()),
+        )
+        .await?;
 
         info!("[数据加载] 全部数据加载完成");
         self.verify_counts().await?;
         Ok(())
     }
 
-    async fn load_table(
+    async fn write_and_load_table<I>(
         &mut self,
+        csv_dir: &Path,
+        load_dir: &str,
         table_name: &str,
-        rows: &[Vec<SqlParam>],
-        col_count: usize,
-    ) -> Result<(), TpccError> {
-        let total = rows.len();
+        columns: &[&str],
+        rows: I,
+    ) -> Result<(), TpccError>
+    where
+        I: IntoIterator<Item = Vec<SqlParam>>,
+    {
         let start = Instant::now();
-        info!("[表加载] {table_name}: 开始加载 {total} 行...");
+        let csv_file = csv_dir.join(format!("{table_name}.csv"));
+        let file = File::create(&csv_file)?;
+        let mut writer = BufWriter::new(file);
 
-        let placeholders = (0..col_count).map(|_| "?").collect::<Vec<_>>().join(", ");
-        let insert_sql = format!("INSERT INTO {table_name} VALUES ({placeholders})");
-
-        let mut loaded = 0usize;
-        let mut failed = 0usize;
-
-        for (i, params) in rows.iter().enumerate() {
-            match self.cursor.execute_update(&insert_sql, params).await {
-                Ok(_) => {
-                    loaded += 1;
-                }
-                Err(e) => {
-                    failed += 1;
-                    if failed <= 5 {
-                        warn!(
-                            "[表加载] {table_name} 第 {} 行 INSERT 失败: {e}",
-                            i + 1
-                        );
-                    }
-                }
-            }
-
-            // Progress reporting for large tables
-            let done = i + 1;
-            if total >= 10000 && done % 10000 == 0 {
-                let pct = (done as f64 / total as f64) * 100.0;
+        writeln!(writer, "{}", columns.join(","))?;
+        let mut total = 0usize;
+        for row in rows {
+            Self::write_csv_row(&mut writer, &row)?;
+            total += 1;
+            if total >= 10000 && total % 10000 == 0 {
                 let elapsed = start.elapsed().as_secs_f64();
-                info!(
-                    "[表加载] {table_name}: {done}/{total} ({pct:.1}%) - {elapsed:.1}s"
-                );
+                info!("[CSV] {table_name}: 已生成 {total} 行 ({elapsed:.1}s)");
             }
         }
+        writer.flush()?;
 
+        let load_path = format!("{load_dir}/{table_name}.csv");
+
+        info!("[表加载] {table_name}: 通过 load 导入 {total} 行 -> {load_path}");
+        self.cursor
+            .execute_update(&format!("load {load_path} into {table_name}"), &[])
+            .await?;
         let elapsed = start.elapsed().as_secs_f64();
-        if failed > 0 {
-            warn!(
-                "[表加载] {table_name}: {loaded}/{total} 行已加载, {failed} 行失败 ({elapsed:.2}s)"
-            );
-        } else {
-            info!(
-                "[表加载] {table_name}: {loaded}/{total} 行已加载 ({elapsed:.2}s)"
-            );
-        }
+        info!("[表加载] {table_name}: load 完成 ({elapsed:.2}s)");
 
         Ok(())
+    }
+
+    fn write_csv_row(writer: &mut BufWriter<File>, row: &[SqlParam]) -> Result<(), TpccError> {
+        for (idx, param) in row.iter().enumerate() {
+            if idx > 0 {
+                write!(writer, ",")?;
+            }
+            write!(writer, "{}", Self::csv_value(param))?;
+        }
+        writeln!(writer)?;
+        Ok(())
+    }
+
+    fn csv_value(param: &SqlParam) -> String {
+        match param {
+            SqlParam::Int(v) => v.to_string(),
+            SqlParam::Float(v) => format!("{v}"),
+            SqlParam::Str(v) => {
+                if v.contains(',') || v.contains('"') || v.contains('\n') || v.contains('\r') {
+                    format!("\"{}\"", v.replace('"', "\"\""))
+                } else {
+                    v.clone()
+                }
+            }
+            SqlParam::Null => String::new(),
+        }
     }
 
     async fn verify_counts(&mut self) -> Result<(), TpccError> {

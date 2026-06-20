@@ -22,7 +22,10 @@
 
 3. **运行**:
    ```bash
-   # 初始化数据库（建表+加载数据）
+   # 创建表和索引
+   ./target/release/tpcc-tester --create-schema -s 1
+
+   # 加载初始数据
    ./target/release/tpcc-tester --init -s 1
 
    # 运行一致性检查
@@ -45,14 +48,15 @@ Options:
   -s, --scale <N>          Scale factor / 仓库数量 [default: 1]
       --host <HOST>        RMDB 服务地址 [default: 127.0.0.1]
       --port <PORT>        RMDB 服务端口 [default: 8765]
-      --init               初始化数据库（建表+加载数据）
+      --create-schema      创建 TPC-C 表和索引
+      --init               加载 TPC-C 初始数据
       --check              运行一致性检查
       --stats              显示各表行数统计
       --benchmark          运行并发基准测试
-      --threads <N>        并发线程数 [default: 1]
+      --threads <N>        并发线程数 [default: 16]
       --transactions <N>   每线程事务数 [default: 100]
-      --rw-ratio <F>       读写比例 0.0-1.0 [default: 1.0]
-      --txn-probs <F F F F F>  事务概率 [default: 0.45 0.43 0.04 0.04 0.04]
+      --rw-ratio <F>       读写比例 0.0-1.0 [default: 0.9130434782608695]
+      --txn-probs <F F F F F>  事务概率 [NewOrder Payment OrderStatus Delivery StockLevel] [default: 10 10 1 1 1]
       --diagnose           运行数据库兼容性诊断
   -v, --verbose            详细日志 (-v=DEBUG, -vv=TRACE)
 ```

@@ -58,26 +58,23 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         return run_diagnose(&config).await;
     }
 
-    let needs_connection = config.init || config.check || config.stats || config.benchmark;
+    let needs_connection =
+        config.create_schema || config.init || config.check || config.stats || config.benchmark;
 
     if !needs_connection {
-        info!(
-            "用法: tpcc-tester --init | --check | --stats | --benchmark | --diagnose"
-        );
-        info!("  --init        初始化数据库（建表+加载数据）");
-        info!("  --check       运行一致性检查");
-        info!("  --stats       显示各表行数统计");
-        info!("  --benchmark   运行并发基准测试");
-        info!("  --diagnose    运行数据库兼容性诊断");
-        info!("  -v / -vv      详细日志");
+        info!("用法: tpcc-tester --create-schema | --init | --check | --stats | --benchmark | --diagnose");
+        info!("  --create-schema 创建 TPC-C 表和索引");
+        info!("  --init          加载 TPC-C 初始数据");
+        info!("  --check         运行一致性检查");
+        info!("  --stats         显示各表行数统计");
+        info!("  --benchmark     运行并发基准测试");
+        info!("  --diagnose      运行数据库兼容性诊断");
+        info!("  -v / -vv        详细日志");
         return Ok(());
     }
 
     // Connection pre-check
-    info!(
-        "连接 RMDB: {}:{} ...",
-        config.host, config.port
-    );
+    info!("连接 RMDB: {}:{} ...", config.host, config.port);
     let client = RmdbClient::connect(&config.host, config.port).await?;
     let mut cursor = RmdbCursor::new(client);
 
@@ -89,14 +86,21 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Init
-    if config.init {
-        info!("初始化 TPC-C 数据库 (scale_factor={})", config.scale_factor);
+    // Schema
+    if config.create_schema {
+        info!("创建 TPC-C 表和索引");
         let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
         ldr.create_tables().await?;
         ldr.create_indexes().await?;
+        info!("TPC-C 表和索引创建完成");
+    }
+
+    // Init data
+    if config.init {
+        info!("加载 TPC-C 初始数据 (scale_factor={})", config.scale_factor);
+        let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
         ldr.load_all_data().await?;
-        info!("数据库初始化完成");
+        info!("TPC-C 初始数据加载完成");
     }
 
     // Check
@@ -148,7 +152,10 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     // 2. Basic SQL
     info!("[2/6] 基础 SQL 能力检测");
     let tests = vec![
-        ("CREATE TABLE", "CREATE TABLE diagtest (id int, name char(10), val float)"),
+        (
+            "CREATE TABLE",
+            "CREATE TABLE diagtest (id int, name char(10), val float)",
+        ),
         ("INSERT", "INSERT INTO diagtest VALUES (1, 'hello', 3.14)"),
         ("SELECT", "SELECT * FROM diagtest WHERE id = 1"),
         ("UPDATE", "UPDATE diagtest SET val = 2.71 WHERE id = 1"),
@@ -164,14 +171,22 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
 
     // 3. Transaction support
     info!("[3/6] 事务支持检测");
-    for cmd in &["BEGIN", "INSERT INTO diagtest VALUES (2, 'txn', 1.0)", "COMMIT"] {
+    for cmd in &[
+        "BEGIN",
+        "INSERT INTO diagtest VALUES (2, 'txn', 1.0)",
+        "COMMIT",
+    ] {
         match cursor.execute_update(cmd, &[]).await {
             Ok(_) => info!("  {:>15}: PASS", *cmd),
             Err(e) => error!("  {:>15}: FAIL - {e}", *cmd),
         }
     }
 
-    for cmd in &["BEGIN", "INSERT INTO diagtest VALUES (3, 'rb', 1.0)", "ROLLBACK"] {
+    for cmd in &[
+        "BEGIN",
+        "INSERT INTO diagtest VALUES (3, 'rb', 1.0)",
+        "ROLLBACK",
+    ] {
         match cursor.execute_update(cmd, &[]).await {
             Ok(_) => info!("  {:>15}: PASS", *cmd),
             Err(e) => error!("  {:>15}: FAIL - {e}", *cmd),
@@ -221,10 +236,7 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     // 6. Cross-table query
     info!("[6/6] 交叉表查询支持检测");
     let _ = cursor
-        .execute_update(
-            "CREATE TABLE diagref (id int, refid int)",
-            &[],
-        )
+        .execute_update("CREATE TABLE diagref (id int, refid int)", &[])
         .await;
     let _ = cursor
         .execute_update("INSERT INTO diagref VALUES (1, 1)", &[])
