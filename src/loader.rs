@@ -8,7 +8,7 @@ use crate::connection::cursor::{RmdbCursor, SqlParam};
 use crate::data_gen::*;
 use crate::error::TpccError;
 
-const TABLE_DATA_DIR_FROM_TESTER: &str = "../src/test/performance_test/table_data";
+const TABLE_DATA_DIR_FROM_TESTER: &str = "../../src/test/performance_test/table_data";
 const TABLE_DATA_DIR_FROM_DATABASE: &str = "../src/test/performance_test/table_data";
 
 pub struct Loader<'a> {
@@ -79,9 +79,13 @@ impl<'a> Loader<'a> {
             self.scale_factor
         );
         let gen = TpccDataGen::new(self.scale_factor);
-        let csv_dir = Path::new(TABLE_DATA_DIR_FROM_TESTER);
+        let csv_dir_path = std::env::var("RMDB_TPCC_CSV_DIR")
+            .unwrap_or_else(|_| TABLE_DATA_DIR_FROM_TESTER.to_string());
+        let load_dir_path = std::env::var("RMDB_TPCC_LOAD_DIR")
+            .unwrap_or_else(|_| TABLE_DATA_DIR_FROM_DATABASE.to_string());
+        let csv_dir = Path::new(&csv_dir_path);
         // RMDB switches its working directory to the database directory after open_db().
-        let load_dir = TABLE_DATA_DIR_FROM_DATABASE;
+        let load_dir = load_dir_path.as_str();
         create_dir_all(csv_dir)?;
 
         self.write_and_load_table(
