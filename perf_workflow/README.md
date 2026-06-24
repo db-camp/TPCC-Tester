@@ -45,8 +45,8 @@ Run the full workflow:
 ```bash
 ./deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode all \
-  --label sf1_t16_official \
-  --db-name tpcc_sf1 \
+  --label sf50_t16_official \
+  --db-name tpcc_sf50 \
   --init-db \
   --check
 ```
@@ -57,7 +57,7 @@ Run only throughput + latency benchmark with the fixed official-style window:
 ./deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode benchmark \
   --label official_like \
-  --db-name tpcc_sf1 \
+  --db-name tpcc_sf50 \
   --init-db \
   --check
 ```
@@ -68,7 +68,7 @@ Run only `perf`:
 ./deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode perf \
   --label perf_only \
-  --db-name tpcc_sf1 \
+  --db-name tpcc_sf50 \
   --perf-record-seconds 30
 ```
 
@@ -84,7 +84,7 @@ It starts the configured Azure self-hosted runner VM, runs on the `rmdb/azure/we
 
 - target_ref: empty, which means the selected workflow branch
 - tpcc_branch: `chen`
-- scale: `1`
+- scale: `50`
 - threads: `16`
 - transactions: `1000000`
 - warmup_seconds: `30`
@@ -97,6 +97,18 @@ It starts the configured Azure self-hosted runner VM, runs on the `rmdb/azure/we
 - callgrind_transactions: `60`
 - heaptrack_transactions: `60`
 - build flags: `-O2 -g -fno-omit-frame-pointer`
+
+The default scale is 50 warehouses, which generates the official-sized initial data set:
+
+- warehouse: 50
+- district: 500
+- customer: 1500000
+- history: 1500000
+- new_orders: 450000
+- orders: 1500000
+- order_line: 15000000
+- item: 100000
+- stock: 5000000
 
 Set `mode` to `perf`, `callgrind`, `heaptrack`, or `all` to collect profiling artifacts. The workflow validates the required tools before running each profiling mode and uploads perf data, flamegraphs, callgrind outputs, heaptrack captures, stdout, and stderr files with the normal TPCC artifacts.
 

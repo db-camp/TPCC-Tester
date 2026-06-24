@@ -23,19 +23,19 @@
 3. **运行**:
    ```bash
    # 创建表和索引
-   ./target/release/tpcc-tester --create-schema -s 1
+   ./target/release/tpcc-tester --create-schema -s 50
 
    # 加载初始数据
-   ./target/release/tpcc-tester --init -s 1
+   ./target/release/tpcc-tester --init -s 50
 
    # 运行一致性检查
-   ./target/release/tpcc-tester --check -s 1
+   ./target/release/tpcc-tester --check -s 50
 
    # 查看各表行数统计
    ./target/release/tpcc-tester --stats
 
    # 运行并发基准测试
-   ./target/release/tpcc-tester --benchmark --threads 4 --transactions 100 -s 1
+   ./target/release/tpcc-tester --benchmark --threads 16 --transactions 100 -s 50
 
    # 运行数据库兼容性诊断
    ./target/release/tpcc-tester --diagnose
@@ -45,7 +45,7 @@
 
 ```
 Options:
-  -s, --scale <N>          Scale factor / 仓库数量 [default: 1]
+  -s, --scale <N>          Scale factor / 仓库数量 [default: 50]
       --host <HOST>        RMDB 服务地址 [default: 127.0.0.1]
       --port <PORT>        RMDB 服务端口 [default: 8765]
       --create-schema      创建 TPC-C 表和索引
@@ -60,6 +60,18 @@ Options:
       --diagnose           运行数据库兼容性诊断
   -v, --verbose            详细日志 (-v=DEBUG, -vv=TRACE)
 ```
+
+默认 scale=50，对应初始数据规模：
+
+- warehouse: 50
+- district: 500
+- customer: 1500000
+- history: 1500000
+- new_orders: 450000
+- orders: 1500000
+- order_line: 15000000
+- item: 100000
+- stock: 5000000
 
 ## 日志级别
 

@@ -4,7 +4,7 @@ use clap::Parser;
 #[command(name = "tpcc-tester", about = "TPC-C Benchmark Tool for RMDB")]
 pub struct Config {
     /// Scale factor / 仓库数量
-    #[arg(short = 's', long = "scale", default_value_t = 1)]
+    #[arg(short = 's', long = "scale", default_value_t = 50)]
     pub scale_factor: i32,
 
     /// RMDB 服务地址
