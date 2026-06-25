@@ -31,15 +31,17 @@ RUN_CHECK=0
 RUN_DIAGNOSE=0
 SKIP_BUILD=0
 SKIP_PERF_RECORD=0
-PERF_RECORD_SECONDS="20"
-CALLGRIND_TRANSACTIONS="60"
-HEAPTRACK_TRANSACTIONS="60"
+PERF_RECORD_SECONDS=""
+PERF_STAT_EVENTS="task-clock,cpu-clock,context-switches,cpu-migrations,page-faults,minor-faults,major-faults,cycles,instructions,branches,branch-misses,cache-references,cache-misses,LLC-loads,LLC-load-misses,LLC-stores,LLC-store-misses,dTLB-loads,dTLB-load-misses,iTLB-loads,iTLB-load-misses"
+CALLGRIND_TRANSACTIONS="500"
+HEAPTRACK_TRANSACTIONS="500"
 WARMUP_TRANSACTIONS="40"
 WARMUP_SECONDS="30"
 MEASURE_SECONDS="60"
 TIMED_TRANSACTIONS_CAP="1000000"
 TIMED_SHUTDOWN_GRACE="10m"
 TPCC_TIMEOUT="5m"
+SERVER_START_TIMEOUT_SECONDS="120"
 DETACH=0
 KEEP_DB_ARTIFACTS=0
 RESULT_DIR=""
@@ -72,11 +74,13 @@ Options:
   --skip-build
   --skip-perf-record
   --perf-record-seconds <n>
+  --perf-stat-events <events>
   --callgrind-transactions <n>
   --heaptrack-transactions <n>
   --warmup-transactions <n>
   --warmup-seconds <n>
   --measure-seconds <n>
+  --server-start-timeout-seconds <n>
   --timed-shutdown-grace <duration>
   --tpcc-timeout <duration>
   --detach
@@ -116,11 +120,13 @@ while [[ $# -gt 0 ]]; do
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-perf-record) SKIP_PERF_RECORD=1; shift ;;
     --perf-record-seconds) PERF_RECORD_SECONDS="$2"; shift 2 ;;
+    --perf-stat-events) PERF_STAT_EVENTS="$2"; shift 2 ;;
     --callgrind-transactions) CALLGRIND_TRANSACTIONS="$2"; shift 2 ;;
     --heaptrack-transactions) HEAPTRACK_TRANSACTIONS="$2"; shift 2 ;;
     --warmup-transactions) WARMUP_TRANSACTIONS="$2"; shift 2 ;;
     --warmup-seconds) WARMUP_SECONDS="$2"; shift 2 ;;
     --measure-seconds) MEASURE_SECONDS="$2"; shift 2 ;;
+    --server-start-timeout-seconds) SERVER_START_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --timed-shutdown-grace) TIMED_SHUTDOWN_GRACE="$2"; shift 2 ;;
     --tpcc-timeout) TPCC_TIMEOUT="$2"; shift 2 ;;
     --detach) DETACH=1; shift ;;
@@ -153,6 +159,11 @@ fi
 if [[ -n "${MEASURE_SECONDS}" ]]; then
   validate_seconds_option "--measure-seconds" "${MEASURE_SECONDS}" 0
 fi
+if [[ -z "${PERF_RECORD_SECONDS}" ]]; then
+  PERF_RECORD_SECONDS="${MEASURE_SECONDS:-60}"
+fi
+validate_seconds_option "--perf-record-seconds" "${PERF_RECORD_SECONDS}" 0
+validate_seconds_option "--server-start-timeout-seconds" "${SERVER_START_TIMEOUT_SECONDS}" 0
 if [[ -z "${TPCC_DIR}" ]]; then
   TPCC_DIR="${RMDB_DIR}/deps/TPCC-Tester"
 fi
@@ -186,6 +197,9 @@ cleanup_server() {
 
 cleanup() {
   cleanup_server
+  if declare -F generate_summary >/dev/null 2>&1; then
+    generate_summary || true
+  fi
   if [[ "${DETACH}" == "0" && "${KEEP_DB_ARTIFACTS}" == "0" ]]; then
     cleanup_database_artifacts
   fi
@@ -316,6 +330,7 @@ record_manifest() {
     echo "skip_build=${SKIP_BUILD}"
     echo "skip_perf_record=${SKIP_PERF_RECORD}"
     echo "perf_record_seconds=${PERF_RECORD_SECONDS}"
+    echo "perf_stat_events=${PERF_STAT_EVENTS}"
     echo "callgrind_transactions=${CALLGRIND_TRANSACTIONS}"
     echo "heaptrack_transactions=${HEAPTRACK_TRANSACTIONS}"
     echo "warmup_transactions=${WARMUP_TRANSACTIONS}"
@@ -324,6 +339,7 @@ record_manifest() {
     echo "timed_transactions_cap=${TIMED_TRANSACTIONS_CAP}"
     echo "timed_shutdown_grace=${TIMED_SHUTDOWN_GRACE}"
     echo "tpcc_timeout=${TPCC_TIMEOUT}"
+    echo "server_start_timeout_seconds=${SERVER_START_TIMEOUT_SECONDS}"
     echo "keep_db_artifacts=${KEEP_DB_ARTIFACTS}"
   } >"${RESULT_DIR}/manifest.txt"
 }
@@ -468,10 +484,7 @@ start_server() {
     RMDB_PORT="${PORT}" "$@" "$(server_bin)" "${DB_NAME}"
   ) >"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
-  local start_timeout=20
-  case "${mode_name}" in
-    callgrind|heaptrack) start_timeout=180 ;;
-  esac
+  local start_timeout="${SERVER_START_TIMEOUT_SECONDS}"
   wait_for_server "${start_timeout}" || {
     {
       echo
@@ -588,6 +601,49 @@ run_benchmark_phase() {
   cleanup_server
 }
 
+run_timed_warmup_phase() {
+  local phase_name="$1"
+  local out_dir="$2"
+  if [[ -n "${WARMUP_SECONDS}" ]]; then
+    if [[ "${WARMUP_SECONDS}" == "0" ]]; then
+      return 0
+    fi
+    local warmup_log="${out_dir}/${phase_name}_warmup.log"
+    local warmup_cmd=(--benchmark --threads "${THREADS}" --transactions "${TIMED_TRANSACTIONS_CAP}" --rw-ratio "${RW_RATIO}")
+    maybe_append_txn_probs warmup_cmd
+    log "running TPCC warmup (${phase_name}, ${WARMUP_SECONDS}s) -> ${warmup_log}"
+    run_tpcc_for_seconds "${warmup_log}" "${WARMUP_SECONDS}" "${warmup_cmd[@]}"
+    return $?
+  fi
+  if [[ "${WARMUP_TRANSACTIONS}" != "0" ]]; then
+    local warmup_log="${out_dir}/${phase_name}_warmup.log"
+    local warmup_cmd=(--benchmark --threads "${THREADS}" --transactions "${WARMUP_TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
+    maybe_append_txn_probs warmup_cmd
+    log "running TPCC warmup (${phase_name}) -> ${warmup_log}"
+    run_tpcc "${warmup_log}" "${warmup_cmd[@]}"
+  fi
+}
+
+supported_perf_events() {
+  local events_csv="$1"
+  local supported=()
+  IFS=',' read -r -a candidates <<<"${events_csv}"
+  for event in "${candidates[@]}"; do
+    [[ -n "${event}" ]] || continue
+    if perf stat -x, -e "${event}" -- sleep 0.01 >/dev/null 2>&1; then
+      supported+=("${event}")
+    else
+      echo "${event}" >>"${RESULT_DIR}/perf_unsupported_events.txt"
+    fi
+  done
+  local joined
+  joined="$(IFS=,; echo "${supported[*]}")"
+  if [[ -z "${joined}" ]]; then
+    joined="task-clock,context-switches,cpu-migrations,page-faults"
+  fi
+  printf '%s\n' "${joined}"
+}
+
 run_perf_phase() {
   local perf_dir="${RESULT_DIR}/perf"
   mkdir -p "${perf_dir}"
@@ -601,7 +657,10 @@ run_perf_phase() {
   maybe_append_txn_probs bench_cmd
 
   start_server "perf"
-  run_tpcc "${perf_dir}/warmup.log" --benchmark --threads "${THREADS}" --transactions "${WARMUP_TRANSACTIONS}" --rw-ratio "${RW_RATIO}" || true
+  run_timed_warmup_phase "perf" "${perf_dir}" || true
+  local perf_event_list
+  perf_event_list="$(supported_perf_events "${PERF_STAT_EVENTS}")"
+  echo "${perf_event_list}" >"${perf_dir}/perf_stat_events.txt"
 
   log "running perf stat"
   "${TPCC_BIN}" --host "${HOST}" --port "${PORT}" -s "${SCALE}" "${bench_cmd[@]}" \
@@ -609,13 +668,14 @@ run_perf_phase() {
   local bench_pid=$!
   sleep 1
   perf stat -x, -o "${perf_stat}" \
-    -e task-clock,context-switches,cpu-migrations,page-faults \
+    -e "${perf_event_list}" \
     -p "${SERVER_PID}" -- sleep "${PERF_RECORD_SECONDS}" \
     >"${perf_dir}/perf_stat.stdout" 2>"${perf_dir}/perf_stat.stderr" || true
   kill -INT "${bench_pid}" 2>/dev/null || true
   wait "${bench_pid}" 2>/dev/null || true
 
   if [[ "${SKIP_PERF_RECORD}" == "0" ]]; then
+    run_timed_warmup_phase "perf_record" "${perf_dir}" || true
     log "running perf record"
     "${TPCC_BIN}" --host "${HOST}" --port "${PORT}" -s "${SCALE}" "${bench_cmd[@]}" \
       >"${perf_dir}/benchmark_record.log" 2>&1 &
@@ -653,6 +713,7 @@ run_callgrind_phase() {
   local callgrind_shutdown_out="${out_dir}/callgrind.shutdown.out"
   local control_log="${out_dir}/callgrind_control.log"
   start_server "callgrind" valgrind --tool=callgrind --instr-atstart=no --callgrind-out-file="${callgrind_out}"
+  run_timed_warmup_phase "callgrind" "${out_dir}" || true
   log "starting callgrind counters after RMDB recovery"
   {
     echo "[callgrind_control -i on ${SERVER_PID}]"
@@ -662,7 +723,9 @@ run_callgrind_phase() {
     callgrind_control -z "${SERVER_PID}"
   } >"${control_log}" 2>&1 || die "callgrind_control failed; see ${control_log}"
   local tpcc_rc=0
-  run_tpcc "${out_dir}/benchmark.log" --benchmark --threads 1 --transactions "${CALLGRIND_TRANSACTIONS}" --rw-ratio "${RW_RATIO}" || tpcc_rc=$?
+  local bench_cmd=(--benchmark --threads "${THREADS}" --transactions "${CALLGRIND_TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
+  maybe_append_txn_probs bench_cmd
+  run_tpcc "${out_dir}/benchmark.log" "${bench_cmd[@]}" || tpcc_rc=$?
   log "dumping callgrind counters before RMDB shutdown"
   {
     echo
@@ -718,6 +781,7 @@ run_heaptrack_phase() {
   fi
   local heaptrack_cmd_log="${out_dir}/heaptrack_command.txt"
   start_server "heaptrack"
+  run_timed_warmup_phase "heaptrack" "${out_dir}" || true
   log "attaching heaptrack after RMDB recovery"
   ensure_heaptrack_attach_allowed "${out_dir}"
   local -a heaptrack_cmd=(heaptrack --pid "${SERVER_PID}")
@@ -736,7 +800,9 @@ run_heaptrack_phase() {
     die "heaptrack attach failed; see ${out_dir}/heaptrack.stderr"
   fi
   local tpcc_rc=0
-  run_tpcc "${out_dir}/benchmark.log" --benchmark --threads 1 --transactions "${HEAPTRACK_TRANSACTIONS}" --rw-ratio "${RW_RATIO}" || tpcc_rc=$?
+  local bench_cmd=(--benchmark --threads "${THREADS}" --transactions "${HEAPTRACK_TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
+  maybe_append_txn_probs bench_cmd
+  run_tpcc "${out_dir}/benchmark.log" "${bench_cmd[@]}" || tpcc_rc=$?
   kill -INT "${heaptrack_pid}" 2>/dev/null || true
   for _ in $(seq 1 40); do
     kill -0 "${heaptrack_pid}" 2>/dev/null || break
@@ -774,9 +840,9 @@ set -euo pipefail
 trap '' HUP
 $(printf 'cd %q\n' "${WORK_ROOT}")
 $(printf 'export PATH=%q:"$PATH"\n' "${LOCAL_BIN}")
-  $(printf 'bash %q --mode %q --label %q --db-name %q --build-dir %q --target-dir %q --record-root %q --host %q --port %q --scale %q --threads %q --transactions %q --rw-ratio %q --perf-record-seconds %q --callgrind-transactions %q --heaptrack-transactions %q --warmup-transactions %q --timed-shutdown-grace %q %s %s %s %s %s %s %s %s\n' \
-  "${SCRIPT_DIR}/run_workflow.sh" "${MODE}" "${LABEL}" "${DB_NAME}" "${BUILD_DIR}" "${RMDB_DIR}" "${RECORD_ROOT}" "${HOST}" "${PORT}" "${SCALE}" "${THREADS}" "${TRANSACTIONS}" "${RW_RATIO}" "${PERF_RECORD_SECONDS}" "${CALLGRIND_TRANSACTIONS}" "${HEAPTRACK_TRANSACTIONS}" "${WARMUP_TRANSACTIONS}" \
-  "${TIMED_SHUTDOWN_GRACE}" \
+  $(printf 'bash %q --mode %q --label %q --db-name %q --build-dir %q --target-dir %q --record-root %q --host %q --port %q --scale %q --threads %q --transactions %q --rw-ratio %q --perf-record-seconds %q --perf-stat-events %q --callgrind-transactions %q --heaptrack-transactions %q --warmup-transactions %q --server-start-timeout-seconds %q --timed-shutdown-grace %q %s %s %s %s %s %s %s %s\n' \
+  "${SCRIPT_DIR}/run_workflow.sh" "${MODE}" "${LABEL}" "${DB_NAME}" "${BUILD_DIR}" "${RMDB_DIR}" "${RECORD_ROOT}" "${HOST}" "${PORT}" "${SCALE}" "${THREADS}" "${TRANSACTIONS}" "${RW_RATIO}" "${PERF_RECORD_SECONDS}" "${PERF_STAT_EVENTS}" "${CALLGRIND_TRANSACTIONS}" "${HEAPTRACK_TRANSACTIONS}" "${WARMUP_TRANSACTIONS}" \
+  "${SERVER_START_TIMEOUT_SECONDS}" "${TIMED_SHUTDOWN_GRACE}" \
   "$( [[ -n "${WARMUP_SECONDS}" ]] && echo "--warmup-seconds ${WARMUP_SECONDS}" )" \
   "$( [[ -n "${MEASURE_SECONDS}" ]] && echo "--measure-seconds ${MEASURE_SECONDS}" )" \
   "$( [[ "${INIT_DB}" == "1" ]] && echo --init-db )" \

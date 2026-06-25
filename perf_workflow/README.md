@@ -80,7 +80,7 @@ The same TPC-C flow is available as a manual GitHub Actions workflow:
 TPCC Performance
 ```
 
-It starts the configured Azure self-hosted runner VM, runs on the `rmdb/azure/westus3/d32alds-v7/nvme` runner labels, and deallocates the VM in an `always()` cleanup job. It defaults to the current quick official-style test:
+It starts the configured Azure self-hosted runner VM, runs on the `rmdb/azure/westus3/d32alds-v7/nvme` runner labels, and deallocates the VM in an `always()` cleanup job. The default dispatch profile is a scale-50, 16-client, timed official-style run:
 
 - target_ref: empty, which means the selected workflow branch
 - tpcc_branch: `chen`
@@ -92,10 +92,12 @@ It starts the configured Azure self-hosted runner VM, runs on the `rmdb/azure/we
 - rw_ratio: `0.9130434782608695`
 - txn_probs: `10 10 1 1 1`
 - mode: `benchmark`
-- perf_record_seconds: `20`
+- perf_record_seconds: follows `measure_seconds`, so the CI default is `60`
 - skip_perf_record: `false`
-- callgrind_transactions: `60`
-- heaptrack_transactions: `60`
+- callgrind_transactions: `100`
+- heaptrack_transactions: `100`
+- timeout_minutes: `20`
+- server_start_timeout_seconds: `120`
 - build flags: `-O2 -g -fno-omit-frame-pointer`
 
 The default scale is 50 warehouses, which generates the official-sized initial data set:
@@ -110,7 +112,11 @@ The default scale is 50 warehouses, which generates the official-sized initial d
 - item: 100000
 - stock: 5000000
 
-Set `mode` to `perf`, `callgrind`, `heaptrack`, or `all` to collect profiling artifacts. The workflow validates the required tools before running each profiling mode and uploads perf data, flamegraphs, callgrind outputs, heaptrack captures, stdout, and stderr files with the normal TPCC artifacts.
+Set `mode` to `perf`, `callgrind`, `heaptrack`, or `all` to collect profiling artifacts. Profiling modes use the same scale, thread count, warmup, transaction mix, and read-write ratio as the benchmark inputs. `perf` runs a timed warmup, records `perf stat` for the full measurement window, and uses the same duration for `perf record` unless `--perf-record-seconds` is set explicitly. The GitHub Actions workflow defaults `callgrind` and `heaptrack` to 100 transactions so `all` mode fits comfortably within the 20-minute CI budget.
+
+`perf stat` starts from a broad candidate event list, probes event support on the runner, writes the selected list to `perf/perf_stat_events.txt`, and writes rejected events to `perf_unsupported_events.txt`. This keeps the workflow portable across runner kernel and hardware configurations while preserving the available counters.
+
+Each run writes `summary.md` during normal completion and during cleanup after a failure. The GitHub Actions summary step publishes the file whenever it exists, so failed runs still retain the manifest, logs, partial profiling artifacts, and the generated summary.
 
 Use `target_ref` to benchmark a different RMDB branch, tag, or commit SHA. `tpcc_branch` supplies the TPCC-Tester checkout under `deps/TPCC-Tester`, including the reusable performance workflow scripts; leave it as `chen` unless you are testing TPCC-Tester workflow changes. The CI checks out both revisions: `target_ref` supplies the RMDB code under test, while `tpcc_branch` supplies the TPCC tester and benchmark workflow.
 
@@ -143,8 +149,8 @@ Profiling support is configured on the Azure runner VM:
 
 - `TPCC-Tester` defaults to the submodule checkout at `<workspace>/deps/TPCC-Tester`. The script initializes and builds it if missing.
 - `perf` hardware counters are not available on this WSL2 host; the workflow uses software events and `cpu-clock` sampling.
-- The installer now prefers already-installed system tools.
+- The installer prefers already-installed system tools.
 - If `~/FlameGraph` exists, the workflow prefers that checkout and symlinks `flamegraph.pl` and `stackcollapse-perf.pl` from it.
-- `heaptrack_gui` and `hotspot` are now expected to be available from the system install.
+- `heaptrack_gui` and `hotspot` are expected to be available from the system install.
 - `trace_processor` and `traceconv` are installed as official Perfetto wrappers and can be used later for trace analysis.
-- `run_workflow.sh` now cleans the temporary database directory by default after each run, so `performance_test_record/` remains the only persistent result store. Use `--keep-db-artifacts` only when you explicitly need the database files.
+- `run_workflow.sh` cleans the temporary database directory by default after each run, so `performance_test_record/` remains the only persistent result store. Use `--keep-db-artifacts` only when you explicitly need the database files.
