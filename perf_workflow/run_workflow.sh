@@ -725,7 +725,13 @@ run_callgrind_phase() {
   local tpcc_rc=0
   local bench_cmd=(--benchmark --threads "${THREADS}" --transactions "${CALLGRIND_TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
   maybe_append_txn_probs bench_cmd
-  run_tpcc "${out_dir}/benchmark.log" "${bench_cmd[@]}" || tpcc_rc=$?
+  if [[ -n "${MEASURE_SECONDS}" && "${MEASURE_SECONDS}" != "0" ]]; then
+    log "running callgrind benchmark (${MEASURE_SECONDS}s) -> ${out_dir}/benchmark.log"
+    run_tpcc_for_seconds "${out_dir}/benchmark.log" "${MEASURE_SECONDS}" "${bench_cmd[@]}" || tpcc_rc=$?
+  else
+    log "running callgrind benchmark -> ${out_dir}/benchmark.log"
+    run_tpcc "${out_dir}/benchmark.log" "${bench_cmd[@]}" || tpcc_rc=$?
+  fi
   log "dumping callgrind counters before RMDB shutdown"
   {
     echo
@@ -802,7 +808,13 @@ run_heaptrack_phase() {
   local tpcc_rc=0
   local bench_cmd=(--benchmark --threads "${THREADS}" --transactions "${HEAPTRACK_TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
   maybe_append_txn_probs bench_cmd
-  run_tpcc "${out_dir}/benchmark.log" "${bench_cmd[@]}" || tpcc_rc=$?
+  if [[ -n "${MEASURE_SECONDS}" && "${MEASURE_SECONDS}" != "0" ]]; then
+    log "running heaptrack benchmark (${MEASURE_SECONDS}s) -> ${out_dir}/benchmark.log"
+    run_tpcc_for_seconds "${out_dir}/benchmark.log" "${MEASURE_SECONDS}" "${bench_cmd[@]}" || tpcc_rc=$?
+  else
+    log "running heaptrack benchmark -> ${out_dir}/benchmark.log"
+    run_tpcc "${out_dir}/benchmark.log" "${bench_cmd[@]}" || tpcc_rc=$?
+  fi
   kill -INT "${heaptrack_pid}" 2>/dev/null || true
   for _ in $(seq 1 40); do
     kill -0 "${heaptrack_pid}" 2>/dev/null || break
