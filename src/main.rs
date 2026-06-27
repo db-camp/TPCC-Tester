@@ -17,6 +17,9 @@ use tracing::{error, info, warn};
 use config::Config;
 use connection::client::RmdbClient;
 use connection::cursor::RmdbCursor;
+use error::TpccError;
+
+const SNAPSHOT_ISOLATION_SQL: &str = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;";
 
 fn setup_tracing(verbose: u8) {
     use tracing_subscriber::EnvFilter;
@@ -78,6 +81,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let client = RmdbClient::connect(&config.host, config.port).await?;
     let mut cursor = RmdbCursor::new(client);
     maybe_disable_output_file(&config, &mut cursor).await?;
+    configure_session(&mut cursor).await?;
 
     // Ping test
     match cursor.client_mut().ping().await {
@@ -150,6 +154,18 @@ async fn maybe_disable_output_file(
     Ok(())
 }
 
+async fn configure_session(cursor: &mut RmdbCursor) -> Result<(), TpccError> {
+    info!("发送 SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION");
+    let response = cursor.client_mut().send_cmd(SNAPSHOT_ISOLATION_SQL).await?;
+    let trimmed = response.trim();
+    if trimmed.starts_with("abort") || trimmed.starts_with("Error") {
+        return Err(TpccError::QueryError(format!(
+            "设置 SNAPSHOT ISOLATION 失败: {trimmed}"
+        )));
+    }
+    Ok(())
+}
+
 async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     info!("========================================");
     info!("   RMDB 兼容性诊断");
@@ -169,6 +185,7 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     };
     let mut cursor = RmdbCursor::new(client);
     maybe_disable_output_file(config, &mut cursor).await?;
+    configure_session(&mut cursor).await?;
 
     // 2. Basic SQL
     info!("[2/6] 基础 SQL 能力检测");

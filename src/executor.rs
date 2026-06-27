@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -12,6 +13,8 @@ use crate::data_gen::TpccDataGen;
 use crate::error::TpccError;
 use crate::report::BenchmarkResult;
 use crate::transaction::{self, TransactionType};
+
+const SNAPSHOT_ISOLATION_SQL: &str = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;";
 
 struct SharedCounters {
     total_committed: AtomicU64,
@@ -49,10 +52,12 @@ impl BenchmarkExecutor {
 
         let start_time = Instant::now();
         let cancelled_at = Arc::new(Mutex::new(None::<Instant>));
+        let (cancel_tx, cancel_rx) = watch::channel(false);
 
         // Ctrl+C handler
         let cancel_counters = counters.clone();
         let cancel_time = cancelled_at.clone();
+        let cancel_signal = cancel_tx.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             info!("收到 Ctrl+C 信号，正在优雅关闭...");
@@ -62,6 +67,7 @@ impl BenchmarkExecutor {
                 }
             }
             cancel_counters.cancelled.store(true, Ordering::Relaxed);
+            let _ = cancel_signal.send(true);
         });
 
         // Progress reporter
@@ -102,6 +108,7 @@ impl BenchmarkExecutor {
             let counters = counters.clone();
             let probs = txn_probs.clone();
             let results = thread_results.clone();
+            let mut cancel_rx = cancel_rx.clone();
 
             join_set.spawn(async move {
                 let mut thread_data: Vec<(TransactionType, f64, bool)> = Vec::new();
@@ -115,12 +122,17 @@ impl BenchmarkExecutor {
                     }
                 };
                 let mut cursor = RmdbCursor::new(client);
+                if let Err(e) = configure_worker_session(&mut cursor, thread_id).await {
+                    error!("[Worker {thread_id}] 会话配置失败: {e}");
+                    results.lock().await.push(thread_data);
+                    return;
+                }
                 let gen = TpccDataGen::new(scale);
 
                 let mut consecutive_failures = 0u32;
 
-                for txn_idx in 0..txn_per_thread {
-                    if counters.cancelled.load(Ordering::Relaxed) {
+                'worker: for txn_idx in 0..txn_per_thread {
+                    if counters.cancelled.load(Ordering::Relaxed) || *cancel_rx.borrow() {
                         break;
                     }
 
@@ -129,11 +141,24 @@ impl BenchmarkExecutor {
 
                     // Retry loop (matches Python behavior: infinite retry until success)
                     loop {
-                        if counters.cancelled.load(Ordering::Relaxed) {
-                            break;
+                        if counters.cancelled.load(Ordering::Relaxed) || *cancel_rx.borrow() {
+                            break 'worker;
                         }
 
-                        match transaction::execute_transaction(&mut cursor, &gen, txn_type).await {
+                        let txn_result = tokio::select! {
+                            biased;
+
+                            changed = cancel_rx.changed() => {
+                                if changed.is_err() || *cancel_rx.borrow() {
+                                    debug!("[Worker {thread_id}] 收到取消信号，结束当前 worker");
+                                    break 'worker;
+                                }
+                                continue;
+                            }
+                            result = transaction::execute_transaction(&mut cursor, &gen, txn_type) => result,
+                        };
+
+                        match txn_result {
                             Ok(true) => {
                                 let elapsed = txn_start.elapsed().as_secs_f64();
                                 counters.total_committed.fetch_add(1, Ordering::Relaxed);
@@ -177,6 +202,13 @@ impl BenchmarkExecutor {
                                 match RmdbClient::connect(&host, port).await {
                                     Ok(new_client) => {
                                         cursor = RmdbCursor::new(new_client);
+                                        if let Err(e) =
+                                            configure_worker_session(&mut cursor, thread_id).await
+                                        {
+                                            error!("[Worker {thread_id}] 重连后会话配置失败: {e}");
+                                            results.lock().await.push(thread_data);
+                                            return;
+                                        }
                                         info!("[Worker {thread_id}] 重连成功");
                                     }
                                     Err(e) => {
@@ -274,4 +306,19 @@ impl BenchmarkExecutor {
             rw_ratio,
         })
     }
+}
+
+async fn configure_worker_session(
+    cursor: &mut RmdbCursor,
+    thread_id: usize,
+) -> Result<(), TpccError> {
+    let response = cursor.client_mut().send_cmd(SNAPSHOT_ISOLATION_SQL).await?;
+    let trimmed = response.trim();
+    if trimmed.starts_with("abort") || trimmed.starts_with("Error") {
+        return Err(TpccError::QueryError(format!(
+            "设置 SNAPSHOT ISOLATION 失败: {trimmed}"
+        )));
+    }
+    debug!("[Worker {thread_id}] 已设置 SNAPSHOT ISOLATION");
+    Ok(())
 }
