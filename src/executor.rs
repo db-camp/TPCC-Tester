@@ -12,7 +12,7 @@ use crate::connection::cursor::RmdbCursor;
 use crate::data_gen::TpccDataGen;
 use crate::error::TpccError;
 use crate::report::BenchmarkResult;
-use crate::transaction::{self, TransactionType};
+use crate::transaction::{self, TransactionSchedule, TransactionType};
 
 const SNAPSHOT_ISOLATION_SQL: &str = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;";
 
@@ -53,6 +53,9 @@ impl BenchmarkExecutor {
         let start_time = Instant::now();
         let cancelled_at = Arc::new(Mutex::new(None::<Instant>));
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let txn_schedule = Arc::new(TransactionSchedule::new(rw_ratio, &txn_probs));
+        let next_txn_sequence = Arc::new(AtomicU64::new(0));
+        info!("事务调度周期: {}", txn_schedule.describe());
 
         // Ctrl+C handler
         let cancel_counters = counters.clone();
@@ -106,9 +109,10 @@ impl BenchmarkExecutor {
             let port = self.config.port;
             let scale = self.config.scale_factor;
             let counters = counters.clone();
-            let probs = txn_probs.clone();
             let results = thread_results.clone();
             let mut cancel_rx = cancel_rx.clone();
+            let txn_schedule = txn_schedule.clone();
+            let next_txn_sequence = next_txn_sequence.clone();
 
             join_set.spawn(async move {
                 let mut thread_data: Vec<(TransactionType, f64, bool)> = Vec::new();
@@ -136,7 +140,8 @@ impl BenchmarkExecutor {
                         break;
                     }
 
-                    let txn_type = transaction::select_transaction_type(rw_ratio, &probs);
+                    let txn_type =
+                        txn_schedule.pick(next_txn_sequence.fetch_add(1, Ordering::Relaxed));
                     let txn_start = Instant::now();
 
                     // Retry loop (matches Python behavior: infinite retry until success)
