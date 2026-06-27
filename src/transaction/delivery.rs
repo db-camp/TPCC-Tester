@@ -58,44 +58,7 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
             return Ok(false);
         }
 
-        // Step 3: Update order with carrier_id
-        if let Err(e) = cursor
-            .execute_update(
-                "UPDATE orders SET o_carrier_id = ? WHERE o_id = ? AND o_d_id = ? AND o_w_id = ?",
-                &[
-                    SqlParam::Int(o_carrier_id as i64),
-                    SqlParam::Int(o_id as i64),
-                    SqlParam::Int(d_id as i64),
-                    SqlParam::Int(w_id as i64),
-                ],
-            )
-            .await
-        {
-            warn!("[Delivery Step 3] UPDATE orders 失败 (d_id={d_id}): {e}");
-            let _ = cursor.execute_update("ROLLBACK", &[]).await;
-            return Ok(false);
-        }
-
-        // Step 4: Update order_lines with delivery date
-        let delivery_date = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        if let Err(e) = cursor
-            .execute_update(
-                "UPDATE order_line SET ol_delivery_d = ? WHERE ol_o_id = ? AND ol_d_id = ? AND ol_w_id = ?",
-                &[
-                    SqlParam::Str(delivery_date),
-                    SqlParam::Int(o_id as i64),
-                    SqlParam::Int(d_id as i64),
-                    SqlParam::Int(w_id as i64),
-                ],
-            )
-            .await
-        {
-            warn!("[Delivery Step 4] UPDATE order_line 失败 (d_id={d_id}): {e}");
-            let _ = cursor.execute_update("ROLLBACK", &[]).await;
-            return Ok(false);
-        }
-
-        // Step 5: Get customer ID
+        // Step 3: Get customer ID
         let order_result = cursor
             .execute(
                 "SELECT o_c_id FROM orders WHERE o_id = ? AND o_d_id = ? AND o_w_id = ?",
@@ -123,15 +86,48 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
 
         let o_c_id: i32 = order_result.rows[0][0].parse().unwrap_or(0);
 
-        // Calculate total amount
-        let total_result = cursor
-            .execute(
-                "SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = ? AND ol_d_id = ? AND ol_w_id = ?",
+        // Step 4: Update order with carrier_id
+        if let Err(e) = cursor
+            .execute_update(
+                "UPDATE orders SET o_carrier_id = ? WHERE o_id = ? AND o_d_id = ? AND o_w_id = ?",
                 &[
+                    SqlParam::Int(o_carrier_id as i64),
                     SqlParam::Int(o_id as i64),
                     SqlParam::Int(d_id as i64),
                     SqlParam::Int(w_id as i64),
                 ],
+            )
+            .await
+        {
+            warn!("[Delivery Step 4] UPDATE orders 失败 (d_id={d_id}): {e}");
+            let _ = cursor.execute_update("ROLLBACK", &[]).await;
+            return Ok(false);
+        }
+
+        // Step 5: Update order_lines with delivery date
+        let delivery_date = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        if let Err(e) = cursor
+            .execute_update(
+                "UPDATE order_line SET ol_delivery_d = ? WHERE ol_o_id = ? AND ol_d_id = ? AND ol_w_id = ?",
+                &[
+                    SqlParam::Str(delivery_date),
+                    SqlParam::Int(o_id as i64),
+                    SqlParam::Int(d_id as i64),
+                    SqlParam::Int(w_id as i64),
+                ],
+            )
+            .await
+        {
+            warn!("[Delivery Step 5] UPDATE order_line 失败 (d_id={d_id}): {e}");
+            let _ = cursor.execute_update("ROLLBACK", &[]).await;
+            return Ok(false);
+        }
+
+        // Calculate total amount
+        let total_result = cursor
+            .execute(
+                "SELECT SUM(ol_amount) FROM order_line WHERE ol_o_id = ? AND ol_d_id = ?",
+                &[SqlParam::Int(o_id as i64), SqlParam::Int(d_id as i64)],
             )
             .await;
 
@@ -151,12 +147,39 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
 
         let order_total: f64 = total_result.rows[0][0].parse().unwrap_or(0.0);
 
+        let balance_result = cursor
+            .execute(
+                "SELECT c_balance FROM customer WHERE c_id = ? AND c_d_id = ? AND c_w_id = ?",
+                &[
+                    SqlParam::Int(o_c_id as i64),
+                    SqlParam::Int(d_id as i64),
+                    SqlParam::Int(w_id as i64),
+                ],
+            )
+            .await;
+
+        let balance_result = match balance_result {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("[Delivery Step 6] SELECT customer balance 失败 (d_id={d_id}): {e}");
+                let _ = cursor.execute_update("ROLLBACK", &[]).await;
+                return Ok(false);
+            }
+        };
+
+        if balance_result.is_empty() {
+            let _ = cursor.execute_update("ROLLBACK", &[]).await;
+            return Ok(false);
+        }
+
+        let c_balance: f64 = balance_result.rows[0][0].parse().unwrap_or(0.0);
+
         // Step 6: Update customer balance
         if let Err(e) = cursor
             .execute_update(
-                "UPDATE customer SET c_balance = c_balance+?, c_delivery_cnt = c_delivery_cnt+1 WHERE c_id = ? AND c_d_id = ? AND c_w_id = ?",
+                "UPDATE customer SET c_balance = ?, c_delivery_cnt = c_delivery_cnt+1 WHERE c_id = ? AND c_d_id = ? AND c_w_id = ?",
                 &[
-                    SqlParam::Float(order_total),
+                    SqlParam::Float(c_balance + order_total),
                     SqlParam::Int(o_c_id as i64),
                     SqlParam::Int(d_id as i64),
                     SqlParam::Int(w_id as i64),

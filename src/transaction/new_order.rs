@@ -31,52 +31,14 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
         return Err(e);
     }
 
-    // Phase 1: Get district info
-    let district_result = cursor
-        .execute(
-            "SELECT d_tax, d_next_o_id FROM district WHERE d_id = ? AND d_w_id = ?",
-            &[SqlParam::Int(d_id as i64), SqlParam::Int(w_id as i64)],
-        )
-        .await;
-
-    let district_result = match district_result {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("[NewOrder Phase 1] SELECT district 失败: {e}");
-            let _ = cursor.execute_update("ROLLBACK", &[]).await;
-            return Ok(false);
-        }
-    };
-
-    if district_result.is_empty() {
-        let _ = cursor.execute_update("ROLLBACK", &[]).await;
-        return Ok(false);
-    }
-
-    let d_tax: f64 = district_result.rows[0][0].parse().unwrap_or(0.0);
-    let o_id: i32 = district_result.rows[0][1].parse().unwrap_or(0);
-
-    // Update next order ID
-    if let Err(e) = cursor
-        .execute_update(
-            "UPDATE district SET d_next_o_id = d_next_o_id+1 WHERE d_id = ? AND d_w_id = ?",
-            &[SqlParam::Int(d_id as i64), SqlParam::Int(w_id as i64)],
-        )
-        .await
-    {
-        warn!("[NewOrder Phase 1] UPDATE district 失败: {e}");
-        let _ = cursor.execute_update("ROLLBACK", &[]).await;
-        return Ok(false);
-    }
-
-    // Get customer and warehouse info
+    // Phase 1: Get customer and warehouse info
     let customer_result = cursor
         .execute(
-            "SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE c_w_id = w_id AND c_d_id = ? AND c_id = ? AND w_id = ?",
+            "SELECT c_discount, c_last, c_credit, w_tax FROM customer, warehouse WHERE w_id = ? AND c_w_id = w_id AND c_d_id = ? AND c_id = ?",
             &[
+                SqlParam::Int(w_id as i64),
                 SqlParam::Int(d_id as i64),
                 SqlParam::Int(c_id as i64),
-                SqlParam::Int(w_id as i64),
             ],
         )
         .await;
@@ -97,6 +59,48 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
 
     let c_discount: f64 = customer_result.rows[0][0].parse().unwrap_or(0.0);
     let w_tax: f64 = customer_result.rows[0][3].parse().unwrap_or(0.0);
+
+    // Phase 1: Get district info
+    let district_result = cursor
+        .execute(
+            "SELECT d_next_o_id, d_tax FROM district WHERE d_id = ? AND d_w_id = ?",
+            &[SqlParam::Int(d_id as i64), SqlParam::Int(w_id as i64)],
+        )
+        .await;
+
+    let district_result = match district_result {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("[NewOrder Phase 1] SELECT district 失败: {e}");
+            let _ = cursor.execute_update("ROLLBACK", &[]).await;
+            return Ok(false);
+        }
+    };
+
+    if district_result.is_empty() {
+        let _ = cursor.execute_update("ROLLBACK", &[]).await;
+        return Ok(false);
+    }
+
+    let o_id: i32 = district_result.rows[0][0].parse().unwrap_or(0);
+    let d_tax: f64 = district_result.rows[0][1].parse().unwrap_or(0.0);
+
+    // Update next order ID
+    if let Err(e) = cursor
+        .execute_update(
+            "UPDATE district SET d_next_o_id = ? WHERE d_id = ? AND d_w_id = ?",
+            &[
+                SqlParam::Int((o_id + 1) as i64),
+                SqlParam::Int(d_id as i64),
+                SqlParam::Int(w_id as i64),
+            ],
+        )
+        .await
+    {
+        warn!("[NewOrder Phase 1] UPDATE district 失败: {e}");
+        let _ = cursor.execute_update("ROLLBACK", &[]).await;
+        return Ok(false);
+    }
 
     // Phase 2: Create order and new order
     let o_entry_d = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -175,14 +179,9 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
         let i_price: f64 = item_result.rows[0][0].parse().unwrap_or(0.0);
         let _i_data = &item_result.rows[0][2];
 
-        // Get stock info with dynamic column name
-        let stock_sql = format!(
-            "SELECT s_quantity, s_dist_{:02}, s_ytd, s_order_cnt, s_remote_cnt, s_data FROM stock WHERE s_i_id = ? AND s_w_id = ?",
-            d_id
-        );
         let stock_result = cursor
             .execute(
-                &stock_sql,
+                "SELECT s_quantity, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10 FROM stock WHERE s_i_id = ? AND s_w_id = ?",
                 &[
                     SqlParam::Int(ol_i_ids[idx] as i64),
                     SqlParam::Int(ol_supply_w_ids[idx] as i64),
@@ -205,11 +204,9 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
         }
 
         let mut s_quantity: i32 = stock_result.rows[0][0].parse().unwrap_or(0);
-        let s_dist = &stock_result.rows[0][1];
-        let mut s_ytd: f64 = stock_result.rows[0][2].parse().unwrap_or(0.0);
-        let mut s_order_cnt: i32 = stock_result.rows[0][3].parse().unwrap_or(0);
-        let mut s_remote_cnt: i32 = stock_result.rows[0][4].parse().unwrap_or(0);
-        let _s_data = &stock_result.rows[0][5];
+        let _s_data = &stock_result.rows[0][1];
+        let s_dist_idx = (d_id as usize + 1).min(stock_result.rows[0].len() - 1);
+        let s_dist = &stock_result.rows[0][s_dist_idx];
 
         // Update stock quantity
         if s_quantity >= ol_quantities[idx] + 10 {
@@ -218,21 +215,12 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
             s_quantity = s_quantity - ol_quantities[idx] + 91;
         }
 
-        s_ytd += ol_quantities[idx] as f64;
-        s_order_cnt += 1;
-        if ol_supply_w_ids[idx] != w_id {
-            s_remote_cnt += 1;
-        }
-
         // Update stock
         if let Err(e) = cursor
             .execute_update(
-                "UPDATE stock SET s_quantity = ?, s_ytd = ?, s_order_cnt = ?, s_remote_cnt = ? WHERE s_i_id = ? AND s_w_id = ?",
+                "UPDATE stock SET s_quantity = ? WHERE s_i_id = ? AND s_w_id = ?",
                 &[
                     SqlParam::Int(s_quantity as i64),
-                    SqlParam::Float(s_ytd),
-                    SqlParam::Int(s_order_cnt as i64),
-                    SqlParam::Int(s_remote_cnt as i64),
                     SqlParam::Int(ol_i_ids[idx] as i64),
                     SqlParam::Int(ol_supply_w_ids[idx] as i64),
                 ],
