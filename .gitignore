@@ -4,3 +4,4 @@ result
 **/__pycache__
 tpcc/logs
 /target/
+docs/convert_pdf.py
