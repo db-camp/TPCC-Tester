@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- README hero: self-contained dark card — always readable in light/dark GitHub themes -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" role="img" aria-labelledby="title desc">
+  <title id="title">TPCC-Tester</title>
+  <desc id="desc">Dark neon banner: database core, throughput bars, TPC-C benchmark client for RMDB</desc>
+  <defs>
+    <linearGradient id="stage" x1="0" y1="0" x2="960" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#020617"/>
+      <stop offset="40%" stop-color="#0B1224"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+    <radialGradient id="glowCore" cx="50%" cy="42%" r="45%">
+      <stop offset="0%" stop-color="#22D3EE" stop-opacity="0.28"/>
+      <stop offset="45%" stop-color="#1D4ED8" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#020617" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tile" x1="360" y1="70" x2="600" y2="310" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E3A8A"/>
+      <stop offset="50%" stop-color="#0F274F"/>
+      <stop offset="100%" stop-color="#071225"/>
+    </linearGradient>
+    <linearGradient id="dbBody" x1="420" y1="130" x2="540" y2="280" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#A5F3FC"/>
+      <stop offset="40%" stop-color="#22D3EE"/>
+      <stop offset="100%" stop-color="#0E7490"/>
+    </linearGradient>
+    <linearGradient id="dbTop" x1="420" y1="120" x2="540" y2="170" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F0FDFA"/>
+      <stop offset="100%" stop-color="#67E8F9"/>
+    </linearGradient>
+    <linearGradient id="bars" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#5EEAD4"/>
+      <stop offset="100%" stop-color="#0D9488"/>
+    </linearGradient>
+    <linearGradient id="neonLine" x1="80" y1="360" x2="880" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22D3EE" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#22D3EE" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#2DD4BF" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="textGlow" x="-10%" y="-40%" width="120%" height="180%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Card -->
+  <rect width="960" height="420" rx="20" fill="url(#stage)"/>
+  <rect x="1.5" y="1.5" width="957" height="417" rx="18.5" fill="none" stroke="#334155" stroke-opacity="0.55" stroke-width="1.5"/>
+  <rect width="960" height="420" rx="20" fill="url(#glowCore)"/>
+
+  <!-- Circuit / arena grid -->
+  <g opacity="0.16" stroke="#38BDF8" stroke-width="1" fill="none">
+    <path d="M60 90h840M60 140h840M60 190h840M60 240h840M60 290h840"/>
+    <path d="M120 50v300M200 50v300M280 50v300M680 50v300M760 50v300M840 50v300"/>
+  </g>
+  <g opacity="0.22" stroke="#2DD4BF" stroke-width="1.2" fill="none" stroke-linecap="round">
+    <path d="M90 320 C180 280, 260 300, 340 250"/>
+    <path d="M620 250 C700 300, 780 280, 870 320"/>
+    <circle cx="340" cy="250" r="3.5" fill="#2DD4BF" stroke="none"/>
+    <circle cx="620" cy="250" r="3.5" fill="#22D3EE" stroke="none"/>
+  </g>
+
+  <!-- Floating metric chips -->
+  <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif" font-size="12" font-weight="700">
+    <g transform="translate(72 118)">
+      <rect width="118" height="36" rx="10" fill="#0F172A" fill-opacity="0.85" stroke="#22D3EE" stroke-opacity="0.35"/>
+      <text x="16" y="23" fill="#67E8F9">NewOrder/min</text>
+    </g>
+    <g transform="translate(770 118)">
+      <rect width="118" height="36" rx="10" fill="#0F172A" fill-opacity="0.85" stroke="#2DD4BF" stroke-opacity="0.4"/>
+      <text x="28" y="23" fill="#5EEAD4">Wire v3</text>
+    </g>
+    <g transform="translate(88 250)">
+      <rect width="96" height="32" rx="9" fill="#0F172A" fill-opacity="0.8" stroke="#6366F1" stroke-opacity="0.4"/>
+      <text x="22" y="21" fill="#A5B4FC">32 clients</text>
+    </g>
+    <g transform="translate(776 250)">
+      <rect width="96" height="32" rx="9" fill="#0F172A" fill-opacity="0.8" stroke="#F59E0B" stroke-opacity="0.35"/>
+      <text x="18" y="21" fill="#FCD34D">SI · ACID</text>
+    </g>
+  </g>
+
+  <!-- Center mark tile -->
+  <g filter="url(#softGlow)">
+    <rect x="384" y="78" width="192" height="192" rx="48" fill="url(#tile)"/>
+    <rect x="386" y="80" width="188" height="188" rx="46" fill="none" stroke="#67E8F9" stroke-opacity="0.35" stroke-width="2"/>
+
+    <!-- inner grid -->
+    <g opacity="0.14" stroke="#67E8F9" stroke-width="1" transform="translate(384 78)">
+      <path d="M24 48h144M24 80h144M24 112h144M24 144h144"/>
+      <path d="M48 24v144M80 24v144M112 24v144M144 24v144"/>
+    </g>
+
+    <!-- DB -->
+    <path d="M432 148c0-12 16.5-22 48-22s48 10 48 22v64c0 12-16.5 22-48 22s-48-10-48-22v-64z" fill="url(#dbBody)"/>
+    <ellipse cx="480" cy="148" rx="48" ry="22" fill="url(#dbTop)"/>
+    <path d="M432 172c3.5 10 20 17.5 48 17.5s44.5-7.5 48-17.5" fill="none" stroke="#155E75" stroke-opacity="0.5" stroke-width="2"/>
+    <path d="M432 196c3.5 10 20 17.5 48 17.5s44.5-7.5 48-17.5" fill="none" stroke="#155E75" stroke-opacity="0.4" stroke-width="2"/>
+    <ellipse cx="480" cy="212" rx="48" ry="22" fill="none" stroke="#0E7490" stroke-opacity="0.55" stroke-width="2"/>
+
+    <!-- bars -->
+    <g transform="translate(528 168)">
+      <rect x="0" y="40" width="12" height="24" rx="3" fill="url(#bars)" opacity="0.8"/>
+      <rect x="18" y="24" width="12" height="40" rx="3" fill="url(#bars)" opacity="0.92"/>
+      <rect x="36" y="8" width="12" height="56" rx="3" fill="url(#bars)"/>
+      <path d="M3 52 L24 32 L42 14" fill="none" stroke="#ECFDF5" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+
+    <!-- check -->
+    <circle cx="430" cy="236" r="16" fill="#042F2E" opacity="0.85"/>
+    <circle cx="430" cy="236" r="16" fill="none" stroke="#5EEAD4" stroke-opacity="0.5" stroke-width="1.5"/>
+    <path d="M422 236.5l5 5 11.5-12" fill="none" stroke="#5EEAD4" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Title under mark (banner-internal wordmark) -->
+  <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" text-anchor="middle">
+    <text x="480" y="322" font-size="42" font-weight="800" letter-spacing="-1" fill="#F8FAFC" filter="url(#textGlow)">TPCC-Tester</text>
+    <text x="480" y="352" font-size="16" font-weight="600" letter-spacing="3.5" fill="#2DD4BF">RMDB · TPC-C BENCHMARK CLIENT</text>
+    <text x="480" y="378" font-size="13" font-weight="500" letter-spacing="0.4" fill="#94A3B8">Local self-check · not the official sealed judge</text>
+  </g>
+
+  <path d="M120 392h720" stroke="url(#neonLine)" stroke-width="2" fill="none"/>
+</svg>

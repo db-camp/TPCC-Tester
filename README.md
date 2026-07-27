@@ -1,12 +1,16 @@
 # TPCC-Tester
 
 <p align="center">
-  <img src="assets/logo.svg" alt="TPCC-Tester" width="420"/>
+  <img src="assets/logo-banner.svg" alt="TPCC-Tester — RMDB TPC-C benchmark client" width="720"/>
 </p>
 
-[db-camp](https://github.com/db-camp) 维护的 TPC-C 风格**本地模拟评测客户端**，面向全国大学生计算机系统能力大赛 · 数据库管理系统设计赛（RMDB）。Rust + tokio 实现。
+<p align="center"><strong>TPCC-Tester</strong> — 面向 RMDB 的 TPC-C 风格本地评测客户端</p>
 
-**Logo 资源**：[`assets/logo.svg`](assets/logo.svg)（横版字标）· [`assets/logo-icon.svg`](assets/logo-icon.svg)（方形图标）
+<p align="center">
+  [db-camp](https://github.com/db-camp) 维护 · Rust + tokio · 全国大学生计算机系统能力大赛 · 数据库管理系统设计赛
+</p>
+
+**Logo 资源**：[banner](assets/logo-banner.svg) · [横版字标](assets/logo.svg)（浅色字，适合深色 UI）· [图标](assets/logo-icon.svg)
 
 | 状态 | 说明 |
 | --- | --- |
