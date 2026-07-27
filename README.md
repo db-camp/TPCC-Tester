@@ -10,8 +10,6 @@
   [db-camp](https://github.com/db-camp) 维护 · Rust + tokio · 全国大学生计算机系统能力大赛 · 数据库管理系统设计赛
 </p>
 
-**Logo 资源**：[banner](assets/logo-banner.svg) · [横版字标](assets/logo.svg)（浅色字，适合深色 UI）· [图标](assets/logo-icon.svg)
-
 | 状态 | 说明 |
 | --- | --- |
 | **当前 `main` 可运行行为** | 对应 **2025 及更早** 文本协议客户端：逐条 SQL、固定「线程 × 事务数」负载、tpmC 风格报告 |
