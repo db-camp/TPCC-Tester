@@ -7,7 +7,7 @@
 <p align="center"><strong>TPCC-Tester</strong> — 面向 RMDB 的 TPC-C 风格本地评测客户端</p>
 
 <p align="center">
-  [db-camp](https://github.com/db-camp) 维护 · Rust + tokio · 全国大学生计算机系统能力大赛 · 数据库管理系统设计赛
+  <a href="https://github.com/db-camp">db-camp</a> 维护 · Rust + tokio · 全国大学生计算机系统能力大赛 · 数据库管理系统设计赛
 </p>
 
 | 状态 | 说明 |
