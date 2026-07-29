@@ -30,6 +30,7 @@ use super::payment_endpoints::{
 };
 use super::recovery_samples::SampleScore;
 use super::rich_recovery_samples::{
+    CanonicalRichBadCreditCustomer, CanonicalRichBadCreditPrefix, CanonicalRichCustomerWitness,
     CanonicalRichDelivery, CanonicalRichDeliveryLine, CanonicalRichNewOrder,
     CanonicalRichOrderLine, CanonicalRichOrderWitness, CanonicalRichRecoveryHeader, OrderKey,
     RichRecoveryError, SealedRichRecoverySamples, MAX_RICH_RECOVERY_RAW_BYTES,
@@ -48,10 +49,13 @@ pub(crate) const MAX_STOCK_INTERVAL_SECTION_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_PAYMENT_ENDPOINT_SECTION_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RICH_NEW_ORDER_SECTION_BYTES: usize = 68 * 1024;
 pub(crate) const MAX_RICH_DELIVERY_SECTION_BYTES: usize = 38 * 1024;
+pub(crate) const MAX_RICH_BAD_CREDIT_SECTION_BYTES: usize = 7_898;
 const MAX_ACCUMULATOR_WORDS: u32 = 6;
 const MAX_INTERVAL_SAMPLES: u32 = 64;
 const MAX_RICH_ENTRY_TIMESTAMP_BYTES: usize = 19;
 const MAX_RICH_DELIVERY_TIMESTAMP_BYTES: usize = 30;
+const MAX_RICH_CUSTOMER_DATA_BYTES: usize = 50;
+const MAX_RICH_BAD_CREDIT_SUFFIX_ENTRIES: usize = 4;
 const RICH_DISTRICT_INFO_BYTES: usize = 24;
 const MIN_RICH_ORDER_LINES: usize = 5;
 const MAX_RICH_ORDER_LINES: usize = 15;
@@ -96,6 +100,25 @@ const _: () = assert!(
         + RICH_RECOVERY_SAMPLE_CAPACITY * MAX_ENCODED_RICH_DELIVERY_BYTES
         <= MAX_RICH_DELIVERY_SECTION_BYTES
 );
+const RICH_BAD_CREDIT_WITNESS_BYTES: usize = 1 + 16 + 12;
+const MAX_ENCODED_RICH_BAD_CREDIT_PREFIX_BYTES: usize = 2 + 1 + 4;
+const MAX_ENCODED_RICH_BAD_CREDIT_BYTES: usize = 16
+    + 12
+    + 4
+    + 2
+    + 1
+    + MAX_RICH_CUSTOMER_DATA_BYTES
+    + 8
+    + 1
+    + MAX_RICH_BAD_CREDIT_SUFFIX_ENTRIES * MAX_ENCODED_RICH_BAD_CREDIT_PREFIX_BYTES;
+const _: () = assert!(
+    SECTION_HEADER_BYTES
+        + RICH_HEADER_BYTES
+        + RICH_BAD_CREDIT_WITNESS_BYTES
+        + 4
+        + RICH_RECOVERY_SAMPLE_CAPACITY * MAX_ENCODED_RICH_BAD_CREDIT_BYTES
+        == MAX_RICH_BAD_CREDIT_SECTION_BYTES
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -106,6 +129,7 @@ enum SectionKind {
     PaymentEndpoints = 4,
     RichNewOrders = 5,
     RichDeliveries = 6,
+    RichBadCreditCustomers = 7,
 }
 
 impl SectionKind {
@@ -117,6 +141,7 @@ impl SectionKind {
             Self::PaymentEndpoints => "Payment endpoints",
             Self::RichNewOrders => "rich NewOrder samples",
             Self::RichDeliveries => "rich Delivery samples",
+            Self::RichBadCreditCustomers => "rich bad-credit Customer samples",
         }
     }
 }
@@ -196,6 +221,13 @@ pub(crate) enum CoreCodecError {
     NonCanonicalRichOrder { domain: &'static str },
     #[error("canonical {domain} section contains duplicate key {key:?}")]
     DuplicateRichOrderKey { domain: &'static str, key: OrderKey },
+    #[error("canonical {domain} samples are not in strict (score, key) order")]
+    NonCanonicalRichCustomer { domain: &'static str },
+    #[error("canonical {domain} section contains duplicate key {key:?}")]
+    DuplicateRichCustomerKey {
+        domain: &'static str,
+        key: CustomerKey,
+    },
     #[error("invalid canonical rich recovery evidence: {0}")]
     InvalidRichRecovery(#[source] RichRecoveryError),
 }
@@ -1456,6 +1488,147 @@ fn decode_rich_delivery_section(
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedRichBadCreditSection {
+    header: CanonicalRichRecoveryHeader,
+    rejected: Option<CanonicalRichCustomerWitness>,
+    entries: Vec<CanonicalRichBadCreditCustomer>,
+}
+
+pub(crate) fn encode_rich_bad_credit_section(
+    samples: &SealedRichRecoverySamples,
+) -> Result<Vec<u8>, CoreCodecError> {
+    let mut writer = section_writer(
+        SectionKind::RichBadCreditCustomers,
+        MAX_RICH_BAD_CREDIT_SECTION_BYTES,
+    )?;
+    encode_rich_header(&mut writer, samples)?;
+    encode_rich_customer_witness(&mut writer, samples.bad_customer_rejected_witness())?;
+    let count = encode_rich_count(
+        "rich bad-credit Customer samples",
+        samples.bad_credit_customers().len(),
+    )?;
+    writer.put_u32(count)?;
+
+    let mut previous = None;
+    let mut keys = BTreeSet::new();
+    for sample in samples.bad_credit_customers() {
+        let key = sample.customer_key();
+        validate_rich_customer_entry(
+            "bad-credit Customer",
+            &mut previous,
+            &mut keys,
+            sample.score(),
+            key,
+        )?;
+        if sample.expected_credit() != b"BC" {
+            return Err(CoreCodecError::InvalidRichRecovery(
+                RichRecoveryError::InvalidEvidence("sealed bad-credit Customer credit is not BC"),
+            ));
+        }
+        encode_sample_score(&mut writer, sample.score())?;
+        encode_customer_key(&mut writer, key)?;
+        writer.put_i32(sample.final_payment_count())?;
+        writer.put_bytes(sample.expected_credit())?;
+        encode_bounded_bytes(
+            &mut writer,
+            "bad-credit Customer data",
+            sample.final_data(),
+            0,
+            MAX_RICH_CUSTOMER_DATA_BYTES,
+        )?;
+        writer.put_u64(sample.committed_payment_updates())?;
+        let suffix_count = encode_u8_count(
+            "bad-credit Payment suffix",
+            sample.payment_suffix().len(),
+            0,
+            MAX_RICH_BAD_CREDIT_SUFFIX_ENTRIES,
+        )?;
+        writer.put_u8(suffix_count)?;
+        for prefix in sample.payment_suffix() {
+            writer.put_u16(prefix.home_warehouse_id())?;
+            writer.put_u8(prefix.home_district_id())?;
+            writer.put_u32(prefix.amount_cents())?;
+        }
+    }
+    Ok(writer.finish())
+}
+
+fn decode_rich_bad_credit_section(
+    bytes: &[u8],
+) -> Result<DecodedRichBadCreditSection, CoreCodecError> {
+    let mut reader = section_reader(
+        bytes,
+        SectionKind::RichBadCreditCustomers,
+        MAX_RICH_BAD_CREDIT_SECTION_BYTES,
+    )?;
+    let header = decode_rich_header(&mut reader)?;
+    let rejected = decode_rich_customer_witness(&mut reader, "bad-credit Customer cutoff witness")?;
+    let count = reader.bounded_count(
+        "rich bad-credit Customer samples",
+        u32::try_from(RICH_RECOVERY_SAMPLE_CAPACITY).expect("sample capacity fits u32"),
+    )?;
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut previous = None;
+    let mut keys = BTreeSet::new();
+    for _ in 0..count {
+        let score = decode_sample_score(&mut reader)?;
+        let key = decode_customer_key(&mut reader)?;
+        validate_rich_customer_entry("bad-credit Customer", &mut previous, &mut keys, score, key)?;
+        let final_payment_count = reader.get_i32()?;
+        let credit: [u8; 2] = reader
+            .take(2)?
+            .try_into()
+            .expect("a two-byte slice has array length two");
+        if credit != *b"BC" {
+            return Err(CoreCodecError::InvalidRichRecovery(
+                RichRecoveryError::InvalidEvidence(
+                    "canonical bad-credit Customer credit is not BC",
+                ),
+            ));
+        }
+        let data = decode_bounded_bytes(
+            &mut reader,
+            "bad-credit Customer data",
+            0,
+            MAX_RICH_CUSTOMER_DATA_BYTES,
+        )?;
+        let committed_payment_updates = reader.get_u64()?;
+        let suffix_count = decode_u8_count(
+            &mut reader,
+            "bad-credit Payment suffix",
+            0,
+            MAX_RICH_BAD_CREDIT_SUFFIX_ENTRIES,
+        )?;
+        let mut payment_suffix = Vec::with_capacity(suffix_count);
+        for _ in 0..suffix_count {
+            payment_suffix.push(CanonicalRichBadCreditPrefix::new(
+                reader.get_u16()?,
+                reader.get_u8()?,
+                reader.get_u32()?,
+            ));
+        }
+        entries.push(
+            CanonicalRichBadCreditCustomer::new(
+                score,
+                key,
+                final_payment_count,
+                credit,
+                data,
+                committed_payment_updates,
+                payment_suffix.into_iter(),
+            )
+            .map_err(CoreCodecError::InvalidRichRecovery)?,
+        );
+    }
+    reader.finish()?;
+    Ok(DecodedRichBadCreditSection {
+        header,
+        rejected,
+        entries,
+    })
+}
+
 fn encode_rich_header(
     writer: &mut CanonicalWriter,
     samples: &SealedRichRecoverySamples,
@@ -1568,6 +1741,23 @@ fn decode_order_key(reader: &mut CanonicalReader<'_>) -> Result<OrderKey, CoreCo
     ))
 }
 
+fn encode_customer_key(
+    writer: &mut CanonicalWriter,
+    key: CustomerKey,
+) -> Result<(), CoreCodecError> {
+    writer.put_i32(key.warehouse_id)?;
+    writer.put_i32(key.district_id)?;
+    writer.put_i32(key.customer_id)
+}
+
+fn decode_customer_key(reader: &mut CanonicalReader<'_>) -> Result<CustomerKey, CoreCodecError> {
+    Ok(CustomerKey {
+        warehouse_id: reader.get_i32()?,
+        district_id: reader.get_i32()?,
+        customer_id: reader.get_i32()?,
+    })
+}
+
 fn encode_rich_order_witness(
     writer: &mut CanonicalWriter,
     witness: Option<&super::rich_recovery_samples::OrderCutoffWitness>,
@@ -1579,6 +1769,34 @@ fn encode_rich_order_witness(
             encode_sample_score(writer, witness.score())?;
             encode_order_key(writer, witness.key())
         }
+    }
+}
+
+fn encode_rich_customer_witness(
+    writer: &mut CanonicalWriter,
+    witness: Option<&super::rich_recovery_samples::CustomerCutoffWitness>,
+) -> Result<(), CoreCodecError> {
+    match witness {
+        None => writer.put_u8(0),
+        Some(witness) => {
+            writer.put_u8(1)?;
+            encode_sample_score(writer, witness.score())?;
+            encode_customer_key(writer, witness.key())
+        }
+    }
+}
+
+fn decode_rich_customer_witness(
+    reader: &mut CanonicalReader<'_>,
+    field: &'static str,
+) -> Result<Option<CanonicalRichCustomerWitness>, CoreCodecError> {
+    match reader.get_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(CanonicalRichCustomerWitness::new(
+            decode_sample_score(reader)?,
+            decode_customer_key(reader)?,
+        ))),
+        actual => Err(CoreCodecError::InvalidPresenceFlag { field, actual }),
     }
 }
 
@@ -1707,6 +1925,24 @@ fn validate_rich_order_entry(
     let current = (score, key);
     if previous.as_ref().is_some_and(|prior| prior >= &current) {
         return Err(CoreCodecError::NonCanonicalRichOrder { domain });
+    }
+    *previous = Some(current);
+    Ok(())
+}
+
+fn validate_rich_customer_entry(
+    domain: &'static str,
+    previous: &mut Option<(SampleScore, CustomerKey)>,
+    keys: &mut BTreeSet<CustomerKey>,
+    score: SampleScore,
+    key: CustomerKey,
+) -> Result<(), CoreCodecError> {
+    if !keys.insert(key) {
+        return Err(CoreCodecError::DuplicateRichCustomerKey { domain, key });
+    }
+    let current = (score, key);
+    if previous.as_ref().is_some_and(|prior| prior >= &current) {
+        return Err(CoreCodecError::NonCanonicalRichCustomer { domain });
     }
     *previous = Some(current);
     Ok(())
@@ -2413,6 +2649,166 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rich_bad_credit_section_round_trips_empty_canonical_state() {
+        let intervals = empty_rich_intervals();
+        let samples = empty_rich_samples(&intervals);
+        let encoded = encode_rich_bad_credit_section(&samples).unwrap();
+        assert_eq!(&encoded[..4], b"TCS1");
+        assert_eq!(encoded[4], SectionKind::RichBadCreditCustomers as u8);
+
+        let decoded = decode_rich_bad_credit_section(&encoded).unwrap();
+        assert!(decoded.entries.is_empty());
+        assert!(decoded.rejected.is_none());
+        let restored = restore_bad_credit_only(decoded, &intervals);
+        assert_eq!(encode_rich_bad_credit_section(&restored).unwrap(), encoded);
+    }
+
+    #[test]
+    fn rich_bad_credit_decoder_prechecks_counts_lengths_credit_and_suffix() {
+        let encoded = test_bad_credit_section(&[(
+            SampleScore { high: 1, low: 2 },
+            CustomerKey {
+                warehouse_id: 1,
+                district_id: 1,
+                customer_id: 1,
+            },
+        )]);
+        let count_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1;
+        let entry_offset = count_offset + 4;
+
+        let mut oversized_count = encoded.clone();
+        oversized_count[count_offset..count_offset + 4].copy_from_slice(
+            &(u32::try_from(RICH_RECOVERY_SAMPLE_CAPACITY).unwrap() + 1).to_le_bytes(),
+        );
+        assert!(matches!(
+            decode_rich_bad_credit_section(&oversized_count),
+            Err(CoreCodecError::OversizedCount {
+                field: "rich bad-credit Customer samples",
+                ..
+            })
+        ));
+
+        let mut invalid_credit = encoded.clone();
+        invalid_credit[entry_offset + 32..entry_offset + 34].copy_from_slice(b"GC");
+        assert!(matches!(
+            decode_rich_bad_credit_section(&invalid_credit),
+            Err(CoreCodecError::InvalidRichRecovery(
+                RichRecoveryError::InvalidEvidence(
+                    "canonical bad-credit Customer credit is not BC"
+                )
+            ))
+        ));
+
+        let mut oversized_data = encoded.clone();
+        oversized_data[entry_offset + 34] = u8::try_from(MAX_RICH_CUSTOMER_DATA_BYTES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_bad_credit_section(&oversized_data),
+            Err(CoreCodecError::InvalidLength {
+                field: "bad-credit Customer data",
+                ..
+            })
+        ));
+
+        let mut oversized_suffix = encoded.clone();
+        oversized_suffix[entry_offset + 51] =
+            u8::try_from(MAX_RICH_BAD_CREDIT_SUFFIX_ENTRIES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_bad_credit_section(&oversized_suffix),
+            Err(CoreCodecError::InvalidLength {
+                field: "bad-credit Payment suffix",
+                ..
+            })
+        ));
+
+        let mut invalid_witness = encoded;
+        invalid_witness[SECTION_HEADER_BYTES + RICH_HEADER_BYTES] = 2;
+        assert!(matches!(
+            decode_rich_bad_credit_section(&invalid_witness),
+            Err(CoreCodecError::InvalidPresenceFlag {
+                field: "bad-credit Customer cutoff witness",
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn rich_bad_credit_decoder_rejects_reordered_duplicate_and_noncanonical_frames() {
+        let first = (
+            SampleScore { high: 1, low: 2 },
+            CustomerKey {
+                warehouse_id: 1,
+                district_id: 1,
+                customer_id: 1,
+            },
+        );
+        let second = (
+            SampleScore { high: 3, low: 4 },
+            CustomerKey {
+                warehouse_id: 1,
+                district_id: 1,
+                customer_id: 2,
+            },
+        );
+        let canonical = test_bad_credit_section(&[first, second]);
+        let decoded = decode_rich_bad_credit_section(&canonical).unwrap();
+        assert_eq!(decoded.entries.len(), 2);
+
+        let entry_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1 + 4;
+        assert_eq!(
+            &canonical[entry_offset..entry_offset + 8],
+            &first.0.high.to_le_bytes()
+        );
+        assert_eq!(
+            &canonical[entry_offset + 16..entry_offset + 20],
+            &first.1.warehouse_id.to_le_bytes()
+        );
+
+        assert!(matches!(
+            decode_rich_bad_credit_section(&test_bad_credit_section(&[second, first])),
+            Err(CoreCodecError::NonCanonicalRichCustomer {
+                domain: "bad-credit Customer"
+            })
+        ));
+        assert!(matches!(
+            decode_rich_bad_credit_section(&test_bad_credit_section(&[
+                first,
+                (
+                    SampleScore { high: 3, low: 4 },
+                    CustomerKey {
+                        warehouse_id: 1,
+                        district_id: 1,
+                        customer_id: 1,
+                    },
+                ),
+            ])),
+            Err(CoreCodecError::DuplicateRichCustomerKey {
+                domain: "bad-credit Customer",
+                ..
+            })
+        ));
+
+        for end in [0, 1, 6, canonical.len() / 2, canonical.len() - 1] {
+            assert!(decode_rich_bad_credit_section(&canonical[..end]).is_err());
+        }
+        let mut unknown = canonical.clone();
+        unknown[4] = 0xff;
+        assert!(matches!(
+            decode_rich_bad_credit_section(&unknown),
+            Err(CoreCodecError::UnexpectedSection { actual: 0xff, .. })
+        ));
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(matches!(
+            decode_rich_bad_credit_section(&trailing),
+            Err(CoreCodecError::TrailingBytes { remaining: 1 })
+        ));
+        assert!(matches!(
+            decode_rich_bad_credit_section(&vec![0; MAX_RICH_BAD_CREDIT_SECTION_BYTES + 1]),
+            Err(CoreCodecError::OversizedSection { .. })
+        ));
+    }
+
     fn empty_rich_intervals() -> SealedIntervalEvidence {
         IntervalCollector::new(1, 1, TEST_SAMPLE_SEED, |_key: StockKey| None)
             .unwrap()
@@ -2502,6 +2898,34 @@ mod tests {
             None,
             decoded.rejected,
             None,
+            None,
+            intervals,
+            &no_history,
+            &no_customer,
+        )
+        .unwrap()
+    }
+
+    fn restore_bad_credit_only(
+        decoded: DecodedRichBadCreditSection,
+        intervals: &SealedIntervalEvidence,
+    ) -> SealedRichRecoverySamples {
+        use crate::ranking::rich_recovery_samples::{
+            CanonicalRichDelivery, CanonicalRichHistoryTuple, InitialCustomerData,
+            InitialHistoryRow,
+        };
+
+        let no_history = |_key: CustomerKey| None::<InitialHistoryRow>;
+        let no_customer = |_key: CustomerKey| None::<InitialCustomerData>;
+        SealedRichRecoverySamples::from_canonical_parts(
+            decoded.header,
+            std::iter::empty::<CanonicalRichNewOrder>(),
+            std::iter::empty::<CanonicalRichDelivery>(),
+            decoded.entries.into_iter(),
+            std::iter::empty::<CanonicalRichHistoryTuple>(),
+            None,
+            None,
+            decoded.rejected,
             None,
             intervals,
             &no_history,
@@ -2602,6 +3026,37 @@ mod tests {
                 .unwrap();
                 writer.put_u32(1.0_f32.to_bits()).unwrap();
             }
+        }
+        writer.finish()
+    }
+
+    fn test_bad_credit_section(entries: &[(SampleScore, CustomerKey)]) -> Vec<u8> {
+        let empty =
+            encode_rich_bad_credit_section(&empty_rich_samples(&empty_rich_intervals())).unwrap();
+        let count_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1;
+        let mut writer = CanonicalWriter::new(MAX_RICH_BAD_CREDIT_SECTION_BYTES);
+        writer.put_bytes(&empty[..count_offset]).unwrap();
+        writer
+            .put_u32(u32::try_from(entries.len()).unwrap())
+            .unwrap();
+        for (score, key) in entries {
+            encode_sample_score(&mut writer, *score).unwrap();
+            encode_customer_key(&mut writer, *key).unwrap();
+            writer.put_i32(2).unwrap();
+            writer.put_bytes(b"BC").unwrap();
+            encode_bounded_bytes(
+                &mut writer,
+                "bad-credit Customer data",
+                b"old-data",
+                0,
+                MAX_RICH_CUSTOMER_DATA_BYTES,
+            )
+            .unwrap();
+            writer.put_u64(1).unwrap();
+            writer.put_u8(1).unwrap();
+            writer.put_u16(1).unwrap();
+            writer.put_u8(1).unwrap();
+            writer.put_u32(100).unwrap();
         }
         writer.finish()
     }
