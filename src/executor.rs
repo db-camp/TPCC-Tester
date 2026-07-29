@@ -15,8 +15,8 @@ use crate::error::TpccError;
 use crate::measurement::{MeasurementSummary, WindowStats, FORMAL_WINDOW_COUNT};
 use crate::phases::{
     AttemptDisposition, AttemptOutcome, EventRecorder, Final2026Scheduler, LocalRuntimeLimits,
-    PhaseId, PhaseScheduleConfig, PreparedSessionId, SchedulerError, SystemMonotonicClock,
-    TransactionIdentity, WorkerId,
+    MonotonicClock, PhaseId, PhaseScheduleConfig, PreparedSessionId, SchedulerError,
+    SystemMonotonicClock, TransactionIdentity, WorkerId,
 };
 use crate::ranking::dispatch::{self, FrozenTransaction};
 use crate::ranking::runner::RankedTransactionOutcome;
@@ -65,9 +65,10 @@ impl BenchmarkExecutor {
                 .map_err(|error| TpccError::Protocol(error.to_string()))?
         };
         let routing = Arc::new(RunRouting::new(router));
+        let monotonic_clock = SystemMonotonicClock::new();
         let scheduler = Arc::new(Mutex::new(
             Final2026Scheduler::new_with_schedule(
-                SystemMonotonicClock::new(),
+                monotonic_clock.clone(),
                 NoopRecorder,
                 limits,
                 *routing.router.hot_warehouses(),
@@ -105,6 +106,7 @@ impl BenchmarkExecutor {
             let cancelled = Arc::clone(&cancelled);
             let ready_barrier = Arc::clone(&ready_barrier);
             let start_barrier = Arc::clone(&start_barrier);
+            let monotonic_clock = monotonic_clock.clone();
             workers.spawn(async move {
                 run_worker(
                     worker_index as u16,
@@ -114,6 +116,7 @@ impl BenchmarkExecutor {
                     cancelled,
                     ready_barrier,
                     start_barrier,
+                    monotonic_clock,
                 )
                 .await
             });
@@ -268,6 +271,7 @@ async fn run_worker(
     cancelled: Arc<AtomicBool>,
     ready_barrier: Arc<Barrier>,
     start_barrier: Arc<Barrier>,
+    monotonic_clock: SystemMonotonicClock,
 ) -> Result<(), TpccError> {
     let worker = WorkerId::new(worker_value).map_err(scheduler_error)?;
     wait_for_timing_release(&ready_barrier, &start_barrier).await;
@@ -323,10 +327,13 @@ async fn run_worker(
         )
         .map_err(scheduler_error)?;
 
-        let mut phase_ticket = {
+        let (mut phase_ticket, mut attempt_deadline) = {
             let mut state = lock_scheduler(&scheduler)?;
             match state.start_transaction(reservation, identity) {
-                Ok(ticket) => ticket,
+                Ok(ticket) => {
+                    let deadline = state.attempt_deadline(ticket).map_err(scheduler_error)?;
+                    (ticket, deadline)
+                }
                 Err(SchedulerError::ReservationDeadlinePassed) => continue,
                 Err(error) => return Err(scheduler_error(error)),
             }
@@ -336,8 +343,29 @@ async fn run_worker(
             if cancelled.load(Ordering::Acquire) {
                 return Ok(());
             }
-            match dispatch::execute(&mut client, &frozen).await {
-                Ok(outcome) => {
+            let deadline = tokio::time::Instant::from_std(
+                monotonic_clock
+                    .instant_at(attempt_deadline)
+                    .map_err(scheduler_error)?,
+            );
+            let result =
+                tokio::time::timeout_at(deadline, dispatch::execute(&mut client, &frozen)).await;
+            let completed_at = monotonic_clock.now();
+            match result {
+                Err(_) => {
+                    return fail_worker(
+                        &scheduler,
+                        &cancelled,
+                        worker,
+                        format!(
+                            "physical attempt {} exceeded absolute local deadline {:?}; \
+                             connection state is unknown and will not be reused",
+                            phase_ticket.id(),
+                            attempt_deadline
+                        ),
+                    );
+                }
+                Ok(Ok(outcome)) => {
                     let attempt = match &outcome {
                         RankedTransactionOutcome::Committed(commit) => AttemptOutcome::Commit {
                             delivery_processed: commit.delivery_processed(),
@@ -349,7 +377,7 @@ async fn run_worker(
                     let disposition = {
                         let mut state = lock_scheduler(&scheduler)?;
                         state
-                            .finish_attempt(phase_ticket, attempt)
+                            .finish_attempt_at(phase_ticket, attempt, completed_at)
                             .map_err(scheduler_error)?
                     };
                     debug_assert!(matches!(
@@ -358,26 +386,34 @@ async fn run_worker(
                     ));
                     break;
                 }
-                Err(error) if error.is_retryable_abort() => {
+                Ok(Err(error)) if error.is_retryable_abort() => {
                     let disposition = {
                         let mut state = lock_scheduler(&scheduler)?;
                         state
-                            .finish_attempt(phase_ticket, AttemptOutcome::RetryableAbort)
+                            .finish_attempt_at(
+                                phase_ticket,
+                                AttemptOutcome::RetryableAbort,
+                                completed_at,
+                            )
                             .map_err(scheduler_error)?
                     };
                     if disposition != AttemptDisposition::RetrySameParameters {
                         break;
                     }
-                    phase_ticket = {
+                    (phase_ticket, attempt_deadline) = {
                         let mut state = lock_scheduler(&scheduler)?;
                         match state.start_retry(phase_ticket) {
-                            Ok(ticket) => ticket,
+                            Ok(ticket) => {
+                                let deadline =
+                                    state.attempt_deadline(ticket).map_err(scheduler_error)?;
+                                (ticket, deadline)
+                            }
                             Err(SchedulerError::RetryDeadlinePassed) => break,
                             Err(error) => return Err(scheduler_error(error)),
                         }
                     };
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     return fail_worker(
                         &scheduler,
                         &cancelled,
