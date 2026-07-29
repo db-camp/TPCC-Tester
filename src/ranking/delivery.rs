@@ -55,6 +55,12 @@ struct StageThreeIndex {
     customer_after: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CustomerAfter {
+    balance_bits: u32,
+    delivery_count: i32,
+}
+
 /// Execute one immutable Delivery input.
 ///
 /// A `TRANSACTION_ABORT` returned by any batch remains the only retryable
@@ -98,18 +104,24 @@ pub async fn execute(
     // The successful third batch includes COMMIT.  A semantic mismatch found
     // below is fatal evidence about committed state; issuing ABORT now would be
     // both meaningless and a protocol error.
-    validate_stage_three(&stage_three_results, &locked_orders, &stage_three_indices)
-        .map_err(RankedTransactionError::Semantic)?;
+    let customer_after =
+        validate_stage_three(&stage_three_results, &locked_orders, &stage_three_indices)
+            .map_err(RankedTransactionError::Semantic)?;
 
     let evidence = locked_orders
         .into_iter()
-        .map(|order| DeliveredOrderEvidence {
+        .zip(customer_after)
+        .map(|(order, after)| DeliveredOrderEvidence {
             warehouse_id,
             district_id: order.claim.district_id,
             order_id: order.claim.order_id,
             customer_id: order.customer_id,
             line_count: order.line_count,
             amount_bits: order.amount_bits,
+            customer_balance_before_bits: order.customer_balance_bits,
+            customer_balance_after_bits: after.balance_bits,
+            customer_delivery_count_before: order.customer_delivery_count,
+            customer_delivery_count_after: after.delivery_count,
         })
         .collect();
 
@@ -384,7 +396,7 @@ fn validate_stage_three(
     results: &BatchResults,
     orders: &[LockedOrder],
     indices: &[StageThreeIndex],
-) -> SemanticResult<()> {
+) -> SemanticResult<Vec<CustomerAfter>> {
     if orders.len() != indices.len() {
         return Err(SemanticViolation::new(format!(
             "Delivery stage-three planner retained {} orders but {} index records",
@@ -393,6 +405,7 @@ fn validate_stage_three(
         )));
     }
 
+    let mut after = Vec::with_capacity(orders.len());
     for (order, index) in orders.iter().zip(indices) {
         let context = format!(
             "Delivery customer after district {} order {}",
@@ -415,8 +428,12 @@ fn validate_stage_three(
             actual_delivery_count,
             &context,
         )?;
+        after.push(CustomerAfter {
+            balance_bits: actual_balance_bits,
+            delivery_count: actual_delivery_count,
+        });
     }
-    Ok(())
+    Ok(after)
 }
 
 fn validate_customer_after(

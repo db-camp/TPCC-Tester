@@ -50,6 +50,10 @@ pub struct DeliveredOrderEvidence {
     pub customer_id: i32,
     pub line_count: u8,
     pub amount_bits: u32,
+    pub customer_balance_before_bits: u32,
+    pub customer_balance_after_bits: u32,
+    pub customer_delivery_count_before: i32,
+    pub customer_delivery_count_after: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,6 +174,10 @@ mod tests {
                 customer_id: 1,
                 line_count: 5,
                 amount_bits: 1.0_f32.to_bits(),
+                customer_balance_before_bits: 0.0_f32.to_bits(),
+                customer_balance_after_bits: 1.0_f32.to_bits(),
+                customer_delivery_count_before: 0,
+                customer_delivery_count_after: 1,
             }])
             .delivery_processed(),
             1
