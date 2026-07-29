@@ -207,11 +207,21 @@ binding headroom + 4 KiB StateStore envelope 得到 16,781,440-byte 上限，并
 精确路径、size 和 SHA-256 绑定进 manifest。任何形态的
 `${STATE_DIR}/run_ledger.state`（包括普通文件、目录、符号链接和 dangling
 symlink）只通过 `lstat` 检测，绝不读取、删除或修改，并立即使正式结果
-fail-closed。显式偏差、`init`/`rank`/`recovery` 拆分模式和 `tools` 始终非排名。
+fail-closed。Rust 在同一个状态目录锁内输出它实际解码验证对象的 canonical
+size/SHA-256 receipt；工作流要求 pre-inspect、Rust receipt 和 final inspect
+精确一致，阻断文件替换后恢复的 ABA。最终 manifest 使用
+`state_directory_fd_flock_v1`：对与 StateStore 同源的状态目录 fd 加独占锁，
+在锁内再次检查 terminal/legacy、原子替换 manifest，并在释放前 fsync 结果
+目录。显式偏差、`init`/`rank`/`recovery` 拆分模式和 `tools` 始终非排名。
 `summary.md` 只从 `manifest.json` 生成，不读取旧式文本 manifest；只有
 size/SHA-256 与 manifest 绑定一致的 `rank.log` 可以提供吞吐，profiling 日志
 始终只是 observation。manifest 缺失、损坏、自相矛盾或状态非成功时不会抽取
 吞吐。
+
+最终排名指标只取 `rank.log` 中按序且各出现一次的三个
+`windowN: new_order_per_min=` 以及唯一
+`ranked_new_order_per_min_median=`。summary 用三值中值重新验证 median 后明确
+输出 `NewOrder/min`；旧式 `Throughput`/`tpmC` 文本不作为排名依据。
 
 资源工件始终标记 `ranked=false`、`score_effect=none`。RSS 是登记 RMDB
 进程树在固定周期采样时的总和峰值；磁盘占用使用 `lstat`/allocated blocks，
