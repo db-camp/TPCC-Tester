@@ -2118,6 +2118,16 @@ fn decode_artifact_and_checksum<'a>(
         header.dataset_checksum,
         header.payload_len,
     );
+    let canonical_header = format!("{metadata}checksum={:016x}\n", header.checksum);
+    let actual_header_len = input
+        .len()
+        .checked_sub(payload.len())
+        .ok_or_else(|| StateError::Invalid("artifact header length underflow".to_owned()))?;
+    if input.as_bytes().get(..actual_header_len) != Some(canonical_header.as_bytes()) {
+        return Err(StateError::Invalid(format!(
+            "{expected_artifact} header is not canonical"
+        )));
+    }
     let actual_checksum = checksum64(metadata.as_bytes(), payload.as_bytes());
     if actual_checksum != header.checksum {
         return Err(StateError::Invalid(format!(
@@ -2847,10 +2857,16 @@ mod tests {
         different_load.partitions[0].undelivered_order_line_rows = 8;
         assert!(decode_artifact(&encoded, "sample", &different_load, 128).is_err());
 
-        let mut damaged = encoded;
+        let mut damaged = encoded.clone();
         damaged.pop();
         damaged.push('x');
         assert!(decode_artifact(&damaged, "sample", &dataset, 128).is_err());
+
+        let noncanonical_version = encoded.replacen("version=1\n", "version=01\n", 1);
+        assert!(
+            decode_artifact(&noncanonical_version, "sample", &dataset, 128).is_err(),
+            "numeric aliases must not bypass canonical artifact encoding"
+        );
 
         let oversized = format!(
             "artifact=sample\nversion=1\nrun_id={}\nseed={}\nwarehouses={}\ndataset_checksum={:016x}\npayload_len=129\nchecksum=0000000000000000\nx",
