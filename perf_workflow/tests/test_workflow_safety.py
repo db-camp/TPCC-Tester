@@ -368,6 +368,11 @@ import sys
 
 with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
     output.write("\\t".join(sys.argv[1:]) + "\\n")
+if (
+    "--attest-formal-state" in sys.argv
+    and os.environ.get("FAKE_TPCC_FAIL_ATTESTATION") == "1"
+):
+    raise SystemExit(42)
 if "--lifecycle-event" in sys.argv:
     event = sys.argv[sys.argv.index("--lifecycle-event") + 1]
     with open(
@@ -1460,9 +1465,6 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 tester,
                 "--port",
                 port,
-                "--allow-deviation",
-                "--scale",
-                "1",
                 env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -1531,6 +1533,54 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 rebound.bind(("127.0.0.1", port))
             finally:
                 rebound.close()
+
+    def test_failed_formal_attestation_blocks_public_success_claim(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            env["FAKE_TPCC_FAIL_ATTESTATION"] = "1"
+            records = temp_path / "records"
+            result = self.run_script(
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                "--allow-deviation",
+                "--scale",
+                "1",
+                env=env,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("formal state attestation failed", result.stderr)
+            manifest = json.loads(
+                (next(records.iterdir()) / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "failed")
+            self.assertNotEqual(
+                manifest["conformance"],
+                "public_spec_aligned",
+            )
+            self.assertFalse(manifest["ranking_eligible"])
+            attestations = {
+                item["name"]: item["status"]
+                for item in manifest["attestations"]["required"]
+            }
+            self.assertEqual(attestations["formal_state_chain"], "failed")
 
     def test_custom_recovery_budget_reaches_every_stateful_tester_call(self):
         with tempfile.TemporaryDirectory() as temp:
