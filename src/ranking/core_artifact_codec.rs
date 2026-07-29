@@ -30,9 +30,10 @@ use super::payment_endpoints::{
 };
 use super::recovery_samples::SampleScore;
 use super::rich_recovery_samples::{
-    CanonicalRichNewOrder, CanonicalRichOrderLine, CanonicalRichOrderWitness,
-    CanonicalRichRecoveryHeader, OrderKey, RichRecoveryError, SealedRichRecoverySamples,
-    MAX_RICH_RECOVERY_RAW_BYTES, RICH_RECOVERY_POLICY_VERSION, RICH_RECOVERY_SAMPLE_CAPACITY,
+    CanonicalRichDelivery, CanonicalRichDeliveryLine, CanonicalRichNewOrder,
+    CanonicalRichOrderLine, CanonicalRichOrderWitness, CanonicalRichRecoveryHeader, OrderKey,
+    RichRecoveryError, SealedRichRecoverySamples, MAX_RICH_RECOVERY_RAW_BYTES,
+    RICH_RECOVERY_POLICY_VERSION, RICH_RECOVERY_SAMPLE_CAPACITY,
 };
 use super::runner::StockVersion;
 
@@ -46,6 +47,7 @@ pub(crate) const MAX_CUSTOMER_INTERVAL_SECTION_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_STOCK_INTERVAL_SECTION_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_PAYMENT_ENDPOINT_SECTION_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RICH_NEW_ORDER_SECTION_BYTES: usize = 68 * 1024;
+pub(crate) const MAX_RICH_DELIVERY_SECTION_BYTES: usize = 38 * 1024;
 const MAX_ACCUMULATOR_WORDS: u32 = 6;
 const MAX_INTERVAL_SAMPLES: u32 = 64;
 const MAX_RICH_ENTRY_TIMESTAMP_BYTES: usize = 19;
@@ -76,6 +78,24 @@ const _: () = assert!(
         + RICH_RECOVERY_SAMPLE_CAPACITY * MAX_ENCODED_RICH_NEW_ORDER_BYTES
         <= MAX_RICH_NEW_ORDER_SECTION_BYTES
 );
+const MAX_ENCODED_RICH_DELIVERY_LINE_BYTES: usize = 1 + 1 + MAX_RICH_DELIVERY_TIMESTAMP_BYTES + 4;
+const MAX_ENCODED_RICH_DELIVERY_BYTES: usize = 16
+    + 7
+    + 4
+    + 1
+    + 1
+    + 1
+    + MAX_RICH_DELIVERY_TIMESTAMP_BYTES
+    + 1
+    + MAX_RICH_ORDER_LINES * MAX_ENCODED_RICH_DELIVERY_LINE_BYTES;
+const _: () = assert!(
+    SECTION_HEADER_BYTES
+        + RICH_HEADER_BYTES
+        + RICH_NEW_ORDER_WITNESS_BYTES
+        + 4
+        + RICH_RECOVERY_SAMPLE_CAPACITY * MAX_ENCODED_RICH_DELIVERY_BYTES
+        <= MAX_RICH_DELIVERY_SECTION_BYTES
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -85,6 +105,7 @@ enum SectionKind {
     StockIntervals = 3,
     PaymentEndpoints = 4,
     RichNewOrders = 5,
+    RichDeliveries = 6,
 }
 
 impl SectionKind {
@@ -95,6 +116,7 @@ impl SectionKind {
             Self::StockIntervals => "stock intervals",
             Self::PaymentEndpoints => "Payment endpoints",
             Self::RichNewOrders => "rich NewOrder samples",
+            Self::RichDeliveries => "rich Delivery samples",
         }
     }
 }
@@ -1304,6 +1326,136 @@ fn decode_rich_new_order_section(
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedRichDeliverySection {
+    header: CanonicalRichRecoveryHeader,
+    rejected: Option<CanonicalRichOrderWitness>,
+    entries: Vec<CanonicalRichDelivery>,
+}
+
+pub(crate) fn encode_rich_delivery_section(
+    samples: &SealedRichRecoverySamples,
+) -> Result<Vec<u8>, CoreCodecError> {
+    let mut writer = section_writer(SectionKind::RichDeliveries, MAX_RICH_DELIVERY_SECTION_BYTES)?;
+    encode_rich_header(&mut writer, samples)?;
+    encode_rich_order_witness(&mut writer, samples.delivery_rejected_witness())?;
+    let count = encode_rich_count("rich Delivery samples", samples.deliveries().len())?;
+    writer.put_u32(count)?;
+
+    let mut previous = None;
+    let mut keys = BTreeSet::new();
+    for sample in samples.deliveries() {
+        validate_rich_order_entry(
+            "Delivery",
+            &mut previous,
+            &mut keys,
+            sample.score(),
+            sample.key(),
+        )?;
+        encode_sample_score(&mut writer, sample.score())?;
+        encode_order_key(&mut writer, sample.key())?;
+        writer.put_i32(sample.customer_id())?;
+        writer.put_u8(sample.carrier_id())?;
+        encode_boolean(&mut writer, sample.queue_present())?;
+        encode_bounded_bytes(
+            &mut writer,
+            "Delivery timestamp",
+            sample.delivery_timestamp(),
+            1,
+            MAX_RICH_DELIVERY_TIMESTAMP_BYTES,
+        )?;
+        let line_count = encode_u8_count(
+            "Delivery lines",
+            sample.lines().len(),
+            MIN_RICH_ORDER_LINES,
+            MAX_RICH_ORDER_LINES,
+        )?;
+        writer.put_u8(line_count)?;
+        for line in sample.lines() {
+            writer.put_u8(line.number())?;
+            encode_bounded_bytes(
+                &mut writer,
+                "Delivery line timestamp",
+                line.delivery_timestamp(),
+                1,
+                MAX_RICH_DELIVERY_TIMESTAMP_BYTES,
+            )?;
+            writer.put_u32(line.amount_bits())?;
+        }
+    }
+    Ok(writer.finish())
+}
+
+fn decode_rich_delivery_section(
+    bytes: &[u8],
+) -> Result<DecodedRichDeliverySection, CoreCodecError> {
+    let mut reader = section_reader(
+        bytes,
+        SectionKind::RichDeliveries,
+        MAX_RICH_DELIVERY_SECTION_BYTES,
+    )?;
+    let header = decode_rich_header(&mut reader)?;
+    let rejected = decode_rich_order_witness(&mut reader, "Delivery cutoff witness")?;
+    let count = reader.bounded_count(
+        "rich Delivery samples",
+        u32::try_from(RICH_RECOVERY_SAMPLE_CAPACITY).expect("sample capacity fits u32"),
+    )?;
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut previous = None;
+    let mut keys = BTreeSet::new();
+    for _ in 0..count {
+        let score = decode_sample_score(&mut reader)?;
+        let key = decode_order_key(&mut reader)?;
+        validate_rich_order_entry("Delivery", &mut previous, &mut keys, score, key)?;
+        let customer_id = reader.get_i32()?;
+        let carrier_id = reader.get_u8()?;
+        let queue_present = decode_boolean(&mut reader, "Delivery queue_present")?;
+        let delivery_timestamp = decode_bounded_bytes(
+            &mut reader,
+            "Delivery timestamp",
+            1,
+            MAX_RICH_DELIVERY_TIMESTAMP_BYTES,
+        )?;
+        let line_count = decode_u8_count(
+            &mut reader,
+            "Delivery lines",
+            MIN_RICH_ORDER_LINES,
+            MAX_RICH_ORDER_LINES,
+        )?;
+        let mut lines = Vec::with_capacity(line_count);
+        for _ in 0..line_count {
+            lines.push(CanonicalRichDeliveryLine::new(
+                reader.get_u8()?,
+                decode_bounded_bytes(
+                    &mut reader,
+                    "Delivery line timestamp",
+                    1,
+                    MAX_RICH_DELIVERY_TIMESTAMP_BYTES,
+                )?,
+                reader.get_u32()?,
+            ));
+        }
+        entries.push(
+            CanonicalRichDelivery::new(
+                score,
+                key,
+                customer_id,
+                carrier_id,
+                queue_present,
+                delivery_timestamp,
+                lines.into_iter(),
+            )
+            .map_err(CoreCodecError::InvalidRichRecovery)?,
+        );
+    }
+    reader.finish()?;
+    Ok(DecodedRichDeliverySection {
+        header,
+        rejected,
+        entries,
+    })
+}
+
 fn encode_rich_header(
     writer: &mut CanonicalWriter,
     samples: &SealedRichRecoverySamples,
@@ -2119,6 +2271,148 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rich_delivery_section_round_trips_empty_canonical_state() {
+        let intervals = empty_rich_intervals();
+        let samples = empty_rich_samples(&intervals);
+        let encoded = encode_rich_delivery_section(&samples).unwrap();
+        assert_eq!(&encoded[..4], b"TCS1");
+        assert_eq!(encoded[4], SectionKind::RichDeliveries as u8);
+
+        let decoded = decode_rich_delivery_section(&encoded).unwrap();
+        assert!(decoded.entries.is_empty());
+        assert!(decoded.rejected.is_none());
+        let restored = restore_delivery_only(decoded, &intervals);
+        assert_eq!(encode_rich_delivery_section(&restored).unwrap(), encoded);
+    }
+
+    #[test]
+    fn rich_delivery_decoder_prechecks_counts_lengths_and_booleans() {
+        let encoded = test_delivery_section(&[(
+            SampleScore { high: 1, low: 2 },
+            OrderKey::from_parts(1, 1, 1),
+        )]);
+        let count_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1;
+        let entry_offset = count_offset + 4;
+
+        let mut oversized_count = encoded.clone();
+        oversized_count[count_offset..count_offset + 4].copy_from_slice(
+            &(u32::try_from(RICH_RECOVERY_SAMPLE_CAPACITY).unwrap() + 1).to_le_bytes(),
+        );
+        assert!(matches!(
+            decode_rich_delivery_section(&oversized_count),
+            Err(CoreCodecError::OversizedCount {
+                field: "rich Delivery samples",
+                ..
+            })
+        ));
+
+        let mut invalid_boolean = encoded.clone();
+        invalid_boolean[entry_offset + 28] = 2;
+        assert!(matches!(
+            decode_rich_delivery_section(&invalid_boolean),
+            Err(CoreCodecError::InvalidBoolean {
+                field: "Delivery queue_present",
+                actual: 2,
+            })
+        ));
+
+        let mut oversized_timestamp = encoded.clone();
+        oversized_timestamp[entry_offset + 29] =
+            u8::try_from(MAX_RICH_DELIVERY_TIMESTAMP_BYTES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_delivery_section(&oversized_timestamp),
+            Err(CoreCodecError::InvalidLength {
+                field: "Delivery timestamp",
+                ..
+            })
+        ));
+
+        let mut oversized_lines = encoded.clone();
+        oversized_lines[entry_offset + 49] = u8::try_from(MAX_RICH_ORDER_LINES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_delivery_section(&oversized_lines),
+            Err(CoreCodecError::InvalidLength {
+                field: "Delivery lines",
+                ..
+            })
+        ));
+
+        let mut oversized_line_timestamp = encoded;
+        oversized_line_timestamp[entry_offset + 51] =
+            u8::try_from(MAX_RICH_DELIVERY_TIMESTAMP_BYTES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_delivery_section(&oversized_line_timestamp),
+            Err(CoreCodecError::InvalidLength {
+                field: "Delivery line timestamp",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rich_delivery_decoder_rejects_reordered_duplicate_and_noncanonical_frames() {
+        let first = (
+            SampleScore { high: 1, low: 2 },
+            OrderKey::from_parts(1, 1, 1),
+        );
+        let second = (
+            SampleScore { high: 3, low: 4 },
+            OrderKey::from_parts(1, 1, 2),
+        );
+        let canonical = test_delivery_section(&[first, second]);
+        let decoded = decode_rich_delivery_section(&canonical).unwrap();
+        assert_eq!(decoded.entries.len(), 2);
+
+        let entry_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1 + 4;
+        assert_eq!(
+            &canonical[entry_offset..entry_offset + 8],
+            &first.0.high.to_le_bytes()
+        );
+        assert_eq!(
+            &canonical[entry_offset + 16..entry_offset + 18],
+            &first.1.warehouse_id().to_le_bytes()
+        );
+
+        assert!(matches!(
+            decode_rich_delivery_section(&test_delivery_section(&[second, first])),
+            Err(CoreCodecError::NonCanonicalRichOrder { domain: "Delivery" })
+        ));
+        assert!(matches!(
+            decode_rich_delivery_section(&test_delivery_section(&[
+                first,
+                (
+                    SampleScore { high: 3, low: 4 },
+                    OrderKey::from_parts(1, 1, 1),
+                ),
+            ])),
+            Err(CoreCodecError::DuplicateRichOrderKey {
+                domain: "Delivery",
+                ..
+            })
+        ));
+
+        for end in [0, 1, 6, canonical.len() / 2, canonical.len() - 1] {
+            assert!(decode_rich_delivery_section(&canonical[..end]).is_err());
+        }
+        let mut unknown = canonical.clone();
+        unknown[4] = 0xff;
+        assert!(matches!(
+            decode_rich_delivery_section(&unknown),
+            Err(CoreCodecError::UnexpectedSection { actual: 0xff, .. })
+        ));
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(matches!(
+            decode_rich_delivery_section(&trailing),
+            Err(CoreCodecError::TrailingBytes { remaining: 1 })
+        ));
+        assert!(matches!(
+            decode_rich_delivery_section(&vec![0; MAX_RICH_DELIVERY_SECTION_BYTES + 1]),
+            Err(CoreCodecError::OversizedSection { .. })
+        ));
+    }
+
     fn empty_rich_intervals() -> SealedIntervalEvidence {
         IntervalCollector::new(1, 1, TEST_SAMPLE_SEED, |_key: StockKey| None)
             .unwrap()
@@ -2188,6 +2482,34 @@ mod tests {
         .unwrap()
     }
 
+    fn restore_delivery_only(
+        decoded: DecodedRichDeliverySection,
+        intervals: &SealedIntervalEvidence,
+    ) -> SealedRichRecoverySamples {
+        use crate::ranking::rich_recovery_samples::{
+            CanonicalRichBadCreditCustomer, CanonicalRichHistoryTuple, InitialCustomerData,
+            InitialHistoryRow,
+        };
+
+        let no_history = |_key: CustomerKey| None::<InitialHistoryRow>;
+        let no_customer = |_key: CustomerKey| None::<InitialCustomerData>;
+        SealedRichRecoverySamples::from_canonical_parts(
+            decoded.header,
+            std::iter::empty::<CanonicalRichNewOrder>(),
+            decoded.entries.into_iter(),
+            std::iter::empty::<CanonicalRichBadCreditCustomer>(),
+            std::iter::empty::<CanonicalRichHistoryTuple>(),
+            None,
+            decoded.rejected,
+            None,
+            None,
+            intervals,
+            &no_history,
+            &no_customer,
+        )
+        .unwrap()
+    }
+
     fn test_new_order_section(entries: &[(SampleScore, OrderKey)]) -> Vec<u8> {
         let empty = encode_rich_new_order_section(&empty_rich_samples(&empty_rich_intervals()))
             .expect("empty rich section encodes");
@@ -2237,6 +2559,48 @@ mod tests {
                     RICH_DISTRICT_INFO_BYTES,
                 )
                 .unwrap();
+            }
+        }
+        writer.finish()
+    }
+
+    fn test_delivery_section(entries: &[(SampleScore, OrderKey)]) -> Vec<u8> {
+        let empty =
+            encode_rich_delivery_section(&empty_rich_samples(&empty_rich_intervals())).unwrap();
+        let count_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1;
+        let mut writer = CanonicalWriter::new(MAX_RICH_DELIVERY_SECTION_BYTES);
+        writer.put_bytes(&empty[..count_offset]).unwrap();
+        writer
+            .put_u32(u32::try_from(entries.len()).unwrap())
+            .unwrap();
+        for (score, key) in entries {
+            encode_sample_score(&mut writer, *score).unwrap();
+            encode_order_key(&mut writer, *key).unwrap();
+            writer.put_i32(1).unwrap();
+            writer.put_u8(1).unwrap();
+            encode_boolean(&mut writer, false).unwrap();
+            encode_bounded_bytes(
+                &mut writer,
+                "Delivery timestamp",
+                b"2026-07-29 12:34:56",
+                1,
+                MAX_RICH_DELIVERY_TIMESTAMP_BYTES,
+            )
+            .unwrap();
+            writer
+                .put_u8(u8::try_from(MIN_RICH_ORDER_LINES).unwrap())
+                .unwrap();
+            for number in 1..=u8::try_from(MIN_RICH_ORDER_LINES).unwrap() {
+                writer.put_u8(number).unwrap();
+                encode_bounded_bytes(
+                    &mut writer,
+                    "Delivery line timestamp",
+                    b"2026-07-29 12:34:56",
+                    1,
+                    MAX_RICH_DELIVERY_TIMESTAMP_BYTES,
+                )
+                .unwrap();
+                writer.put_u32(1.0_f32.to_bits()).unwrap();
             }
         }
         writer.finish()
