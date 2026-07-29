@@ -3,9 +3,11 @@ use tracing::{error, info, warn};
 use crate::connection::cursor::{RmdbCursor, SqlParam};
 use crate::data_gen::{DISTRICTS_PER_WAREHOUSE, ORDERS_PER_DISTRICT};
 use crate::error::TpccError;
+use crate::runtime_schema::{LogicalTable, RuntimeSchema};
 
 pub struct ConsistencyChecker<'a> {
     cursor: &'a mut RmdbCursor,
+    schema: &'a RuntimeSchema,
     scale_factor: i32,
     expected_new_orders: Option<i64>,
 }
@@ -13,11 +15,13 @@ pub struct ConsistencyChecker<'a> {
 impl<'a> ConsistencyChecker<'a> {
     pub fn new(
         cursor: &'a mut RmdbCursor,
+        schema: &'a RuntimeSchema,
         scale_factor: i32,
         expected_new_orders: Option<i64>,
     ) -> Self {
         Self {
             cursor,
+            schema,
             scale_factor,
             expected_new_orders,
         }
@@ -66,30 +70,19 @@ impl<'a> ConsistencyChecker<'a> {
         info!("       数据库表行数统计");
         info!("========================================");
 
-        let tables = [
-            "warehouse",
-            "district",
-            "customer",
-            "item",
-            "stock",
-            "orders",
-            "order_line",
-            "new_orders",
-            "history",
-        ];
-
-        for table in &tables {
-            let sql = format!("SELECT COUNT(*) FROM {table}");
+        for table in LogicalTable::ALL {
+            let logical = table.canonical();
+            let sql = format!("SELECT COUNT(*) FROM {}", self.schema.table(table));
             match self.cursor.execute(&sql, &[]).await {
                 Ok(result) => {
                     if let Some(row) = result.rows.first() {
                         if let Some(val) = row.first() {
-                            info!("  {table:>15}: {val:>12}");
+                            info!("  {logical:>15}: {val:>12}");
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("  {table:>15}: 查询失败 - {e}");
+                    warn!("  {logical:>15}: 查询失败 - {e}");
                     warn!("  建议: 该查询使用了 COUNT 聚合函数，请确认数据库支持此功能");
                 }
             }
@@ -107,10 +100,13 @@ impl<'a> ConsistencyChecker<'a> {
         for w_id in 1..=self.scale_factor {
             for d_id in 1..=10 {
                 // Get d_next_o_id
+                let sql = self
+                    .schema
+                    .render_sql("SELECT d_next_o_id FROM district WHERE d_w_id = ? AND d_id = ?");
                 let d_result = self
                     .cursor
                     .execute(
-                        "SELECT d_next_o_id FROM district WHERE d_w_id = ? AND d_id = ?",
+                        &sql,
                         &[SqlParam::Int(w_id as i64), SqlParam::Int(d_id as i64)],
                     )
                     .await;
@@ -130,10 +126,13 @@ impl<'a> ConsistencyChecker<'a> {
                 };
 
                 // Get MAX(o_id)
+                let sql = self
+                    .schema
+                    .render_sql("SELECT MAX(o_id) FROM orders WHERE o_w_id = ? AND o_d_id = ?");
                 let max_o = self
                     .cursor
                     .execute(
-                        "SELECT MAX(o_id) FROM orders WHERE o_w_id = ? AND o_d_id = ?",
+                        &sql,
                         &[SqlParam::Int(w_id as i64), SqlParam::Int(d_id as i64)],
                     )
                     .await;
@@ -154,10 +153,13 @@ impl<'a> ConsistencyChecker<'a> {
                 };
 
                 // Get MAX(no_o_id)
+                let sql = self.schema.render_sql(
+                    "SELECT MAX(no_o_id) FROM new_orders WHERE no_w_id = ? AND no_d_id = ?",
+                );
                 let max_no = self
                     .cursor
                     .execute(
-                        "SELECT MAX(no_o_id) FROM new_orders WHERE no_w_id = ? AND no_d_id = ?",
+                        &sql,
                         &[SqlParam::Int(w_id as i64), SqlParam::Int(d_id as i64)],
                     )
                     .await;
@@ -204,10 +206,13 @@ impl<'a> ConsistencyChecker<'a> {
         for w_id in 1..=self.scale_factor {
             for d_id in 1..=10 {
                 // COUNT(no_o_id)
+                let sql = self.schema.render_sql(
+                    "SELECT COUNT(no_o_id) FROM new_orders WHERE no_w_id = ? AND no_d_id = ?",
+                );
                 let count_result = self
                     .cursor
                     .execute(
-                        "SELECT COUNT(no_o_id) FROM new_orders WHERE no_w_id = ? AND no_d_id = ?",
+                        &sql,
                         &[SqlParam::Int(w_id as i64), SqlParam::Int(d_id as i64)],
                     )
                     .await;
@@ -221,10 +226,13 @@ impl<'a> ConsistencyChecker<'a> {
                 };
 
                 // MAX(no_o_id)
+                let sql = self.schema.render_sql(
+                    "SELECT MAX(no_o_id) FROM new_orders WHERE no_w_id = ? AND no_d_id = ?",
+                );
                 let max_result = self
                     .cursor
                     .execute(
-                        "SELECT MAX(no_o_id) FROM new_orders WHERE no_w_id = ? AND no_d_id = ?",
+                        &sql,
                         &[SqlParam::Int(w_id as i64), SqlParam::Int(d_id as i64)],
                     )
                     .await;
@@ -238,10 +246,13 @@ impl<'a> ConsistencyChecker<'a> {
                 };
 
                 // MIN(no_o_id)
+                let sql = self.schema.render_sql(
+                    "SELECT MIN(no_o_id) FROM new_orders WHERE no_w_id = ? AND no_d_id = ?",
+                );
                 let min_result = self
                     .cursor
                     .execute(
-                        "SELECT MIN(no_o_id) FROM new_orders WHERE no_w_id = ? AND no_d_id = ?",
+                        &sql,
                         &[SqlParam::Int(w_id as i64), SqlParam::Int(d_id as i64)],
                     )
                     .await;
@@ -282,10 +293,13 @@ impl<'a> ConsistencyChecker<'a> {
         for w_id in 1..=self.scale_factor {
             for d_id in 1..=10 {
                 // SUM(o_ol_cnt)
+                let sql = self
+                    .schema
+                    .render_sql("SELECT SUM(o_ol_cnt) FROM orders WHERE o_w_id = ? AND o_d_id = ?");
                 let sum_result = self
                     .cursor
                     .execute(
-                        "SELECT SUM(o_ol_cnt) FROM orders WHERE o_w_id = ? AND o_d_id = ?",
+                        &sql,
                         &[SqlParam::Int(w_id as i64), SqlParam::Int(d_id as i64)],
                     )
                     .await;
@@ -305,10 +319,13 @@ impl<'a> ConsistencyChecker<'a> {
                 };
 
                 // COUNT(ol_o_id)
+                let sql = self.schema.render_sql(
+                    "SELECT COUNT(ol_o_id) FROM order_line WHERE ol_w_id = ? AND ol_d_id = ?",
+                );
                 let count_result = self
                     .cursor
                     .execute(
-                        "SELECT COUNT(ol_o_id) FROM order_line WHERE ol_w_id = ? AND ol_d_id = ?",
+                        &sql,
                         &[SqlParam::Int(w_id as i64), SqlParam::Int(d_id as i64)],
                     )
                     .await;
@@ -347,10 +364,8 @@ impl<'a> ConsistencyChecker<'a> {
             return Ok(true);
         };
 
-        let result = self
-            .cursor
-            .execute("SELECT COUNT(*) FROM orders", &[])
-            .await;
+        let sql = self.schema.render_sql("SELECT COUNT(*) FROM orders");
+        let result = self.cursor.execute(&sql, &[]).await;
         let count_orders: i64 = match result {
             Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
             Ok(_) => {

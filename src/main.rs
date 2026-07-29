@@ -402,7 +402,13 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         }
 
         if config.stats {
-            let mut chk = checker::ConsistencyChecker::new(&mut cursor, config.scale_factor, None);
+            let (_, dataset) = load_bound_state(&config, &effective)?;
+            let mut chk = checker::ConsistencyChecker::new(
+                &mut cursor,
+                &dataset.runtime_schema,
+                config.scale_factor,
+                None,
+            );
             chk.show_stats().await?;
         }
     }

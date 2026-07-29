@@ -20,19 +20,53 @@ use crate::consistency::{
 use crate::error::TpccError;
 use crate::ranking::ledger::{LedgerEvent, RunLedger};
 use crate::run_state::DatasetState;
+use crate::runtime_schema::RuntimeSchema;
 
 pub type FloatBaseline = BTreeMap<FloatAggregateId, u32>;
 
 const PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT: usize = 64;
 
 pub async fn run_setup(client: &mut RmdbClient, dataset: &DatasetState) -> Result<(), TpccError> {
-    let plan = setup_plan(SetupExpectations {
+    let plan = scheduled_setup_plan(dataset)?;
+    run_plan(client, &plan, &dataset.runtime_schema).await
+}
+
+fn scheduled_setup_plan(dataset: &DatasetState) -> Result<ConsistencyPlan, TpccError> {
+    let generated = setup_plan(SetupExpectations {
         warehouses: dataset.warehouses,
         order_line_rows: dataset.order_line_rows,
         undelivered_order_line_rows: dataset.undelivered_order_line_rows,
     })
     .map_err(|error| TpccError::Protocol(format!("invalid setup plan: {error}")))?;
-    run_plan(client, &plan).await
+    let count_queries = generated
+        .queries
+        .iter()
+        .filter(|query| query.id.starts_with("setup.count."))
+        .count();
+    if count_queries != 9 {
+        return Err(TpccError::Protocol(format!(
+            "setup plan generated {count_queries} COUNT phase queries, expected 9"
+        )));
+    }
+    let mut post_count = generated
+        .queries
+        .into_iter()
+        .filter(|query| !query.id.starts_with("setup.count."))
+        .map(|query| (query.id.clone(), query))
+        .collect::<BTreeMap<_, _>>();
+    let mut plan = ConsistencyPlan::default();
+    for id in dataset.runtime_schema.schedule().setup_checks() {
+        plan.queries.push(post_count.remove(*id).ok_or_else(|| {
+            TpccError::Protocol(format!("setup schedule references unknown check {id:?}"))
+        })?);
+    }
+    if !post_count.is_empty() {
+        return Err(TpccError::Protocol(format!(
+            "setup schedule omitted checks: {}",
+            post_count.keys().cloned().collect::<Vec<_>>().join(",")
+        )));
+    }
+    Ok(plan)
 }
 
 /// Execute the public final-2026 online gate with typed Wire values.
@@ -51,10 +85,10 @@ pub async fn run_final_online(
     let expectations = final_expectations(dataset, ledger, initial_order_line_amounts)?;
     let plan = public_online_integer_plan(expectations)
         .map_err(|error| protocol_error("invalid public online plan", error))?;
-    run_plan(client, &plan).await?;
+    run_plan(client, &plan, &dataset.runtime_schema).await?;
 
     validate_transaction_evidence(ledger)?;
-    let values = read_float_aggregates(client, CheckScope::Online).await?;
+    let values = read_float_aggregates(client, CheckScope::Online, &dataset.runtime_schema).await?;
     validate_online_float_ledger(dataset, ledger, initial_order_line_amounts, &values)?;
     info!(
         "public online consistency PASS; hidden official 6/37 SQL, keys, seed, and answers were not inferred"
@@ -80,13 +114,20 @@ pub async fn run_final_recovery(
     let expectations = final_expectations(dataset, ledger, initial_order_line_amounts)?;
     let plan = recovery_plan(expectations)
         .map_err(|error| protocol_error("invalid public recovery plan", error))?;
-    run_plan(client, &plan).await?;
+    run_plan(client, &plan, &dataset.runtime_schema).await?;
 
     let endpoints = validate_transaction_evidence(ledger)?;
-    let recovered = read_float_aggregates(client, CheckScope::Recovery).await?;
+    let recovered =
+        read_float_aggregates(client, CheckScope::Recovery, &dataset.runtime_schema).await?;
     validate_float_baseline(online_baseline, &recovered)?;
-    validate_payment_endpoints(client, dataset.warehouses, &endpoints).await?;
-    validate_customer_endpoint_sample(client, &endpoints).await?;
+    validate_payment_endpoints(
+        client,
+        &dataset.runtime_schema,
+        dataset.warehouses,
+        &endpoints,
+    )
+    .await?;
+    validate_customer_endpoint_sample(client, &dataset.runtime_schema, &endpoints).await?;
 
     let partitions = partition_expectations(dataset, ledger)?;
     // Reuse the transport-neutral generator as a strict completeness and
@@ -94,17 +135,21 @@ pub async fn run_final_recovery(
     // queries rather than 3,000 scalar requests.
     recovery_partition_audits_for_warehouses(dataset.warehouses, partitions.clone())
         .map_err(|error| protocol_error("invalid recovery partition ledger", error))?;
-    run_grouped_partition_audit(client, &partitions).await?;
+    run_grouped_partition_audit(client, &dataset.runtime_schema, &partitions).await?;
     info!(
         "public recovery consistency PASS; hidden official 37 SQL, generated keys, seed, and answers remain unavailable"
     );
     Ok(())
 }
 
-pub async fn run_plan(client: &mut RmdbClient, plan: &ConsistencyPlan) -> Result<(), TpccError> {
+pub async fn run_plan(
+    client: &mut RmdbClient,
+    plan: &ConsistencyPlan,
+    schema: &RuntimeSchema,
+) -> Result<(), TpccError> {
     warn!("{PUBLIC_SPEC_NOTICE}");
     for query in &plan.queries {
-        let result = execute_query(client, query).await?;
+        let result = execute_query(client, schema, query).await?;
         query.validate(&result).map_err(|error| {
             TpccError::QueryError(format!(
                 "consistency check {} ({}) failed: {error}",
@@ -119,11 +164,12 @@ pub async fn run_plan(client: &mut RmdbClient, plan: &ConsistencyPlan) -> Result
 pub async fn read_float_aggregates(
     client: &mut RmdbClient,
     scope: CheckScope,
+    schema: &RuntimeSchema,
 ) -> Result<FloatBaseline, TpccError> {
     let plan = float_aggregate_plan(scope);
     let mut values = BTreeMap::new();
     for (spec, query) in FLOAT_AGGREGATES.iter().zip(&plan.queries) {
-        let result = execute_query(client, query).await?;
+        let result = execute_query(client, schema, query).await?;
         query.validate(&result).map_err(|error| {
             TpccError::QueryError(format!(
                 "FLOAT32 consistency check {} failed: {error}",
@@ -430,11 +476,13 @@ fn require_zero_ulp(name: &str, expected_bits: u32, actual_bits: u32) -> Result<
 
 async fn validate_payment_endpoints(
     client: &mut RmdbClient,
+    schema: &RuntimeSchema,
     warehouse_count: i32,
     endpoints: &RelativeEndpoints,
 ) -> Result<(), TpccError> {
     let warehouses = execute_typed_sql(
         client,
+        schema,
         "recovery.payment.warehouse_endpoints",
         "SELECT w_id, w_ytd FROM warehouse",
     )
@@ -460,6 +508,7 @@ async fn validate_payment_endpoints(
 
     let districts = execute_typed_sql(
         client,
+        schema,
         "recovery.payment.district_endpoints",
         "SELECT d_w_id, d_id, d_ytd FROM district",
     )
@@ -490,12 +539,14 @@ async fn validate_payment_endpoints(
 
 async fn validate_customer_endpoint_sample(
     client: &mut RmdbClient,
+    schema: &RuntimeSchema,
     endpoints: &RelativeEndpoints,
 ) -> Result<(), TpccError> {
     let sample = evenly_spaced_customer_sample(&endpoints.customers);
     for (ordinal, (key, endpoint)) in sample.iter().enumerate() {
         let result = execute_typed_sql(
             client,
+            schema,
             &format!("recovery.customer.sample.{}", ordinal + 1),
             &format!(
                 "SELECT c_w_id, c_d_id, c_id, c_balance, c_ytd_payment, c_payment_cnt, \
@@ -775,6 +826,7 @@ impl PartitionMetric {
 
 async fn run_grouped_partition_audit(
     client: &mut RmdbClient,
+    schema: &RuntimeSchema,
     partitions: &[PartitionExpectation],
 ) -> Result<(), TpccError> {
     for (id, sql, metric) in [
@@ -804,7 +856,7 @@ async fn run_grouped_partition_audit(
             PartitionMetric::CarrierZero,
         ),
     ] {
-        let result = execute_typed_sql(client, id, sql).await?;
+        let result = execute_typed_sql(client, schema, id, sql).await?;
         validate_grouped_partition_counts(id, result, partitions, metric)?;
         info!(
             "consistency PASS: {id} ({} partitions in one typed response)",
@@ -814,6 +866,7 @@ async fn run_grouped_partition_audit(
 
     let result = execute_typed_sql(
         client,
+        schema,
         "recovery.partition.grouped.next_order_id",
         "SELECT d_w_id, d_id, d_next_o_id FROM district",
     )
@@ -927,10 +980,12 @@ fn validate_partition_next_order_ids(
 
 async fn execute_typed_sql(
     client: &mut RmdbClient,
+    schema: &RuntimeSchema,
     id: &str,
     sql: &str,
 ) -> Result<TypedResult, TpccError> {
-    match client.exec_stream(&terminated_sql(sql)).await? {
+    let rendered = schema.render_sql(sql);
+    match client.exec_stream(&terminated_sql(&rendered)).await? {
         StreamResponse::Query { rows, .. } => Ok(TypedResult {
             rows: rows
                 .into_iter()
@@ -951,9 +1006,10 @@ async fn execute_typed_sql(
 
 async fn execute_query(
     client: &mut RmdbClient,
+    schema: &RuntimeSchema,
     query: &CheckQuery,
 ) -> Result<TypedResult, TpccError> {
-    execute_typed_sql(client, &query.id, &query.sql).await
+    execute_typed_sql(client, schema, &query.id, &query.sql).await
 }
 
 fn protocol_error(context: &str, error: impl std::fmt::Display) -> TpccError {
@@ -1031,6 +1087,24 @@ mod tests {
             DISTRICTS_PER_WAREHOUSE as usize
         );
         assert!(validate_consistency_warehouse_count(FINAL_WAREHOUSES + 1).is_err());
+    }
+
+    #[test]
+    fn setup_executes_only_the_scheduled_post_count_checks() {
+        let dataset = smoke_dataset(1);
+        let plan = scheduled_setup_plan(&dataset).unwrap();
+        assert_eq!(plan.queries.len(), 18);
+        assert!(plan
+            .queries
+            .iter()
+            .all(|query| !query.id.starts_with("setup.count.")));
+        assert_eq!(
+            plan.queries
+                .iter()
+                .map(|query| query.id.as_str())
+                .collect::<Vec<_>>(),
+            dataset.runtime_schema.schedule().setup_checks()
+        );
     }
 
     #[test]
