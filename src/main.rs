@@ -7,6 +7,7 @@ mod executor;
 mod loader;
 pub mod measurement;
 mod model;
+pub mod phases;
 mod profile;
 mod report;
 mod transaction;
