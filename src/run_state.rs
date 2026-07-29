@@ -1860,11 +1860,6 @@ pub fn attest_formal_state(
     #[cfg(unix)]
     {
         expected_contract.validate_shape()?;
-        if expected_contract.conformance != RunConformance::PublicSpecAligned {
-            return Err(StateError::Invalid(
-                "formal-state attestation requires the public-spec-aligned contract".to_owned(),
-            ));
-        }
 
         let directory_lock = lock_readonly_formal_state_directory(root)?;
         let directory_metadata = directory_lock.0.metadata()?;
@@ -4133,13 +4128,23 @@ mod tests {
     }
 
     fn initialize_formal_run(directory: &TestDirectory) -> (DatasetState, RunContract) {
-        let store = StateStore::open_terminal(&directory.0).unwrap();
-        let dataset = sample_dataset_with_warehouses(
+        initialize_formal_run_with_shape(
+            directory,
             "run-formal-attestation",
             0x7a11_ce55,
-            i32::from(OFFICIAL_WAREHOUSES),
-        );
-        let contract = sample_contract(OFFICIAL_WAREHOUSES);
+            OFFICIAL_WAREHOUSES,
+        )
+    }
+
+    fn initialize_formal_run_with_shape(
+        directory: &TestDirectory,
+        run_id: &str,
+        seed: u64,
+        warehouses: u16,
+    ) -> (DatasetState, RunContract) {
+        let store = StateStore::open_terminal(&directory.0).unwrap();
+        let dataset = sample_dataset_with_warehouses(run_id, seed, i32::from(warehouses));
+        let contract = sample_contract(warehouses);
         initialize_online_run(&store, &dataset, &contract);
         for event in [
             CrashLifecycleEvent::Intent,
@@ -4348,6 +4353,23 @@ mod tests {
 
         fs::write(directory.0.join(DIAGNOSTIC_OBSERVATION_RECEIPT_FILE), []).unwrap();
         assert!(attest_formal_state(&directory.0, dataset.seed, &contract).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn formal_attestation_accepts_a_valid_explicit_non_ranked_chain() {
+        let directory = TestDirectory::new();
+        let (dataset, contract) =
+            initialize_formal_run_with_shape(&directory, "run-formal-smoke", 0x5a0c_e001, 1);
+        assert_eq!(contract.conformance, RunConformance::NonRankedDeviation);
+
+        let receipt = attest_formal_state(&directory.0, dataset.seed, &contract)
+            .unwrap()
+            .to_string();
+        assert!(receipt.is_ascii());
+        assert!(receipt.starts_with("FORMAL_STATE_V2 terminal_evidence_size="));
+        assert!(!receipt.contains("ranking"));
+        assert!(!receipt.contains("public_spec_aligned"));
     }
 
     #[cfg(unix)]
