@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 from decimal import Decimal
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -491,6 +492,7 @@ def validate_rank_result(manifest: dict[str, Any]) -> dict[str, Any]:
 def validate_formal_state(
     manifest: dict[str, Any],
     attestation_status: str,
+    state_descriptor: int | None,
 ) -> bool:
     formal = manifest.get("formal_state")
     if (
@@ -686,8 +688,15 @@ def validate_formal_state(
         raise ManifestError(
             "manifest.json has an invalid formal state chain binding"
         )
+    if state_descriptor is None:
+        raise ManifestError(
+            "formal state snapshot lock is unavailable"
+        )
     try:
-        actual = FORMAL_STATE_CHAIN.inspect_formal_state_path(state_dir)
+        actual = FORMAL_STATE_CHAIN.inspect_formal_state_fd(
+            state_descriptor,
+            expected_path=state_dir,
+        )
     except FORMAL_STATE_CHAIN.FormalStateError as error:
         raise ManifestError(
             f"formal state chain revalidation failed: {error}"
@@ -716,6 +725,65 @@ def load_authoritative_manifest(
     )
     if not text:
         raise ManifestError("manifest.json is missing or empty")
+    try:
+        preliminary = json.loads(text)
+    except json.JSONDecodeError:
+        preliminary = None
+
+    state_descriptor = -1
+    if isinstance(preliminary, dict) and preliminary.get("mode") == "all":
+        paths = preliminary.get("paths")
+        state_value = paths.get("state") if isinstance(paths, dict) else None
+        if not isinstance(state_value, str):
+            raise ManifestError("manifest.json has no formal-state directory")
+        state_path = pathlib.Path(state_value)
+        if not state_path.is_absolute():
+            raise ManifestError("formal-state directory is not absolute")
+        if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+            raise ManifestError(
+                "safe formal-state snapshot locking is unavailable"
+            )
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            state_descriptor = os.open(state_path, flags)
+            fcntl.flock(state_descriptor, fcntl.LOCK_SH)
+        except OSError as error:
+            if state_descriptor >= 0:
+                os.close(state_descriptor)
+            raise ManifestError(
+                "could not lock the formal-state snapshot"
+            ) from error
+
+    try:
+        locked_text = read_regular_text(
+            result_dir,
+            "manifest.json",
+            MAX_MANIFEST_BYTES,
+        )
+        if locked_text != text:
+            raise ManifestError(
+                "manifest.json changed while locking its formal-state snapshot"
+            )
+        return _load_authoritative_manifest_snapshot(
+            result_dir,
+            locked_text,
+            state_descriptor if state_descriptor >= 0 else None,
+        )
+    finally:
+        if state_descriptor >= 0:
+            try:
+                fcntl.flock(state_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(state_descriptor)
+
+
+def _load_authoritative_manifest_snapshot(
+    result_dir: pathlib.Path,
+    text: str,
+    state_descriptor: int | None,
+) -> tuple[dict[str, Any], str]:
     try:
         manifest = json.loads(text)
     except json.JSONDecodeError as error:
@@ -849,6 +917,7 @@ def load_authoritative_manifest(
     formal_state_verified = validate_formal_state(
         manifest,
         by_name["formal_state_chain"]["status"],
+        state_descriptor,
     )
     expected_configuration_status = (
         "not_applicable"

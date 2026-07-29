@@ -38,6 +38,12 @@ FORMAL_CHAIN_SPEC = importlib.util.spec_from_file_location(
 )
 FORMAL_STATE_CHAIN = importlib.util.module_from_spec(FORMAL_CHAIN_SPEC)
 FORMAL_CHAIN_SPEC.loader.exec_module(FORMAL_STATE_CHAIN)
+SUMMARY_SPEC = importlib.util.spec_from_file_location(
+    "workflow_summary_validator",
+    SUMMARY_HELPER,
+)
+SUMMARY_VALIDATOR = importlib.util.module_from_spec(SUMMARY_SPEC)
+SUMMARY_SPEC.loader.exec_module(SUMMARY_VALIDATOR)
 
 
 class WorkflowSafetyTests(unittest.TestCase):
@@ -529,6 +535,91 @@ class WorkflowSafetyTests(unittest.TestCase):
                 "legacy_run_ledger.status: absent",
                 result.stdout,
             )
+
+    def test_summary_holds_formal_snapshot_lock_through_rank_binding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result_dir = Path(temp)
+            self.write_summary_manifest(
+                result_dir,
+                status="success",
+                ranking_eligible=True,
+                conformance="public_spec_aligned",
+                attestation_status="verified",
+                rank_text="rank snapshot fixture\n",
+            )
+            state_dir = result_dir / "state"
+            ready = result_dir / "legacy-writer.ready"
+            legacy = state_dir / "run_ledger.state"
+            child = None
+            original_inspect = (
+                SUMMARY_VALIDATOR.FORMAL_STATE_CHAIN
+                .inspect_formal_state_fd
+            )
+            original_read = SUMMARY_VALIDATOR.read_regular_bytes
+
+            def inspect_then_start_writer(*args, **kwargs):
+                nonlocal child
+                inspection = original_inspect(*args, **kwargs)
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import fcntl, os, pathlib, sys\n"
+                            "state = pathlib.Path(sys.argv[1])\n"
+                            "ready = pathlib.Path(sys.argv[2])\n"
+                            "fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)\n"
+                            "ready.write_text('waiting\\n', encoding='ascii')\n"
+                            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                            "(state / 'run_ledger.state').write_bytes(b'legacy\\n')\n"
+                            "fcntl.flock(fd, fcntl.LOCK_UN)\n"
+                            "os.close(fd)\n"
+                        ),
+                        str(state_dir),
+                        str(ready),
+                    ]
+                )
+                deadline = time.monotonic() + 2
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                return inspection
+
+            def assert_locked_rank_read(directory, name, limit):
+                if name == "rank.log":
+                    self.assertIsNotNone(child)
+                    self.assertIsNone(child.poll())
+                    self.assertFalse(legacy.exists())
+                return original_read(directory, name, limit)
+
+            try:
+                with mock.patch.object(
+                    SUMMARY_VALIDATOR.FORMAL_STATE_CHAIN,
+                    "inspect_formal_state_fd",
+                    side_effect=inspect_then_start_writer,
+                ), mock.patch.object(
+                    SUMMARY_VALIDATOR,
+                    "read_regular_bytes",
+                    side_effect=assert_locked_rank_read,
+                ):
+                    manifest, rank_text = (
+                        SUMMARY_VALIDATOR.load_authoritative_manifest(
+                            result_dir.resolve()
+                        )
+                    )
+                self.assertTrue(manifest["ranking_eligible"])
+                self.assertTrue(rank_text)
+                child.wait(timeout=2)
+                self.assertEqual(child.returncode, 0)
+                self.assertTrue(legacy.is_file())
+                with self.assertRaises(SUMMARY_VALIDATOR.ManifestError):
+                    SUMMARY_VALIDATOR.load_authoritative_manifest(
+                        result_dir.resolve()
+                    )
+            finally:
+                if child is not None and child.poll() is None:
+                    child.terminate()
+                    child.wait(timeout=2)
 
     def test_summary_revalidates_terminal_evidence_bytes_and_file_shape(self):
         def remove_terminal(path):
