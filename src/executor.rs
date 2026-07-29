@@ -27,7 +27,7 @@ use crate::ranking::catalog::RuntimeCatalog;
 use crate::ranking::common::install_statement_layout;
 use crate::ranking::dispatch::{self, FrozenTransaction};
 use crate::ranking::evidence_collector::{CustomerKey, StockKey};
-use crate::ranking::ledger::{LedgerClass, LedgerError, RunLedger};
+use crate::ranking::ledger::LedgerClass;
 use crate::ranking::preflight;
 use crate::ranking::rich_recovery_samples::{InitialCustomerData, InitialHistoryRow};
 use crate::ranking::runner::{RankedTransactionOutcome, StockVersion};
@@ -359,14 +359,12 @@ impl BenchmarkExecutor {
         );
 
         let mut first_error = None;
-        let mut worker_ledgers: Vec<Option<RunLedger>> = std::iter::repeat_with(|| None)
-            .take(usize::from(profile.clients))
-            .collect();
+        let mut completed_workers = vec![false; usize::from(profile.clients)];
         while let Some(joined) = workers.join_next().await {
             match joined {
-                Ok(Ok((worker, ledger))) => {
+                Ok(Ok(worker)) => {
                     let index = usize::from(worker);
-                    if index >= worker_ledgers.len() {
+                    if index >= completed_workers.len() {
                         cancelled.store(true, Ordering::Release);
                         terminal_evidence
                             .poison(format!("ranked worker returned out-of-range id {worker}"))
@@ -376,16 +374,14 @@ impl BenchmarkExecutor {
                                 "ranked worker returned out-of-range id {worker}"
                             )));
                         }
-                    } else if worker_ledgers[index].replace(ledger).is_some() {
+                    } else if std::mem::replace(&mut completed_workers[index], true) {
                         cancelled.store(true, Ordering::Release);
                         terminal_evidence
-                            .poison(format!(
-                                "ranked worker returned duplicate ledger for id {worker}"
-                            ))
+                            .poison(format!("ranked worker returned duplicate id {worker}"))
                             .await;
                         if first_error.is_none() {
                             first_error = Some(TpccError::Protocol(format!(
-                                "ranked worker returned duplicate ledger for id {worker}"
+                                "ranked worker returned duplicate id {worker}"
                             )));
                         }
                     }
@@ -415,18 +411,18 @@ impl BenchmarkExecutor {
         if let Some(error) = first_error {
             return Err(error);
         }
-        let worker_ledgers = worker_ledgers
+        completed_workers
             .into_iter()
             .enumerate()
-            .map(|(worker, ledger)| {
-                ledger.ok_or_else(|| {
-                    TpccError::Protocol(format!(
-                        "ranked worker {worker} did not return its physical commit ledger"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let ledger = RunLedger::merge_all(worker_ledgers).map_err(ledger_error)?;
+            .try_for_each(|(worker, completed)| {
+                if completed {
+                    Ok(())
+                } else {
+                    Err(TpccError::Protocol(format!(
+                        "ranked worker {worker} did not report completion"
+                    )))
+                }
+            })?;
         let terminal_evidence = terminal_evidence
             .seal()
             .await
@@ -451,7 +447,6 @@ impl BenchmarkExecutor {
             median_new_order_per_minute,
             response_timeout,
             phase_tail_grace: limits.phase_tail_grace,
-            ledger,
             terminal_evidence,
         };
 
@@ -551,7 +546,7 @@ async fn run_worker(
     start_barrier: Arc<Barrier>,
     monotonic_clock: SystemMonotonicClock,
     terminal_evidence: Arc<TerminalEvidenceCollector>,
-) -> Result<(u16, RunLedger), TpccError> {
+) -> Result<u16, TpccError> {
     let failure_scheduler = Arc::clone(&scheduler);
     let failure_cancelled = Arc::clone(&cancelled);
     let failure_evidence = Arc::clone(&terminal_evidence);
@@ -592,18 +587,17 @@ async fn run_worker_inner(
     start_barrier: Arc<Barrier>,
     monotonic_clock: SystemMonotonicClock,
     terminal_evidence: Arc<TerminalEvidenceCollector>,
-) -> Result<(u16, RunLedger), TpccError> {
+) -> Result<u16, TpccError> {
     let worker = WorkerId::new(worker_value).map_err(scheduler_error)?;
     wait_for_timing_release(&ready_barrier, &start_barrier).await;
 
-    let mut ledger = RunLedger::default();
     let mut sequence_phase = None;
     let mut sequence = ClientSequence::new(worker_value)
         .map_err(|error| TpccError::Protocol(error.to_string()))?;
 
     loop {
         if cancelled.load(Ordering::Acquire) {
-            return Ok((worker_value, ledger));
+            return Ok(worker_value);
         }
 
         let reservation_result = {
@@ -617,7 +611,7 @@ async fn run_worker_inner(
                     .worker_finished(worker_value)
                     .await
                     .map_err(terminal_evidence_error)?;
-                return Ok((worker_value, ledger));
+                return Ok(worker_value);
             }
             Err(error) => return Err(scheduler_error(error)),
         };
@@ -669,7 +663,7 @@ async fn run_worker_inner(
 
         loop {
             if cancelled.load(Ordering::Acquire) {
-                return Ok((worker_value, ledger));
+                return Ok(worker_value);
             }
             let deadline = tokio::time::Instant::from_std(
                 monotonic_clock
@@ -736,21 +730,6 @@ async fn run_worker_inner(
                             &cancelled,
                             worker,
                             format!("bounded terminal evidence rejected terminal: {error}"),
-                        );
-                    }
-                    let record_result = match disposition {
-                        AttemptDisposition::Finished => ledger.record(frozen.ticket(), &outcome),
-                        AttemptDisposition::GraceTail => {
-                            ledger.record_grace_tail(frozen.ticket(), &outcome)
-                        }
-                        _ => unreachable!("terminal disposition was validated above"),
-                    };
-                    if let Err(error) = record_result {
-                        return fail_worker(
-                            &scheduler,
-                            &cancelled,
-                            worker,
-                            format!("physical commit ledger rejected terminal: {error}"),
                         );
                     }
                     break;
@@ -825,10 +804,6 @@ fn scheduler_error(error: SchedulerError) -> TpccError {
     TpccError::Protocol(format!("ranked scheduler: {error}"))
 }
 
-fn ledger_error(error: LedgerError) -> TpccError {
-    TpccError::Protocol(format!("ranked physical commit ledger: {error}"))
-}
-
 fn terminal_evidence_error(error: TerminalEvidenceError) -> TpccError {
     TpccError::Protocol(format!("ranked bounded terminal evidence: {error}"))
 }
@@ -860,15 +835,10 @@ pub struct Final2026RunResult {
     median_new_order_per_minute: f64,
     response_timeout: Duration,
     phase_tail_grace: Duration,
-    ledger: RunLedger,
     terminal_evidence: SealedTerminalEvidence,
 }
 
 impl Final2026RunResult {
-    pub fn ledger(&self) -> &RunLedger {
-        &self.ledger
-    }
-
     pub fn terminal_evidence(&self) -> &SealedTerminalEvidence {
         &self.terminal_evidence
     }

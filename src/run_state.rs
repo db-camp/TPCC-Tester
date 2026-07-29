@@ -20,7 +20,6 @@ use crate::ranking::core_artifact_codec::{
     TerminalArtifactBinding, MAX_TERMINAL_ARTIFACT_HEX_CHARS,
 };
 use crate::ranking::evidence_collector::CustomerKey;
-use crate::ranking::ledger::RunLedger;
 use crate::ranking::rich_recovery_samples::{InitialCustomerData, InitialHistoryRow};
 use crate::ranking::terminal_evidence::SealedTerminalEvidence;
 use crate::runtime_schema::{RuntimeSchema, ENCODED_BEGIN_MARKER, ENCODED_END_MARKER};
@@ -42,10 +41,6 @@ const SETUP_RECEIPT_ARTIFACT: &str = "setup_check_receipt";
 const SETUP_RECEIPT_FILE: &str = "setup_check.passed";
 const RANK_CLAIM_ARTIFACT: &str = "rank_claim";
 const RANK_CLAIM_FILE: &str = "rank.started";
-const RANKED_LEDGER_ARTIFACT: &str = "ranked_run_ledger";
-const NON_RANKED_LEDGER_ARTIFACT: &str = "non_ranked_run_ledger";
-#[cfg(test)]
-const LEDGER_ARTIFACT: &str = "run_ledger";
 const LEDGER_FILE: &str = "run_ledger.state";
 const RANKED_TERMINAL_EVIDENCE_ARTIFACT: &str = "ranked_terminal_evidence";
 const NON_RANKED_TERMINAL_EVIDENCE_ARTIFACT: &str = "non_ranked_terminal_evidence";
@@ -74,7 +69,7 @@ const DIAGNOSTIC_OBSERVATION_CLAIM_ARTIFACT: &str = "diagnostic_observation_clai
 const DIAGNOSTIC_OBSERVATION_CLAIM_FILE: &str = "diagnostic_observation.started";
 const DIAGNOSTIC_OBSERVATION_RECEIPT_ARTIFACT: &str = "diagnostic_observation_receipt";
 const DIAGNOSTIC_OBSERVATION_RECEIPT_FILE: &str = "diagnostic_observation.passed";
-const STATE_ARTIFACT_FILES: [&str; 21] = [
+const STATE_ARTIFACT_FILES: [&str; 20] = [
     DATASET_FILE,
     SETUP_INTENT_FILE,
     SETUP_EXECUTION_FILE,
@@ -82,7 +77,6 @@ const STATE_ARTIFACT_FILES: [&str; 21] = [
     SETUP_CHECK_CLAIM_FILE,
     SETUP_RECEIPT_FILE,
     RANK_CLAIM_FILE,
-    LEDGER_FILE,
     TERMINAL_EVIDENCE_FILE,
     ONLINE_CLAIM_FILE,
     FLOAT_BASELINE_FILE,
@@ -98,7 +92,6 @@ const STATE_ARTIFACT_FILES: [&str; 21] = [
     DIAGNOSTIC_OBSERVATION_RECEIPT_FILE,
 ];
 const MAX_ARTIFACT_HEADER_BYTES: u64 = 4 * 1024;
-const MAX_LEDGER_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_TERMINAL_EVIDENCE_HEX_CHARS: usize = 16_777_216;
 const MAX_BOUND_PAYLOAD_OVERHEAD_BYTES: usize = 128;
 const MAX_TERMINAL_EVIDENCE_PAYLOAD_BYTES: usize = 16_777_344;
@@ -299,21 +292,9 @@ pub struct SetupCheckClaim(ClaimToken);
 pub struct RankClaim(ClaimToken);
 
 #[derive(Debug)]
-pub struct OnlineCheckClaim {
-    token: ClaimToken,
-    ledger_checksum: u64,
-}
-
-#[derive(Debug)]
 pub struct TerminalOnlineCheckClaim {
     token: ClaimToken,
     terminal_evidence_checksum: u64,
-}
-
-#[derive(Debug)]
-pub struct RecoveryCheckClaim {
-    token: ClaimToken,
-    baseline_checksum: u64,
 }
 
 #[derive(Debug)]
@@ -321,12 +302,6 @@ pub struct TerminalRecoveryCheckClaim {
     token: ClaimToken,
     terminal_evidence_checksum: u64,
     baseline_checksum: u64,
-}
-
-#[derive(Debug)]
-pub struct DiagnosticClaim {
-    token: ClaimToken,
-    stage: DiagnosticStage,
 }
 
 #[derive(Debug)]
@@ -630,28 +605,13 @@ impl DatasetState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StateAuthority {
-    LegacyLedger,
-    TerminalEvidence,
-}
-
 #[derive(Clone, Debug)]
 pub struct StateStore {
     root: PathBuf,
-    authority: StateAuthority,
 }
 
 impl StateStore {
-    pub fn open(root: &Path) -> Result<Self, StateError> {
-        Self::open_with_authority(root, StateAuthority::LegacyLedger)
-    }
-
     pub fn open_terminal(root: &Path) -> Result<Self, StateError> {
-        Self::open_with_authority(root, StateAuthority::TerminalEvidence)
-    }
-
-    fn open_with_authority(root: &Path, authority: StateAuthority) -> Result<Self, StateError> {
         match fs::symlink_metadata(root) {
             Ok(metadata) => validate_real_directory(root, &metadata)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -662,25 +622,13 @@ impl StateStore {
         }
         let store = Self {
             root: root.to_path_buf(),
-            authority,
         };
         let _directory_lock = store.lock_clean()?;
         drop(_directory_lock);
         Ok(store)
     }
 
-    pub fn open_existing(root: &Path) -> Result<Self, StateError> {
-        Self::open_existing_with_authority(root, StateAuthority::LegacyLedger)
-    }
-
     pub fn open_existing_terminal(root: &Path) -> Result<Self, StateError> {
-        Self::open_existing_with_authority(root, StateAuthority::TerminalEvidence)
-    }
-
-    fn open_existing_with_authority(
-        root: &Path,
-        authority: StateAuthority,
-    ) -> Result<Self, StateError> {
         let metadata = fs::symlink_metadata(root).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 StateError::Invalid(format!(
@@ -694,7 +642,6 @@ impl StateStore {
         validate_real_directory(root, &metadata)?;
         let store = Self {
             root: root.to_path_buf(),
-            authority,
         };
         let _directory_lock = store.lock_clean()?;
         drop(_directory_lock);
@@ -702,24 +649,7 @@ impl StateStore {
     }
 
     fn lock_clean(&self) -> Result<StateDirectoryLock, StateError> {
-        match self.authority {
-            StateAuthority::LegacyLedger => lock_clean_state_directory(&self.root),
-            StateAuthority::TerminalEvidence => lock_clean_terminal_state_directory(&self.root),
-        }
-    }
-
-    fn require_authority(&self, expected: StateAuthority) -> Result<(), StateError> {
-        if self.authority != expected {
-            return Err(StateError::Invalid(match expected {
-                StateAuthority::LegacyLedger => {
-                    "legacy run-ledger operation requires a legacy state store".to_owned()
-                }
-                StateAuthority::TerminalEvidence => {
-                    "terminal-evidence operation requires a terminal state store".to_owned()
-                }
-            }));
-        }
-        Ok(())
+        lock_clean_terminal_state_directory(&self.root)
     }
 
     pub fn publish_setup_intent(
@@ -945,32 +875,6 @@ impl StateStore {
         }))
     }
 
-    pub fn complete_rank(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-        claim: RankClaim,
-        ledger: &RunLedger,
-    ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::LegacyLedger)?;
-        let _directory_lock = self.lock_clean()?;
-        self.validate_claim(
-            dataset,
-            contract,
-            claim.0,
-            RANK_CLAIM_FILE,
-            RANK_CLAIM_ARTIFACT,
-        )?;
-        let payload = encode_bound_payload(
-            claim.0.contract_checksum,
-            claim.0.claim_checksum,
-            &ledger.encode(),
-        );
-        let artifact = ledger_artifact(contract.conformance);
-        let encoded = encode_artifact(artifact, dataset, &payload, MAX_LEDGER_PAYLOAD_BYTES)?;
-        atomic_publish_new(&self.root, LEDGER_FILE, encoded.as_bytes())
-    }
-
     pub fn complete_rank_with_terminal_evidence(
         &self,
         dataset: &DatasetState,
@@ -978,7 +882,6 @@ impl StateStore {
         claim: RankClaim,
         terminal_evidence: &SealedTerminalEvidence,
     ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::TerminalEvidence)?;
         let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
@@ -1008,42 +911,11 @@ impl StateStore {
         atomic_publish_new(&self.root, TERMINAL_EVIDENCE_FILE, encoded.as_bytes())
     }
 
-    pub fn begin_online_check(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-    ) -> Result<(OnlineCheckClaim, RunLedger), StateError> {
-        self.require_authority(StateAuthority::LegacyLedger)?;
-        let _directory_lock = self.lock_clean()?;
-        self.ensure_no_diagnostic_drift()?;
-        let (contract_checksum, _, ledger, ledger_checksum) =
-            self.load_bound_ledger(dataset, contract)?;
-        let claim_checksum = self.publish_marker(
-            ONLINE_CLAIM_FILE,
-            ONLINE_CLAIM_ARTIFACT,
-            dataset,
-            contract_checksum,
-            ledger_checksum,
-        )?;
-        Ok((
-            OnlineCheckClaim {
-                token: ClaimToken {
-                    contract_checksum,
-                    claim_checksum,
-                    predecessor_checksum: ledger_checksum,
-                },
-                ledger_checksum,
-            },
-            ledger,
-        ))
-    }
-
     pub fn begin_online_check_from_terminal_evidence(
         &self,
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<(TerminalOnlineCheckClaim, PersistedTerminalEvidence), StateError> {
-        self.require_authority(StateAuthority::TerminalEvidence)?;
         let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, terminal_evidence, terminal_evidence_checksum) =
@@ -1068,43 +940,6 @@ impl StateStore {
         ))
     }
 
-    pub fn complete_online_check(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-        claim: OnlineCheckClaim,
-        values: &BTreeMap<FloatAggregateId, u32>,
-    ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::LegacyLedger)?;
-        let _directory_lock = self.lock_clean()?;
-        self.validate_claim(
-            dataset,
-            contract,
-            claim.token,
-            ONLINE_CLAIM_FILE,
-            ONLINE_CLAIM_ARTIFACT,
-        )?;
-        let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
-        if ledger_checksum != claim.ledger_checksum {
-            return Err(StateError::Invalid(
-                "online claim belongs to a different run ledger".to_owned(),
-            ));
-        }
-        let baseline = encode_float_baseline(values, ledger_checksum)?;
-        let payload = encode_bound_payload(
-            claim.token.contract_checksum,
-            claim.token.claim_checksum,
-            &baseline,
-        );
-        let encoded = encode_artifact(
-            FLOAT_BASELINE_ARTIFACT,
-            dataset,
-            &payload,
-            MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
-        )?;
-        atomic_publish_new(&self.root, FLOAT_BASELINE_FILE, encoded.as_bytes())
-    }
-
     pub fn complete_online_check_from_terminal_evidence(
         &self,
         dataset: &DatasetState,
@@ -1112,7 +947,6 @@ impl StateStore {
         claim: TerminalOnlineCheckClaim,
         values: &BTreeMap<FloatAggregateId, u32>,
     ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::TerminalEvidence)?;
         let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
@@ -1143,52 +977,12 @@ impl StateStore {
         atomic_publish_new(&self.root, FLOAT_BASELINE_FILE, encoded.as_bytes())
     }
 
-    pub fn record_crash_lifecycle(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-        event: CrashLifecycleEvent,
-    ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::LegacyLedger)?;
-        let _directory_lock = self.lock_clean()?;
-        self.ensure_no_diagnostic_drift()?;
-        let (contract_checksum, ledger_checksum, baseline_checksum) =
-            self.load_crash_context(dataset, contract)?;
-        let specifications = crash_lifecycle_specs();
-        let target_index = crash_lifecycle_index(event);
-        let mut predecessor_checksum = baseline_checksum;
-        for &(file, artifact) in &specifications[..target_index] {
-            predecessor_checksum = self.load_crash_lifecycle_marker(
-                file,
-                artifact,
-                dataset,
-                contract_checksum,
-                ledger_checksum,
-                baseline_checksum,
-                predecessor_checksum,
-            )?;
-        }
-        self.ensure_lifecycle_tail_absent(&specifications[target_index..])?;
-        let (file, artifact) = specifications[target_index];
-        self.publish_crash_lifecycle_marker(
-            file,
-            artifact,
-            dataset,
-            contract_checksum,
-            ledger_checksum,
-            baseline_checksum,
-            predecessor_checksum,
-        )?;
-        Ok(())
-    }
-
     pub fn record_crash_lifecycle_from_terminal_evidence(
         &self,
         dataset: &DatasetState,
         contract: &RunContract,
         event: CrashLifecycleEvent,
     ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::TerminalEvidence)?;
         let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, terminal_evidence_checksum, baseline_checksum) =
@@ -1221,52 +1015,6 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn begin_recovery_check(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-    ) -> Result<
-        (
-            RecoveryCheckClaim,
-            RunLedger,
-            BTreeMap<FloatAggregateId, u32>,
-        ),
-        StateError,
-    > {
-        self.require_authority(StateAuthority::LegacyLedger)?;
-        let _directory_lock = self.lock_clean()?;
-        self.ensure_no_diagnostic_drift()?;
-        let (contract_checksum, _, ledger, ledger_checksum) =
-            self.load_bound_ledger(dataset, contract)?;
-        let (baseline, baseline_checksum) =
-            self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
-        let restart_ready_checksum = self.load_complete_crash_lifecycle(
-            dataset,
-            contract_checksum,
-            ledger_checksum,
-            baseline_checksum,
-        )?;
-        let claim_checksum = self.publish_marker(
-            RECOVERY_CLAIM_FILE,
-            RECOVERY_CLAIM_ARTIFACT,
-            dataset,
-            contract_checksum,
-            restart_ready_checksum,
-        )?;
-        Ok((
-            RecoveryCheckClaim {
-                token: ClaimToken {
-                    contract_checksum,
-                    claim_checksum,
-                    predecessor_checksum: restart_ready_checksum,
-                },
-                baseline_checksum,
-            },
-            ledger,
-            baseline,
-        ))
-    }
-
     pub fn begin_recovery_check_from_terminal_evidence(
         &self,
         dataset: &DatasetState,
@@ -1279,7 +1027,6 @@ impl StateStore {
         ),
         StateError,
     > {
-        self.require_authority(StateAuthority::TerminalEvidence)?;
         let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, terminal_evidence, terminal_evidence_checksum) =
@@ -1317,58 +1064,12 @@ impl StateStore {
         ))
     }
 
-    pub fn complete_recovery_check(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-        claim: RecoveryCheckClaim,
-    ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::LegacyLedger)?;
-        let _directory_lock = self.lock_clean()?;
-        self.validate_claim(
-            dataset,
-            contract,
-            claim.token,
-            RECOVERY_CLAIM_FILE,
-            RECOVERY_CLAIM_ARTIFACT,
-        )?;
-        let contract_checksum = self.contract_checksum(dataset, contract)?;
-        let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
-        let (_, baseline_checksum) =
-            self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
-        let restart_ready_checksum = self.load_complete_crash_lifecycle(
-            dataset,
-            contract_checksum,
-            ledger_checksum,
-            baseline_checksum,
-        )?;
-        if baseline_checksum != claim.baseline_checksum {
-            return Err(StateError::Invalid(
-                "recovery claim belongs to a different FLOAT baseline".to_owned(),
-            ));
-        }
-        if restart_ready_checksum != claim.token.predecessor_checksum {
-            return Err(StateError::Invalid(
-                "recovery claim belongs to a different restart-ready transition".to_owned(),
-            ));
-        }
-        self.publish_marker(
-            RECOVERY_RECEIPT_FILE,
-            RECOVERY_RECEIPT_ARTIFACT,
-            dataset,
-            claim.token.contract_checksum,
-            claim.token.claim_checksum,
-        )?;
-        Ok(())
-    }
-
     pub fn complete_recovery_check_from_terminal_evidence(
         &self,
         dataset: &DatasetState,
         contract: &RunContract,
         claim: TerminalRecoveryCheckClaim,
     ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::TerminalEvidence)?;
         let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
@@ -1416,77 +1117,12 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn begin_diagnostic(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-        stage: DiagnosticStage,
-    ) -> Result<DiagnosticClaim, StateError> {
-        self.require_authority(StateAuthority::LegacyLedger)?;
-        let _directory_lock = self.lock_clean()?;
-        let contract_checksum = self.contract_checksum(dataset, contract)?;
-        let predecessor_checksum = match stage {
-            DiagnosticStage::Warmup => {
-                let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
-                let (_, baseline_checksum) =
-                    self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
-                let restart_ready_checksum = self.load_complete_crash_lifecycle(
-                    dataset,
-                    contract_checksum,
-                    ledger_checksum,
-                    baseline_checksum,
-                )?;
-                let recovery_claim = self.load_marker(
-                    RECOVERY_CLAIM_FILE,
-                    RECOVERY_CLAIM_ARTIFACT,
-                    dataset,
-                    contract_checksum,
-                    restart_ready_checksum,
-                )?;
-                self.load_marker(
-                    RECOVERY_RECEIPT_FILE,
-                    RECOVERY_RECEIPT_ARTIFACT,
-                    dataset,
-                    contract_checksum,
-                    recovery_claim,
-                )?
-            }
-            DiagnosticStage::Observation => {
-                let warmup_claim = self.load_diagnostic_warmup_claim(dataset, contract)?;
-                self.load_marker(
-                    DIAGNOSTIC_WARMUP_RECEIPT_FILE,
-                    DIAGNOSTIC_WARMUP_RECEIPT_ARTIFACT,
-                    dataset,
-                    contract_checksum,
-                    warmup_claim,
-                )?
-            }
-        };
-        let (file, artifact) = diagnostic_claim_spec(stage);
-        let claim_checksum = self.publish_marker(
-            file,
-            artifact,
-            dataset,
-            contract_checksum,
-            predecessor_checksum,
-        )?;
-        Ok(DiagnosticClaim {
-            token: ClaimToken {
-                contract_checksum,
-                claim_checksum,
-                predecessor_checksum,
-            },
-            stage,
-        })
-    }
-
     pub fn begin_diagnostic_from_terminal_evidence(
         &self,
         dataset: &DatasetState,
         contract: &RunContract,
         stage: DiagnosticStage,
     ) -> Result<TerminalDiagnosticClaim, StateError> {
-        self.require_authority(StateAuthority::TerminalEvidence)?;
         let _directory_lock = self.lock_clean()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let predecessor_checksum = match stage {
@@ -1548,34 +1184,12 @@ impl StateStore {
         })
     }
 
-    pub fn complete_diagnostic(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-        claim: DiagnosticClaim,
-    ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::LegacyLedger)?;
-        let _directory_lock = self.lock_clean()?;
-        let (claim_file, claim_artifact) = diagnostic_claim_spec(claim.stage);
-        self.validate_claim(dataset, contract, claim.token, claim_file, claim_artifact)?;
-        let (receipt_file, receipt_artifact) = diagnostic_receipt_spec(claim.stage);
-        self.publish_marker(
-            receipt_file,
-            receipt_artifact,
-            dataset,
-            claim.token.contract_checksum,
-            claim.token.claim_checksum,
-        )?;
-        Ok(())
-    }
-
     pub fn complete_diagnostic_from_terminal_evidence(
         &self,
         dataset: &DatasetState,
         contract: &RunContract,
         claim: TerminalDiagnosticClaim,
     ) -> Result<(), StateError> {
-        self.require_authority(StateAuthority::TerminalEvidence)?;
         let _directory_lock = self.lock_clean()?;
         let (claim_file, claim_artifact) = diagnostic_claim_spec(claim.stage);
         self.validate_claim(dataset, contract, claim.token, claim_file, claim_artifact)?;
@@ -1701,77 +1315,8 @@ impl StateStore {
         DatasetState::decode(&input)
     }
 
-    #[cfg(test)]
-    fn save_ledger(&self, dataset: &DatasetState, ledger: &RunLedger) -> Result<(), StateError> {
-        dataset.validate()?;
-        let payload = ledger.encode();
-        let encoded =
-            encode_artifact(LEDGER_ARTIFACT, dataset, &payload, MAX_LEDGER_PAYLOAD_BYTES)?;
-        atomic_publish_new(&self.root, LEDGER_FILE, encoded.as_bytes())
-    }
-
-    #[cfg(test)]
-    fn load_ledger(&self, dataset: &DatasetState) -> Result<RunLedger, StateError> {
-        dataset.validate()?;
-        let input = read_limited(
-            &self.root.join(LEDGER_FILE),
-            MAX_LEDGER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
-        )?;
-        let payload = decode_artifact(&input, LEDGER_ARTIFACT, dataset, MAX_LEDGER_PAYLOAD_BYTES)?;
-        RunLedger::decode(payload)
-            .map_err(|error| StateError::Invalid(format!("invalid run ledger payload: {error}")))
-    }
-
-    #[cfg(test)]
-    fn save_float_baseline(
-        &self,
-        dataset: &DatasetState,
-        values: &BTreeMap<FloatAggregateId, u32>,
-    ) -> Result<(), StateError> {
-        dataset.validate()?;
-        let ledger_checksum = self.read_ledger_checksum(dataset)?;
-        let payload = encode_float_baseline(values, ledger_checksum)?;
-        let encoded = encode_artifact(
-            FLOAT_BASELINE_ARTIFACT,
-            dataset,
-            &payload,
-            MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
-        )?;
-        atomic_publish_new(&self.root, FLOAT_BASELINE_FILE, encoded.as_bytes())
-    }
-
-    #[cfg(test)]
-    fn load_float_baseline(
-        &self,
-        dataset: &DatasetState,
-    ) -> Result<BTreeMap<FloatAggregateId, u32>, StateError> {
-        dataset.validate()?;
-        let ledger_checksum = self.read_ledger_checksum(dataset)?;
-        let input = read_limited(
-            &self.root.join(FLOAT_BASELINE_FILE),
-            MAX_FLOAT_BASELINE_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
-        )?;
-        let payload = decode_artifact(
-            &input,
-            FLOAT_BASELINE_ARTIFACT,
-            dataset,
-            MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
-        )?;
-        decode_float_baseline(payload, ledger_checksum)
-    }
-
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    #[cfg(test)]
-    fn read_ledger_checksum(&self, dataset: &DatasetState) -> Result<u64, StateError> {
-        read_artifact_header_checksum(
-            &self.root.join(LEDGER_FILE),
-            LEDGER_ARTIFACT,
-            dataset,
-            MAX_LEDGER_PAYLOAD_BYTES,
-        )
     }
 
     fn contract_checksum(
@@ -1923,25 +1468,6 @@ impl StateStore {
         Ok((contract_checksum, rank_claim))
     }
 
-    fn load_bound_ledger(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-    ) -> Result<(u64, u64, RunLedger, u64), StateError> {
-        let (contract_checksum, rank_claim) = self.load_rank_claim(dataset, contract)?;
-        let input = read_limited(
-            &self.root.join(LEDGER_FILE),
-            MAX_LEDGER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
-        )?;
-        let artifact = ledger_artifact(contract.conformance);
-        let (payload, ledger_checksum) =
-            decode_artifact_and_checksum(&input, artifact, dataset, MAX_LEDGER_PAYLOAD_BYTES)?;
-        let inner = decode_bound_payload(payload, contract_checksum, rank_claim, "run ledger")?;
-        let ledger = RunLedger::decode(inner)
-            .map_err(|error| StateError::Invalid(format!("invalid run ledger payload: {error}")))?;
-        Ok((contract_checksum, rank_claim, ledger, ledger_checksum))
-    }
-
     fn load_bound_terminal_evidence(
         &self,
         dataset: &DatasetState,
@@ -1968,37 +1494,6 @@ impl StateStore {
             rank_claim,
             terminal_evidence,
             terminal_evidence_checksum,
-        ))
-    }
-
-    fn load_bound_baseline(
-        &self,
-        dataset: &DatasetState,
-        contract_checksum: u64,
-        ledger_checksum: u64,
-    ) -> Result<(BTreeMap<FloatAggregateId, u32>, u64), StateError> {
-        let online_claim = self.load_marker(
-            ONLINE_CLAIM_FILE,
-            ONLINE_CLAIM_ARTIFACT,
-            dataset,
-            contract_checksum,
-            ledger_checksum,
-        )?;
-        let input = read_limited(
-            &self.root.join(FLOAT_BASELINE_FILE),
-            MAX_FLOAT_BASELINE_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
-        )?;
-        let (payload, baseline_checksum) = decode_artifact_and_checksum(
-            &input,
-            FLOAT_BASELINE_ARTIFACT,
-            dataset,
-            MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
-        )?;
-        let inner =
-            decode_bound_payload(payload, contract_checksum, online_claim, "FLOAT baseline")?;
-        Ok((
-            decode_float_baseline(inner, ledger_checksum)?,
-            baseline_checksum,
         ))
     }
 
@@ -2033,18 +1528,6 @@ impl StateStore {
         ))
     }
 
-    fn load_crash_context(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-    ) -> Result<(u64, u64, u64), StateError> {
-        let (contract_checksum, _, _, ledger_checksum) =
-            self.load_bound_ledger(dataset, contract)?;
-        let (_, baseline_checksum) =
-            self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
-        Ok((contract_checksum, ledger_checksum, baseline_checksum))
-    }
-
     fn load_terminal_crash_context(
         &self,
         dataset: &DatasetState,
@@ -2062,31 +1545,6 @@ impl StateStore {
             terminal_evidence_checksum,
             baseline_checksum,
         ))
-    }
-
-    fn publish_crash_lifecycle_marker(
-        &self,
-        file: &str,
-        artifact: &str,
-        dataset: &DatasetState,
-        contract_checksum: u64,
-        ledger_checksum: u64,
-        baseline_checksum: u64,
-        predecessor_checksum: u64,
-    ) -> Result<u64, StateError> {
-        let inner = encode_crash_lifecycle_binding(ledger_checksum, baseline_checksum);
-        let payload = encode_bound_payload(contract_checksum, predecessor_checksum, inner.as_str());
-        let encoded = encode_artifact(artifact, dataset, &payload, MAX_MARKER_PAYLOAD_BYTES)?;
-        atomic_publish_new(&self.root, file, encoded.as_bytes())?;
-        self.load_crash_lifecycle_marker(
-            file,
-            artifact,
-            dataset,
-            contract_checksum,
-            ledger_checksum,
-            baseline_checksum,
-            predecessor_checksum,
-        )
     }
 
     fn publish_terminal_crash_lifecycle_marker(
@@ -2115,28 +1573,6 @@ impl StateStore {
         )
     }
 
-    fn load_crash_lifecycle_marker(
-        &self,
-        file: &str,
-        artifact: &str,
-        dataset: &DatasetState,
-        contract_checksum: u64,
-        ledger_checksum: u64,
-        baseline_checksum: u64,
-        predecessor_checksum: u64,
-    ) -> Result<u64, StateError> {
-        let input = read_limited(
-            &self.root.join(file),
-            MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
-        )?;
-        let (payload, checksum) =
-            decode_artifact_and_checksum(&input, artifact, dataset, MAX_MARKER_PAYLOAD_BYTES)?;
-        let inner =
-            decode_bound_payload(payload, contract_checksum, predecessor_checksum, artifact)?;
-        decode_crash_lifecycle_binding(inner, ledger_checksum, baseline_checksum, artifact)?;
-        Ok(checksum)
-    }
-
     fn load_terminal_crash_lifecycle_marker(
         &self,
         file: &str,
@@ -2162,28 +1598,6 @@ impl StateStore {
             artifact,
         )?;
         Ok(checksum)
-    }
-
-    fn load_complete_crash_lifecycle(
-        &self,
-        dataset: &DatasetState,
-        contract_checksum: u64,
-        ledger_checksum: u64,
-        baseline_checksum: u64,
-    ) -> Result<u64, StateError> {
-        let mut predecessor_checksum = baseline_checksum;
-        for (file, artifact) in crash_lifecycle_specs() {
-            predecessor_checksum = self.load_crash_lifecycle_marker(
-                file,
-                artifact,
-                dataset,
-                contract_checksum,
-                ledger_checksum,
-                baseline_checksum,
-                predecessor_checksum,
-            )?;
-        }
-        Ok(predecessor_checksum)
     }
 
     fn load_complete_terminal_crash_lifecycle(
@@ -2245,44 +1659,6 @@ impl StateStore {
             }
         }
         Ok(())
-    }
-
-    fn load_diagnostic_warmup_claim(
-        &self,
-        dataset: &DatasetState,
-        contract: &RunContract,
-    ) -> Result<u64, StateError> {
-        let contract_checksum = self.contract_checksum(dataset, contract)?;
-        let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
-        let (_, baseline_checksum) =
-            self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
-        let restart_ready_checksum = self.load_complete_crash_lifecycle(
-            dataset,
-            contract_checksum,
-            ledger_checksum,
-            baseline_checksum,
-        )?;
-        let recovery_claim = self.load_marker(
-            RECOVERY_CLAIM_FILE,
-            RECOVERY_CLAIM_ARTIFACT,
-            dataset,
-            contract_checksum,
-            restart_ready_checksum,
-        )?;
-        let recovery_receipt = self.load_marker(
-            RECOVERY_RECEIPT_FILE,
-            RECOVERY_RECEIPT_ARTIFACT,
-            dataset,
-            contract_checksum,
-            recovery_claim,
-        )?;
-        self.load_marker(
-            DIAGNOSTIC_WARMUP_CLAIM_FILE,
-            DIAGNOSTIC_WARMUP_CLAIM_ARTIFACT,
-            dataset,
-            contract_checksum,
-            recovery_receipt,
-        )
     }
 
     fn load_terminal_diagnostic_warmup_claim(
@@ -2640,13 +2016,6 @@ fn parse<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, StateError>
         .map_err(|_| StateError::Invalid(format!("{name} is not a valid number")))
 }
 
-fn ledger_artifact(conformance: RunConformance) -> &'static str {
-    match conformance {
-        RunConformance::PublicSpecAligned => RANKED_LEDGER_ARTIFACT,
-        RunConformance::NonRankedDeviation => NON_RANKED_LEDGER_ARTIFACT,
-    }
-}
-
 fn terminal_evidence_artifact(conformance: RunConformance) -> &'static str {
     match conformance {
         RunConformance::PublicSpecAligned => RANKED_TERMINAL_EVIDENCE_ARTIFACT,
@@ -2735,39 +2104,6 @@ fn crash_lifecycle_index(event: CrashLifecycleEvent) -> usize {
         CrashLifecycleEvent::RestartStarted => 2,
         CrashLifecycleEvent::RestartReady => 3,
     }
-}
-
-fn encode_crash_lifecycle_binding(ledger_checksum: u64, baseline_checksum: u64) -> String {
-    format!("ledger_checksum={ledger_checksum:016x}\nbaseline_checksum={baseline_checksum:016x}\n")
-}
-
-fn decode_crash_lifecycle_binding(
-    input: &str,
-    expected_ledger_checksum: u64,
-    expected_baseline_checksum: u64,
-    artifact: &str,
-) -> Result<(), StateError> {
-    if !input.ends_with('\n') {
-        return Err(StateError::Invalid(format!(
-            "{artifact} binding must end with a newline"
-        )));
-    }
-    let mut lines = input.split_terminator('\n');
-    let ledger_checksum = parse_checksum(value(&mut lines, "ledger_checksum")?)?;
-    let baseline_checksum = parse_checksum(value(&mut lines, "baseline_checksum")?)?;
-    if lines.next().is_some() {
-        return Err(StateError::Invalid(format!(
-            "{artifact} binding contains trailing fields"
-        )));
-    }
-    if ledger_checksum != expected_ledger_checksum
-        || baseline_checksum != expected_baseline_checksum
-    {
-        return Err(StateError::Invalid(format!(
-            "{artifact} belongs to a different ledger or online baseline"
-        )));
-    }
-    Ok(())
 }
 
 fn encode_terminal_crash_lifecycle_binding(
@@ -3106,107 +2442,6 @@ fn parse_accumulator_words(value: &str) -> Result<Vec<u64>, StateError> {
         .collect()
 }
 
-fn encode_float_baseline(
-    values: &BTreeMap<FloatAggregateId, u32>,
-    ledger_checksum: u64,
-) -> Result<String, StateError> {
-    if values.len() != FLOAT_AGGREGATES.len()
-        || FLOAT_AGGREGATES
-            .iter()
-            .any(|spec| !values.contains_key(&spec.id))
-    {
-        return Err(StateError::Invalid(
-            "FLOAT baseline must contain all seven aggregate categories exactly once".to_owned(),
-        ));
-    }
-
-    let mut payload = format!("ledger_checksum={ledger_checksum:016x}\n");
-    for spec in FLOAT_AGGREGATES {
-        let bits = values
-            .get(&spec.id)
-            .ok_or_else(|| StateError::Invalid("missing FLOAT baseline category".to_owned()))?;
-        if !f32::from_bits(*bits).is_finite() {
-            return Err(StateError::Invalid(format!(
-                "FLOAT baseline {} must be finite",
-                float_aggregate_name(spec.id)
-            )));
-        }
-        payload.push_str(float_aggregate_name(spec.id));
-        payload.push('=');
-        payload.push_str(&format!("{bits:08x}"));
-        payload.push('\n');
-    }
-    Ok(payload)
-}
-
-fn decode_float_baseline(
-    payload: &str,
-    ledger_checksum: u64,
-) -> Result<BTreeMap<FloatAggregateId, u32>, StateError> {
-    if !payload.ends_with('\n') {
-        return Err(StateError::Invalid(
-            "FLOAT baseline payload must end with a newline".to_owned(),
-        ));
-    }
-
-    let mut lines = payload.split_terminator('\n');
-    let encoded_ledger_checksum = parse_checksum(value(&mut lines, "ledger_checksum")?)?;
-    if encoded_ledger_checksum != ledger_checksum {
-        return Err(StateError::Invalid(
-            "FLOAT baseline belongs to a different run ledger".to_owned(),
-        ));
-    }
-
-    let mut values = BTreeMap::new();
-    for line in lines {
-        if line.is_empty() {
-            return Err(StateError::Invalid(
-                "FLOAT baseline contains an empty field".to_owned(),
-            ));
-        }
-        let (name, encoded_bits) = line
-            .split_once('=')
-            .ok_or_else(|| StateError::Invalid(format!("invalid FLOAT baseline field {line:?}")))?;
-        let id = parse_float_aggregate_name(name).ok_or_else(|| {
-            StateError::Invalid(format!("unknown FLOAT baseline category {name:?}"))
-        })?;
-        if encoded_bits.len() != 8
-            || !encoded_bits
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(StateError::Invalid(format!(
-                "FLOAT baseline {name} must contain eight lower-case hexadecimal digits"
-            )));
-        }
-        let bits = u32::from_str_radix(encoded_bits, 16).map_err(|_| {
-            StateError::Invalid(format!("FLOAT baseline {name} is not valid hexadecimal"))
-        })?;
-        if !f32::from_bits(bits).is_finite() {
-            return Err(StateError::Invalid(format!(
-                "FLOAT baseline {name} must be finite"
-            )));
-        }
-        if values.insert(id, bits).is_some() {
-            return Err(StateError::Invalid(format!(
-                "duplicate FLOAT baseline category {name:?}"
-            )));
-        }
-    }
-
-    if values.len() != FLOAT_AGGREGATES.len() {
-        let missing = FLOAT_AGGREGATES
-            .iter()
-            .find(|spec| !values.contains_key(&spec.id))
-            .map(|spec| float_aggregate_name(spec.id))
-            .unwrap_or("unknown");
-        return Err(StateError::Invalid(format!(
-            "missing FLOAT baseline category {missing:?}"
-        )));
-    }
-    Ok(values)
-}
-
 fn encode_terminal_float_baseline(
     values: &BTreeMap<FloatAggregateId, u32>,
     terminal_evidence_checksum: u64,
@@ -3478,13 +2713,6 @@ fn lock_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
     Ok(StateDirectoryLock(directory))
 }
 
-fn lock_clean_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
-    let directory_lock = lock_state_directory(root)?;
-    cleanup_orphan_temporary_files(root, &directory_lock.0)?;
-    validate_locked_directory_identity(root, &directory_lock.0)?;
-    Ok(directory_lock)
-}
-
 fn lock_clean_terminal_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
     lock_clean_terminal_state_directory_with_hook(root, || Ok(()))
 }
@@ -3511,12 +2739,7 @@ fn ensure_snapshot_legacy_state_absent(entries: &[PathBuf]) -> Result<(), StateE
         let Some(file_name) = path.file_name() else {
             continue;
         };
-        if file_name == LEDGER_FILE
-            || file_name
-                .to_str()
-                .and_then(temporary_target_name)
-                .is_some_and(|target| target == LEDGER_FILE)
-        {
+        if file_name == LEDGER_FILE || file_name.to_str().is_some_and(is_legacy_temporary_name) {
             return Err(StateError::Invalid(format!(
                 "legacy run-ledger state is incompatible with terminal-evidence authority: {}",
                 path.display()
@@ -3543,7 +2766,7 @@ fn ensure_legacy_state_absent(root: &Path) -> Result<(), StateError> {
         let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if temporary_target_name(&file_name) == Some(LEDGER_FILE) {
+        if is_legacy_temporary_name(&file_name) {
             return Err(StateError::Invalid(format!(
                 "legacy run-ledger publication temporary is incompatible with terminal-evidence authority: {}",
                 entry.path().display()
@@ -3553,6 +2776,7 @@ fn ensure_legacy_state_absent(root: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cleanup_orphan_temporary_files(root: &Path, directory: &File) -> Result<(), StateError> {
     cleanup_orphan_temporary_files_with_fault(root, directory, |_| Ok(()))
 }
@@ -3569,6 +2793,7 @@ struct OrphanTemporary {
     metadata: fs::Metadata,
 }
 
+#[cfg(test)]
 fn cleanup_orphan_temporary_files_with_fault(
     root: &Path,
     directory: &File,
@@ -3773,6 +2998,19 @@ fn temporary_target_name(file_name: &str) -> Option<&str> {
         return None;
     }
     Some(target)
+}
+
+fn is_legacy_temporary_name(file_name: &str) -> bool {
+    let Some(body) = file_name
+        .strip_prefix(".run_ledger.state.")
+        .and_then(|body| body.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((process, counter)) = body.split_once('.') else {
+        return false;
+    };
+    !counter.contains('.') && canonical_decimal(process) && canonical_decimal(counter)
 }
 
 fn canonical_decimal(value: &str) -> bool {
@@ -4103,13 +3341,20 @@ mod tests {
     fn initialize_online_run(store: &StateStore, dataset: &DatasetState, contract: &RunContract) {
         initialize_checked_run(store, dataset, contract);
         let rank = store.begin_rank(dataset, contract).unwrap();
+        let evidence = sample_terminal_evidence(dataset);
         store
-            .complete_rank(dataset, contract, rank, &RunLedger::default())
+            .complete_rank_with_terminal_evidence(dataset, contract, rank, &evidence)
             .unwrap();
-        let (online, ledger) = store.begin_online_check(dataset, contract).unwrap();
-        assert_eq!(ledger, RunLedger::default());
+        let (online, _) = store
+            .begin_online_check_from_terminal_evidence(dataset, contract)
+            .unwrap();
         store
-            .complete_online_check(dataset, contract, online, &sample_float_baseline())
+            .complete_online_check_from_terminal_evidence(
+                dataset,
+                contract,
+                online,
+                &sample_float_baseline(),
+            )
             .unwrap();
     }
 
@@ -4301,71 +3546,6 @@ mod tests {
     }
 
     #[test]
-    fn state_store_round_trips_ledger_and_float_baseline() {
-        let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
-        let dataset = sample_dataset("run-state-store", 73);
-        let ledger = RunLedger::default();
-        let baseline = sample_float_baseline();
-
-        store.save_ledger(&dataset, &ledger).unwrap();
-        store.save_float_baseline(&dataset, &baseline).unwrap();
-
-        assert_eq!(store.load_ledger(&dataset).unwrap(), ledger);
-        assert_eq!(store.load_float_baseline(&dataset).unwrap(), baseline);
-    }
-
-    #[test]
-    fn float_baseline_rejects_same_length_ledger_payload_damage() {
-        let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
-        let dataset = sample_dataset("run-ledger-damage", 74);
-        store.save_ledger(&dataset, &RunLedger::default()).unwrap();
-        store
-            .save_float_baseline(&dataset, &sample_float_baseline())
-            .unwrap();
-
-        let ledger_path = directory.0.join(LEDGER_FILE);
-        let mut bytes = fs::read(&ledger_path).unwrap();
-        let payload_byte = bytes
-            .iter_mut()
-            .rev()
-            .find(|byte| **byte == b'0')
-            .expect("default ledger contains a decimal zero");
-        *payload_byte = b'1';
-        fs::write(&ledger_path, bytes).unwrap();
-
-        assert!(store.load_float_baseline(&dataset).is_err());
-    }
-
-    #[test]
-    fn float_baseline_rejects_incomplete_duplicate_and_unknown_fields() {
-        let ledger_checksum = 0x1234_5678_90ab_cdef;
-        let complete = encode_float_baseline(&sample_float_baseline(), ledger_checksum).unwrap();
-        assert_eq!(
-            decode_float_baseline(&complete, ledger_checksum).unwrap(),
-            sample_float_baseline()
-        );
-
-        assert!(decode_float_baseline(&complete, ledger_checksum + 1).is_err());
-        assert!(decode_float_baseline(
-            "ledger_checksum=1234567890abcdef\nwarehouse_ytd=3f800000\n",
-            ledger_checksum
-        )
-        .is_err());
-        assert!(decode_float_baseline(
-            "ledger_checksum=1234567890abcdef\nwarehouse_ytd=3f800000\nwarehouse_ytd=3f800000\n",
-            ledger_checksum
-        )
-        .is_err());
-        assert!(decode_float_baseline(
-            "ledger_checksum=1234567890abcdef\nfuture_category=3f800000\n",
-            ledger_checksum
-        )
-        .is_err());
-    }
-
-    #[test]
     fn terminal_evidence_authority_round_trips_the_complete_state_chain() {
         let directory = TestDirectory::new();
         let store = StateStore::open_terminal(&directory.0).unwrap();
@@ -4498,9 +3678,11 @@ mod tests {
             )
             .unwrap();
         let terminal_before = fs::read(target_directory.0.join(TERMINAL_EVIDENCE_FILE)).unwrap();
-        target_store
-            .save_ledger(&target_dataset, &RunLedger::default())
-            .unwrap();
+        fs::write(
+            target_directory.0.join(LEDGER_FILE),
+            b"forbidden legacy target",
+        )
+        .unwrap();
         let target_unrelated_temporary = target_directory
             .0
             .join(format!(".{DATASET_FILE}.{}.100.tmp", std::process::id()));
@@ -4647,29 +3829,38 @@ mod tests {
     #[test]
     fn append_only_state_chain_gates_recovery_and_two_diagnostic_segments() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-chain", 81);
         let contract = sample_contract(1);
         initialize_checked_run(&store, &dataset, &contract);
 
         assert!(store
-            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Warmup)
+            .begin_diagnostic_from_terminal_evidence(&dataset, &contract, DiagnosticStage::Warmup)
             .is_err());
 
         let rank = store.begin_rank(&dataset, &contract).unwrap();
+        let evidence = sample_terminal_evidence(&dataset);
         store
-            .complete_rank(&dataset, &contract, rank, &RunLedger::default())
+            .complete_rank_with_terminal_evidence(&dataset, &contract, rank, &evidence)
             .unwrap();
-        let (online, ledger) = store.begin_online_check(&dataset, &contract).unwrap();
-        assert_eq!(ledger, RunLedger::default());
+        let (online, _) = store
+            .begin_online_check_from_terminal_evidence(&dataset, &contract)
+            .unwrap();
         store
-            .complete_online_check(&dataset, &contract, online, &sample_float_baseline())
+            .complete_online_check_from_terminal_evidence(
+                &dataset,
+                &contract,
+                online,
+                &sample_float_baseline(),
+            )
             .unwrap();
 
         assert!(store
-            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Warmup)
+            .begin_diagnostic_from_terminal_evidence(&dataset, &contract, DiagnosticStage::Warmup)
             .is_err());
-        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+        assert!(store
+            .begin_recovery_check_from_terminal_evidence(&dataset, &contract)
+            .is_err());
         for event in [
             CrashLifecycleEvent::Intent,
             CrashLifecycleEvent::Killed,
@@ -4677,98 +3868,159 @@ mod tests {
             CrashLifecycleEvent::RestartReady,
         ] {
             store
-                .record_crash_lifecycle(&dataset, &contract, event)
+                .record_crash_lifecycle_from_terminal_evidence(&dataset, &contract, event)
                 .unwrap();
         }
-        let (recovery, ledger, baseline) = store.begin_recovery_check(&dataset, &contract).unwrap();
-        assert_eq!(ledger, RunLedger::default());
+        let (recovery, _, baseline) = store
+            .begin_recovery_check_from_terminal_evidence(&dataset, &contract)
+            .unwrap();
         assert_eq!(baseline, sample_float_baseline());
         store
-            .complete_recovery_check(&dataset, &contract, recovery)
+            .complete_recovery_check_from_terminal_evidence(&dataset, &contract, recovery)
             .unwrap();
 
         assert!(store
-            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Observation)
+            .begin_diagnostic_from_terminal_evidence(
+                &dataset,
+                &contract,
+                DiagnosticStage::Observation
+            )
             .is_err());
         let warmup = store
-            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Warmup)
+            .begin_diagnostic_from_terminal_evidence(&dataset, &contract, DiagnosticStage::Warmup)
             .unwrap();
-        assert!(store.begin_online_check(&dataset, &contract).is_err());
-        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+        assert!(store
+            .begin_online_check_from_terminal_evidence(&dataset, &contract)
+            .is_err());
+        assert!(store
+            .begin_recovery_check_from_terminal_evidence(&dataset, &contract)
+            .is_err());
         store
-            .complete_diagnostic(&dataset, &contract, warmup)
+            .complete_diagnostic_from_terminal_evidence(&dataset, &contract, warmup)
             .unwrap();
 
-        let reopened = StateStore::open_existing(&directory.0).unwrap();
+        let reopened = StateStore::open_existing_terminal(&directory.0).unwrap();
         let observation = reopened
-            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Observation)
+            .begin_diagnostic_from_terminal_evidence(
+                &dataset,
+                &contract,
+                DiagnosticStage::Observation,
+            )
             .unwrap();
         reopened
-            .complete_diagnostic(&dataset, &contract, observation)
+            .complete_diagnostic_from_terminal_evidence(&dataset, &contract, observation)
             .unwrap();
         assert!(reopened.begin_rank(&dataset, &contract).is_err());
         assert!(reopened
-            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Observation)
+            .begin_diagnostic_from_terminal_evidence(
+                &dataset,
+                &contract,
+                DiagnosticStage::Observation
+            )
             .is_err());
     }
 
     #[test]
     fn crash_lifecycle_rejects_repeats_and_out_of_order_transitions() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-crash-order", 91);
         let contract = sample_contract(1);
         initialize_online_run(&store, &dataset, &contract);
 
         assert!(store
-            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::Killed)
+            .record_crash_lifecycle_from_terminal_evidence(
+                &dataset,
+                &contract,
+                CrashLifecycleEvent::Killed
+            )
             .is_err());
-        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+        assert!(store
+            .begin_recovery_check_from_terminal_evidence(&dataset, &contract)
+            .is_err());
 
         store
-            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::Intent)
+            .record_crash_lifecycle_from_terminal_evidence(
+                &dataset,
+                &contract,
+                CrashLifecycleEvent::Intent,
+            )
             .unwrap();
         assert!(store
-            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::Intent)
+            .record_crash_lifecycle_from_terminal_evidence(
+                &dataset,
+                &contract,
+                CrashLifecycleEvent::Intent
+            )
             .is_err());
         assert!(store
-            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::RestartStarted)
+            .record_crash_lifecycle_from_terminal_evidence(
+                &dataset,
+                &contract,
+                CrashLifecycleEvent::RestartStarted
+            )
             .is_err());
-        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+        assert!(store
+            .begin_recovery_check_from_terminal_evidence(&dataset, &contract)
+            .is_err());
 
         store
-            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::Killed)
+            .record_crash_lifecycle_from_terminal_evidence(
+                &dataset,
+                &contract,
+                CrashLifecycleEvent::Killed,
+            )
             .unwrap();
         assert!(store
-            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::RestartReady)
+            .record_crash_lifecycle_from_terminal_evidence(
+                &dataset,
+                &contract,
+                CrashLifecycleEvent::RestartReady
+            )
             .is_err());
         store
-            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::RestartStarted)
+            .record_crash_lifecycle_from_terminal_evidence(
+                &dataset,
+                &contract,
+                CrashLifecycleEvent::RestartStarted,
+            )
             .unwrap();
-        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+        assert!(store
+            .begin_recovery_check_from_terminal_evidence(&dataset, &contract)
+            .is_err());
         store
-            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::RestartReady)
+            .record_crash_lifecycle_from_terminal_evidence(
+                &dataset,
+                &contract,
+                CrashLifecycleEvent::RestartReady,
+            )
             .unwrap();
-        assert!(store.begin_recovery_check(&dataset, &contract).is_ok());
+        assert!(store
+            .begin_recovery_check_from_terminal_evidence(&dataset, &contract)
+            .is_ok());
     }
 
     #[test]
     fn crash_lifecycle_is_fail_closed_on_orphans_and_tampering() {
         let orphan_directory = TestDirectory::new();
-        let orphan_store = StateStore::open(&orphan_directory.0).unwrap();
+        let orphan_store = StateStore::open_terminal(&orphan_directory.0).unwrap();
         let orphan_dataset = sample_dataset("run-crash-orphan", 92);
         let contract = sample_contract(1);
         initialize_online_run(&orphan_store, &orphan_dataset, &contract);
         fs::write(orphan_directory.0.join(RESTART_READY_FILE), b"orphan").unwrap();
         assert!(orphan_store
-            .record_crash_lifecycle(&orphan_dataset, &contract, CrashLifecycleEvent::Intent)
+            .record_crash_lifecycle_from_terminal_evidence(
+                &orphan_dataset,
+                &contract,
+                CrashLifecycleEvent::Intent
+            )
             .is_err());
         assert!(orphan_store
-            .begin_recovery_check(&orphan_dataset, &contract)
+            .begin_recovery_check_from_terminal_evidence(&orphan_dataset, &contract)
             .is_err());
 
         let tamper_directory = TestDirectory::new();
-        let tamper_store = StateStore::open(&tamper_directory.0).unwrap();
+        let tamper_store = StateStore::open_terminal(&tamper_directory.0).unwrap();
         let tamper_dataset = sample_dataset("run-crash-tamper", 93);
         initialize_online_run(&tamper_store, &tamper_dataset, &contract);
         for event in [
@@ -4778,7 +4030,7 @@ mod tests {
             CrashLifecycleEvent::RestartReady,
         ] {
             tamper_store
-                .record_crash_lifecycle(&tamper_dataset, &contract, event)
+                .record_crash_lifecycle_from_terminal_evidence(&tamper_dataset, &contract, event)
                 .unwrap();
         }
         let killed_path = tamper_directory.0.join(CRASH_KILLED_FILE);
@@ -4786,14 +4038,14 @@ mod tests {
         *killed.last_mut().unwrap() ^= 1;
         fs::write(killed_path, killed).unwrap();
         assert!(tamper_store
-            .begin_recovery_check(&tamper_dataset, &contract)
+            .begin_recovery_check_from_terminal_evidence(&tamper_dataset, &contract)
             .is_err());
     }
 
     #[test]
-    fn rank_claim_and_ledger_are_write_once_across_contracts() {
+    fn rank_claim_and_terminal_evidence_are_write_once_across_contracts() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset_with_warehouses(
             "run-ranked-write-once",
             82,
@@ -4803,23 +4055,24 @@ mod tests {
         initialize_checked_run(&store, &dataset, &contract);
 
         let rank = store.begin_rank(&dataset, &contract).unwrap();
+        let evidence = sample_terminal_evidence(&dataset);
         store
-            .complete_rank(&dataset, &contract, rank, &RunLedger::default())
+            .complete_rank_with_terminal_evidence(&dataset, &contract, rank, &evidence)
             .unwrap();
-        let ledger_path = directory.0.join(LEDGER_FILE);
-        let original = fs::read(&ledger_path).unwrap();
+        let evidence_path = directory.0.join(TERMINAL_EVIDENCE_FILE);
+        let original = fs::read(&evidence_path).unwrap();
 
         let mut non_ranked = contract.clone();
         non_ranked.clients = 1;
         non_ranked.conformance = RunConformance::NonRankedDeviation;
         assert!(store.begin_rank(&dataset, &non_ranked).is_err());
-        assert_eq!(fs::read(ledger_path).unwrap(), original);
+        assert_eq!(fs::read(evidence_path).unwrap(), original);
     }
 
     #[test]
     fn run_contract_binds_client_timing_deadlines_and_conformance() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-contract-binding", 83);
         let contract = sample_contract(1);
         store.initialize_run(&dataset, &contract).unwrap();
@@ -4860,7 +4113,7 @@ mod tests {
     #[test]
     fn setup_claim_is_persisted_before_dataset_and_rejects_reuse() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-setup-claim", 87);
         let contract = sample_contract(1);
 
@@ -4895,7 +4148,7 @@ mod tests {
     #[test]
     fn concurrent_init_claims_cannot_consume_one_setup_intent_twice() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-concurrent-setup", 94);
         let contract = sample_contract(1);
         store
@@ -4931,7 +4184,7 @@ mod tests {
     #[test]
     fn completed_dataset_is_bound_to_pre_ddl_setup_claim() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-complete-setup", 88);
         let contract = sample_contract(1);
         store
@@ -4952,15 +4205,17 @@ mod tests {
     #[test]
     fn incomplete_rank_claim_is_fail_closed() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-incomplete-rank", 84);
         let contract = sample_contract(1);
         initialize_checked_run(&store, &dataset, &contract);
 
         let _claim = store.begin_rank(&dataset, &contract).unwrap();
         assert!(store.begin_rank(&dataset, &contract).is_err());
-        assert!(store.begin_online_check(&dataset, &contract).is_err());
-        assert!(!directory.0.join(LEDGER_FILE).exists());
+        assert!(store
+            .begin_online_check_from_terminal_evidence(&dataset, &contract)
+            .is_err());
+        assert!(!directory.0.join(TERMINAL_EVIDENCE_FILE).exists());
     }
 
     #[test]
@@ -5075,7 +4330,7 @@ mod tests {
         let encoded = encode_setup_intent(run_id, seed, &contract).unwrap();
         let linked = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
-        let claimant_store = StateStore::open_existing(&directory.0).unwrap();
+        let claimant_store = StateStore::open_existing_terminal(&directory.0).unwrap();
 
         let publisher_root = directory.0.clone();
         let publisher_linked = Arc::clone(&linked);
@@ -5106,12 +4361,8 @@ mod tests {
         let claimant_contract = contract.clone();
         let (send, receive) = mpsc::channel();
         let claimant = thread::spawn(move || {
-            send.send(claimant_store.begin_or_resume_setup(
-                run_id,
-                seed,
-                &claimant_contract,
-            ))
-            .unwrap();
+            send.send(claimant_store.begin_or_resume_setup(run_id, seed, &claimant_contract))
+                .unwrap();
         });
         assert!(matches!(
             receive.recv_timeout(Duration::from_millis(100)),
@@ -5135,20 +4386,19 @@ mod tests {
     fn open_existing_does_not_create_a_missing_state_directory() {
         let directory = TestDirectory::new();
         let missing = directory.0.join("missing");
-        assert!(StateStore::open_existing(&missing).is_err());
+        assert!(StateStore::open_existing_terminal(&missing).is_err());
         assert!(!missing.exists());
     }
 
     #[test]
     fn reopening_cleans_strict_unlinked_publication_temporary() {
         let directory = TestDirectory::new();
-        let temporary = directory.0.join(format!(
-            ".{SETUP_INTENT_FILE}.{}.0.tmp",
-            std::process::id()
-        ));
+        let temporary = directory
+            .0
+            .join(format!(".{SETUP_INTENT_FILE}.{}.0.tmp", std::process::id()));
         fs::write(&temporary, b"crash-before-link").unwrap();
 
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         assert!(!temporary.exists());
         let contract = sample_contract(1);
         store
@@ -5259,7 +4509,7 @@ mod tests {
     #[test]
     fn preopened_store_recovers_linked_orphan_after_publisher_exit() {
         let directory = TestDirectory::new();
-        let claimant_store = StateStore::open_existing(&directory.0).unwrap();
+        let claimant_store = StateStore::open_existing_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-preopened-orphan", 53);
         let encoded = dataset.encode();
         let publisher_root = directory.0.clone();
@@ -5315,10 +4565,9 @@ mod tests {
         let run_id = "run-linked-orphan";
         let seed = 52;
         let contract = sample_contract(1);
-        let temporary = directory.0.join(format!(
-            ".{SETUP_INTENT_FILE}.{}.1.tmp",
-            std::process::id()
-        ));
+        let temporary = directory
+            .0
+            .join(format!(".{SETUP_INTENT_FILE}.{}.1.tmp", std::process::id()));
         fs::write(
             &temporary,
             encode_setup_intent(run_id, seed, &contract).unwrap(),
@@ -5327,7 +4576,7 @@ mod tests {
         let target = directory.0.join(SETUP_INTENT_FILE);
         fs::hard_link(&temporary, &target).unwrap();
 
-        let store = StateStore::open_existing(&directory.0).unwrap();
+        let store = StateStore::open_existing_terminal(&directory.0).unwrap();
         assert!(!temporary.exists());
         assert!(target.is_file());
         let (_, origin) = store
@@ -5343,15 +4592,14 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
-        let dataset = sample_dataset("run-symlink", 5);
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         symlink(
             directory.0.join("missing-target"),
             directory.0.join(LEDGER_FILE),
         )
         .unwrap();
 
-        assert!(store.save_ledger(&dataset, &RunLedger::default()).is_err());
-        assert!(store.load_ledger(&dataset).is_err());
+        assert!(store.load_dataset().is_err());
+        assert!(directory.0.join(LEDGER_FILE).is_symlink());
     }
 }

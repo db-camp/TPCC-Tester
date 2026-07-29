@@ -9,17 +9,14 @@ use crate::connection::wire::{StreamResponse, WireValue};
 use crate::consistency::{
     float32_matches, float_aggregate_plan, public_online_integer_plan,
     recovery_partition_audits_for_warehouses, recovery_plan, setup_plan, sum_f32_as_f64_once,
-    validate_crash_float_baseline, validate_customer_update_chain, validate_public_float_ledger,
-    validate_relative_update_chain_from_initial, CheckQuery, CheckScope, ConsistencyPlan,
-    CustomerLogicalVersion, CustomerUpdateEvidence, CustomerUpdateKind, FloatAggregateId,
-    NonNegativeF32Accumulator, PartitionExpectation, PartitionKey, PublicFloatLedgerEvidence,
-    RecoveryExpectations, RelativeUpdateEvidence, SetupExpectations, TypedResult, TypedValue,
-    DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES, FLOAT_AGGREGATES, NEW_ORDERS_PER_DISTRICT,
-    ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
+    validate_crash_float_baseline, validate_public_float_ledger, CheckQuery, CheckScope,
+    ConsistencyPlan, FloatAggregateId, NonNegativeF32Accumulator, PartitionExpectation,
+    PartitionKey, PublicFloatLedgerEvidence, RecoveryExpectations, SetupExpectations, TypedResult,
+    TypedValue, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES, FLOAT_AGGREGATES,
+    NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
 };
 use crate::error::TpccError;
 use crate::ranking::bounded_stats::BoundedPhysicalStats;
-use crate::ranking::ledger::{LedgerEvent, RunLedger};
 use crate::ranking::payment_endpoints::PaymentEndpointView;
 use crate::ranking::terminal_evidence::{validate_terminal_evidence, TerminalEvidenceView};
 use crate::recovery_sample_checker;
@@ -30,8 +27,6 @@ use crate::sample_evidence::{
 };
 
 pub type FloatBaseline = BTreeMap<FloatAggregateId, u32>;
-
-const PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT: usize = 64;
 
 pub async fn run_setup(client: &mut RmdbClient, dataset: &DatasetState) -> Result<(), TpccError> {
     dataset
@@ -438,36 +433,6 @@ fn typed_kind(value: &TypedValue) -> &'static str {
     }
 }
 
-/// Execute the public final-2026 online gate with typed Wire values.
-///
-/// `ledger` must be the full physical projection (warmup, ranked commits, and
-/// grace-tail commits), not only the ranked projection. The exact initial
-/// order-line accumulator is produced while loading and is a separate input so
-/// the runtime never uses the database query itself as its expected answer.
-pub async fn run_final_online(
-    client: &mut RmdbClient,
-    dataset: &DatasetState,
-    ledger: &RunLedger,
-    initial_order_line_amounts: &NonNegativeF32Accumulator,
-) -> Result<FloatBaseline, TpccError> {
-    warn!("{PUBLIC_SPEC_NOTICE}");
-    let expectations = final_expectations(dataset, ledger, initial_order_line_amounts)?;
-    let sample = dataset
-        .online_key_sample()
-        .map_err(|error| protocol_error("invalid online setup-evidence binding", error))?;
-    let plan = public_online_integer_plan(expectations, sample)
-        .map_err(|error| protocol_error("invalid public online plan", error))?;
-    run_plan(client, &plan, &dataset.runtime_schema).await?;
-
-    validate_transaction_evidence(ledger)?;
-    let values = read_float_aggregates(client, CheckScope::Online, &dataset.runtime_schema).await?;
-    validate_online_float_ledger(dataset, ledger, initial_order_line_amounts, &values)?;
-    info!(
-        "public online consistency PASS; hidden official 6/37 SQL, keys, seed, and answers were not inferred"
-    );
-    Ok(values)
-}
-
 /// Execute the public online gate from the bounded terminal oracle.
 ///
 /// Every artifact, dataset, Payment-domain, integer, and FLOAT oracle check is
@@ -540,59 +505,13 @@ fn prepare_bounded_online(
     })
 }
 
-/// Execute the public final-2026 post-crash gate.
-///
-/// This reruns full public integer checks, compares all seven raw FLOAT32
-/// aggregate values to the online baseline with the per-category ULP limits,
-/// verifies Payment warehouse/district endpoints at 0 ULP, and audits every
-/// warehouse/district partition (500 at the official scale) in six grouped
-/// round trips.
-pub async fn run_final_recovery(
-    client: &mut RmdbClient,
-    dataset: &DatasetState,
-    ledger: &RunLedger,
-    initial_order_line_amounts: &NonNegativeF32Accumulator,
-    online_baseline: &FloatBaseline,
-) -> Result<(), TpccError> {
-    warn!("{PUBLIC_SPEC_NOTICE}");
-    let expectations = final_expectations(dataset, ledger, initial_order_line_amounts)?;
-    let plan = recovery_plan(expectations)
-        .map_err(|error| protocol_error("invalid public recovery plan", error))?;
-    run_plan(client, &plan, &dataset.runtime_schema).await?;
-
-    let endpoints = validate_transaction_evidence(ledger)?;
-    let recovered =
-        read_float_aggregates(client, CheckScope::Recovery, &dataset.runtime_schema).await?;
-    validate_float_baseline(online_baseline, &recovered)?;
-    validate_payment_endpoints(
-        client,
-        &dataset.runtime_schema,
-        dataset.warehouses,
-        &endpoints,
-    )
-    .await?;
-    validate_customer_endpoint_sample(client, &dataset.runtime_schema, &endpoints).await?;
-
-    let partitions = partition_expectations(dataset, ledger)?;
-    // Reuse the transport-neutral generator as a strict completeness and
-    // invariant validator, but execute the equivalent audit in six grouped
-    // queries rather than 3,000 scalar requests.
-    recovery_partition_audits_for_warehouses(dataset.warehouses, partitions.clone())
-        .map_err(|error| protocol_error("invalid recovery partition ledger", error))?;
-    run_grouped_partition_audit(client, &dataset.runtime_schema, &partitions).await?;
-    info!(
-        "public recovery consistency PASS; hidden official 37 SQL, generated keys, seed, and answers remain unavailable"
-    );
-    Ok(())
-}
-
 /// Execute post-crash validation from the bounded, canonically restorable
 /// terminal oracle.
 ///
-/// This path never reconstructs or accepts a physical `RunLedger`: public
-/// counts and partitions come from bounded statistics, exact Warehouse and
-/// District values come from the Payment endpoint certificate, and retained
-/// per-key mutations are checked by the bounded recovery sample executor.
+/// Public counts and partitions come from bounded statistics, exact Warehouse
+/// and District values come from the Payment endpoint certificate, and
+/// retained per-key mutations are checked by the bounded recovery sample
+/// executor.
 pub async fn run_final_recovery_from_terminal_evidence(
     client: &mut RmdbClient,
     dataset: &DatasetState,
@@ -688,31 +607,6 @@ pub async fn read_float_aggregates(
     Ok(values)
 }
 
-fn final_expectations(
-    dataset: &DatasetState,
-    ledger: &RunLedger,
-    initial_order_line_amounts: &NonNegativeF32Accumulator,
-) -> Result<RecoveryExpectations, TpccError> {
-    validate_consistency_warehouse_count(dataset.warehouses)?;
-    let initial_terms = u64::try_from(dataset.order_line_rows).map_err(|_| {
-        TpccError::Protocol("dataset order-line count is negative or too large".to_owned())
-    })?;
-    if initial_order_line_amounts.term_count() != initial_terms {
-        return Err(TpccError::Protocol(format!(
-            "initial order-line FLOAT accumulator has {} terms, dataset records {initial_terms}",
-            initial_order_line_amounts.term_count()
-        )));
-    }
-    Ok(RecoveryExpectations {
-        setup: SetupExpectations {
-            warehouses: dataset.warehouses,
-            order_line_rows: dataset.order_line_rows,
-            undelivered_order_line_rows: dataset.undelivered_order_line_rows,
-        },
-        committed: ledger.to_committed_ledger(),
-    })
-}
-
 fn bounded_recovery_expectations(
     dataset: &DatasetState,
     stats: &BoundedPhysicalStats,
@@ -763,219 +657,6 @@ fn validate_terminal_dataset_binding(
         ));
     }
     Ok(())
-}
-
-#[derive(Debug, Default)]
-struct RelativeEndpoints {
-    warehouses: BTreeMap<i32, u32>,
-    districts: BTreeMap<(i32, i32), u32>,
-    customers: BTreeMap<CustomerKey, CustomerEndpoint>,
-}
-
-type CustomerKey = (i32, i32, i32);
-
-#[derive(Clone, Copy, Debug)]
-struct CustomerEndpoint {
-    balance_bits: u32,
-    ytd_payment_bits: u32,
-    payment_count: i32,
-    delivery_count: i32,
-}
-
-impl Default for CustomerEndpoint {
-    fn default() -> Self {
-        Self {
-            balance_bits: (-10.0_f32).to_bits(),
-            ytd_payment_bits: 10.0_f32.to_bits(),
-            payment_count: 1,
-            delivery_count: 0,
-        }
-    }
-}
-
-fn validate_transaction_evidence(ledger: &RunLedger) -> Result<RelativeEndpoints, TpccError> {
-    let mut warehouse_updates: BTreeMap<i32, Vec<RelativeUpdateEvidence>> = BTreeMap::new();
-    let mut district_updates: BTreeMap<(i32, i32), Vec<RelativeUpdateEvidence>> = BTreeMap::new();
-    let mut customer_updates: BTreeMap<CustomerKey, Vec<CustomerUpdateEvidence>> = BTreeMap::new();
-
-    for event in ledger.events() {
-        match event {
-            LedgerEvent::Payment(delta) => {
-                let amount = delta.amount_bits;
-                warehouse_updates
-                    .entry(i32::from(delta.warehouse_id))
-                    .or_default()
-                    .push(RelativeUpdateEvidence {
-                        before_bits: delta.warehouse_before_bits,
-                        bound_amount_bits: amount,
-                        after_bits: delta.warehouse_after_bits,
-                    });
-                district_updates
-                    .entry((i32::from(delta.warehouse_id), i32::from(delta.district_id)))
-                    .or_default()
-                    .push(RelativeUpdateEvidence {
-                        before_bits: delta.district_before_bits,
-                        bound_amount_bits: amount,
-                        after_bits: delta.district_after_bits,
-                    });
-                let customer = (
-                    i32::from(delta.customer_warehouse_id),
-                    i32::from(delta.customer_district_id),
-                    delta.customer_id,
-                );
-                customer_updates
-                    .entry(customer)
-                    .or_default()
-                    .push(CustomerUpdateEvidence {
-                        kind: CustomerUpdateKind::Payment,
-                        before_version: CustomerLogicalVersion {
-                            payment_count: delta.customer_payment_count_before,
-                            delivery_count: delta.customer_delivery_count_before,
-                        },
-                        after_version: CustomerLogicalVersion {
-                            payment_count: delta.customer_payment_count_after,
-                            delivery_count: delta.customer_delivery_count_after,
-                        },
-                        amount_bits: amount,
-                        balance_before_bits: delta.customer_balance_before_bits,
-                        balance_after_bits: delta.customer_balance_after_bits,
-                        ytd_payment_before_bits: Some(delta.customer_ytd_before_bits),
-                        ytd_payment_after_bits: Some(delta.customer_ytd_after_bits),
-                    });
-            }
-            LedgerEvent::Delivery(delta) => {
-                for order in &delta.orders {
-                    let customer = (
-                        i32::from(delta.warehouse_id),
-                        i32::from(order.district_id),
-                        order.customer_id,
-                    );
-                    customer_updates
-                        .entry(customer)
-                        .or_default()
-                        .push(CustomerUpdateEvidence {
-                            kind: CustomerUpdateKind::Delivery,
-                            before_version: CustomerLogicalVersion {
-                                payment_count: order.customer_payment_count_before,
-                                delivery_count: order.customer_delivery_count_before,
-                            },
-                            after_version: CustomerLogicalVersion {
-                                payment_count: order.customer_payment_count_after,
-                                delivery_count: order.customer_delivery_count_after,
-                            },
-                            amount_bits: order.customer_amount_bits,
-                            balance_before_bits: order.customer_balance_before_bits,
-                            balance_after_bits: order.customer_balance_after_bits,
-                            ytd_payment_before_bits: None,
-                            ytd_payment_after_bits: None,
-                        });
-                }
-            }
-            LedgerEvent::NewOrder(_)
-            | LedgerEvent::OrderStatus { .. }
-            | LedgerEvent::StockLevel { .. }
-            | LedgerEvent::ExpectedRollback { .. } => {}
-        }
-    }
-
-    let mut endpoints = RelativeEndpoints::default();
-    for (warehouse, updates) in warehouse_updates {
-        let endpoint =
-            validate_relative_update_chain_from_initial(300_000.0_f32.to_bits(), &updates)
-                .map_err(|error| {
-                    TpccError::QueryError(format!(
-                        "Payment w_ytd chain for warehouse {warehouse} failed: {error}"
-                    ))
-                })?;
-        endpoints.warehouses.insert(warehouse, endpoint);
-    }
-    for ((warehouse, district), updates) in district_updates {
-        let endpoint =
-            validate_relative_update_chain_from_initial(30_000.0_f32.to_bits(), &updates)
-                .map_err(|error| {
-                    TpccError::QueryError(format!(
-                        "Payment d_ytd chain for warehouse {warehouse}, district {district} failed: {error}"
-                    ))
-                })?;
-        endpoints.districts.insert((warehouse, district), endpoint);
-    }
-    for ((warehouse, district, customer), updates) in customer_updates {
-        let endpoint = validate_customer_update_chain(
-            (-10.0_f32).to_bits(),
-            10.0_f32.to_bits(),
-            CustomerLogicalVersion {
-                payment_count: 1,
-                delivery_count: 0,
-            },
-            &updates,
-        )
-        .map_err(|error| {
-            TpccError::QueryError(format!(
-                "Payment/Delivery customer version chain for \
-                 ({warehouse},{district},{customer}) failed: {error}"
-            ))
-        })?;
-        endpoints.customers.insert(
-            (warehouse, district, customer),
-            CustomerEndpoint {
-                balance_bits: endpoint.balance_bits,
-                ytd_payment_bits: endpoint.ytd_payment_bits,
-                payment_count: endpoint.version.payment_count,
-                delivery_count: endpoint.version.delivery_count,
-            },
-        );
-    }
-    Ok(endpoints)
-}
-
-fn validate_online_float_ledger(
-    dataset: &DatasetState,
-    ledger: &RunLedger,
-    initial_order_line_amounts: &NonNegativeF32Accumulator,
-    values: &FloatBaseline,
-) -> Result<(), TpccError> {
-    let initial_history_rows = i64::from(dataset.warehouses)
-        .checked_mul(i64::from(DISTRICTS_PER_WAREHOUSE))
-        .and_then(|count| count.checked_mul(3_000))
-        .ok_or_else(|| TpccError::Protocol("initial history row count overflowed".to_owned()))?;
-    let mut history = NonNegativeF32Accumulator::default();
-    history
-        .add_repeated_bits(
-            10.0_f32.to_bits(),
-            u64::try_from(initial_history_rows)
-                .map_err(|_| TpccError::Protocol("negative history row count".to_owned()))?,
-        )
-        .map_err(|error| protocol_error("initial history accumulator failed", error))?;
-    history
-        .extend_bits(ledger.payment_amount_bits().iter().copied())
-        .map_err(|error| protocol_error("Payment history accumulator failed", error))?;
-
-    let mut order_line = initial_order_line_amounts.clone();
-    order_line
-        .extend_bits(ledger.new_order_line_amount_bits().iter().copied())
-        .map_err(|error| protocol_error("order-line accumulator failed", error))?;
-
-    let stock_ytd = ledger.stock_ytd_delta() as f32;
-    if !stock_ytd.is_finite() {
-        return Err(TpccError::Protocol(
-            "stock YTD ledger cannot be represented as finite FLOAT32".to_owned(),
-        ));
-    }
-    validate_public_float_ledger(
-        aggregate_bits(values, FloatAggregateId::HistoryAmount)?,
-        aggregate_bits(values, FloatAggregateId::StockYtd)?,
-        aggregate_bits(values, FloatAggregateId::OrderLineAmount)?,
-        PublicFloatLedgerEvidence {
-            history_amount: history
-                .boundary()
-                .map_err(|error| protocol_error("history boundary failed", error))?,
-            stock_ytd_bits: stock_ytd.to_bits(),
-            order_line_amount: order_line
-                .boundary()
-                .map_err(|error| protocol_error("order-line boundary failed", error))?,
-        },
-    )
-    .map_err(|error| TpccError::QueryError(format!("public FLOAT ledger gate failed: {error}")))
 }
 
 fn bounded_online_float_oracle(
@@ -1075,69 +756,6 @@ fn require_zero_ulp(name: &str, expected_bits: u32, actual_bits: u32) -> Result<
             "{name} expected 0x{expected_bits:08x}, got 0x{actual_bits:08x} (0 ULP)"
         )))
     }
-}
-
-async fn validate_payment_endpoints(
-    client: &mut RmdbClient,
-    schema: &RuntimeSchema,
-    warehouse_count: i32,
-    endpoints: &RelativeEndpoints,
-) -> Result<(), TpccError> {
-    let warehouses = execute_typed_sql(
-        client,
-        schema,
-        "recovery.payment.warehouse_endpoints",
-        "SELECT w_id, w_ytd FROM warehouse",
-    )
-    .await?;
-    validate_float_endpoint_rows(
-        "warehouse w_ytd",
-        warehouses,
-        (1..=warehouse_count).map(|warehouse| {
-            (
-                PartitionKey {
-                    warehouse_id: warehouse,
-                    district_id: 0,
-                },
-                endpoints
-                    .warehouses
-                    .get(&warehouse)
-                    .copied()
-                    .unwrap_or(300_000.0_f32.to_bits()),
-            )
-        }),
-        false,
-    )?;
-
-    let districts = execute_typed_sql(
-        client,
-        schema,
-        "recovery.payment.district_endpoints",
-        "SELECT d_w_id, d_id, d_ytd FROM district",
-    )
-    .await?;
-    validate_float_endpoint_rows(
-        "district d_ytd",
-        districts,
-        (1..=warehouse_count).flat_map(|warehouse| {
-            (1..=DISTRICTS_PER_WAREHOUSE).map(move |district| {
-                (
-                    PartitionKey {
-                        warehouse_id: warehouse,
-                        district_id: district,
-                    },
-                    endpoints
-                        .districts
-                        .get(&(warehouse, district))
-                        .copied()
-                        .unwrap_or(30_000.0_f32.to_bits()),
-                )
-            })
-        }),
-        true,
-    )?;
-    info!("recovery Payment warehouse/district endpoints PASS (0 ULP)");
-    Ok(())
 }
 
 async fn validate_bounded_payment_endpoints(
@@ -1274,140 +892,6 @@ fn require_finite_endpoint_bits(bits: u32) -> Result<(), TpccError> {
     }
 }
 
-async fn validate_customer_endpoint_sample(
-    client: &mut RmdbClient,
-    schema: &RuntimeSchema,
-    endpoints: &RelativeEndpoints,
-) -> Result<(), TpccError> {
-    let sample = evenly_spaced_customer_sample(&endpoints.customers);
-    for (ordinal, (key, endpoint)) in sample.iter().enumerate() {
-        let result = execute_typed_sql(
-            client,
-            schema,
-            &format!("recovery.customer.sample.{}", ordinal + 1),
-            &format!(
-                "SELECT c_w_id, c_d_id, c_id, c_balance, c_ytd_payment, c_payment_cnt, \
-                 c_delivery_cnt FROM customer WHERE c_w_id = {} AND c_d_id = {} AND c_id = {}",
-                key.0, key.1, key.2
-            ),
-        )
-        .await?;
-        let expected = BTreeMap::from([(*key, *endpoint)]);
-        validate_customer_endpoint_rows("recovery", result, &expected)?;
-    }
-    info!(
-        "recovery customer ledger sample PASS ({} composite-index keys, raw FLOAT32 and counters)",
-        sample.len()
-    );
-    Ok(())
-}
-
-fn evenly_spaced_customer_sample(
-    expected: &BTreeMap<CustomerKey, CustomerEndpoint>,
-) -> Vec<(CustomerKey, CustomerEndpoint)> {
-    let count = expected.len().min(PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT);
-    if count == 0 {
-        return Vec::new();
-    }
-    if count == expected.len() {
-        return expected.iter().map(|(key, value)| (*key, *value)).collect();
-    }
-
-    let last_index = expected.len() - 1;
-    let denominator = count - 1;
-    let selected_indexes = (0..count)
-        .map(|ordinal| ordinal * last_index / denominator)
-        .collect::<Vec<_>>();
-    let mut selected = Vec::with_capacity(count);
-    let mut next = selected_indexes.into_iter();
-    let mut selected_index = next.next();
-    for (index, (key, value)) in expected.iter().enumerate() {
-        if selected_index == Some(index) {
-            selected.push((*key, *value));
-            selected_index = next.next();
-        }
-    }
-    selected
-}
-
-fn validate_customer_endpoint_rows(
-    scope: &str,
-    result: TypedResult,
-    expected: &BTreeMap<CustomerKey, CustomerEndpoint>,
-) -> Result<(), TpccError> {
-    let mut actual = BTreeMap::new();
-    for row in result.rows {
-        let endpoint = match row.as_slice() {
-            [TypedValue::Int32(warehouse), TypedValue::Int32(district), TypedValue::Int32(customer), TypedValue::Float32(balance_bits), TypedValue::Float32(ytd_payment_bits), TypedValue::Int32(payment_count), TypedValue::Int32(delivery_count)] => {
-                (
-                    (*warehouse, *district, *customer),
-                    CustomerEndpoint {
-                        balance_bits: *balance_bits,
-                        ytd_payment_bits: *ytd_payment_bits,
-                        payment_count: *payment_count,
-                        delivery_count: *delivery_count,
-                    },
-                )
-            }
-            _ => {
-                return Err(TpccError::Protocol(format!(
-                    "{scope} changed-customer endpoint query returned an invalid typed row"
-                )));
-            }
-        };
-        let (key, value) = endpoint;
-        if !expected.contains_key(&key) {
-            return Err(TpccError::QueryError(format!(
-                "{scope} changed-customer endpoint query returned unexpected key ({},{},{})",
-                key.0, key.1, key.2
-            )));
-        }
-        if actual.insert(key, value).is_some() {
-            return Err(TpccError::Protocol(format!(
-                "{scope} changed-customer endpoint query returned duplicate key ({},{},{})",
-                key.0, key.1, key.2
-            )));
-        }
-    }
-
-    for (key, expected_endpoint) in expected {
-        let actual_endpoint = actual.get(key).ok_or_else(|| {
-            TpccError::QueryError(format!(
-                "{scope} changed-customer endpoint query omitted key ({},{},{})",
-                key.0, key.1, key.2
-            ))
-        })?;
-        require_zero_ulp(
-            &format!("{scope} customer ({},{},{}) c_balance", key.0, key.1, key.2),
-            expected_endpoint.balance_bits,
-            actual_endpoint.balance_bits,
-        )?;
-        require_zero_ulp(
-            &format!(
-                "{scope} customer ({},{},{}) c_ytd_payment",
-                key.0, key.1, key.2
-            ),
-            expected_endpoint.ytd_payment_bits,
-            actual_endpoint.ytd_payment_bits,
-        )?;
-        if actual_endpoint.payment_count != expected_endpoint.payment_count
-            || actual_endpoint.delivery_count != expected_endpoint.delivery_count
-        {
-            return Err(TpccError::QueryError(format!(
-                "{scope} customer ({},{},{}) counters expected payment/delivery={}/{}, got {}/{}",
-                key.0,
-                key.1,
-                key.2,
-                expected_endpoint.payment_count,
-                expected_endpoint.delivery_count,
-                actual_endpoint.payment_count,
-                actual_endpoint.delivery_count
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn validate_float_endpoint_rows<I>(
     name: &str,
     result: TypedResult,
@@ -1467,71 +951,6 @@ where
         require_zero_ulp(name, expected_bits, actual_bits)?;
     }
     Ok(())
-}
-
-fn partition_expectations(
-    dataset: &DatasetState,
-    ledger: &RunLedger,
-) -> Result<Vec<PartitionExpectation>, TpccError> {
-    let expected_partitions = validate_consistency_warehouse_count(dataset.warehouses)?;
-    if dataset.partitions.len() != expected_partitions {
-        return Err(TpccError::Protocol(format!(
-            "recovery requires {expected_partitions} load partitions for {} warehouses, state has {}",
-            dataset.warehouses,
-            dataset.partitions.len(),
-        )));
-    }
-    dataset
-        .partitions
-        .iter()
-        .map(|initial| {
-            let key = PartitionKey {
-                warehouse_id: initial.warehouse_id,
-                district_id: initial.district_id,
-            };
-            let delta = ledger
-                .partition_delta(key.warehouse_id, key.district_id)
-                .map_err(|error| protocol_error("invalid ledger partition", error))?;
-            let order_count = checked_partition_add(
-                i64::from(ORDERS_PER_DISTRICT),
-                delta.new_orders,
-                "partition order count",
-            )?;
-            let order_line_count = checked_partition_add(
-                initial.order_line_rows,
-                delta.new_order_lines,
-                "partition order-line count",
-            )?;
-            let new_order_count = checked_partition_add(
-                checked_partition_add(
-                    i64::from(NEW_ORDERS_PER_DISTRICT),
-                    delta.new_orders,
-                    "partition new-order count",
-                )?,
-                -delta.delivered_orders,
-                "partition new-order count",
-            )?;
-            let empty_delivery_time_count = checked_partition_add(
-                checked_partition_add(
-                    initial.undelivered_order_line_rows,
-                    delta.new_order_lines,
-                    "partition empty delivery count",
-                )?,
-                -delta.delivered_order_lines,
-                "partition empty delivery count",
-            )?;
-            let next_order_id = checked_partition_add(order_count, 1, "partition next order id")?;
-            Ok(PartitionExpectation {
-                key,
-                order_count,
-                order_line_count,
-                new_order_count,
-                empty_delivery_time_count,
-                carrier_zero_count: new_order_count,
-                next_order_id,
-            })
-        })
-        .collect()
 }
 
 fn bounded_partition_expectations(
@@ -2050,25 +1469,6 @@ mod tests {
     }
 
     #[test]
-    fn sf1_smoke_uses_its_complete_dataset_keyspace() {
-        let dataset = smoke_dataset(1);
-        let ledger = RunLedger::default();
-        let expectations =
-            final_expectations(&dataset, &ledger, dataset.initial_order_line_amounts()).unwrap();
-        assert_eq!(expectations.setup.warehouses, 1);
-
-        let partitions = partition_expectations(&dataset, &ledger).unwrap();
-        assert_eq!(partitions.len(), DISTRICTS_PER_WAREHOUSE as usize);
-        assert_eq!(
-            recovery_partition_audits_for_warehouses(dataset.warehouses, partitions)
-                .unwrap()
-                .len(),
-            DISTRICTS_PER_WAREHOUSE as usize
-        );
-        assert!(validate_consistency_warehouse_count(FINAL_WAREHOUSES + 1).is_err());
-    }
-
-    #[test]
     fn bounded_sf1_recovery_uses_its_complete_dataset_keyspace() {
         let dataset = smoke_dataset(1);
         let stats = BoundedPhysicalStats::default();
@@ -2085,6 +1485,7 @@ mod tests {
                 .len(),
             DISTRICTS_PER_WAREHOUSE as usize
         );
+        assert!(validate_consistency_warehouse_count(FINAL_WAREHOUSES + 1).is_err());
     }
 
     #[test]
@@ -2265,9 +1666,12 @@ mod tests {
         let dataset = smoke_dataset(1);
         assert_eq!(dataset.runtime_schema.mode(), SchemaMode::LocalSeedOpaqueV1);
 
-        let ledger = RunLedger::default();
-        let expectations =
-            final_expectations(&dataset, &ledger, dataset.initial_order_line_amounts()).unwrap();
+        let expectations = bounded_recovery_expectations(
+            &dataset,
+            &BoundedPhysicalStats::default(),
+            dataset.initial_order_line_amounts(),
+        )
+        .unwrap();
         let plan = recovery_plan(expectations).unwrap();
         assert_eq!(plan.queries.len(), PUBLIC_RECOVERY_INTEGER_CHECK_COUNT);
 
@@ -2436,63 +1840,6 @@ mod tests {
             false
         )
         .is_ok());
-    }
-
-    #[test]
-    fn customer_sample_rows_require_exact_bits_counters_and_key_set() {
-        let key = (1, 2, 3);
-        let endpoint = CustomerEndpoint {
-            balance_bits: 7.25_f32.to_bits(),
-            ytd_payment_bits: 22.5_f32.to_bits(),
-            payment_count: 4,
-            delivery_count: 2,
-        };
-        let expected = [(key, endpoint)].into_iter().collect();
-        let row = || {
-            vec![
-                TypedValue::Int32(key.0),
-                TypedValue::Int32(key.1),
-                TypedValue::Int32(key.2),
-                TypedValue::Float32(endpoint.balance_bits),
-                TypedValue::Float32(endpoint.ytd_payment_bits),
-                TypedValue::Int32(endpoint.payment_count),
-                TypedValue::Int32(endpoint.delivery_count),
-            ]
-        };
-        assert!(validate_customer_endpoint_rows(
-            "recovery",
-            TypedResult { rows: vec![row()] },
-            &expected
-        )
-        .is_ok());
-
-        let mut wrong_bits = row();
-        wrong_bits[3] = TypedValue::Float32((7.25_f32.to_bits()) + 1);
-        assert!(validate_customer_endpoint_rows(
-            "recovery",
-            TypedResult {
-                rows: vec![wrong_bits]
-            },
-            &expected
-        )
-        .is_err());
-        assert!(validate_customer_endpoint_rows(
-            "recovery",
-            TypedResult { rows: Vec::new() },
-            &expected
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn customer_sample_is_bounded_and_spans_sorted_keys() {
-        let expected = (1..=100)
-            .map(|customer| ((1, 1, customer), CustomerEndpoint::default()))
-            .collect::<BTreeMap<_, _>>();
-        let sample = evenly_spaced_customer_sample(&expected);
-        assert_eq!(sample.len(), PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT);
-        assert_eq!(sample.first().map(|item| item.0), Some((1, 1, 1)));
-        assert_eq!(sample.last().map(|item| item.0), Some((1, 1, 100)));
     }
 
     #[test]
