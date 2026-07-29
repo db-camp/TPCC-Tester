@@ -85,13 +85,7 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             "执行 Wire v3 readiness probe: {}:{}",
             config.host, config.port
         );
-        let mut client = RmdbClient::connect_with_timeout(
-            &config.host,
-            config.port,
-            Duration::from_secs(config.response_timeout_seconds),
-        )
-        .await?;
-        client.ping().await?;
+        RmdbClient::probe_readiness(&config.host, config.port).await?;
         info!("Wire v3 readiness probe 通过（完整执行 `show tables;`）");
         return Ok(());
     }

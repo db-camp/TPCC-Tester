@@ -17,6 +17,26 @@ pub struct RmdbClient {
 }
 
 impl RmdbClient {
+    /// Run the exact readiness request without imposing a client-local
+    /// connect or response timeout.
+    ///
+    /// The workflow supervisor owns the single monotonic deadline that also
+    /// covers server launch, process registration, and listener ownership.
+    /// Keeping this path unbounded internally lets an already connected
+    /// fragmented response consume all of that remaining shared budget.
+    pub async fn probe_readiness(host: &str, port: u16) -> Result<(), TpccError> {
+        let addr = format!("{host}:{port}");
+        debug!("正在连接 RMDB readiness endpoint: {addr}");
+        let mut connection = WireConnection::connect(&addr)
+            .await
+            .map_err(map_wire_error)?;
+        let response = connection
+            .exec_stream("show tables;")
+            .await
+            .map_err(|error| map_exec_wire_error(error, "show tables;"))?;
+        validate_readiness_response(response)
+    }
+
     pub async fn connect(host: &str, port: u16) -> Result<Self, TpccError> {
         Self::connect_with_timeout(host, port, DEFAULT_RESPONSE_TIMEOUT).await
     }
@@ -166,7 +186,10 @@ fn wire_value_text(value: WireValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::wire::WireTimeoutPhase;
+    use crate::connection::wire::{WireTimeoutPhase, HANDSHAKE};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::Instant;
 
     #[test]
     fn readiness_accepts_both_published_success_terminals() {
@@ -213,5 +236,65 @@ mod tests {
         .to_string();
         assert!(read.contains("response read timeout"));
         assert!(read.contains("show tables;"));
+    }
+
+    #[tokio::test]
+    async fn readiness_allows_fragmented_terminal_after_two_seconds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; HANDSHAKE.len()];
+            socket.read_exact(&mut handshake).await.unwrap();
+            assert_eq!(handshake, HANDSHAKE);
+            socket.write_all(&HANDSHAKE).await.unwrap();
+
+            let mut header = [0_u8; 8];
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[4], 0x20);
+            let payload_bytes =
+                u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let mut payload = vec![0_u8; payload_bytes];
+            socket.read_exact(&mut payload).await.unwrap();
+            assert_eq!(payload, b"show tables;");
+
+            let command_ok = [0_u8, 0, 0, 0, 0x10, 0, 0, 0];
+            socket.write_all(&command_ok[..4]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2_100)).await;
+            socket.write_all(&command_ok[4..]).await.unwrap();
+        });
+
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            RmdbClient::probe_readiness("127.0.0.1", port),
+        )
+        .await
+        .expect("test safety timeout elapsed")
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_eof_for_supervisor_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; HANDSHAKE.len()];
+            socket.read_exact(&mut handshake).await.unwrap();
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            RmdbClient::probe_readiness("127.0.0.1", port),
+        )
+        .await
+        .expect("readiness EOF did not fail promptly")
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("连接失败"), "{error}");
+        server.await.unwrap();
     }
 }
