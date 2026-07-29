@@ -10,7 +10,7 @@ use std::fmt;
 
 use crate::connection::prepared::{Statement, StatementKind};
 use crate::connection::wire::{Column, SqlType};
-use crate::runtime_schema::RuntimeSchema;
+use crate::runtime_schema::{RuntimeSchema, StatementLayout};
 
 pub const UNDELIVERED_CARRIER_ID: i32 = 0;
 pub const UNDELIVERED_DATE: &str = "";
@@ -942,6 +942,48 @@ pub fn runtime_catalog(schema: &RuntimeSchema) -> Result<Vec<Statement>, Catalog
     Ok(catalog)
 }
 
+/// One validated catalogue derived once from the persisted per-run schema.
+///
+/// Executors share this value across every session so statement ids, SQL, and
+/// declared result aliases cannot be regenerated or mixed after dispatch
+/// begins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeCatalog {
+    schema_fingerprint: u64,
+    statement_layout: StatementLayout,
+    statements: Vec<Statement>,
+}
+
+impl RuntimeCatalog {
+    pub fn from_schema(schema: &RuntimeSchema) -> Result<Self, CatalogError> {
+        let statements = runtime_catalog(schema)?;
+        if statements.len() != StatementId::ALL.len() {
+            return Err(CatalogError::new(format!(
+                "runtime catalogue has {} statements, expected {}",
+                statements.len(),
+                StatementId::ALL.len()
+            )));
+        }
+        Ok(Self {
+            schema_fingerprint: schema.fingerprint(),
+            statement_layout: schema.statements().clone(),
+            statements,
+        })
+    }
+
+    pub const fn schema_fingerprint(&self) -> u64 {
+        self.schema_fingerprint
+    }
+
+    pub fn statement_layout(&self) -> &StatementLayout {
+        &self.statement_layout
+    }
+
+    pub fn statements(&self) -> &[Statement] {
+        &self.statements
+    }
+}
+
 fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement {
     use SqlType::{Char, Float32, Int32};
 
@@ -1266,7 +1308,8 @@ mod runtime_tests {
     #[test]
     fn opaque_catalog_renders_sql_and_declared_aliases_together() {
         let schema = RuntimeSchema::opaque(2026).unwrap();
-        let catalog = runtime_catalog(&schema).unwrap();
+        let runtime = RuntimeCatalog::from_schema(&schema).unwrap();
+        let catalog = runtime.statements();
         let payment_id = schema
             .statements()
             .id(StatementId::PaymentWarehouse.key())
@@ -1281,5 +1324,7 @@ mod runtime_tests {
             .contains(schema.table(crate::runtime_schema::LogicalTable::Warehouse)));
         assert!(!payment.sql.contains(" FROM warehouse "));
         validate_runtime_catalog(&catalog, &schema).unwrap();
+        assert_eq!(runtime.schema_fingerprint(), schema.fingerprint());
+        assert_eq!(runtime.statement_layout(), schema.statements());
     }
 }

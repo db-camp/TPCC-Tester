@@ -417,7 +417,8 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         info!("启动原生 final2026 连续三窗口基准测试...");
         let (store, dataset, contract) = load_bound_state(&config, &effective)?;
         let claim = store.begin_rank(&dataset, &contract)?;
-        let exec = executor::BenchmarkExecutor::new(config, effective);
+        let exec =
+            executor::BenchmarkExecutor::new(config, effective, dataset.runtime_schema.clone());
         let result = exec.run().await?;
         store.complete_rank(&dataset, &contract, claim, result.ledger())?;
         info!(

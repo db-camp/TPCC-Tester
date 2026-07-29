@@ -19,11 +19,15 @@ use tracing::info;
 use crate::config::{Config, DiagnosticSegment, ResolvedProfile};
 use crate::connection::client::RmdbClient;
 use crate::error::TpccError;
-use crate::profile::{TransactionKind, OFFICIAL_CLIENTS};
+use crate::profile::{TransactionKind, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES};
+use crate::ranking::catalog::RuntimeCatalog;
+use crate::ranking::common::install_statement_layout;
 use crate::ranking::dispatch::{self, FrozenTransaction};
 use crate::ranking::runner::RankedTransactionOutcome;
 use crate::ranking::session::open_ranked_session;
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
+use crate::run_state::StateStore;
+use crate::runtime_schema::{RuntimeSchema, SchemaMode};
 use crate::workload::Final2026Workload;
 
 const DIAGNOSTIC_STAGE: StageId = StageId::custom(0x6469_6167_3230_3236);
@@ -53,6 +57,15 @@ impl DiagnosticExecutor {
         let seed = self.effective.seed.ok_or_else(|| {
             TpccError::Protocol("diagnostic workload requires an explicit seed".to_owned())
         })?;
+        let runtime_schema = self.validate_state_binding(seed)?;
+        let catalog = Arc::new(
+            RuntimeCatalog::from_schema(&runtime_schema).map_err(|error| {
+                TpccError::Protocol(format!("invalid diagnostic runtime catalogue: {error}"))
+            })?,
+        );
+        install_statement_layout(catalog.statement_layout()).map_err(|error| {
+            TpccError::Protocol(format!("diagnostic statement layout: {error}"))
+        })?;
 
         let response_timeout = Duration::from_secs(self.config.response_timeout_seconds);
         let phase_tail_grace = Duration::from_secs(self.config.phase_tail_grace_seconds);
@@ -65,7 +78,9 @@ impl DiagnosticExecutor {
             "preparing {} diagnostic Wire v3 sessions with SNAPSHOT ISOLATION and PREPARE_SET",
             OFFICIAL_CLIENTS
         );
-        let sessions = self.open_sessions(response_timeout).await?;
+        let sessions = self
+            .open_sessions(response_timeout, Arc::clone(&catalog))
+            .await?;
         let cancelled = Arc::new(AtomicBool::new(false));
         let ready_barrier = Arc::new(Barrier::new(usize::from(OFFICIAL_CLIENTS) + 1));
         let start_barrier = Arc::new(Barrier::new(usize::from(OFFICIAL_CLIENTS) + 1));
@@ -141,18 +156,66 @@ impl DiagnosticExecutor {
         })
     }
 
+    fn validate_state_binding(&self, seed: u64) -> Result<RuntimeSchema, TpccError> {
+        let state_dir = self.config.state_dir.as_deref().ok_or_else(|| {
+            TpccError::Protocol("diagnostic workload requires a state directory".to_owned())
+        })?;
+        let metadata = std::fs::symlink_metadata(state_dir).map_err(|error| {
+            TpccError::Protocol(format!(
+                "diagnostic state directory must already exist (read-only binding): {error}"
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(TpccError::Protocol(format!(
+                "diagnostic state path is not a real directory: {}",
+                state_dir.display()
+            )));
+        }
+        let store = StateStore::open_existing(state_dir)
+            .map_err(|error| TpccError::Protocol(format!("diagnostic state: {error}")))?;
+        let dataset = store
+            .load_dataset()
+            .map_err(|error| TpccError::Protocol(format!("diagnostic dataset state: {error}")))?;
+        if dataset.seed != seed
+            || dataset.warehouses != i32::from(OFFICIAL_WAREHOUSES)
+            || self.config.scale_factor != i32::from(OFFICIAL_WAREHOUSES)
+        {
+            return Err(TpccError::Protocol(format!(
+                "diagnostic dataset state mismatch: state seed/SF={}/{}, CLI seed/SF={}/{}",
+                dataset.seed, dataset.warehouses, seed, self.config.scale_factor
+            )));
+        }
+        if dataset.runtime_schema.mode() != SchemaMode::LocalSeedOpaqueV1 {
+            return Err(TpccError::Protocol(format!(
+                "diagnostic workload requires local_seed_opaque_v1 state, found {}",
+                dataset.runtime_schema.mode().as_str()
+            )));
+        }
+        if let Ok(run_id) = std::env::var("RMDB_TPCC_RUN_ID") {
+            if dataset.run_id != run_id {
+                return Err(TpccError::Protocol(format!(
+                    "diagnostic run id mismatch: state={}, environment={run_id}",
+                    dataset.run_id
+                )));
+            }
+        }
+        Ok(dataset.runtime_schema)
+    }
+
     async fn open_sessions(
         &self,
         response_timeout: Duration,
+        catalog: Arc<RuntimeCatalog>,
     ) -> Result<Vec<RmdbClient>, TpccError> {
         let mut tasks = JoinSet::new();
         for worker in 0..OFFICIAL_CLIENTS {
             let host = self.config.host.clone();
             let port = self.config.port;
+            let catalog = Arc::clone(&catalog);
             tasks.spawn(async move {
                 (
                     worker,
-                    open_ranked_session(&host, port, response_timeout).await,
+                    open_ranked_session(&host, port, response_timeout, catalog).await,
                 )
             });
         }

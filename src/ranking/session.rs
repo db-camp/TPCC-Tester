@@ -1,5 +1,6 @@
 //! Ranked-session setup in the exact final-2026 order.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::connection::client::RmdbClient;
@@ -7,7 +8,7 @@ use crate::connection::prepared::PrepareResponse;
 use crate::connection::wire::StreamResponse;
 use crate::error::TpccError;
 
-use super::catalog::{final2026_catalog, validate_catalog};
+use super::catalog::RuntimeCatalog;
 
 pub const SNAPSHOT_ISOLATION_SQL: &str = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;";
 
@@ -18,14 +19,12 @@ pub async fn open_ranked_session(
     host: &str,
     port: u16,
     response_timeout: Duration,
+    catalog: Arc<RuntimeCatalog>,
 ) -> Result<RmdbClient, TpccError> {
     let mut client = RmdbClient::connect_with_timeout(host, port, response_timeout).await?;
     configure_snapshot_isolation(&mut client).await?;
 
-    let catalog = final2026_catalog();
-    validate_catalog(&catalog)
-        .map_err(|error| TpccError::Protocol(format!("invalid ranked catalogue: {error}")))?;
-    match client.prepare_set(&catalog).await? {
+    match client.prepare_set(catalog.statements()).await? {
         PrepareResponse::Installed => Ok(client),
         PrepareResponse::Error { diagnostic } => Err(TpccError::QueryError(format!(
             "PREPARE_SET failed: {diagnostic}"
@@ -51,6 +50,7 @@ async fn configure_snapshot_isolation(client: &mut RmdbClient) -> Result<(), Tpc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ranking::catalog::{final2026_catalog, validate_catalog};
 
     #[test]
     fn ranked_setup_sql_is_exact_and_does_not_change_output_mode() {

@@ -22,12 +22,15 @@ use crate::phases::{
     MonotonicClock, PhaseId, PhaseScheduleConfig, PreparedSessionId, SchedulerError,
     SchedulerEvent, SystemMonotonicClock, TransactionIdentity, WorkerId,
 };
+use crate::ranking::catalog::RuntimeCatalog;
+use crate::ranking::common::install_statement_layout;
 use crate::ranking::dispatch::{self, FrozenTransaction};
 use crate::ranking::ledger::{LedgerError, RunLedger};
 use crate::ranking::preflight;
 use crate::ranking::runner::RankedTransactionOutcome;
 use crate::ranking::session::open_ranked_session;
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
+use crate::runtime_schema::RuntimeSchema;
 use crate::transaction::TransactionType;
 use crate::workload::Final2026Workload;
 
@@ -151,11 +154,16 @@ type Scheduler = Final2026Scheduler<SystemMonotonicClock, ResourceTimelineRecord
 pub struct BenchmarkExecutor {
     config: Config,
     effective: ResolvedProfile,
+    runtime_schema: RuntimeSchema,
 }
 
 impl BenchmarkExecutor {
-    pub fn new(config: Config, effective: ResolvedProfile) -> Self {
-        Self { config, effective }
+    pub fn new(config: Config, effective: ResolvedProfile, runtime_schema: RuntimeSchema) -> Self {
+        Self {
+            config,
+            effective,
+            runtime_schema,
+        }
     }
 
     pub async fn run(&self) -> Result<Final2026RunResult, TpccError> {
@@ -163,6 +171,17 @@ impl BenchmarkExecutor {
         let seed = self.effective.seed.ok_or_else(|| {
             TpccError::Protocol("ranked run requires an explicit seed".to_owned())
         })?;
+        if self.runtime_schema.seed() != seed {
+            return Err(TpccError::Protocol(format!(
+                "ranked runtime schema seed {} does not match workload seed {seed}",
+                self.runtime_schema.seed()
+            )));
+        }
+        let catalog = Arc::new(RuntimeCatalog::from_schema(&self.runtime_schema).map_err(
+            |error| TpccError::Protocol(format!("invalid ranked runtime catalogue: {error}")),
+        )?);
+        install_statement_layout(catalog.statement_layout())
+            .map_err(|error| TpccError::Protocol(format!("ranked statement layout: {error}")))?;
         let response_timeout = Duration::from_secs(self.config.response_timeout_seconds);
         let limits =
             LocalRuntimeLimits::new(Duration::from_secs(self.config.phase_tail_grace_seconds))
@@ -195,7 +214,7 @@ impl BenchmarkExecutor {
             profile.clients
         );
         let mut sessions = self
-            .open_sessions(profile.clients, response_timeout)
+            .open_sessions(profile.clients, response_timeout, Arc::clone(&catalog))
             .await?;
         info!(
             "all {} sessions completed SNAPSHOT ISOLATION and PREPARE_SET schema verification; \
@@ -350,15 +369,17 @@ impl BenchmarkExecutor {
         &self,
         clients: u16,
         response_timeout: Duration,
+        catalog: Arc<RuntimeCatalog>,
     ) -> Result<Vec<RmdbClient>, TpccError> {
         let mut tasks = JoinSet::new();
         for worker in 0..clients {
             let host = self.config.host.clone();
             let port = self.config.port;
+            let catalog = Arc::clone(&catalog);
             tasks.spawn(async move {
                 (
                     worker,
-                    open_ranked_session(&host, port, response_timeout).await,
+                    open_ranked_session(&host, port, response_timeout, catalog).await,
                 )
             });
         }
