@@ -1,9 +1,7 @@
-//! Strict canonical binary building blocks for bounded terminal artifacts.
+//! Strict canonical binary codec for bounded terminal evidence.
 //!
-//! This module intentionally encodes only individual, stable sections. It is
-//! not an artifact envelope and must not be published as a complete terminal
-//! evidence bundle: the final artifact also binds the rich recovery sections
-//! and outer run metadata.
+//! The top-level artifact fixes eight typed sections in semantic order, binds
+//! them to trusted run metadata, and applies one outer lower-hex encoding.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -33,14 +31,24 @@ use super::rich_recovery_samples::{
     CanonicalRichBadCreditCustomer, CanonicalRichBadCreditPrefix, CanonicalRichCustomerWitness,
     CanonicalRichDelivery, CanonicalRichDeliveryLine, CanonicalRichHistoryTuple,
     CanonicalRichHistoryWitness, CanonicalRichNewOrder, CanonicalRichOrderLine,
-    CanonicalRichOrderWitness, CanonicalRichRecoveryHeader, HistoryGroupKey, OrderKey,
-    RichRecoveryError, SealedRichRecoverySamples, MAX_RICH_RECOVERY_RAW_BYTES,
-    RICH_HISTORY_SAMPLE_CAPACITY, RICH_RECOVERY_POLICY_VERSION, RICH_RECOVERY_SAMPLE_CAPACITY,
+    CanonicalRichOrderWitness, CanonicalRichRecoveryHeader, HistoryGroupKey,
+    InitialCustomerDataProvider, InitialHistoryProvider, OrderKey, RichRecoveryError,
+    SealedRichRecoverySamples, MAX_RICH_RECOVERY_RAW_BYTES, RICH_HISTORY_SAMPLE_CAPACITY,
+    RICH_RECOVERY_POLICY_VERSION, RICH_RECOVERY_SAMPLE_CAPACITY,
 };
 use super::runner::StockVersion;
+use super::terminal_evidence::{
+    validate_terminal_evidence, TerminalEvidenceError, TerminalEvidenceView,
+    TERMINAL_EVIDENCE_POLICY_VERSION,
+};
 
 const SECTION_MAGIC: [u8; 4] = *b"TCS1";
 const SECTION_VERSION: u16 = 1;
+const ARTIFACT_MAGIC: [u8; 4] = *b"TCA1";
+const ARTIFACT_VERSION: u16 = 1;
+const TERMINAL_ARTIFACT_SECTION_COUNT: u8 = 8;
+const TERMINAL_ARTIFACT_HEADER_BYTES: usize = 4 + 2 + 4 + 2 + 8 + 8 + 1;
+const TERMINAL_ARTIFACT_DESCRIPTOR_BYTES: usize = 1 + 4;
 
 pub(crate) const MAX_CORE_SECTION_BYTES: usize = 20 * 1024;
 pub(crate) const MAX_CORE_SECTION_HEX_CHARS: usize = MAX_CORE_SECTION_BYTES * 2;
@@ -52,6 +60,23 @@ pub(crate) const MAX_RICH_NEW_ORDER_SECTION_BYTES: usize = 68 * 1024;
 pub(crate) const MAX_RICH_DELIVERY_SECTION_BYTES: usize = 38 * 1024;
 pub(crate) const MAX_RICH_BAD_CREDIT_SECTION_BYTES: usize = 7_898;
 pub(crate) const MAX_RICH_HISTORY_SECTION_BYTES: usize = 305;
+pub(crate) const MAX_TERMINAL_ARTIFACT_RAW_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_TERMINAL_ARTIFACT_HEX_CHARS: usize = MAX_TERMINAL_ARTIFACT_RAW_BYTES * 2;
+pub(crate) const MAX_TERMINAL_ARTIFACT_FINAL_BYTES: usize = 32 * 1024 * 1024;
+const _: () = assert!(MAX_TERMINAL_ARTIFACT_HEX_CHARS < MAX_TERMINAL_ARTIFACT_FINAL_BYTES);
+const _: () = assert!(
+    TERMINAL_ARTIFACT_HEADER_BYTES
+        + TERMINAL_ARTIFACT_DESCRIPTOR_BYTES * TERMINAL_ARTIFACT_SECTION_COUNT as usize
+        + MAX_PHYSICAL_STATS_SECTION_BYTES
+        + MAX_CUSTOMER_INTERVAL_SECTION_BYTES
+        + MAX_STOCK_INTERVAL_SECTION_BYTES
+        + MAX_PAYMENT_ENDPOINT_SECTION_BYTES
+        + MAX_RICH_NEW_ORDER_SECTION_BYTES
+        + MAX_RICH_DELIVERY_SECTION_BYTES
+        + MAX_RICH_BAD_CREDIT_SECTION_BYTES
+        + MAX_RICH_HISTORY_SECTION_BYTES
+        <= MAX_TERMINAL_ARTIFACT_RAW_BYTES
+);
 const MAX_ACCUMULATOR_WORDS: u32 = 6;
 const MAX_INTERVAL_SAMPLES: u32 = 64;
 const MAX_RICH_ENTRY_TIMESTAMP_BYTES: usize = 19;
@@ -154,6 +179,17 @@ enum SectionKind {
     RichHistory = 8,
 }
 
+const TERMINAL_ARTIFACT_SECTION_ORDER: [SectionKind; TERMINAL_ARTIFACT_SECTION_COUNT as usize] = [
+    SectionKind::PhysicalStats,
+    SectionKind::CustomerIntervals,
+    SectionKind::StockIntervals,
+    SectionKind::PaymentEndpoints,
+    SectionKind::RichNewOrders,
+    SectionKind::RichDeliveries,
+    SectionKind::RichBadCreditCustomers,
+    SectionKind::RichHistory,
+];
+
 impl SectionKind {
     fn name(self) -> &'static str {
         match self {
@@ -165,6 +201,19 @@ impl SectionKind {
             Self::RichDeliveries => "rich Delivery samples",
             Self::RichBadCreditCustomers => "rich bad-credit Customer samples",
             Self::RichHistory => "rich History samples",
+        }
+    }
+
+    const fn maximum_bytes(self) -> usize {
+        match self {
+            Self::PhysicalStats => MAX_PHYSICAL_STATS_SECTION_BYTES,
+            Self::CustomerIntervals => MAX_CUSTOMER_INTERVAL_SECTION_BYTES,
+            Self::StockIntervals => MAX_STOCK_INTERVAL_SECTION_BYTES,
+            Self::PaymentEndpoints => MAX_PAYMENT_ENDPOINT_SECTION_BYTES,
+            Self::RichNewOrders => MAX_RICH_NEW_ORDER_SECTION_BYTES,
+            Self::RichDeliveries => MAX_RICH_DELIVERY_SECTION_BYTES,
+            Self::RichBadCreditCustomers => MAX_RICH_BAD_CREDIT_SECTION_BYTES,
+            Self::RichHistory => MAX_RICH_HISTORY_SECTION_BYTES,
         }
     }
 }
@@ -257,6 +306,36 @@ pub(crate) enum CoreCodecError {
     DuplicateRichHistoryTuple,
     #[error("invalid canonical rich recovery evidence: {0}")]
     InvalidRichRecovery(#[source] RichRecoveryError),
+    #[error("terminal artifact has invalid magic")]
+    InvalidArtifactMagic,
+    #[error("unsupported terminal artifact version {actual}")]
+    UnsupportedArtifactVersion { actual: u16 },
+    #[error("unsupported terminal evidence policy version {actual}")]
+    UnsupportedTerminalPolicy { actual: u32 },
+    #[error(
+        "terminal artifact section count {actual} does not equal the required fixed count {expected}"
+    )]
+    InvalidArtifactSectionCount { actual: u8, expected: u8 },
+    #[error(
+        "terminal artifact section {position} has kind {actual}, expected canonical {expected}"
+    )]
+    UnexpectedArtifactSection {
+        position: u8,
+        expected: &'static str,
+        actual: u8,
+    },
+    #[error("terminal artifact has invalid trusted binding: {0}")]
+    InvalidArtifactBinding(&'static str),
+    #[error("terminal artifact {field} {actual} does not match trusted outer value {expected}")]
+    ArtifactBindingMismatch {
+        field: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("terminal artifact rich recovery sections disagree on their common header")]
+    MismatchedRichMetadata,
+    #[error("terminal artifact violates a cross-component invariant: {0}")]
+    InvalidTerminalEvidence(#[source] TerminalEvidenceError),
 }
 
 /// A limit-aware writer for fixed-width little-endian canonical values.
@@ -477,6 +556,356 @@ fn lower_hex_nibble(byte: u8) -> Result<u8, CoreCodecError> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         _ => Err(CoreCodecError::InvalidHexDigit),
     }
+}
+
+/// Trusted run identity for one terminal artifact.
+///
+/// The load seed is required to rederive sampled Stock roots; none of these
+/// values is accepted merely because the artifact repeats it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TerminalArtifactBinding {
+    warehouses: u16,
+    sample_seed: u64,
+    load_seed: u64,
+}
+
+impl TerminalArtifactBinding {
+    pub(crate) const fn new(warehouses: u16, sample_seed: u64, load_seed: u64) -> Self {
+        Self {
+            warehouses,
+            sample_seed,
+            load_seed,
+        }
+    }
+}
+
+/// Fully reconstructed, cross-validated terminal oracle.
+pub(crate) struct PersistedTerminalEvidence {
+    policy_version: u32,
+    stats: BoundedPhysicalStats,
+    intervals: SealedIntervalEvidence,
+    payment: PersistedPaymentEndpoints,
+    rich: SealedRichRecoverySamples,
+}
+
+impl PersistedTerminalEvidence {
+    pub(crate) const fn policy_version(&self) -> u32 {
+        self.policy_version
+    }
+
+    pub(crate) fn stats(&self) -> &BoundedPhysicalStats {
+        &self.stats
+    }
+
+    pub(crate) fn intervals(&self) -> &SealedIntervalEvidence {
+        &self.intervals
+    }
+
+    pub(crate) fn payment(&self) -> &PersistedPaymentEndpoints {
+        &self.payment
+    }
+
+    pub(crate) fn rich(&self) -> &SealedRichRecoverySamples {
+        &self.rich
+    }
+}
+
+impl TerminalEvidenceView for PersistedTerminalEvidence {
+    fn policy_version(&self) -> u32 {
+        self.policy_version
+    }
+
+    fn stats(&self) -> &BoundedPhysicalStats {
+        &self.stats
+    }
+
+    fn intervals(&self) -> &SealedIntervalEvidence {
+        &self.intervals
+    }
+
+    fn payment(&self) -> &dyn PaymentEndpointView {
+        &self.payment
+    }
+
+    fn rich(&self) -> &SealedRichRecoverySamples {
+        &self.rich
+    }
+}
+
+/// Encode one complete terminal oracle with exactly one outer lower-hex layer.
+pub(crate) fn encode_terminal_artifact_hex(
+    evidence: &dyn TerminalEvidenceView,
+    binding: TerminalArtifactBinding,
+) -> Result<String, CoreCodecError> {
+    validate_artifact_binding(binding)?;
+    validate_terminal_evidence(evidence).map_err(CoreCodecError::InvalidTerminalEvidence)?;
+    validate_evidence_binding(evidence, binding)?;
+
+    let sections = [
+        (
+            SectionKind::PhysicalStats,
+            encode_physical_stats_section(evidence.stats())?,
+        ),
+        (
+            SectionKind::CustomerIntervals,
+            encode_customer_interval_section(evidence.intervals())?,
+        ),
+        (
+            SectionKind::StockIntervals,
+            encode_stock_interval_section(evidence.intervals())?,
+        ),
+        (
+            SectionKind::PaymentEndpoints,
+            encode_payment_endpoint_section(evidence.payment())?,
+        ),
+        (
+            SectionKind::RichNewOrders,
+            encode_rich_new_order_section(evidence.rich())?,
+        ),
+        (
+            SectionKind::RichDeliveries,
+            encode_rich_delivery_section(evidence.rich())?,
+        ),
+        (
+            SectionKind::RichBadCreditCustomers,
+            encode_rich_bad_credit_section(evidence.rich())?,
+        ),
+        (
+            SectionKind::RichHistory,
+            encode_rich_history_section(evidence.rich())?,
+        ),
+    ];
+    let bytes = encode_terminal_artifact_bytes(evidence.policy_version(), binding, &sections)?;
+    encode_lower_hex(&bytes, MAX_TERMINAL_ARTIFACT_RAW_BYTES)
+}
+
+/// Decode, structurally reconstruct, and cross-validate one terminal oracle.
+pub(crate) fn decode_terminal_artifact_hex(
+    encoded: &str,
+    binding: TerminalArtifactBinding,
+    initial_history: &dyn InitialHistoryProvider,
+    initial_customers: &dyn InitialCustomerDataProvider,
+) -> Result<PersistedTerminalEvidence, CoreCodecError> {
+    validate_artifact_binding(binding)?;
+    let bytes = decode_lower_hex(encoded, MAX_TERMINAL_ARTIFACT_RAW_BYTES)?;
+    decode_terminal_artifact_bytes(&bytes, binding, initial_history, initial_customers)
+}
+
+fn validate_artifact_binding(binding: TerminalArtifactBinding) -> Result<(), CoreCodecError> {
+    if binding.warehouses == 0 || binding.warehouses > OFFICIAL_WAREHOUSES {
+        return Err(CoreCodecError::InvalidArtifactBinding(
+            "warehouses must be in 1..=50",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_evidence_binding(
+    evidence: &dyn TerminalEvidenceView,
+    binding: TerminalArtifactBinding,
+) -> Result<(), CoreCodecError> {
+    if evidence.intervals().warehouses() != binding.warehouses {
+        return Err(CoreCodecError::ArtifactBindingMismatch {
+            field: "warehouse count",
+            expected: u64::from(binding.warehouses),
+            actual: u64::from(evidence.intervals().warehouses()),
+        });
+    }
+    if evidence.intervals().sample_seed() != binding.sample_seed {
+        return Err(CoreCodecError::ArtifactBindingMismatch {
+            field: "sample seed",
+            expected: binding.sample_seed,
+            actual: evidence.intervals().sample_seed(),
+        });
+    }
+    Ok(())
+}
+
+fn encode_terminal_artifact_bytes(
+    policy_version: u32,
+    binding: TerminalArtifactBinding,
+    sections: &[(SectionKind, Vec<u8>); TERMINAL_ARTIFACT_SECTION_COUNT as usize],
+) -> Result<Vec<u8>, CoreCodecError> {
+    let mut writer = CanonicalWriter::new(MAX_TERMINAL_ARTIFACT_RAW_BYTES);
+    writer.put_bytes(&ARTIFACT_MAGIC)?;
+    writer.put_u16(ARTIFACT_VERSION)?;
+    writer.put_u32(policy_version)?;
+    writer.put_u16(binding.warehouses)?;
+    writer.put_u64(binding.sample_seed)?;
+    writer.put_u64(binding.load_seed)?;
+    writer.put_u8(TERMINAL_ARTIFACT_SECTION_COUNT)?;
+    for (position, ((kind, bytes), expected)) in sections
+        .iter()
+        .zip(TERMINAL_ARTIFACT_SECTION_ORDER)
+        .enumerate()
+    {
+        if *kind != expected {
+            return Err(CoreCodecError::UnexpectedArtifactSection {
+                position: u8::try_from(position).expect("eight sections fit u8"),
+                expected: expected.name(),
+                actual: *kind as u8,
+            });
+        }
+        if bytes.len() > kind.maximum_bytes() {
+            return Err(CoreCodecError::OversizedSection {
+                section: kind.name(),
+                actual: bytes.len(),
+                maximum: kind.maximum_bytes(),
+            });
+        }
+        let length = u32::try_from(bytes.len()).map_err(|_| CoreCodecError::OversizedSection {
+            section: kind.name(),
+            actual: bytes.len(),
+            maximum: kind.maximum_bytes(),
+        })?;
+        writer.put_u8(*kind as u8)?;
+        writer.put_u32(length)?;
+        writer.put_bytes(bytes)?;
+    }
+    Ok(writer.finish())
+}
+
+fn decode_terminal_artifact_bytes(
+    bytes: &[u8],
+    binding: TerminalArtifactBinding,
+    initial_history: &dyn InitialHistoryProvider,
+    initial_customers: &dyn InitialCustomerDataProvider,
+) -> Result<PersistedTerminalEvidence, CoreCodecError> {
+    if bytes.len() > MAX_TERMINAL_ARTIFACT_RAW_BYTES {
+        return Err(CoreCodecError::OversizedSection {
+            section: "terminal artifact",
+            actual: bytes.len(),
+            maximum: MAX_TERMINAL_ARTIFACT_RAW_BYTES,
+        });
+    }
+    let mut reader = CanonicalReader::new(bytes);
+    if reader.take(ARTIFACT_MAGIC.len())? != ARTIFACT_MAGIC {
+        return Err(CoreCodecError::InvalidArtifactMagic);
+    }
+    let version = reader.get_u16()?;
+    if version != ARTIFACT_VERSION {
+        return Err(CoreCodecError::UnsupportedArtifactVersion { actual: version });
+    }
+    let policy_version = reader.get_u32()?;
+    if policy_version != TERMINAL_EVIDENCE_POLICY_VERSION {
+        return Err(CoreCodecError::UnsupportedTerminalPolicy {
+            actual: policy_version,
+        });
+    }
+    validate_outer_binding(&mut reader, binding)?;
+    let section_count = reader.get_u8()?;
+    if section_count != TERMINAL_ARTIFACT_SECTION_COUNT {
+        return Err(CoreCodecError::InvalidArtifactSectionCount {
+            actual: section_count,
+            expected: TERMINAL_ARTIFACT_SECTION_COUNT,
+        });
+    }
+
+    // Count and every declared bound are checked before retaining a slice;
+    // the fixed borrowed array requires no section-table allocation.
+    let mut sections: [&[u8]; TERMINAL_ARTIFACT_SECTION_COUNT as usize] =
+        [&[]; TERMINAL_ARTIFACT_SECTION_COUNT as usize];
+    for (position, expected) in TERMINAL_ARTIFACT_SECTION_ORDER.into_iter().enumerate() {
+        let actual = reader.get_u8()?;
+        if actual != expected as u8 {
+            return Err(CoreCodecError::UnexpectedArtifactSection {
+                position: u8::try_from(position).expect("eight sections fit u8"),
+                expected: expected.name(),
+                actual,
+            });
+        }
+        let encoded_length = reader.get_u32()?;
+        let length =
+            usize::try_from(encoded_length).map_err(|_| CoreCodecError::OversizedSection {
+                section: expected.name(),
+                actual: usize::MAX,
+                maximum: expected.maximum_bytes(),
+            })?;
+        if length < SECTION_HEADER_BYTES {
+            return Err(CoreCodecError::InvalidLength {
+                field: expected.name(),
+                actual: length,
+                minimum: SECTION_HEADER_BYTES,
+                maximum: expected.maximum_bytes(),
+            });
+        }
+        if length > expected.maximum_bytes() {
+            return Err(CoreCodecError::OversizedSection {
+                section: expected.name(),
+                actual: length,
+                maximum: expected.maximum_bytes(),
+            });
+        }
+        sections[position] = reader.take(length)?;
+    }
+    reader.finish()?;
+
+    let stats = decode_physical_stats_section(sections[0])?;
+    let intervals = decode_interval_sections(
+        sections[1],
+        sections[2],
+        IntervalSectionBinding::new(binding.warehouses, binding.sample_seed, binding.load_seed),
+    )?;
+    let payment = decode_payment_endpoint_section(sections[3])?;
+    let new_orders = decode_rich_new_order_section(sections[4])?;
+    let deliveries = decode_rich_delivery_section(sections[5])?;
+    let bad_credit = decode_rich_bad_credit_section(sections[6])?;
+    let history = decode_rich_history_section(sections[7])?;
+    if new_orders.header != deliveries.header
+        || new_orders.header != bad_credit.header
+        || new_orders.header != history.header
+    {
+        return Err(CoreCodecError::MismatchedRichMetadata);
+    }
+
+    let rich = SealedRichRecoverySamples::from_canonical_parts(
+        new_orders.header,
+        new_orders.entries.into_iter(),
+        deliveries.entries.into_iter(),
+        bad_credit.entries.into_iter(),
+        history.entries.into_iter(),
+        new_orders.rejected,
+        deliveries.rejected,
+        bad_credit.rejected,
+        history.rejected,
+        &intervals,
+        initial_history,
+        initial_customers,
+    )
+    .map_err(CoreCodecError::InvalidRichRecovery)?;
+    let restored = PersistedTerminalEvidence {
+        policy_version,
+        stats,
+        intervals,
+        payment,
+        rich,
+    };
+    validate_terminal_evidence(&restored).map_err(CoreCodecError::InvalidTerminalEvidence)?;
+    Ok(restored)
+}
+
+fn validate_outer_binding(
+    reader: &mut CanonicalReader<'_>,
+    binding: TerminalArtifactBinding,
+) -> Result<(), CoreCodecError> {
+    for (field, expected, actual) in [
+        (
+            "warehouse count",
+            u64::from(binding.warehouses),
+            u64::from(reader.get_u16()?),
+        ),
+        ("sample seed", binding.sample_seed, reader.get_u64()?),
+        ("load seed", binding.load_seed, reader.get_u64()?),
+    ] {
+        if actual != expected {
+            return Err(CoreCodecError::ArtifactBindingMismatch {
+                field,
+                expected,
+                actual,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn encode_physical_stats_section(
@@ -3308,6 +3737,232 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn terminal_artifact_round_trips_fixed_binary_sections_in_one_lower_hex_frame() {
+        let evidence = empty_terminal_evidence();
+        let binding = terminal_artifact_binding();
+        let encoded = encode_terminal_artifact_hex(&evidence, binding).unwrap();
+        assert!(encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(encoded.len() <= MAX_TERMINAL_ARTIFACT_HEX_CHARS);
+        assert!(encoded.len() < MAX_TERMINAL_ARTIFACT_FINAL_BYTES);
+
+        let raw = decode_lower_hex(&encoded, MAX_TERMINAL_ARTIFACT_RAW_BYTES).unwrap();
+        let mut reader = CanonicalReader::new(&raw);
+        assert_eq!(reader.take(4).unwrap(), ARTIFACT_MAGIC);
+        assert_eq!(reader.get_u16().unwrap(), ARTIFACT_VERSION);
+        assert_eq!(reader.get_u32().unwrap(), TERMINAL_EVIDENCE_POLICY_VERSION);
+        assert_eq!(reader.get_u16().unwrap(), 1);
+        assert_eq!(reader.get_u64().unwrap(), TEST_SAMPLE_SEED);
+        assert_eq!(reader.get_u64().unwrap(), TEST_LOAD_SEED);
+        assert_eq!(reader.get_u8().unwrap(), TERMINAL_ARTIFACT_SECTION_COUNT);
+        for expected in TERMINAL_ARTIFACT_SECTION_ORDER {
+            assert_eq!(reader.get_u8().unwrap(), expected as u8);
+            let length = reader.get_u32().unwrap() as usize;
+            assert!(length <= expected.maximum_bytes());
+            let section = reader.take(length).unwrap();
+            assert_eq!(&section[..4], &SECTION_MAGIC);
+            assert_eq!(section[4], expected as u8);
+        }
+        reader.finish().unwrap();
+
+        let restored = decode_terminal_artifact_hex(
+            &encoded,
+            binding,
+            &no_initial_history,
+            &no_initial_customer,
+        )
+        .unwrap();
+        assert_eq!(restored.policy_version(), TERMINAL_EVIDENCE_POLICY_VERSION);
+        assert_eq!(restored.stats(), evidence.stats());
+        assert_eq!(restored.payment(), evidence.payment());
+        assert_eq!(
+            restored.intervals().customer_update_count(),
+            evidence.intervals().customer_update_count()
+        );
+        assert_eq!(
+            restored.rich().raw_size_bytes(),
+            evidence.rich().raw_size_bytes()
+        );
+        assert_eq!(
+            encode_terminal_artifact_hex(&restored, binding).unwrap(),
+            encoded
+        );
+    }
+
+    #[test]
+    fn terminal_artifact_rejects_count_unknown_duplicate_reorder_missing_and_trailing() {
+        let raw = empty_terminal_artifact_raw();
+        let offsets = terminal_artifact_descriptor_offsets(&raw);
+
+        let mut wrong_count = raw.clone();
+        wrong_count[TERMINAL_ARTIFACT_HEADER_BYTES - 1] = 7;
+        assert!(matches!(
+            decode_empty_terminal_artifact(&wrong_count),
+            Err(CoreCodecError::InvalidArtifactSectionCount {
+                actual: 7,
+                expected: 8
+            })
+        ));
+
+        let mut unknown = raw.clone();
+        unknown[offsets[0]] = 0xff;
+        assert!(matches!(
+            decode_empty_terminal_artifact(&unknown),
+            Err(CoreCodecError::UnexpectedArtifactSection {
+                position: 0,
+                actual: 0xff,
+                ..
+            })
+        ));
+
+        let mut duplicate = raw.clone();
+        duplicate[offsets[1]] = SectionKind::PhysicalStats as u8;
+        assert!(matches!(
+            decode_empty_terminal_artifact(&duplicate),
+            Err(CoreCodecError::UnexpectedArtifactSection { position: 1, .. })
+        ));
+
+        let mut reordered = raw.clone();
+        reordered.swap(offsets[0], offsets[1]);
+        assert!(matches!(
+            decode_empty_terminal_artifact(&reordered),
+            Err(CoreCodecError::UnexpectedArtifactSection { position: 0, .. })
+        ));
+
+        assert!(matches!(
+            decode_empty_terminal_artifact(&raw[..raw.len() - 1]),
+            Err(CoreCodecError::Truncated)
+        ));
+        let mut trailing = raw;
+        trailing.push(0);
+        assert!(matches!(
+            decode_empty_terminal_artifact(&trailing),
+            Err(CoreCodecError::TrailingBytes { remaining: 1 })
+        ));
+    }
+
+    #[test]
+    fn terminal_artifact_prechecks_limits_hex_and_trusted_bindings() {
+        let mut raw = empty_terminal_artifact_raw();
+        let first = terminal_artifact_descriptor_offsets(&raw)[0];
+        raw[first + 1..first + 5].copy_from_slice(
+            &u32::try_from(MAX_PHYSICAL_STATS_SECTION_BYTES + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert!(matches!(
+            decode_empty_terminal_artifact(&raw),
+            Err(CoreCodecError::OversizedSection {
+                section: "physical statistics",
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode_empty_terminal_artifact(&vec![0; MAX_TERMINAL_ARTIFACT_RAW_BYTES + 1]),
+            Err(CoreCodecError::OversizedSection {
+                section: "terminal artifact",
+                ..
+            })
+        ));
+
+        let valid =
+            encode_terminal_artifact_hex(&empty_terminal_evidence(), terminal_artifact_binding())
+                .unwrap();
+        assert!(matches!(
+            decode_terminal_artifact_hex(
+                &valid.to_ascii_uppercase(),
+                terminal_artifact_binding(),
+                &no_initial_history,
+                &no_initial_customer
+            ),
+            Err(CoreCodecError::InvalidHexDigit)
+        ));
+        assert!(matches!(
+            decode_terminal_artifact_hex(
+                &valid[..valid.len() - 1],
+                terminal_artifact_binding(),
+                &no_initial_history,
+                &no_initial_customer
+            ),
+            Err(CoreCodecError::InvalidHexLength)
+        ));
+
+        let raw = empty_terminal_artifact_raw();
+        assert!(matches!(
+            decode_terminal_artifact_bytes(
+                &raw,
+                TerminalArtifactBinding::new(1, TEST_SAMPLE_SEED ^ 1, TEST_LOAD_SEED),
+                &no_initial_history,
+                &no_initial_customer
+            ),
+            Err(CoreCodecError::ArtifactBindingMismatch {
+                field: "sample seed",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn terminal_artifact_matches_rich_headers_and_cross_validates_restored_view() {
+        use crate::ranking::payment_endpoints::{DISTRICT_YTD_ROOT_BITS, WAREHOUSE_YTD_ROOT_BITS};
+
+        let mut mismatched_rich = empty_terminal_artifact_raw();
+        let delivery_descriptor = terminal_artifact_descriptor_offsets(&mismatched_rich)[5];
+        let rich_seed_offset =
+            delivery_descriptor + TERMINAL_ARTIFACT_DESCRIPTOR_BYTES + SECTION_HEADER_BYTES + 2;
+        mismatched_rich[rich_seed_offset] ^= 1;
+        assert!(matches!(
+            decode_empty_terminal_artifact(&mismatched_rich),
+            Err(CoreCodecError::MismatchedRichMetadata)
+        ));
+
+        let one_payment = PersistedPaymentEndpoints::from_canonical_endpoints(
+            1,
+            1,
+            1,
+            1,
+            vec![((f32::from_bits(WAREHOUSE_YTD_ROOT_BITS) + 1.0).to_bits(), 1)],
+            {
+                let mut districts =
+                    vec![(DISTRICT_YTD_ROOT_BITS, 0); PAYMENT_DISTRICTS_PER_WAREHOUSE as usize];
+                districts[0] = ((f32::from_bits(DISTRICT_YTD_ROOT_BITS) + 1.0).to_bits(), 1);
+                districts
+            },
+        )
+        .unwrap();
+        let mut raw = empty_terminal_artifact_raw();
+        let replacement = encode_payment_endpoint_section(&one_payment).unwrap();
+        let descriptor = terminal_artifact_descriptor_offsets(&raw)[3];
+        let encoded_length =
+            u32::from_le_bytes(raw[descriptor + 1..descriptor + 5].try_into().unwrap()) as usize;
+        assert_eq!(replacement.len(), encoded_length);
+        raw[descriptor + TERMINAL_ARTIFACT_DESCRIPTOR_BYTES
+            ..descriptor + TERMINAL_ARTIFACT_DESCRIPTOR_BYTES + encoded_length]
+            .copy_from_slice(&replacement);
+        assert!(matches!(
+            decode_empty_terminal_artifact(&raw),
+            Err(CoreCodecError::InvalidTerminalEvidence(
+                TerminalEvidenceError::CrossInvariant(_)
+            ))
+        ));
+
+        let invalid = PersistedTerminalEvidence {
+            policy_version: TERMINAL_EVIDENCE_POLICY_VERSION,
+            stats: BoundedPhysicalStats::default(),
+            intervals: empty_rich_intervals(),
+            payment: one_payment,
+            rich: empty_rich_samples(&empty_rich_intervals()),
+        };
+        assert!(matches!(
+            encode_terminal_artifact_hex(&invalid, terminal_artifact_binding()),
+            Err(CoreCodecError::InvalidTerminalEvidence(
+                TerminalEvidenceError::CrossInvariant(_)
+            ))
+        ));
+    }
+
     fn empty_rich_intervals() -> SealedIntervalEvidence {
         IntervalCollector::new(1, 1, TEST_SAMPLE_SEED, |_key: StockKey| None)
             .unwrap()
@@ -3347,6 +4002,78 @@ mod tests {
             &no_customer,
         )
         .unwrap()
+    }
+
+    fn empty_terminal_evidence() -> PersistedTerminalEvidence {
+        use crate::ranking::payment_endpoints::{DISTRICT_YTD_ROOT_BITS, WAREHOUSE_YTD_ROOT_BITS};
+
+        let intervals = empty_rich_intervals();
+        let rich = empty_rich_samples(&intervals);
+        let payment = PersistedPaymentEndpoints::from_canonical_endpoints(
+            1,
+            0,
+            0,
+            0,
+            vec![(WAREHOUSE_YTD_ROOT_BITS, 0)],
+            vec![(DISTRICT_YTD_ROOT_BITS, 0); PAYMENT_DISTRICTS_PER_WAREHOUSE as usize],
+        )
+        .unwrap();
+        let evidence = PersistedTerminalEvidence {
+            policy_version: TERMINAL_EVIDENCE_POLICY_VERSION,
+            stats: BoundedPhysicalStats::default(),
+            intervals,
+            payment,
+            rich,
+        };
+        validate_terminal_evidence(&evidence).unwrap();
+        evidence
+    }
+
+    fn terminal_artifact_binding() -> TerminalArtifactBinding {
+        TerminalArtifactBinding::new(1, TEST_SAMPLE_SEED, TEST_LOAD_SEED)
+    }
+
+    fn empty_terminal_artifact_raw() -> Vec<u8> {
+        let encoded =
+            encode_terminal_artifact_hex(&empty_terminal_evidence(), terminal_artifact_binding())
+                .unwrap();
+        decode_lower_hex(&encoded, MAX_TERMINAL_ARTIFACT_RAW_BYTES).unwrap()
+    }
+
+    fn terminal_artifact_descriptor_offsets(raw: &[u8]) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(TERMINAL_ARTIFACT_SECTION_COUNT as usize);
+        let mut offset = TERMINAL_ARTIFACT_HEADER_BYTES;
+        for _ in 0..TERMINAL_ARTIFACT_SECTION_COUNT {
+            offsets.push(offset);
+            let length =
+                u32::from_le_bytes(raw[offset + 1..offset + 5].try_into().unwrap()) as usize;
+            offset += TERMINAL_ARTIFACT_DESCRIPTOR_BYTES + length;
+        }
+        assert_eq!(offset, raw.len());
+        offsets
+    }
+
+    fn decode_empty_terminal_artifact(
+        raw: &[u8],
+    ) -> Result<PersistedTerminalEvidence, CoreCodecError> {
+        decode_terminal_artifact_bytes(
+            raw,
+            terminal_artifact_binding(),
+            &no_initial_history,
+            &no_initial_customer,
+        )
+    }
+
+    fn no_initial_history(
+        _key: CustomerKey,
+    ) -> Option<crate::ranking::rich_recovery_samples::InitialHistoryRow> {
+        None
+    }
+
+    fn no_initial_customer(
+        _key: CustomerKey,
+    ) -> Option<crate::ranking::rich_recovery_samples::InitialCustomerData> {
+        None
     }
 
     fn restore_new_order_only(
