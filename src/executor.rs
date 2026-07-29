@@ -23,6 +23,7 @@ use crate::ranking::ledger::{LedgerError, RunLedger};
 use crate::ranking::runner::RankedTransactionOutcome;
 use crate::ranking::session::open_ranked_session;
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
+use crate::transaction::TransactionType;
 use crate::workload::Final2026Workload;
 
 #[derive(Default)]
@@ -556,10 +557,15 @@ impl Final2026RunResult {
             let window = &self.windows[index];
             let gate = &self.summary.window_gates[index];
             println!(
-                "window{}: new_order_per_min={:.3}, committed={}, expected_rollback={}, retry_abort={}, abandoned={}, grace_tail={}, delivery_processed={}, warehouses={}/{}, gate={}",
+                "window{}: new_order_per_min={:.3}, committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, retry_abort={}, abandoned={}, grace_tail={}, delivery_processed={}, warehouses={}/{}, gate={}",
                 index + 1,
                 self.window_rates[index],
                 window.committed,
+                window.transaction_commits(TransactionType::NewOrder),
+                window.transaction_commits(TransactionType::Payment),
+                window.transaction_commits(TransactionType::OrderStatus),
+                window.transaction_commits(TransactionType::Delivery),
+                window.transaction_commits(TransactionType::StockLevel),
                 window.expected_rollbacks,
                 window.retry_aborts,
                 window.abandoned,
@@ -573,6 +579,11 @@ impl Final2026RunResult {
         println!(
             "ranked_new_order_per_min_median={:.3}",
             self.median_new_order_per_minute
+        );
+        println!(
+            "new_order_latency_ms=p50:{},p99:{}",
+            format_latency(self.summary.new_order_latency_p50),
+            format_latency(self.summary.new_order_latency_p99)
         );
         println!(
             "combined_coverage={}/{}, combined_gate={}",
@@ -590,11 +601,23 @@ impl Final2026RunResult {
     }
 }
 
+fn format_latency(value: Option<Duration>) -> String {
+    value
+        .map(|duration| format!("{:.3}", duration.as_secs_f64() * 1_000.0))
+        .unwrap_or_else(|| "unavailable".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    #[test]
+    fn latency_report_preserves_fractional_milliseconds_and_empty_samples() {
+        assert_eq!(format_latency(Some(Duration::from_micros(1_234))), "1.234");
+        assert_eq!(format_latency(None), "unavailable");
+    }
 
     #[tokio::test]
     async fn worker_tasks_wait_for_explicit_timing_release_after_ready() {
