@@ -1410,6 +1410,129 @@ pub fn validate_relative_update_chain(
     Ok(())
 }
 
+/// Infer and validate the terminal value of an unordered relative-update chain.
+///
+/// The graph must contain every supplied edge in one trail rooted at the
+/// caller's known load/checkpoint value. A stale lost update normally creates
+/// two outgoing edges from the same committed value; without a matching
+/// serialized predecessor/successor, that fork cannot form this complete
+/// trail and is rejected. Every edge is also checked as one binary32 RNE add.
+pub fn validate_relative_update_chain_from_initial(
+    initial_bits: u32,
+    updates: &[RelativeUpdateEvidence],
+) -> Result<u32, FloatError> {
+    require_finite(initial_bits)?;
+    if updates.is_empty() {
+        return Ok(canonical_zero(initial_bits));
+    }
+
+    let start = canonical_zero(initial_bits);
+    let mut balance: BTreeMap<u32, i64> = BTreeMap::new();
+    for update in updates {
+        validate_relative_add(
+            update.before_bits,
+            update.bound_amount_bits,
+            update.after_bits,
+        )?;
+        let before = canonical_zero(update.before_bits);
+        let after = canonical_zero(update.after_bits);
+        *balance.entry(before).or_default() += 1;
+        *balance.entry(after).or_default() -= 1;
+    }
+
+    let mut end = None;
+    for (node, degree) in &balance {
+        if *node == start {
+            if *degree == 0 {
+                continue;
+            }
+            if *degree != 1 {
+                return Err(FloatError::BrokenUpdateChain {
+                    expected_final_bits: start,
+                    observed_final_bits: *node,
+                    used_updates: 0,
+                    total_updates: updates.len(),
+                });
+            }
+        } else if *degree == -1 && end.is_none() {
+            end = Some(*node);
+        } else if *degree != 0 {
+            return Err(FloatError::BrokenUpdateChain {
+                expected_final_bits: start,
+                observed_final_bits: *node,
+                used_updates: 0,
+                total_updates: updates.len(),
+            });
+        }
+    }
+
+    let endpoint = end.unwrap_or(start);
+    validate_relative_update_chain(initial_bits, endpoint, updates)?;
+    Ok(endpoint)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CounterChainError {
+    Overflow,
+    InvalidEdge { before: i32, after: i32 },
+    DuplicatePredecessor(i32),
+    MissingPredecessor(i32),
+}
+
+impl fmt::Display for CounterChainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Overflow => write!(f, "counter chain overflowed INT32"),
+            Self::InvalidEdge { before, after } => {
+                write!(f, "counter edge {before}->{after} is not exactly +1")
+            }
+            Self::DuplicatePredecessor(value) => {
+                write!(f, "counter chain forks from duplicate predecessor {value}")
+            }
+            Self::MissingPredecessor(value) => {
+                write!(f, "counter chain is disconnected at predecessor {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CounterChainError {}
+
+/// Validate an unordered set of `before -> before + 1` counter edges.
+///
+/// Counts make stale forks unambiguous: two committed writers reporting the
+/// same predecessor are rejected even if their associated FLOAT32 value did
+/// not change because of rounding.
+pub fn validate_increment_chain(
+    initial: i32,
+    updates: &[(i32, i32)],
+) -> Result<i32, CounterChainError> {
+    let mut by_before = BTreeMap::new();
+    for (before, after) in updates {
+        let expected = before.checked_add(1).ok_or(CounterChainError::Overflow)?;
+        if *after != expected {
+            return Err(CounterChainError::InvalidEdge {
+                before: *before,
+                after: *after,
+            });
+        }
+        if by_before.insert(*before, *after).is_some() {
+            return Err(CounterChainError::DuplicatePredecessor(*before));
+        }
+    }
+
+    let mut current = initial;
+    for _ in 0..updates.len() {
+        current = by_before
+            .remove(&current)
+            .ok_or(CounterChainError::MissingPredecessor(current))?;
+    }
+    if let Some((&before, _)) = by_before.first_key_value() {
+        return Err(CounterChainError::MissingPredecessor(before));
+    }
+    Ok(current)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum FloatError {
     NonFinite(u32),
@@ -1418,6 +1541,7 @@ pub enum FloatError {
     NegativeExactSum(f64),
     TooManyTerms(u64),
     ArithmeticOverflow,
+    InvalidAccumulator(&'static str),
     BoundaryMismatch {
         aggregate: FloatAggregateId,
         actual_bits: u32,
@@ -1456,6 +1580,9 @@ impl fmt::Display for FloatError {
                 "large-set boundary supports at most 2^53 terms, got {count}"
             ),
             Self::ArithmeticOverflow => write!(f, "FLOAT32 operation overflowed"),
+            Self::InvalidAccumulator(reason) => {
+                write!(f, "invalid non-negative FLOAT32 accumulator: {reason}")
+            }
             Self::BoundaryMismatch {
                 aggregate,
                 actual_bits,
@@ -1586,6 +1713,133 @@ impl LargeSetBoundary {
     }
 }
 
+const MAX_ACCUMULATOR_TERMS: u64 = 1_u64 << 53;
+const MAX_ACCUMULATOR_WORDS: usize = 6;
+
+/// Mergeable exact sum of non-negative binary32 inputs.
+///
+/// The little-endian words encode an integer in units of 2^-149. Together
+/// with `term_count`, this is sufficient to persist and later reproduce the
+/// published rank-scale boundary without decimal formatting or an
+/// order-dependent binary64 sum.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NonNegativeF32Accumulator {
+    term_count: u64,
+    exact: PositiveF32Sum,
+}
+
+impl NonNegativeF32Accumulator {
+    pub fn term_count(&self) -> u64 {
+        self.term_count
+    }
+
+    pub fn add_bits(&mut self, bits: u32) -> Result<(), FloatError> {
+        let value = require_finite(bits)?;
+        if value < 0.0 {
+            return Err(FloatError::NegativeInput(bits));
+        }
+        let next = self
+            .term_count
+            .checked_add(1)
+            .ok_or(FloatError::ArithmeticOverflow)?;
+        if next > MAX_ACCUMULATOR_TERMS {
+            return Err(FloatError::TooManyTerms(next));
+        }
+        self.exact.add_bits(bits);
+        self.term_count = next;
+        Ok(())
+    }
+
+    pub fn extend_bits<I>(&mut self, values: I) -> Result<(), FloatError>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        for bits in values {
+            self.add_bits(bits)?;
+        }
+        Ok(())
+    }
+
+    pub fn add_repeated_bits(&mut self, bits: u32, count: u64) -> Result<(), FloatError> {
+        let value = require_finite(bits)?;
+        if value < 0.0 {
+            return Err(FloatError::NegativeInput(bits));
+        }
+        let next = self
+            .term_count
+            .checked_add(count)
+            .ok_or(FloatError::ArithmeticOverflow)?;
+        if next > MAX_ACCUMULATOR_TERMS {
+            return Err(FloatError::TooManyTerms(next));
+        }
+        let mut term = PositiveF32Sum::default();
+        term.add_bits(bits);
+        self.exact.add_sum(&term.mul_u64(count));
+        self.term_count = next;
+        Ok(())
+    }
+
+    pub fn merge(&mut self, other: &Self) -> Result<(), FloatError> {
+        let next = self
+            .term_count
+            .checked_add(other.term_count)
+            .ok_or(FloatError::ArithmeticOverflow)?;
+        if next > MAX_ACCUMULATOR_TERMS {
+            return Err(FloatError::TooManyTerms(next));
+        }
+        self.exact.add_sum(&other.exact);
+        self.term_count = next;
+        Ok(())
+    }
+
+    pub fn boundary(&self) -> Result<LargeSetBoundary, FloatError> {
+        boundary_from_exact(&self.exact, self.term_count)
+    }
+
+    /// Return `(term_count, exact little-endian 64-bit words)`.
+    pub fn to_words(&self) -> (u64, Vec<u64>) {
+        (self.term_count, self.exact.limbs.clone())
+    }
+
+    /// Restore a canonical accumulator representation.
+    ///
+    /// Trailing zero words, impossible sums for the supplied term count, and
+    /// counts above the public 2^53 bound are rejected.
+    pub fn from_words(term_count: u64, words: &[u64]) -> Result<Self, FloatError> {
+        if term_count > MAX_ACCUMULATOR_TERMS {
+            return Err(FloatError::TooManyTerms(term_count));
+        }
+        if words.len() > MAX_ACCUMULATOR_WORDS {
+            return Err(FloatError::InvalidAccumulator(
+                "exact sum contains too many words",
+            ));
+        }
+        if words.last() == Some(&0) {
+            return Err(FloatError::InvalidAccumulator(
+                "words must not contain a trailing zero",
+            ));
+        }
+        if term_count == 0 && !words.is_empty() {
+            return Err(FloatError::InvalidAccumulator(
+                "zero terms must have a zero exact sum",
+            ));
+        }
+
+        let exact = PositiveF32Sum {
+            limbs: words.to_vec(),
+        };
+        let mut maximum_term = PositiveF32Sum::default();
+        maximum_term.add_bits(f32::MAX.to_bits());
+        let maximum = maximum_term.mul_u64(term_count);
+        if exact.greater_than(&maximum) {
+            return Err(FloatError::InvalidAccumulator(
+                "exact sum exceeds term_count * FLOAT32_MAX",
+            ));
+        }
+        Ok(Self { term_count, exact })
+    }
+}
+
 /// Published rank-scale non-negative ledger boundary.
 ///
 /// `exact_sum` is the caller ledger's exact-real sum represented as binary64.
@@ -1636,31 +1890,22 @@ pub fn large_set_boundary_from_f32<I>(values: I) -> Result<LargeSetBoundary, Flo
 where
     I: IntoIterator<Item = u32>,
 {
-    const DENOMINATOR: u64 = 1_u64 << 53;
+    let mut accumulator = NonNegativeF32Accumulator::default();
+    accumulator.extend_bits(values)?;
+    accumulator.boundary()
+}
 
-    let mut exact = PositiveF32Sum::default();
-    let mut term_count = 0_u64;
-    for bits in values {
-        let value = require_finite(bits)?;
-        if value < 0.0 {
-            return Err(FloatError::NegativeInput(bits));
-        }
-        term_count = term_count
-            .checked_add(1)
-            .ok_or(FloatError::ArithmeticOverflow)?;
-        if term_count > DENOMINATOR {
-            return Err(FloatError::TooManyTerms(term_count));
-        }
-        exact.add_bits(bits);
-    }
-
+fn boundary_from_exact(
+    exact: &PositiveF32Sum,
+    term_count: u64,
+) -> Result<LargeSetBoundary, FloatError> {
     let sum_for_diagnostics = exact.to_f64();
     if !sum_for_diagnostics.is_finite() {
         return Err(FloatError::ArithmeticOverflow);
     }
     let error_bound_for_diagnostics = (term_count as f64) * 2.0_f64.powi(-53) * sum_for_diagnostics;
-    let lower = exact.mul_u64(DENOMINATOR - term_count);
-    let upper = exact.mul_u64(DENOMINATOR + term_count);
+    let lower = exact.mul_u64(MAX_ACCUMULATOR_TERMS - term_count);
+    let upper = exact.mul_u64(MAX_ACCUMULATOR_TERMS + term_count);
     // exact uses units of 2^-149 and the endpoint factor has denominator 2^53.
     let lower_bits = round_positive_binary_to_f32(&lower, -202)?;
     let upper_bits = round_positive_binary_to_f32(&upper, -202)?;
@@ -1740,6 +1985,23 @@ impl PositiveF32Sum {
         self.trim();
     }
 
+    fn add_sum(&mut self, other: &Self) {
+        let required = self.limbs.len().max(other.limbs.len());
+        self.limbs.resize(required, 0);
+        let mut carry = 0_u128;
+        for index in 0..required {
+            let sum = u128::from(self.limbs[index])
+                + u128::from(other.limbs.get(index).copied().unwrap_or(0))
+                + carry;
+            self.limbs[index] = sum as u64;
+            carry = sum >> 64;
+        }
+        if carry != 0 {
+            self.limbs.push(carry as u64);
+        }
+        self.trim();
+    }
+
     fn mul_u64(&self, multiplier: u64) -> Self {
         if multiplier == 0 || self.is_zero() {
             return Self::default();
@@ -1755,6 +2017,18 @@ impl PositiveF32Sum {
             result.push(carry as u64);
         }
         Self { limbs: result }
+    }
+
+    fn greater_than(&self, other: &Self) -> bool {
+        if self.limbs.len() != other.limbs.len() {
+            return self.limbs.len() > other.limbs.len();
+        }
+        self.limbs
+            .iter()
+            .rev()
+            .zip(other.limbs.iter().rev())
+            .find_map(|(left, right)| (left != right).then_some(left > right))
+            .unwrap_or(false)
     }
 
     fn is_zero(&self) -> bool {
@@ -1949,4 +2223,79 @@ fn add_to_count(
         .expect("internal table count must be present");
     *current = checked_add(*current, delta, table)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mergeable_accumulator_round_trips_canonical_words() {
+        let mut left = NonNegativeF32Accumulator::default();
+        left.add_repeated_bits(10.0_f32.to_bits(), 1_500_000)
+            .unwrap();
+        let mut right = NonNegativeF32Accumulator::default();
+        right
+            .extend_bits([1.25_f32.to_bits(), 2.5_f32.to_bits()])
+            .unwrap();
+        left.merge(&right).unwrap();
+
+        let (terms, words) = left.to_words();
+        let restored = NonNegativeF32Accumulator::from_words(terms, &words).unwrap();
+        assert_eq!(restored, left);
+        assert_eq!(restored.boundary().unwrap(), left.boundary().unwrap());
+
+        let mut non_canonical = words.clone();
+        non_canonical.push(0);
+        assert!(NonNegativeF32Accumulator::from_words(terms, &non_canonical).is_err());
+        assert!(NonNegativeF32Accumulator::from_words(0, &[1]).is_err());
+    }
+
+    #[test]
+    fn accumulator_merge_matches_streaming_exact_sum() {
+        let values = [
+            f32::from_bits(1).to_bits(),
+            1.0_f32.to_bits(),
+            1234.5_f32.to_bits(),
+            0.0_f32.to_bits(),
+        ];
+        let mut first = NonNegativeF32Accumulator::default();
+        first.extend_bits(values[..2].iter().copied()).unwrap();
+        let mut second = NonNegativeF32Accumulator::default();
+        second.extend_bits(values[2..].iter().copied()).unwrap();
+        first.merge(&second).unwrap();
+        assert_eq!(
+            first.boundary().unwrap(),
+            large_set_boundary_from_f32(values).unwrap()
+        );
+    }
+
+    #[test]
+    fn inferred_relative_chain_rejects_stale_fork() {
+        let edge = |before: f32, delta: f32, after: f32| RelativeUpdateEvidence {
+            before_bits: before.to_bits(),
+            bound_amount_bits: delta.to_bits(),
+            after_bits: after.to_bits(),
+        };
+        let serialized = [edge(100.0, 1.0, 101.0), edge(101.0, 2.0, 103.0)];
+        assert_eq!(
+            validate_relative_update_chain_from_initial(100.0_f32.to_bits(), &serialized).unwrap(),
+            103.0_f32.to_bits()
+        );
+
+        let stale_fork = [edge(100.0, 1.0, 101.0), edge(100.0, 2.0, 102.0)];
+        assert!(
+            validate_relative_update_chain_from_initial(100.0_f32.to_bits(), &stale_fork).is_err()
+        );
+    }
+
+    #[test]
+    fn counter_chain_rejects_duplicate_predecessor() {
+        assert_eq!(validate_increment_chain(1, &[(2, 3), (1, 2)]), Ok(3));
+        assert_eq!(
+            validate_increment_chain(1, &[(1, 2), (1, 2)]),
+            Err(CounterChainError::DuplicatePredecessor(1))
+        );
+        assert!(validate_increment_chain(1, &[(2, 3)]).is_err());
+    }
 }
