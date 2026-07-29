@@ -21,8 +21,8 @@ use super::common::{
     row_int32, BatchResults, SemanticResult, SemanticResultExt, SemanticViolation,
 };
 use super::runner::{
-    execute_batch, semantic_or_abort, PaymentEvidence, RankedCommit, RankedTransactionError,
-    RankedTransactionOutcome,
+    execute_batch, semantic_or_abort, CustomerVersion, PaymentEvidence, RankedCommit,
+    RankedTransactionError, RankedTransactionOutcome,
 };
 
 const STAGE_ONE_WAREHOUSE_BEFORE: usize = 1;
@@ -117,8 +117,14 @@ pub async fn execute(
             customer_balance_after_bits: customer_after.balance_bits,
             customer_ytd_before_bits: snapshot.customer.ytd_payment_bits,
             customer_ytd_after_bits: customer_after.ytd_payment_bits,
-            customer_payment_count_before: snapshot.customer.payment_count,
-            customer_payment_count_after: customer_after.payment_count,
+            customer_version_before: CustomerVersion {
+                payment_count: snapshot.customer.payment_count,
+                delivery_count: snapshot.customer.delivery_count,
+            },
+            customer_version_after: CustomerVersion {
+                payment_count: customer_after.payment_count,
+                delivery_count: customer_after.delivery_count,
+            },
         },
     )))
 }

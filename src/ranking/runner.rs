@@ -22,6 +22,18 @@ pub struct NewOrderEvidence {
     pub line_amount_bits: Vec<u32>,
 }
 
+/// The two counters jointly identify one logical customer-row predecessor.
+///
+/// Payment advances only `payment_count`; Delivery advances only
+/// `delivery_count`. Recording both values before and after each update makes
+/// stale cross-family writers visible even when a FLOAT32 balance update
+/// rounds to a self-loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustomerVersion {
+    pub payment_count: i32,
+    pub delivery_count: i32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentEvidence {
     pub warehouse_id: u16,
@@ -38,8 +50,8 @@ pub struct PaymentEvidence {
     pub customer_balance_after_bits: u32,
     pub customer_ytd_before_bits: u32,
     pub customer_ytd_after_bits: u32,
-    pub customer_payment_count_before: i32,
-    pub customer_payment_count_after: i32,
+    pub customer_version_before: CustomerVersion,
+    pub customer_version_after: CustomerVersion,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,8 +64,8 @@ pub struct DeliveredOrderEvidence {
     pub amount_bits: u32,
     pub customer_balance_before_bits: u32,
     pub customer_balance_after_bits: u32,
-    pub customer_delivery_count_before: i32,
-    pub customer_delivery_count_after: i32,
+    pub customer_version_before: CustomerVersion,
+    pub customer_version_after: CustomerVersion,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,8 +188,14 @@ mod tests {
                 amount_bits: 1.0_f32.to_bits(),
                 customer_balance_before_bits: 0.0_f32.to_bits(),
                 customer_balance_after_bits: 1.0_f32.to_bits(),
-                customer_delivery_count_before: 0,
-                customer_delivery_count_after: 1,
+                customer_version_before: CustomerVersion {
+                    payment_count: 1,
+                    delivery_count: 0,
+                },
+                customer_version_after: CustomerVersion {
+                    payment_count: 1,
+                    delivery_count: 1,
+                },
             }])
             .delivery_processed(),
             1

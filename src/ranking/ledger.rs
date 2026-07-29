@@ -19,9 +19,9 @@ use crate::workload::{
     MAX_ORDER_LINES, MIN_CARRIER_ID, MIN_ITEM_QUANTITY, MIN_ORDER_LINES,
 };
 
-use super::runner::{RankedCommit, RankedTransactionOutcome};
+use super::runner::{CustomerVersion, RankedCommit, RankedTransactionOutcome};
 
-const FORMAT_HEADER: &str = "RMDB_TPCC_RUN_LEDGER_V1";
+const FORMAT_HEADER: &str = "RMDB_TPCC_RUN_LEDGER_V2";
 const PARTITION_COUNT: usize = (FINAL_WAREHOUSES as usize) * (DISTRICTS_PER_WAREHOUSE as usize);
 
 const GLOBAL_FIELDS: [&str; 15] = [
@@ -235,6 +235,8 @@ pub struct PaymentDelta {
     pub customer_ytd_after_bits: u32,
     pub customer_payment_count_before: i32,
     pub customer_payment_count_after: i32,
+    pub customer_delivery_count_before: i32,
+    pub customer_delivery_count_after: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -246,6 +248,8 @@ pub struct DeliveredOrderDelta {
     pub customer_amount_bits: u32,
     pub customer_balance_before_bits: u32,
     pub customer_balance_after_bits: u32,
+    pub customer_payment_count_before: i32,
+    pub customer_payment_count_after: i32,
     pub customer_delivery_count_before: i32,
     pub customer_delivery_count_after: i32,
 }
@@ -359,8 +363,14 @@ impl LedgerEvent {
                     customer_balance_after_bits: delta.customer_balance_after_bits,
                     customer_ytd_before_bits: delta.customer_ytd_before_bits,
                     customer_ytd_after_bits: delta.customer_ytd_after_bits,
-                    customer_payment_count_before: delta.customer_payment_count_before,
-                    customer_payment_count_after: delta.customer_payment_count_after,
+                    customer_version_before: CustomerVersion {
+                        payment_count: delta.customer_payment_count_before,
+                        delivery_count: delta.customer_delivery_count_before,
+                    },
+                    customer_version_after: CustomerVersion {
+                        payment_count: delta.customer_payment_count_after,
+                        delivery_count: delta.customer_delivery_count_after,
+                    },
                 },
             )),
             Self::Delivery(delta) => RankedTransactionOutcome::Committed(RankedCommit::Delivery(
@@ -376,8 +386,14 @@ impl LedgerEvent {
                         amount_bits: order.customer_amount_bits,
                         customer_balance_before_bits: order.customer_balance_before_bits,
                         customer_balance_after_bits: order.customer_balance_after_bits,
-                        customer_delivery_count_before: order.customer_delivery_count_before,
-                        customer_delivery_count_after: order.customer_delivery_count_after,
+                        customer_version_before: CustomerVersion {
+                            payment_count: order.customer_payment_count_before,
+                            delivery_count: order.customer_delivery_count_before,
+                        },
+                        customer_version_after: CustomerVersion {
+                            payment_count: order.customer_payment_count_after,
+                            delivery_count: order.customer_delivery_count_after,
+                        },
                     })
                     .collect(),
             )),
@@ -516,8 +532,10 @@ fn event_from_ticket(
                 customer_balance_after_bits: evidence.customer_balance_after_bits,
                 customer_ytd_before_bits: evidence.customer_ytd_before_bits,
                 customer_ytd_after_bits: evidence.customer_ytd_after_bits,
-                customer_payment_count_before: evidence.customer_payment_count_before,
-                customer_payment_count_after: evidence.customer_payment_count_after,
+                customer_payment_count_before: evidence.customer_version_before.payment_count,
+                customer_payment_count_after: evidence.customer_version_after.payment_count,
+                customer_delivery_count_before: evidence.customer_version_before.delivery_count,
+                customer_delivery_count_after: evidence.customer_version_after.delivery_count,
             })
         }
         (
@@ -543,8 +561,10 @@ fn event_from_ticket(
                     customer_amount_bits: order.amount_bits,
                     customer_balance_before_bits: order.customer_balance_before_bits,
                     customer_balance_after_bits: order.customer_balance_after_bits,
-                    customer_delivery_count_before: order.customer_delivery_count_before,
-                    customer_delivery_count_after: order.customer_delivery_count_after,
+                    customer_payment_count_before: order.customer_version_before.payment_count,
+                    customer_payment_count_after: order.customer_version_after.payment_count,
+                    customer_delivery_count_before: order.customer_version_before.delivery_count,
+                    customer_delivery_count_after: order.customer_version_after.delivery_count,
                 });
             }
             LedgerEvent::Delivery(DeliveryDelta {
@@ -657,6 +677,11 @@ fn validate_payment_delta(delta: &PaymentDelta) -> Result<(), LedgerError> {
         "Payment customer c_payment_cnt",
         delta.customer_payment_count_before,
         delta.customer_payment_count_after,
+    )?;
+    validate_unchanged(
+        "Payment customer c_delivery_cnt",
+        delta.customer_delivery_count_before,
+        delta.customer_delivery_count_after,
     )
 }
 
@@ -710,6 +735,11 @@ fn validate_delivery_delta(delta: &DeliveryDelta) -> Result<(), LedgerError> {
             "Delivery customer c_delivery_cnt",
             order.customer_delivery_count_before,
             order.customer_delivery_count_after,
+        )?;
+        validate_unchanged(
+            "Delivery customer c_payment_cnt",
+            order.customer_payment_count_before,
+            order.customer_payment_count_after,
         )?;
     }
     Ok(())
@@ -783,6 +813,20 @@ fn validate_increment(field: &'static str, before: i32, after: i32) -> Result<()
     if after != expected {
         return Err(LedgerError::Inconsistent(format!(
             "{field} is not exactly before + 1"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_unchanged(field: &'static str, before: i32, after: i32) -> Result<(), LedgerError> {
+    if before < 0 || after < 0 {
+        return Err(LedgerError::InvalidEvidence(
+            "customer transaction count must be non-negative",
+        ));
+    }
+    if before != after {
+        return Err(LedgerError::Inconsistent(format!(
+            "{field} changed during the other transaction family"
         )));
     }
     Ok(())
@@ -1813,7 +1857,7 @@ fn append_event(output: &mut String, event: &LedgerEvent) {
             append_meta(output, delta.meta);
             let _ = write!(
                 output,
-                "|{},{},{},{},{},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{},{}",
+                "|{},{},{},{},{},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{},{},{},{}",
                 delta.warehouse_id,
                 delta.district_id,
                 delta.customer_warehouse_id,
@@ -1829,7 +1873,9 @@ fn append_event(output: &mut String, event: &LedgerEvent) {
                 delta.customer_ytd_before_bits,
                 delta.customer_ytd_after_bits,
                 delta.customer_payment_count_before,
-                delta.customer_payment_count_after
+                delta.customer_delivery_count_before,
+                delta.customer_payment_count_after,
+                delta.customer_delivery_count_after
             );
         }
         LedgerEvent::Delivery(delta) => {
@@ -1842,7 +1888,7 @@ fn append_event(output: &mut String, event: &LedgerEvent) {
                 }
                 let _ = write!(
                     output,
-                    "{},{},{},{},{:08x},{:08x},{:08x},{},{}",
+                    "{},{},{},{},{:08x},{:08x},{:08x},{},{},{},{}",
                     order.district_id,
                     order.order_id,
                     order.customer_id,
@@ -1850,7 +1896,9 @@ fn append_event(output: &mut String, event: &LedgerEvent) {
                     order.customer_amount_bits,
                     order.customer_balance_before_bits,
                     order.customer_balance_after_bits,
+                    order.customer_payment_count_before,
                     order.customer_delivery_count_before,
+                    order.customer_payment_count_after,
                     order.customer_delivery_count_after
                 );
             }
@@ -1935,7 +1983,7 @@ fn parse_event(encoded: &str) -> Result<LedgerEvent, LedgerError> {
             })
         }
         ["P", meta, body] => {
-            let values = parse_csv_exact(body, 16, "Payment")?;
+            let values = parse_csv_exact(body, 18, "Payment")?;
             LedgerEvent::Payment(PaymentDelta {
                 meta: parse_meta(meta)?,
                 warehouse_id: parse_u16("Payment warehouse_id", values[0])?,
@@ -1965,9 +2013,17 @@ fn parse_event(encoded: &str) -> Result<LedgerEvent, LedgerError> {
                     "Payment customer payment count before",
                     values[14],
                 )?,
+                customer_delivery_count_before: parse_i32(
+                    "Payment customer delivery count before",
+                    values[15],
+                )?,
                 customer_payment_count_after: parse_i32(
                     "Payment customer payment count after",
-                    values[15],
+                    values[16],
+                )?,
+                customer_delivery_count_after: parse_i32(
+                    "Payment customer delivery count after",
+                    values[17],
                 )?,
             })
         }
@@ -1976,7 +2032,7 @@ fn parse_event(encoded: &str) -> Result<LedgerEvent, LedgerError> {
             let mut decoded_orders = Vec::new();
             if !orders.is_empty() {
                 for encoded_order in orders.split(';') {
-                    let values = parse_csv_exact(encoded_order, 9, "Delivery order")?;
+                    let values = parse_csv_exact(encoded_order, 11, "Delivery order")?;
                     decoded_orders.push(DeliveredOrderDelta {
                         district_id: parse_u8("Delivery district_id", values[0])?,
                         order_id: parse_i32("Delivery order_id", values[1])?,
@@ -1994,13 +2050,21 @@ fn parse_event(encoded: &str) -> Result<LedgerEvent, LedgerError> {
                             "Delivery customer balance after",
                             values[6],
                         )?,
+                        customer_payment_count_before: parse_i32(
+                            "Delivery customer payment count before",
+                            values[7],
+                        )?,
                         customer_delivery_count_before: parse_i32(
                             "Delivery customer delivery count before",
-                            values[7],
+                            values[8],
+                        )?,
+                        customer_payment_count_after: parse_i32(
+                            "Delivery customer payment count after",
+                            values[9],
                         )?,
                         customer_delivery_count_after: parse_i32(
                             "Delivery customer delivery count after",
-                            values[8],
+                            values[10],
                         )?,
                     });
                 }
@@ -2392,8 +2456,14 @@ mod tests {
             customer_balance_after_bits: (customer_balance_before - amount).to_bits(),
             customer_ytd_before_bits: customer_ytd_before.to_bits(),
             customer_ytd_after_bits: (customer_ytd_before + amount).to_bits(),
-            customer_payment_count_before: 1,
-            customer_payment_count_after: 2,
+            customer_version_before: CustomerVersion {
+                payment_count: 1,
+                delivery_count: 0,
+            },
+            customer_version_after: CustomerVersion {
+                payment_count: 2,
+                delivery_count: 0,
+            },
         }))
     }
 
@@ -2409,8 +2479,14 @@ mod tests {
             amount_bits: amount.to_bits(),
             customer_balance_before_bits: customer_balance_before.to_bits(),
             customer_balance_after_bits: (customer_balance_before + amount).to_bits(),
-            customer_delivery_count_before: 0,
-            customer_delivery_count_after: 1,
+            customer_version_before: CustomerVersion {
+                payment_count: 1,
+                delivery_count: 0,
+            },
+            customer_version_after: CustomerVersion {
+                payment_count: 1,
+                delivery_count: 1,
+            },
         }]))
     }
 
@@ -2634,13 +2710,20 @@ mod tests {
             .unwrap();
 
         let encoded = ledger.encode();
-        assert!(encoded.starts_with("RMDB_TPCC_RUN_LEDGER_V1\n"));
+        assert!(encoded.starts_with("RMDB_TPCC_RUN_LEDGER_V2\n"));
         assert!(encoded.contains("event_count=3\n"));
         assert!(encoded.contains("event.0=N|"));
         assert!(encoded.contains("event.1=P|"));
         assert!(encoded.contains("event.2=D|"));
         assert_eq!(RunLedger::decode(&encoded).unwrap(), ledger);
         assert_eq!(RunLedger::decode(&encoded).unwrap().encode(), encoded);
+
+        let old_header = encoded.replacen("RMDB_TPCC_RUN_LEDGER_V2", "RMDB_TPCC_RUN_LEDGER_V1", 1);
+        assert!(matches!(
+            RunLedger::decode(&old_header),
+            Err(LedgerError::UnsupportedVersion(header))
+                if header == "RMDB_TPCC_RUN_LEDGER_V1"
+        ));
     }
 
     #[test]
@@ -2732,6 +2815,19 @@ mod tests {
                 if message.contains("warehouse w_ytd")
         ));
 
+        let mut invalid_payment_version = payment(&payment_ticket);
+        let RankedTransactionOutcome::Committed(RankedCommit::Payment(evidence)) =
+            &mut invalid_payment_version
+        else {
+            unreachable!();
+        };
+        evidence.customer_version_after.delivery_count += 1;
+        assert!(matches!(
+            RunLedger::default().record(&payment_ticket, &invalid_payment_version),
+            Err(LedgerError::Inconsistent(message))
+                if message.contains("c_delivery_cnt")
+        ));
+
         let delivery_ticket = ticket(
             TransactionKind::Delivery,
             None,
@@ -2745,11 +2841,24 @@ mod tests {
         else {
             unreachable!();
         };
-        orders[0].customer_delivery_count_after = 2;
+        orders[0].customer_version_after.delivery_count = 2;
         assert!(matches!(
             RunLedger::default().record(&delivery_ticket, &invalid_delivery),
             Err(LedgerError::Inconsistent(message))
                 if message.contains("c_delivery_cnt")
+        ));
+
+        let mut invalid_delivery_version = delivery(&delivery_ticket);
+        let RankedTransactionOutcome::Committed(RankedCommit::Delivery(orders)) =
+            &mut invalid_delivery_version
+        else {
+            unreachable!();
+        };
+        orders[0].customer_version_after.payment_count += 1;
+        assert!(matches!(
+            RunLedger::default().record(&delivery_ticket, &invalid_delivery_version),
+            Err(LedgerError::Inconsistent(message))
+                if message.contains("c_payment_cnt")
         ));
     }
 

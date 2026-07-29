@@ -18,8 +18,8 @@ use super::common::{
     SemanticViolation,
 };
 use super::runner::{
-    execute_batch, semantic_or_abort, DeliveredOrderEvidence, RankedCommit, RankedTransactionError,
-    RankedTransactionOutcome,
+    execute_batch, semantic_or_abort, CustomerVersion, DeliveredOrderEvidence, RankedCommit,
+    RankedTransactionError, RankedTransactionOutcome,
 };
 
 const MIN_ORDER_LINES: usize = 5;
@@ -122,8 +122,14 @@ pub async fn execute(
             amount_bits: order.amount_bits,
             customer_balance_before_bits: order.customer_balance_bits,
             customer_balance_after_bits: after.balance_bits,
-            customer_delivery_count_before: order.customer_delivery_count,
-            customer_delivery_count_after: after.delivery_count,
+            customer_version_before: CustomerVersion {
+                payment_count: order.customer_payment_count,
+                delivery_count: order.customer_delivery_count,
+            },
+            customer_version_after: CustomerVersion {
+                payment_count: after.payment_count,
+                delivery_count: after.delivery_count,
+            },
         })
         .collect();
 
