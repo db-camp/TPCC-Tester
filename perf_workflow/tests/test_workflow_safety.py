@@ -631,11 +631,47 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
 if "--benchmark" in sys.argv:
     print("Throughput: 1 txn/s")
     print("tpmC: 1")
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    state_dir.mkdir(parents=True, exist_ok=True)
+    terminal = state_dir / "terminal_evidence.state"
+    terminal_mode = os.environ.get("FAKE_TPCC_TERMINAL_MODE", "regular")
+    if terminal_mode == "regular":
+        terminal.write_bytes(b"RMDB_TPCC_TERMINAL_EVIDENCE_TEST_V1\\n")
+    elif terminal_mode == "symlink":
+        target = state_dir / "terminal_evidence.target"
+        target.write_bytes(b"unsafe indirection\\n")
+        terminal.symlink_to(target)
+    elif terminal_mode == "oversized":
+        with terminal.open("wb") as output:
+            output.truncate(16 * 1024 * 1024 + 128 + 4 * 1024 + 1)
+    elif terminal_mode != "missing":
+        raise RuntimeError(f"unknown terminal mode: {terminal_mode}")
+    legacy_mode = os.environ.get("FAKE_TPCC_LEGACY_MODE", "absent")
+    legacy = state_dir / "run_ledger.state"
+    if legacy_mode == "file":
+        legacy.write_bytes(b"legacy ledger must never be read\\n")
+    elif legacy_mode == "directory":
+        legacy.mkdir()
+    elif legacy_mode == "symlink":
+        target = state_dir / "run_ledger.target"
+        target.write_bytes(b"legacy symlink target\\n")
+        legacy.symlink_to(target)
+    elif legacy_mode == "dangling_symlink":
+        legacy.symlink_to(state_dir / "missing-run-ledger-target")
+    elif legacy_mode != "absent":
+        raise RuntimeError(f"unknown legacy mode: {legacy_mode}")
 if (
     "--attest-formal-state" in sys.argv
     and os.environ.get("FAKE_TPCC_FAIL_ATTESTATION") == "1"
 ):
     raise SystemExit(42)
+if (
+    "--attest-formal-state" in sys.argv
+    and os.environ.get("FAKE_TPCC_TAMPER_TERMINAL") == "1"
+):
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    with (state_dir / "terminal_evidence.state").open("ab") as terminal:
+        terminal.write(b"tampered during attestation\\n")
 if (
     "--attest-formal-state" in sys.argv
     and os.environ.get("FAKE_TPCC_DAMAGE_IDENTITY_AFTER_ATTESTATION") == "1"
@@ -1767,6 +1803,42 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 "non_ranked_deviation",
             )
             self.assertFalse(manifest["ranking_eligible"])
+            terminal_path = (
+                Path(manifest["paths"]["state"])
+                / "terminal_evidence.state"
+            )
+            terminal_bytes = terminal_path.read_bytes()
+            self.assertEqual(
+                manifest["formal_state"],
+                {
+                    "status": "verified",
+                    "terminal_evidence": {
+                        "path": str(terminal_path),
+                        "status": "verified",
+                        "file_type": "regular",
+                        "open_policy": (
+                            "state_dir_fd_o_nofollow_sha256_v1"
+                        ),
+                        "size_bytes": len(terminal_bytes),
+                        "max_size_bytes": (
+                            16 * 1024 * 1024 + 128 + 4 * 1024
+                        ),
+                        "sha256": hashlib.sha256(
+                            terminal_bytes
+                        ).hexdigest(),
+                    },
+                    "legacy_run_ledger": {
+                        "path": str(
+                            Path(manifest["paths"]["state"])
+                            / "run_ledger.state"
+                        ),
+                        "status": "absent",
+                        "inspection_policy": (
+                            "state_dir_fd_lstat_only_v1"
+                        ),
+                    },
+                },
+            )
             events = server_events.read_text(encoding="utf-8").splitlines()
             starts = [line.split() for line in events if line.startswith("start ")]
             graceful = [
@@ -1854,6 +1926,180 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 for item in manifest["attestations"]["required"]
             }
             self.assertEqual(attestations["formal_state_chain"], "failed")
+
+    def test_terminal_evidence_file_shape_failures_are_fail_closed(self):
+        for mode, expected_status in (
+            ("missing", "missing"),
+            ("symlink", "unsafe"),
+            ("oversized", "oversized"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                temp_path = Path(temp)
+                root = self.make_root(temp)
+                server, tester, _, _, env, port = (
+                    self.make_lifecycle_fakes(temp_path, root)
+                )
+                env["FAKE_TPCC_TERMINAL_MODE"] = mode
+                records = temp_path / "records"
+                result = self.run_script(
+                    "--mode",
+                    "all",
+                    "--target-dir",
+                    root,
+                    "--record-root",
+                    records,
+                    "--skip-build",
+                    "--server-bin",
+                    server,
+                    "--tpcc-bin",
+                    tester,
+                    "--port",
+                    port,
+                    env=env,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "rejected terminal evidence state",
+                    result.stderr,
+                )
+                manifest = json.loads(
+                    (
+                        next(records.iterdir()) / "manifest.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["status"], "failed")
+                self.assertFalse(manifest["ranking_eligible"])
+                self.assertEqual(
+                    manifest["formal_state"]["status"],
+                    "failed",
+                )
+                descriptor = manifest["formal_state"][
+                    "terminal_evidence"
+                ]
+                self.assertEqual(descriptor["status"], expected_status)
+                self.assertIsNone(descriptor["size_bytes"])
+                self.assertIsNone(descriptor["sha256"])
+                self.assertEqual(
+                    manifest["formal_state"]["legacy_run_ledger"][
+                        "status"
+                    ],
+                    "absent",
+                )
+
+    def test_terminal_evidence_tamper_during_attestation_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            env["FAKE_TPCC_TAMPER_TERMINAL"] = "1"
+            records = temp_path / "records"
+            result = self.run_script(
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "terminal evidence changed during formal state attestation",
+                result.stderr,
+            )
+            manifest = json.loads(
+                (next(records.iterdir()) / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "failed")
+            self.assertFalse(manifest["ranking_eligible"])
+            self.assertEqual(
+                manifest["formal_state"]["terminal_evidence"]["status"],
+                "changed",
+            )
+            self.assertIsNone(
+                manifest["formal_state"]["terminal_evidence"]["size_bytes"]
+            )
+            self.assertIsNone(
+                manifest["formal_state"]["terminal_evidence"]["sha256"]
+            )
+
+    def test_any_legacy_run_ledger_shape_is_preserved_and_fail_closed(self):
+        for mode in ("file", "directory", "symlink", "dangling_symlink"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                temp_path = Path(temp)
+                root = self.make_root(temp)
+                server, tester, _, _, env, port = (
+                    self.make_lifecycle_fakes(temp_path, root)
+                )
+                env["FAKE_TPCC_LEGACY_MODE"] = mode
+                records = temp_path / "records"
+                result = self.run_script(
+                    "--mode",
+                    "all",
+                    "--target-dir",
+                    root,
+                    "--record-root",
+                    records,
+                    "--skip-build",
+                    "--server-bin",
+                    server,
+                    "--tpcc-bin",
+                    tester,
+                    "--port",
+                    port,
+                    env=env,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                manifest = json.loads(
+                    (
+                        next(records.iterdir()) / "manifest.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["status"], "failed")
+                self.assertFalse(manifest["ranking_eligible"])
+                formal = manifest["formal_state"]
+                self.assertEqual(formal["status"], "failed")
+                self.assertEqual(
+                    formal["terminal_evidence"]["status"],
+                    "legacy_present",
+                )
+                self.assertEqual(
+                    formal["legacy_run_ledger"]["status"],
+                    "present",
+                )
+                legacy = (
+                    Path(manifest["paths"]["state"])
+                    / "run_ledger.state"
+                )
+                self.assertTrue(os.path.lexists(legacy))
+                if mode == "file":
+                    self.assertEqual(
+                        legacy.read_bytes(),
+                        b"legacy ledger must never be read\n",
+                    )
+                elif mode == "directory":
+                    self.assertTrue(legacy.is_dir())
+                    self.assertEqual(list(legacy.iterdir()), [])
+                else:
+                    self.assertTrue(legacy.is_symlink())
+                    expected = (
+                        "run_ledger.target"
+                        if mode == "symlink"
+                        else "missing-run-ledger-target"
+                    )
+                    self.assertEqual(legacy.readlink().name, expected)
 
     def test_cleanup_failure_prevents_terminal_success_claim(self):
         with tempfile.TemporaryDirectory() as temp:

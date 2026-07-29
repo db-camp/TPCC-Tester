@@ -100,6 +100,10 @@ PHASE_CRASH_RESTART="not_applicable"
 PHASE_RECOVERY="not_applicable"
 PHASE_DIAGNOSTICS="not_requested"
 FORMAL_STATE_ATTESTATION_STATUS="not_applicable"
+TERMINAL_EVIDENCE_STATUS="not_applicable"
+TERMINAL_EVIDENCE_SIZE=""
+TERMINAL_EVIDENCE_SHA256=""
+LEGACY_RUN_LEDGER_STATUS="not_applicable"
 
 PUBLIC_SCALE=50
 PUBLIC_CLIENTS=32
@@ -110,6 +114,12 @@ PUBLIC_READY_TIMEOUT_SECONDS=90
 DIAGNOSTIC_WARMUP_SECONDS=10
 DIAGNOSTIC_OBSERVATION_SECONDS=60
 RESOURCE_INTERVAL_MS=1000
+TERMINAL_EVIDENCE_FILE="terminal_evidence.state"
+LEGACY_RUN_LEDGER_FILE="run_ledger.state"
+# The canonical codec emits at most 16 MiB of lower-hex payload. The
+# dataset/contract binding has 128 bytes of fixed headroom and the StateStore
+# envelope is bounded by 4 KiB. Keep this below the 32 MiB artifact ceiling.
+TERMINAL_EVIDENCE_STATE_MAX_BYTES=$((16 * 1024 * 1024 + 128 + 4 * 1024))
 
 usage() {
   cat <<'EOF'
@@ -1585,6 +1595,8 @@ case "${MODE}" in
     PHASE_CRASH_RESTART="pending"
     PHASE_RECOVERY="pending"
     FORMAL_STATE_ATTESTATION_STATUS="pending"
+    TERMINAL_EVIDENCE_STATUS="pending"
+    LEGACY_RUN_LEDGER_STATUS="pending"
     ;;
   init)
     PHASE_SETUP="pending"
@@ -1732,6 +1744,9 @@ write_manifest() {
     "${DIAGNOSTIC_OBSERVATION_SECONDS}" "${RESOURCE_STATUS}" \
     "${RESOURCE_INTERVAL_MS}" "${RESOURCE_METRICS}" \
     "${FORMAL_STATE_ATTESTATION_STATUS}" \
+    "${TERMINAL_EVIDENCE_STATUS}" "${TERMINAL_EVIDENCE_SIZE}" \
+    "${TERMINAL_EVIDENCE_SHA256}" "${LEGACY_RUN_LEDGER_STATUS}" \
+    "${TERMINAL_EVIDENCE_STATE_MAX_BYTES}" \
     "${TESTER_BINARY_PROVENANCE_STATUS}" "${TPCC_BIN}" \
     "${TESTER_BINARY_SHA256}" "${TESTER_BINARY_DEVICE}" \
     "${TESTER_BINARY_INODE}" "${TESTER_BINARY_SIZE}" \
@@ -1794,6 +1809,11 @@ import sys
     resource_interval_ms,
     resource_metrics_path,
     formal_state_attestation_status,
+    terminal_evidence_status,
+    terminal_evidence_size,
+    terminal_evidence_sha256,
+    legacy_run_ledger_status,
+    terminal_evidence_max_bytes,
     tester_binary_provenance_status,
     tester_binary_path,
     tester_binary_sha256,
@@ -2140,13 +2160,73 @@ valid_formal_attestation_statuses = {
     "failed",
     "not_applicable",
 }
+valid_terminal_evidence_statuses = {
+    "pending",
+    "verified",
+    "missing",
+    "unsafe",
+    "empty",
+    "oversized",
+    "changed",
+    "inspection_failed",
+    "legacy_present",
+    "not_applicable",
+}
+valid_legacy_run_ledger_statuses = {
+    "pending",
+    "absent",
+    "present",
+    "inspection_failed",
+    "not_applicable",
+}
 formal_attestation_status = (
     formal_state_attestation_status
     if formal_state_attestation_status in valid_formal_attestation_statuses
     else "failed"
 )
+safe_terminal_evidence_status = (
+    terminal_evidence_status
+    if terminal_evidence_status in valid_terminal_evidence_statuses
+    else "inspection_failed"
+)
+safe_legacy_run_ledger_status = (
+    legacy_run_ledger_status
+    if legacy_run_ledger_status in valid_legacy_run_ledger_statuses
+    else "inspection_failed"
+)
 if mode != "all":
     formal_attestation_status = "not_applicable"
+    safe_terminal_evidence_status = "not_applicable"
+    safe_legacy_run_ledger_status = "not_applicable"
+terminal_evidence_size_value = None
+terminal_evidence_sha256_value = None
+if safe_terminal_evidence_status == "verified":
+    try:
+        terminal_evidence_size_value = int(terminal_evidence_size)
+    except ValueError:
+        safe_terminal_evidence_status = "inspection_failed"
+    if (
+        terminal_evidence_size_value is None
+        or terminal_evidence_size_value <= 0
+        or terminal_evidence_size_value > int(terminal_evidence_max_bytes)
+        or len(terminal_evidence_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in terminal_evidence_sha256
+        )
+    ):
+        safe_terminal_evidence_status = "inspection_failed"
+        terminal_evidence_size_value = None
+    else:
+        terminal_evidence_sha256_value = terminal_evidence_sha256
+terminal_evidence_verified = (
+    safe_terminal_evidence_status == "verified"
+    and safe_legacy_run_ledger_status == "absent"
+    and terminal_evidence_size_value is not None
+    and terminal_evidence_sha256_value is not None
+)
+if formal_attestation_status == "verified" and not terminal_evidence_verified:
+    formal_attestation_status = "failed"
 tester_attestation_status = required_status(
     tester_binary_verified,
     tester_binary_provenance_status == "pending_fresh_build",
@@ -2188,7 +2268,7 @@ ranking_eligible = workflow_status == "success" and all(
     item["status"] == "verified"
     for item in required_attestations
     if item["required_for_ranking"]
-)
+) and terminal_evidence_verified
 if ranking_eligible:
     conformance = "public_spec_aligned"
 elif ranked_configuration != "1":
@@ -2278,6 +2358,27 @@ payload = {
     },
     "database_identity": database_identity,
     "rank_result": rank_result,
+    "formal_state": {
+        "status": formal_attestation_status,
+        "terminal_evidence": {
+            "path": str(Path(state_dir) / "terminal_evidence.state"),
+            "status": safe_terminal_evidence_status,
+            "file_type": (
+                "regular"
+                if safe_terminal_evidence_status == "verified"
+                else None
+            ),
+            "open_policy": "state_dir_fd_o_nofollow_sha256_v1",
+            "size_bytes": terminal_evidence_size_value,
+            "max_size_bytes": int(terminal_evidence_max_bytes),
+            "sha256": terminal_evidence_sha256_value,
+        },
+        "legacy_run_ledger": {
+            "path": str(Path(state_dir) / "run_ledger.state"),
+            "status": safe_legacy_run_ledger_status,
+            "inspection_policy": "state_dir_fd_lstat_only_v1",
+        },
+    },
     "phases": {
         "setup": phase_setup,
         "rank": phase_rank,
@@ -4800,21 +4901,211 @@ run_final_diagnostics() {
   return 0
 }
 
+inspect_terminal_evidence_state() {
+  local inspection=""
+  local status=""
+  local size=""
+  local digest=""
+  local legacy=""
+  local extra=""
+  if ! inspection="$(
+    python3 - "${STATE_DIR}" "${TERMINAL_EVIDENCE_STATE_MAX_BYTES}" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+state_dir, maximum_text = sys.argv[1:]
+terminal_name = "terminal_evidence.state"
+legacy_name = "run_ledger.state"
+
+
+def emit(status, size="-", digest="-", legacy="inspection_failed"):
+    print(status, size, digest, legacy)
+
+
+try:
+    maximum = int(maximum_text)
+except ValueError:
+    emit("inspection_failed")
+    raise SystemExit(0)
+expected_maximum = 16 * 1024 * 1024 + 128 + 4 * 1024
+if maximum != expected_maximum or maximum >= 32 * 1024 * 1024:
+    emit("inspection_failed")
+    raise SystemExit(0)
+if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+    emit("inspection_failed")
+    raise SystemExit(0)
+
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+if hasattr(os, "O_CLOEXEC"):
+    directory_flags |= os.O_CLOEXEC
+try:
+    state_descriptor = os.open(state_dir, directory_flags)
+except OSError:
+    emit("unsafe")
+    raise SystemExit(0)
+
+try:
+    try:
+        os.stat(legacy_name, dir_fd=state_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        legacy_status = "absent"
+    except OSError:
+        emit("inspection_failed")
+        raise SystemExit(0)
+    else:
+        # Presence alone is terminal. Never open, read, remove, or rewrite it.
+        emit("legacy_present", legacy="present")
+        raise SystemExit(0)
+
+    try:
+        before = os.stat(
+            terminal_name,
+            dir_fd=state_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        emit("missing", legacy=legacy_status)
+        raise SystemExit(0)
+    except OSError:
+        emit("unsafe", legacy=legacy_status)
+        raise SystemExit(0)
+    if not stat.S_ISREG(before.st_mode):
+        emit("unsafe", legacy=legacy_status)
+        raise SystemExit(0)
+    if before.st_size == 0:
+        emit("empty", legacy=legacy_status)
+        raise SystemExit(0)
+    if before.st_size > maximum:
+        emit("oversized", legacy=legacy_status)
+        raise SystemExit(0)
+
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        file_flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(
+            terminal_name,
+            file_flags,
+            dir_fd=state_descriptor,
+        )
+    except OSError:
+        emit("unsafe", legacy=legacy_status)
+        raise SystemExit(0)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_size != before.st_size
+            or opened.st_mtime_ns != before.st_mtime_ns
+        ):
+            emit("changed", legacy=legacy_status)
+            raise SystemExit(0)
+        digest = hashlib.sha256()
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        try:
+            current = os.stat(
+                terminal_name,
+                dir_fd=state_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            emit("changed", legacy=legacy_status)
+            raise SystemExit(0)
+        if (
+            remaining != 0
+            or after.st_dev != opened.st_dev
+            or after.st_ino != opened.st_ino
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or current.st_size != opened.st_size
+            or current.st_mtime_ns != opened.st_mtime_ns
+        ):
+            emit("changed", legacy=legacy_status)
+            raise SystemExit(0)
+        emit("verified", opened.st_size, digest.hexdigest(), legacy_status)
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(state_descriptor)
+PY
+  )"; then
+    TERMINAL_EVIDENCE_STATUS="inspection_failed"
+    TERMINAL_EVIDENCE_SIZE=""
+    TERMINAL_EVIDENCE_SHA256=""
+    LEGACY_RUN_LEDGER_STATUS="inspection_failed"
+    return 1
+  fi
+  read -r status size digest legacy extra <<<"${inspection}"
+  if [[ -n "${extra}" || -z "${status}" || -z "${size}" \
+    || -z "${digest}" || -z "${legacy}" ]]; then
+    TERMINAL_EVIDENCE_STATUS="inspection_failed"
+    TERMINAL_EVIDENCE_SIZE=""
+    TERMINAL_EVIDENCE_SHA256=""
+    LEGACY_RUN_LEDGER_STATUS="inspection_failed"
+    return 1
+  fi
+  TERMINAL_EVIDENCE_STATUS="${status}"
+  TERMINAL_EVIDENCE_SIZE=""
+  TERMINAL_EVIDENCE_SHA256=""
+  LEGACY_RUN_LEDGER_STATUS="${legacy}"
+  if [[ "${status}" == "verified" ]]; then
+    TERMINAL_EVIDENCE_SIZE="${size}"
+    TERMINAL_EVIDENCE_SHA256="${digest}"
+  fi
+  [[ "${status}" == "verified" && "${legacy}" == "absent" ]]
+}
+
 attest_formal_state() {
   [[ "${MODE}" == "all" ]] || return 0
   log "revalidating every required formal state artifact"
   FORMAL_STATE_ATTESTATION_STATUS="pending"
+  TERMINAL_EVIDENCE_STATUS="pending"
+  TERMINAL_EVIDENCE_SIZE=""
+  TERMINAL_EVIDENCE_SHA256=""
+  LEGACY_RUN_LEDGER_STATUS="pending"
   write_manifest
-  if run_profile_tester "${RESULT_DIR}/formal_state_attestation.log" \
+  if ! inspect_terminal_evidence_state; then
+    FORMAL_STATE_ATTESTATION_STATUS="failed"
+    write_manifest
+    die "formal state attestation rejected terminal evidence state"
+  fi
+  local before_size="${TERMINAL_EVIDENCE_SIZE}"
+  local before_digest="${TERMINAL_EVIDENCE_SHA256}"
+  write_manifest
+  if ! run_profile_tester "${RESULT_DIR}/formal_state_attestation.log" \
       --attest-formal-state --profile "${PROFILE}" --seed "${SEED}" \
       --state-dir "${STATE_DIR}"; then
-    FORMAL_STATE_ATTESTATION_STATUS="verified"
-    write_manifest
-  else
     FORMAL_STATE_ATTESTATION_STATUS="failed"
+    inspect_terminal_evidence_state || true
     write_manifest
     die "formal state attestation failed; see ${RESULT_DIR}/formal_state_attestation.log"
   fi
+  if ! inspect_terminal_evidence_state \
+    || [[ "${TERMINAL_EVIDENCE_SIZE}" != "${before_size}" \
+      || "${TERMINAL_EVIDENCE_SHA256}" != "${before_digest}" ]]; then
+    [[ "${TERMINAL_EVIDENCE_STATUS}" != "verified" ]] \
+      || TERMINAL_EVIDENCE_STATUS="changed"
+    TERMINAL_EVIDENCE_SIZE=""
+    TERMINAL_EVIDENCE_SHA256=""
+    FORMAL_STATE_ATTESTATION_STATUS="failed"
+    write_manifest
+    die "terminal evidence changed during formal state attestation"
+  fi
+  FORMAL_STATE_ATTESTATION_STATUS="verified"
+  write_manifest
 }
 
 write_summary() {
