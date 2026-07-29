@@ -14,6 +14,9 @@ pub enum TpccError {
     #[error("响应解析失败: {0}")]
     ParseError(String),
 
+    #[error("Wire 协议错误: {0}")]
+    Protocol(String),
+
     #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
 

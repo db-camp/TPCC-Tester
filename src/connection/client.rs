@@ -1,92 +1,131 @@
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tracing::{debug, trace, warn};
 
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tracing::{debug, trace};
+
+use crate::connection::wire::{StreamResponse, WireConnection, WireError, WireValue};
 use crate::error::TpccError;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+
 pub struct RmdbClient {
-    stream: TcpStream,
-    buf: Vec<u8>,
+    connection: WireConnection<TcpStream>,
+    response_timeout: Duration,
 }
 
 impl RmdbClient {
     pub async fn connect(host: &str, port: u16) -> Result<Self, TpccError> {
+        Self::connect_with_timeout(host, port, DEFAULT_RESPONSE_TIMEOUT).await
+    }
+
+    pub async fn connect_with_timeout(
+        host: &str,
+        port: u16,
+        response_timeout: Duration,
+    ) -> Result<Self, TpccError> {
         let addr = format!("{host}:{port}");
         debug!("正在连接 RMDB: {addr}");
 
-        let stream = tokio::time::timeout(
-            Duration::from_secs(30),
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| TpccError::Timeout {
-            context: format!("连接 {addr} 超时 (30s)"),
-        })?
-        .map_err(|e| {
-            let msg = match e.kind() {
-                std::io::ErrorKind::ConnectionRefused => {
-                    format!("连接被拒绝 - 请确认 rmdb 服务已启动并监听在 {addr}")
-                }
-                std::io::ErrorKind::AddrNotAvailable => {
-                    format!("地址不可用 - 请检查地址 {addr} 是否正确")
-                }
-                _ => format!("连接失败: {e}"),
-            };
-            TpccError::Connection(msg)
-        })?;
+        let connection = tokio::time::timeout(CONNECT_TIMEOUT, WireConnection::connect(&addr))
+            .await
+            .map_err(|_| TpccError::Timeout {
+                context: format!("连接及 Wire v3 握手 {addr} 超时 ({CONNECT_TIMEOUT:?})"),
+            })?
+            .map_err(map_wire_error)?;
 
-        debug!("已连接到 RMDB: {addr}");
+        debug!("已连接到 RMDB 且完成 Wire v3 握手: {addr}");
         Ok(Self {
-            stream,
-            buf: vec![0u8; 8192],
+            connection,
+            response_timeout,
         })
     }
 
-    pub async fn send_cmd(&mut self, cmd: &str) -> Result<String, TpccError> {
+    pub async fn exec_stream(&mut self, cmd: &str) -> Result<StreamResponse, TpccError> {
         trace!("发送 SQL: {cmd}");
 
-        self.stream
-            .write_all(cmd.as_bytes())
+        tokio::time::timeout(self.response_timeout, self.connection.exec_stream(cmd))
             .await
-            .map_err(|e| TpccError::Connection(format!("发送失败: {e}")))?;
-
-        let n = tokio::time::timeout(
-            Duration::from_secs(300),
-            self.stream.read(&mut self.buf),
-        )
-        .await
-        .map_err(|_| TpccError::Timeout {
-            context: format!("等待响应超时 (300s), 最后发送的 SQL: {cmd}"),
-        })?
-        .map_err(|e| TpccError::Connection(format!("读取响应失败: {e}")))?;
-
-        if n == 0 {
-            return Err(TpccError::Connection(
-                "连接已断开 - rmdb 可能已关闭连接，请检查服务状态".to_string(),
-            ));
-        }
-
-        let response = String::from_utf8_lossy(&self.buf[..n]).to_string();
-        trace!("收到响应 ({n} bytes): {response}");
-        Ok(response)
+            .map_err(|_| TpccError::Timeout {
+                context: format!(
+                    "等待完整 Wire 响应帧超时 ({:?}), 最后发送的 SQL: {cmd}",
+                    self.response_timeout
+                ),
+            })?
+            .map_err(map_wire_error)
     }
 
-    pub async fn close(mut self) {
-        let _ = self.stream.shutdown().await;
+    /// Transitional text adapter for legacy callers.
+    ///
+    /// New code should use `exec_stream` so FLOAT32 raw bits and terminal
+    /// status are never flattened into text.
+    pub async fn send_cmd(&mut self, cmd: &str) -> Result<String, TpccError> {
+        Ok(response_as_legacy_text(self.exec_stream(cmd).await?))
+    }
+
+    pub async fn close(self) {
+        let mut stream = self.connection.into_inner();
+        let _ = stream.shutdown().await;
         debug!("RMDB 连接已关闭");
     }
 
+    /// Official readiness is a complete framed execution of this exact SQL,
+    /// not merely a successful TCP connect.
     pub async fn ping(&mut self) -> Result<(), TpccError> {
-        // Try a simple BEGIN/COMMIT to check the connection
-        let resp = self.send_cmd("BEGIN;").await?;
-        if resp.starts_with("abort") || resp.starts_with("Error") {
-            warn!("Ping 响应异常: {resp}");
+        match self.exec_stream("show tables;").await? {
+            StreamResponse::Query { .. } => Ok(()),
+            StreamResponse::CommandOk => Err(TpccError::Protocol(
+                "show tables; 必须返回 META/RESULT_END 查询响应".to_owned(),
+            )),
+            StreamResponse::TransactionAbort { diagnostic } => Err(TpccError::Abort(diagnostic)),
+            StreamResponse::Error { diagnostic } => Err(TpccError::QueryError(diagnostic)),
         }
-        let resp = self.send_cmd("COMMIT;").await?;
-        if resp.starts_with("abort") || resp.starts_with("Error") {
-            warn!("Ping COMMIT 响应异常: {resp}");
+    }
+
+    pub fn wire_mut(&mut self) -> &mut WireConnection<TcpStream> {
+        &mut self.connection
+    }
+}
+
+fn map_wire_error(error: WireError) -> TpccError {
+    match error {
+        WireError::Io(error) => TpccError::Connection(error.to_string()),
+        WireError::Protocol(message) => TpccError::Protocol(message),
+    }
+}
+
+fn response_as_legacy_text(response: StreamResponse) -> String {
+    match response {
+        StreamResponse::CommandOk => "OK".to_owned(),
+        StreamResponse::TransactionAbort { diagnostic } => format!("abort {diagnostic}"),
+        StreamResponse::Error { diagnostic } => format!("Error {diagnostic}"),
+        StreamResponse::Query { columns, rows } => {
+            let mut output = String::new();
+            output.push('|');
+            for column in columns {
+                output.push_str(&column.name);
+                output.push('|');
+            }
+            output.push('\n');
+            for row in rows {
+                output.push('|');
+                for value in row {
+                    output.push_str(&wire_value_text(value));
+                    output.push('|');
+                }
+                output.push('\n');
+            }
+            output
         }
-        Ok(())
+    }
+}
+
+fn wire_value_text(value: WireValue) -> String {
+    match value {
+        WireValue::Null => "NULL".to_owned(),
+        WireValue::Int32(value) => value.to_string(),
+        WireValue::Float32(bits) => f32::from_bits(bits).to_string(),
+        WireValue::Char(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
     }
 }
