@@ -1,8 +1,12 @@
 //! Native final-2026 ranked timeline and worker pool.
 
+use std::ffi::OsStr;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::Local;
 use tokio::sync::Barrier;
@@ -16,7 +20,7 @@ use crate::measurement::{MeasurementSummary, WindowStats, FORMAL_WINDOW_COUNT};
 use crate::phases::{
     AttemptDisposition, AttemptOutcome, EventRecorder, Final2026Scheduler, LocalRuntimeLimits,
     MonotonicClock, PhaseId, PhaseScheduleConfig, PreparedSessionId, SchedulerError,
-    SystemMonotonicClock, TransactionIdentity, WorkerId,
+    SchedulerEvent, SystemMonotonicClock, TransactionIdentity, WorkerId,
 };
 use crate::ranking::dispatch::{self, FrozenTransaction};
 use crate::ranking::ledger::{LedgerError, RunLedger};
@@ -26,14 +30,122 @@ use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, Wo
 use crate::transaction::TransactionType;
 use crate::workload::Final2026Workload;
 
-#[derive(Default)]
-struct NoopRecorder;
+const RESOURCE_TIMELINE_ENV: &str = "RMDB_TPCC_RESOURCE_TIMELINE_FILE";
 
-impl EventRecorder for NoopRecorder {
-    fn record(&mut self, _event: crate::phases::SchedulerEvent) {}
+struct ResourceTimelineRecorder {
+    output: Option<PathBuf>,
+    schedule: PhaseScheduleConfig,
+    emitted: bool,
 }
 
-type Scheduler = Final2026Scheduler<SystemMonotonicClock, NoopRecorder>;
+impl ResourceTimelineRecorder {
+    fn from_environment(schedule: PhaseScheduleConfig) -> Self {
+        let output = std::env::var_os(RESOURCE_TIMELINE_ENV).and_then(|value| {
+            if value.is_empty() {
+                warn!("{RESOURCE_TIMELINE_ENV} is empty; resource timeline is unavailable");
+                None
+            } else {
+                Some(PathBuf::from(value))
+            }
+        });
+        Self {
+            output,
+            schedule,
+            emitted: false,
+        }
+    }
+}
+
+impl EventRecorder for ResourceTimelineRecorder {
+    fn record(&mut self, event: SchedulerEvent) {
+        if self.emitted {
+            return;
+        }
+        let SchedulerEvent::BarrierReleased { workers, .. } = event else {
+            return;
+        };
+        self.emitted = true;
+
+        let Some(output) = self.output.as_deref() else {
+            return;
+        };
+        if workers != self.schedule.clients() {
+            warn!(
+                "resource timeline worker count changed from {} to {}; observation is unavailable",
+                self.schedule.clients(),
+                workers
+            );
+            return;
+        }
+        let origin_unix_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(origin) => origin.as_nanos(),
+            Err(error) => {
+                warn!("resource timeline clock is before the Unix epoch: {error}");
+                return;
+            }
+        };
+        let payload = encode_resource_timeline(origin_unix_ns, self.schedule);
+        if let Err(error) = publish_resource_timeline(output, payload.as_bytes()) {
+            warn!(
+                "could not publish non-ranked resource timeline {}: {error}",
+                output.display()
+            );
+        }
+    }
+}
+
+fn encode_resource_timeline(origin_unix_ns: u128, schedule: PhaseScheduleConfig) -> String {
+    format!(
+        "schema_version=1\n\
+         kind=final2026_rank_timeline\n\
+         origin_unix_ns={origin_unix_ns}\n\
+         warmup_ns={}\n\
+         measurement_windows={FORMAL_WINDOW_COUNT}\n\
+         measurement_window_ns={}\n",
+        schedule.warmup_duration().as_nanos(),
+        schedule.measurement_window_duration().as_nanos(),
+    )
+}
+
+fn publish_resource_timeline(output: &Path, payload: &[u8]) -> io::Result<()> {
+    let parent = output.parent().filter(|path| !path.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let file_name = output
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| OsStr::new("resource_timeline"));
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(payload)?;
+        file.sync_all()?;
+        match fs::symlink_metadata(output) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "resource timeline output already exists",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(&temporary, output)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+type Scheduler = Final2026Scheduler<SystemMonotonicClock, ResourceTimelineRecorder>;
 
 pub struct BenchmarkExecutor {
     config: Config,
@@ -69,7 +181,7 @@ impl BenchmarkExecutor {
         let scheduler = Arc::new(Mutex::new(
             Final2026Scheduler::new_with_schedule(
                 monotonic_clock.clone(),
-                NoopRecorder,
+                ResourceTimelineRecorder::from_environment(schedule),
                 limits,
                 *routing.router.hot_warehouses(),
                 schedule,
@@ -615,6 +727,22 @@ mod tests {
     fn latency_report_preserves_fractional_milliseconds_and_empty_samples() {
         assert_eq!(format_latency(Some(Duration::from_micros(1_234))), "1.234");
         assert_eq!(format_latency(None), "unavailable");
+    }
+
+    #[test]
+    fn resource_timeline_preserves_the_scheduler_boundaries() {
+        let schedule =
+            PhaseScheduleConfig::new(2, Duration::from_secs(7), Duration::from_millis(1_250))
+                .unwrap();
+        assert_eq!(
+            encode_resource_timeline(123_456_789, schedule),
+            "schema_version=1\n\
+             kind=final2026_rank_timeline\n\
+             origin_unix_ns=123456789\n\
+             warmup_ns=7000000000\n\
+             measurement_windows=3\n\
+             measurement_window_ns=1250000000\n"
+        );
     }
 
     #[tokio::test]
