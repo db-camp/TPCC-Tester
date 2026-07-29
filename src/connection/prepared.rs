@@ -273,13 +273,19 @@ fn parse_prepare_ok(payload: &[u8], statements: &[Statement]) -> WireResult<()> 
             StatementKind::Command => {}
             StatementKind::Query {
                 columns: expected_columns,
-            } if columns != *expected_columns => {
-                return Err(WireError::Protocol(format!(
-                    "PREPARE_OK query statement {statement_id} schema mismatch: expected \
-                     {expected_columns:?}, got {columns:?}"
-                )));
+            } => {
+                let schema_matches = columns.len() == expected_columns.len()
+                    && columns
+                        .iter()
+                        .zip(expected_columns)
+                        .all(|(actual, expected)| actual.sql_type == expected.sql_type);
+                if !schema_matches {
+                    return Err(WireError::Protocol(format!(
+                        "PREPARE_OK query statement {statement_id} schema mismatch: expected \
+                         {expected_columns:?}, got {columns:?}"
+                    )));
+                }
             }
-            StatementKind::Query { .. } => {}
         }
     }
 
@@ -934,6 +940,70 @@ mod tests {
         assert_eq!(connection.prepared.len(), 1);
         assert!(connection.prepared.contains_key(&99));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepare_accepts_normalized_column_names_with_matching_types() {
+        let statements = vec![query(
+            7,
+            vec![
+                column("w_ytd", SqlType::Float32),
+                column("w_id", SqlType::Int32),
+            ],
+            "select w_ytd, w_id from warehouse;",
+        )];
+        let (client_io, mut server_io) = duplex(64);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            let (tag, flags, _) = read_request(&mut server_io).await;
+            assert_eq!((tag, flags), (FrameTag::PrepareSet, 0));
+            let response = response_frame(
+                FrameTag::PrepareOk,
+                &prepare_ok(&[(
+                    7,
+                    vec![
+                        column("W_YTD", SqlType::Float32),
+                        column("warehouse.w_id", SqlType::Int32),
+                    ],
+                )]),
+            );
+            write_fragmented(&mut server_io, &response).await;
+        });
+
+        let mut connection = WireConnection::new(ChunkedIo::new(client_io, 2, 3));
+        connection.handshake().await.unwrap();
+        assert_eq!(
+            connection.prepare_set(&statements).await.unwrap(),
+            PrepareResponse::Installed
+        );
+        assert_eq!(
+            connection.prepared.get(&7).unwrap().columns.as_ref(),
+            Some(&vec![
+                column("w_ytd", SqlType::Float32),
+                column("w_id", SqlType::Int32),
+            ])
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn prepare_rejects_empty_response_column_name() {
+        let statements = vec![query(
+            7,
+            vec![column("amount", SqlType::Float32)],
+            "select amount from warehouse;",
+        )];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u16.to_be_bytes());
+        payload.extend_from_slice(&7_u16.to_be_bytes());
+        payload.extend_from_slice(&1_u16.to_be_bytes());
+        payload.extend_from_slice(&0_u16.to_be_bytes());
+        payload.push(SqlType::Float32 as u8);
+
+        let error = parse_prepare_ok(&payload, &statements)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("column 0 name must not be empty"));
     }
 
     #[test]
