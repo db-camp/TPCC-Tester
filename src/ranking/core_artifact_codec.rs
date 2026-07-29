@@ -31,10 +31,11 @@ use super::payment_endpoints::{
 use super::recovery_samples::SampleScore;
 use super::rich_recovery_samples::{
     CanonicalRichBadCreditCustomer, CanonicalRichBadCreditPrefix, CanonicalRichCustomerWitness,
-    CanonicalRichDelivery, CanonicalRichDeliveryLine, CanonicalRichNewOrder,
-    CanonicalRichOrderLine, CanonicalRichOrderWitness, CanonicalRichRecoveryHeader, OrderKey,
+    CanonicalRichDelivery, CanonicalRichDeliveryLine, CanonicalRichHistoryTuple,
+    CanonicalRichHistoryWitness, CanonicalRichNewOrder, CanonicalRichOrderLine,
+    CanonicalRichOrderWitness, CanonicalRichRecoveryHeader, HistoryGroupKey, OrderKey,
     RichRecoveryError, SealedRichRecoverySamples, MAX_RICH_RECOVERY_RAW_BYTES,
-    RICH_RECOVERY_POLICY_VERSION, RICH_RECOVERY_SAMPLE_CAPACITY,
+    RICH_HISTORY_SAMPLE_CAPACITY, RICH_RECOVERY_POLICY_VERSION, RICH_RECOVERY_SAMPLE_CAPACITY,
 };
 use super::runner::StockVersion;
 
@@ -50,11 +51,14 @@ pub(crate) const MAX_PAYMENT_ENDPOINT_SECTION_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_RICH_NEW_ORDER_SECTION_BYTES: usize = 68 * 1024;
 pub(crate) const MAX_RICH_DELIVERY_SECTION_BYTES: usize = 38 * 1024;
 pub(crate) const MAX_RICH_BAD_CREDIT_SECTION_BYTES: usize = 7_898;
+pub(crate) const MAX_RICH_HISTORY_SECTION_BYTES: usize = 305;
 const MAX_ACCUMULATOR_WORDS: u32 = 6;
 const MAX_INTERVAL_SAMPLES: u32 = 64;
 const MAX_RICH_ENTRY_TIMESTAMP_BYTES: usize = 19;
 const MAX_RICH_DELIVERY_TIMESTAMP_BYTES: usize = 30;
 const MAX_RICH_CUSTOMER_DATA_BYTES: usize = 50;
+const MAX_RICH_HISTORY_TIMESTAMP_BYTES: usize = 19;
+const MAX_RICH_HISTORY_DATA_BYTES: usize = 24;
 const MAX_RICH_BAD_CREDIT_SUFFIX_ENTRIES: usize = 4;
 const RICH_DISTRICT_INFO_BYTES: usize = 24;
 const MIN_RICH_ORDER_LINES: usize = 5;
@@ -119,6 +123,23 @@ const _: () = assert!(
         + RICH_RECOVERY_SAMPLE_CAPACITY * MAX_ENCODED_RICH_BAD_CREDIT_BYTES
         == MAX_RICH_BAD_CREDIT_SECTION_BYTES
 );
+const MAX_ENCODED_RICH_HISTORY_GROUP_BYTES: usize = 4 + 1 + 2 + 1 + 2;
+const MAX_ENCODED_RICH_HISTORY_KEY_BYTES: usize = MAX_ENCODED_RICH_HISTORY_GROUP_BYTES
+    + 1
+    + MAX_RICH_HISTORY_TIMESTAMP_BYTES
+    + 4
+    + 1
+    + MAX_RICH_HISTORY_DATA_BYTES;
+const RICH_HISTORY_WITNESS_BYTES: usize = 1 + 16 + MAX_ENCODED_RICH_HISTORY_KEY_BYTES;
+const MAX_ENCODED_RICH_HISTORY_TUPLE_BYTES: usize = 16 + MAX_ENCODED_RICH_HISTORY_KEY_BYTES + 8 + 1;
+const _: () = assert!(
+    SECTION_HEADER_BYTES
+        + RICH_HEADER_BYTES
+        + RICH_HISTORY_WITNESS_BYTES
+        + 4
+        + RICH_HISTORY_SAMPLE_CAPACITY * MAX_ENCODED_RICH_HISTORY_TUPLE_BYTES
+        == MAX_RICH_HISTORY_SECTION_BYTES
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -130,6 +151,7 @@ enum SectionKind {
     RichNewOrders = 5,
     RichDeliveries = 6,
     RichBadCreditCustomers = 7,
+    RichHistory = 8,
 }
 
 impl SectionKind {
@@ -142,6 +164,7 @@ impl SectionKind {
             Self::RichNewOrders => "rich NewOrder samples",
             Self::RichDeliveries => "rich Delivery samples",
             Self::RichBadCreditCustomers => "rich bad-credit Customer samples",
+            Self::RichHistory => "rich History samples",
         }
     }
 }
@@ -228,6 +251,10 @@ pub(crate) enum CoreCodecError {
         domain: &'static str,
         key: CustomerKey,
     },
+    #[error("canonical History tuples are not in strict (score, complete key) order")]
+    NonCanonicalRichHistory,
+    #[error("canonical History section contains a duplicate complete tuple key")]
+    DuplicateRichHistoryTuple,
     #[error("invalid canonical rich recovery evidence: {0}")]
     InvalidRichRecovery(#[source] RichRecoveryError),
 }
@@ -1629,6 +1656,138 @@ fn decode_rich_bad_credit_section(
     })
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RichHistoryTupleKey {
+    group: HistoryGroupKey,
+    timestamp: Vec<u8>,
+    amount_bits: u32,
+    data: Vec<u8>,
+}
+
+impl RichHistoryTupleKey {
+    fn new(group: HistoryGroupKey, timestamp: Vec<u8>, amount_bits: u32, data: Vec<u8>) -> Self {
+        Self {
+            group,
+            timestamp,
+            amount_bits,
+            data,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedRichHistorySection {
+    header: CanonicalRichRecoveryHeader,
+    rejected: Option<CanonicalRichHistoryWitness>,
+    entries: Vec<CanonicalRichHistoryTuple>,
+}
+
+pub(crate) fn encode_rich_history_section(
+    samples: &SealedRichRecoverySamples,
+) -> Result<Vec<u8>, CoreCodecError> {
+    let mut writer = section_writer(SectionKind::RichHistory, MAX_RICH_HISTORY_SECTION_BYTES)?;
+    encode_rich_header(&mut writer, samples)?;
+    encode_rich_history_witness(&mut writer, samples.history_rejected_witness())?;
+
+    let mut entries = Vec::with_capacity(RICH_HISTORY_SAMPLE_CAPACITY);
+    for (group, tuple) in samples.history_tuples() {
+        if entries.len() == RICH_HISTORY_SAMPLE_CAPACITY {
+            return Err(CoreCodecError::OversizedCount {
+                field: "rich History tuples",
+                actual: (entries.len() + 1) as u64,
+                maximum: RICH_HISTORY_SAMPLE_CAPACITY as u64,
+            });
+        }
+        entries.push((
+            tuple.score(),
+            RichHistoryTupleKey::new(
+                group,
+                tuple.timestamp().to_vec(),
+                tuple.amount_bits(),
+                tuple.data().to_vec(),
+            ),
+            tuple,
+        ));
+    }
+    entries.sort_by(|(left_score, left_key, _), (right_score, right_key, _)| {
+        rich_history_rank_cmp(*left_score, left_key, *right_score, right_key)
+    });
+    writer.put_u32(encode_bounded_count(
+        "rich History tuples",
+        entries.len(),
+        RICH_HISTORY_SAMPLE_CAPACITY,
+    )?)?;
+
+    let mut previous = None;
+    let mut keys = BTreeSet::new();
+    for (score, key, tuple) in entries {
+        validate_rich_history_entry(&mut previous, &mut keys, score, &key)?;
+        encode_sample_score(&mut writer, score)?;
+        encode_rich_history_key(&mut writer, &key)?;
+        if tuple.committed_multiplicity() == 0 {
+            return Err(CoreCodecError::InvalidRichRecovery(
+                RichRecoveryError::InvalidEvidence(
+                    "sealed History tuple has zero committed multiplicity",
+                ),
+            ));
+        }
+        writer.put_u64(tuple.committed_multiplicity())?;
+        encode_binary_u8(
+            &mut writer,
+            "History setup collision",
+            tuple.setup_collision_multiplicity(),
+        )?;
+    }
+    Ok(writer.finish())
+}
+
+fn decode_rich_history_section(bytes: &[u8]) -> Result<DecodedRichHistorySection, CoreCodecError> {
+    let mut reader = section_reader(
+        bytes,
+        SectionKind::RichHistory,
+        MAX_RICH_HISTORY_SECTION_BYTES,
+    )?;
+    let header = decode_rich_header(&mut reader)?;
+    let rejected = decode_rich_history_witness(&mut reader, "History cutoff witness")?;
+    let count = reader.bounded_count(
+        "rich History tuples",
+        u32::try_from(RICH_HISTORY_SAMPLE_CAPACITY).expect("History capacity fits u32"),
+    )?;
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut previous = None;
+    let mut keys = BTreeSet::new();
+    for _ in 0..count {
+        let score = decode_sample_score(&mut reader)?;
+        let key = decode_rich_history_key(&mut reader)?;
+        validate_rich_history_entry(&mut previous, &mut keys, score, &key)?;
+        let committed_multiplicity = reader.get_u64()?;
+        if committed_multiplicity == 0 {
+            return Err(CoreCodecError::InvalidRichRecovery(
+                RichRecoveryError::InvalidEvidence(
+                    "canonical History tuple has zero committed multiplicity",
+                ),
+            ));
+        }
+        let setup_collision_multiplicity =
+            u8::from(decode_boolean(&mut reader, "History setup collision")?);
+        entries.push(CanonicalRichHistoryTuple::new(
+            score,
+            key.group,
+            key.timestamp,
+            key.amount_bits,
+            key.data,
+            committed_multiplicity,
+            setup_collision_multiplicity,
+        ));
+    }
+    reader.finish()?;
+    Ok(DecodedRichHistorySection {
+        header,
+        rejected,
+        entries,
+    })
+}
+
 fn encode_rich_header(
     writer: &mut CanonicalWriter,
     samples: &SealedRichRecoverySamples,
@@ -1758,6 +1917,67 @@ fn decode_customer_key(reader: &mut CanonicalReader<'_>) -> Result<CustomerKey, 
     })
 }
 
+fn encode_history_group(
+    writer: &mut CanonicalWriter,
+    group: HistoryGroupKey,
+) -> Result<(), CoreCodecError> {
+    writer.put_i32(group.customer_id())?;
+    writer.put_u8(group.customer_district_id())?;
+    writer.put_u16(group.customer_warehouse_id())?;
+    writer.put_u8(group.home_district_id())?;
+    writer.put_u16(group.home_warehouse_id())
+}
+
+fn decode_history_group(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<HistoryGroupKey, CoreCodecError> {
+    Ok(HistoryGroupKey::from_parts(
+        reader.get_i32()?,
+        reader.get_u8()?,
+        reader.get_u16()?,
+        reader.get_u8()?,
+        reader.get_u16()?,
+    ))
+}
+
+fn encode_rich_history_key(
+    writer: &mut CanonicalWriter,
+    key: &RichHistoryTupleKey,
+) -> Result<(), CoreCodecError> {
+    encode_history_group(writer, key.group)?;
+    encode_bounded_bytes(
+        writer,
+        "History timestamp",
+        &key.timestamp,
+        1,
+        MAX_RICH_HISTORY_TIMESTAMP_BYTES,
+    )?;
+    writer.put_u32(key.amount_bits)?;
+    encode_bounded_bytes(
+        writer,
+        "History data",
+        &key.data,
+        1,
+        MAX_RICH_HISTORY_DATA_BYTES,
+    )
+}
+
+fn decode_rich_history_key(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<RichHistoryTupleKey, CoreCodecError> {
+    Ok(RichHistoryTupleKey::new(
+        decode_history_group(reader)?,
+        decode_bounded_bytes(
+            reader,
+            "History timestamp",
+            1,
+            MAX_RICH_HISTORY_TIMESTAMP_BYTES,
+        )?,
+        reader.get_u32()?,
+        decode_bounded_bytes(reader, "History data", 1, MAX_RICH_HISTORY_DATA_BYTES)?,
+    ))
+}
+
 fn encode_rich_order_witness(
     writer: &mut CanonicalWriter,
     witness: Option<&super::rich_recovery_samples::OrderCutoffWitness>,
@@ -1800,6 +2020,49 @@ fn decode_rich_customer_witness(
     }
 }
 
+fn encode_rich_history_witness(
+    writer: &mut CanonicalWriter,
+    witness: Option<&super::rich_recovery_samples::HistoryCutoffWitness>,
+) -> Result<(), CoreCodecError> {
+    match witness {
+        None => writer.put_u8(0),
+        Some(witness) => {
+            writer.put_u8(1)?;
+            encode_sample_score(writer, witness.score())?;
+            encode_rich_history_key(
+                writer,
+                &RichHistoryTupleKey::new(
+                    witness.group(),
+                    witness.timestamp().to_vec(),
+                    witness.amount_bits(),
+                    witness.data().to_vec(),
+                ),
+            )
+        }
+    }
+}
+
+fn decode_rich_history_witness(
+    reader: &mut CanonicalReader<'_>,
+    field: &'static str,
+) -> Result<Option<CanonicalRichHistoryWitness>, CoreCodecError> {
+    match reader.get_u8()? {
+        0 => Ok(None),
+        1 => {
+            let score = decode_sample_score(reader)?;
+            let key = decode_rich_history_key(reader)?;
+            Ok(Some(CanonicalRichHistoryWitness::new(
+                score,
+                key.group,
+                key.timestamp,
+                key.amount_bits,
+                key.data,
+            )))
+        }
+        actual => Err(CoreCodecError::InvalidPresenceFlag { field, actual }),
+    }
+}
+
 fn decode_rich_order_witness(
     reader: &mut CanonicalReader<'_>,
     field: &'static str,
@@ -1815,7 +2078,15 @@ fn decode_rich_order_witness(
 }
 
 fn encode_rich_count(field: &'static str, count: usize) -> Result<u32, CoreCodecError> {
-    let maximum = RICH_RECOVERY_SAMPLE_CAPACITY as u64;
+    encode_bounded_count(field, count, RICH_RECOVERY_SAMPLE_CAPACITY)
+}
+
+fn encode_bounded_count(
+    field: &'static str,
+    count: usize,
+    maximum: usize,
+) -> Result<u32, CoreCodecError> {
+    let maximum = maximum as u64;
     let actual = u64::try_from(count).unwrap_or(u64::MAX);
     if actual > maximum {
         return Err(CoreCodecError::OversizedCount {
@@ -1901,6 +2172,17 @@ fn encode_boolean(writer: &mut CanonicalWriter, value: bool) -> Result<(), CoreC
     writer.put_u8(u8::from(value))
 }
 
+fn encode_binary_u8(
+    writer: &mut CanonicalWriter,
+    field: &'static str,
+    value: u8,
+) -> Result<(), CoreCodecError> {
+    match value {
+        0 | 1 => writer.put_u8(value),
+        actual => Err(CoreCodecError::InvalidBoolean { field, actual }),
+    }
+}
+
 fn decode_boolean(
     reader: &mut CanonicalReader<'_>,
     field: &'static str,
@@ -1943,6 +2225,34 @@ fn validate_rich_customer_entry(
     let current = (score, key);
     if previous.as_ref().is_some_and(|prior| prior >= &current) {
         return Err(CoreCodecError::NonCanonicalRichCustomer { domain });
+    }
+    *previous = Some(current);
+    Ok(())
+}
+
+fn rich_history_rank_cmp(
+    left_score: SampleScore,
+    left_key: &RichHistoryTupleKey,
+    right_score: SampleScore,
+    right_key: &RichHistoryTupleKey,
+) -> Ordering {
+    left_score
+        .cmp(&right_score)
+        .then_with(|| left_key.cmp(right_key))
+}
+
+fn validate_rich_history_entry(
+    previous: &mut Option<(SampleScore, RichHistoryTupleKey)>,
+    keys: &mut BTreeSet<RichHistoryTupleKey>,
+    score: SampleScore,
+    key: &RichHistoryTupleKey,
+) -> Result<(), CoreCodecError> {
+    if !keys.insert(key.clone()) {
+        return Err(CoreCodecError::DuplicateRichHistoryTuple);
+    }
+    let current = (score, key.clone());
+    if previous.as_ref().is_some_and(|prior| prior >= &current) {
+        return Err(CoreCodecError::NonCanonicalRichHistory);
     }
     *previous = Some(current);
     Ok(())
@@ -2809,6 +3119,195 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rich_history_section_round_trips_empty_canonical_state() {
+        let intervals = empty_rich_intervals();
+        let samples = empty_rich_samples(&intervals);
+        let encoded = encode_rich_history_section(&samples).unwrap();
+        assert_eq!(&encoded[..4], b"TCS1");
+        assert_eq!(encoded[4], SectionKind::RichHistory as u8);
+
+        let decoded = decode_rich_history_section(&encoded).unwrap();
+        assert!(decoded.entries.is_empty());
+        assert!(decoded.rejected.is_none());
+        let restored = restore_history_only(decoded, &intervals);
+        assert_eq!(encode_rich_history_section(&restored).unwrap(), encoded);
+    }
+
+    #[test]
+    fn rich_history_decoder_prechecks_counts_lengths_multiplicity_and_flags() {
+        let key = test_history_key(1, b"2026-07-29 12:34:56", b"HISTORY-DATA");
+        let encoded = test_history_section(&[(SampleScore { high: 1, low: 2 }, key.clone())]);
+        let count_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1;
+        let entry_offset = count_offset + 4;
+
+        let mut oversized_count = encoded.clone();
+        oversized_count[count_offset..count_offset + 4].copy_from_slice(
+            &(u32::try_from(RICH_HISTORY_SAMPLE_CAPACITY).unwrap() + 1).to_le_bytes(),
+        );
+        assert!(matches!(
+            decode_rich_history_section(&oversized_count),
+            Err(CoreCodecError::OversizedCount {
+                field: "rich History tuples",
+                ..
+            })
+        ));
+
+        let mut oversized_timestamp = encoded.clone();
+        oversized_timestamp[entry_offset + 26] =
+            u8::try_from(MAX_RICH_HISTORY_TIMESTAMP_BYTES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_history_section(&oversized_timestamp),
+            Err(CoreCodecError::InvalidLength {
+                field: "History timestamp",
+                ..
+            })
+        ));
+
+        let mut oversized_data = encoded.clone();
+        oversized_data[entry_offset + 50] = u8::try_from(MAX_RICH_HISTORY_DATA_BYTES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_history_section(&oversized_data),
+            Err(CoreCodecError::InvalidLength {
+                field: "History data",
+                ..
+            })
+        ));
+
+        let mut zero_multiplicity = encoded.clone();
+        zero_multiplicity[entry_offset + 63..entry_offset + 71]
+            .copy_from_slice(&0_u64.to_le_bytes());
+        assert!(matches!(
+            decode_rich_history_section(&zero_multiplicity),
+            Err(CoreCodecError::InvalidRichRecovery(
+                RichRecoveryError::InvalidEvidence(
+                    "canonical History tuple has zero committed multiplicity"
+                )
+            ))
+        ));
+
+        let mut invalid_collision = encoded;
+        invalid_collision[entry_offset + 71] = 2;
+        assert!(matches!(
+            decode_rich_history_section(&invalid_collision),
+            Err(CoreCodecError::InvalidBoolean {
+                field: "History setup collision",
+                actual: 2,
+            })
+        ));
+
+        let witness = test_history_frame(Some((SampleScore { high: 3, low: 4 }, key)), &[]);
+        let mut oversized_witness_timestamp = witness.clone();
+        oversized_witness_timestamp[84] =
+            u8::try_from(MAX_RICH_HISTORY_TIMESTAMP_BYTES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_history_section(&oversized_witness_timestamp),
+            Err(CoreCodecError::InvalidLength {
+                field: "History timestamp",
+                ..
+            })
+        ));
+        let mut invalid_witness = witness;
+        invalid_witness[SECTION_HEADER_BYTES + RICH_HEADER_BYTES] = 2;
+        assert!(matches!(
+            decode_rich_history_section(&invalid_witness),
+            Err(CoreCodecError::InvalidPresenceFlag {
+                field: "History cutoff witness",
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn rich_history_decoder_enforces_global_rank_order_duplicates_and_tight_frame() {
+        let first_key = test_history_key(1, b"2026-07-29 12:34:56", b"HISTORY-DATA");
+        let second_key = test_history_key(2, b"2026-07-29 12:34:56", b"HISTORY-DATA");
+        let first = (SampleScore { high: 1, low: 2 }, first_key.clone());
+        let second = (SampleScore { high: 3, low: 4 }, second_key.clone());
+        let canonical = test_history_section(&[first.clone(), second.clone()]);
+        let decoded = decode_rich_history_section(&canonical).unwrap();
+        assert_eq!(decoded.entries.len(), 2);
+
+        let entry_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1 + 4;
+        assert_eq!(
+            &canonical[entry_offset..entry_offset + 8],
+            &first.0.high.to_le_bytes()
+        );
+        assert_eq!(
+            &canonical[entry_offset + 16..entry_offset + 20],
+            &first.1.group.customer_id().to_le_bytes()
+        );
+
+        assert!(matches!(
+            decode_rich_history_section(&test_history_section(&[second.clone(), first.clone()])),
+            Err(CoreCodecError::NonCanonicalRichHistory)
+        ));
+        assert!(matches!(
+            decode_rich_history_section(&test_history_section(&[
+                first.clone(),
+                (SampleScore { high: 3, low: 4 }, first_key),
+            ])),
+            Err(CoreCodecError::DuplicateRichHistoryTuple)
+        ));
+
+        let mut group_major = vec![
+            (
+                SampleScore { high: 9, low: 0 },
+                test_history_key(1, b"2026-07-29 12:34:56", b"A"),
+            ),
+            (
+                SampleScore { high: 1, low: 0 },
+                test_history_key(2, b"2026-07-29 12:34:56", b"B"),
+            ),
+        ];
+        group_major.sort_by(|(left_score, left_key), (right_score, right_key)| {
+            rich_history_rank_cmp(*left_score, left_key, *right_score, right_key)
+        });
+        assert_eq!(group_major[0].1.group.customer_id(), 2);
+
+        for end in [0, 1, 6, canonical.len() / 2, canonical.len() - 1] {
+            assert!(decode_rich_history_section(&canonical[..end]).is_err());
+        }
+        let mut unknown = canonical.clone();
+        unknown[4] = 0xff;
+        assert!(matches!(
+            decode_rich_history_section(&unknown),
+            Err(CoreCodecError::UnexpectedSection { actual: 0xff, .. })
+        ));
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(matches!(
+            decode_rich_history_section(&trailing),
+            Err(CoreCodecError::TrailingBytes { remaining: 1 })
+        ));
+
+        let maximum_key = test_history_key(
+            1,
+            &[b'T'; MAX_RICH_HISTORY_TIMESTAMP_BYTES],
+            &[b'D'; MAX_RICH_HISTORY_DATA_BYTES],
+        );
+        let maximum = test_history_frame(
+            Some((SampleScore { high: 9, low: 9 }, maximum_key.clone())),
+            &[
+                (SampleScore { high: 1, low: 1 }, maximum_key.clone()),
+                (
+                    SampleScore { high: 2, low: 2 },
+                    RichHistoryTupleKey::new(
+                        HistoryGroupKey::from_parts(2, 1, 1, 1, 1),
+                        maximum_key.timestamp,
+                        maximum_key.amount_bits,
+                        maximum_key.data,
+                    ),
+                ),
+            ],
+        );
+        assert_eq!(maximum.len(), MAX_RICH_HISTORY_SECTION_BYTES);
+        assert!(matches!(
+            decode_rich_history_section(&vec![0; MAX_RICH_HISTORY_SECTION_BYTES + 1]),
+            Err(CoreCodecError::OversizedSection { .. })
+        ));
+    }
+
     fn empty_rich_intervals() -> SealedIntervalEvidence {
         IntervalCollector::new(1, 1, TEST_SAMPLE_SEED, |_key: StockKey| None)
             .unwrap()
@@ -2927,6 +3426,34 @@ mod tests {
             None,
             decoded.rejected,
             None,
+            intervals,
+            &no_history,
+            &no_customer,
+        )
+        .unwrap()
+    }
+
+    fn restore_history_only(
+        decoded: DecodedRichHistorySection,
+        intervals: &SealedIntervalEvidence,
+    ) -> SealedRichRecoverySamples {
+        use crate::ranking::rich_recovery_samples::{
+            CanonicalRichBadCreditCustomer, CanonicalRichDelivery, InitialCustomerData,
+            InitialHistoryRow,
+        };
+
+        let no_history = |_key: CustomerKey| None::<InitialHistoryRow>;
+        let no_customer = |_key: CustomerKey| None::<InitialCustomerData>;
+        SealedRichRecoverySamples::from_canonical_parts(
+            decoded.header,
+            std::iter::empty::<CanonicalRichNewOrder>(),
+            std::iter::empty::<CanonicalRichDelivery>(),
+            std::iter::empty::<CanonicalRichBadCreditCustomer>(),
+            decoded.entries.into_iter(),
+            None,
+            None,
+            None,
+            decoded.rejected,
             intervals,
             &no_history,
             &no_customer,
@@ -3057,6 +3584,48 @@ mod tests {
             writer.put_u16(1).unwrap();
             writer.put_u8(1).unwrap();
             writer.put_u32(100).unwrap();
+        }
+        writer.finish()
+    }
+
+    fn test_history_key(customer_id: i32, timestamp: &[u8], data: &[u8]) -> RichHistoryTupleKey {
+        RichHistoryTupleKey::new(
+            HistoryGroupKey::from_parts(customer_id, 1, 1, 1, 1),
+            timestamp.to_vec(),
+            1.0_f32.to_bits(),
+            data.to_vec(),
+        )
+    }
+
+    fn test_history_section(entries: &[(SampleScore, RichHistoryTupleKey)]) -> Vec<u8> {
+        test_history_frame(None, entries)
+    }
+
+    fn test_history_frame(
+        witness: Option<(SampleScore, RichHistoryTupleKey)>,
+        entries: &[(SampleScore, RichHistoryTupleKey)],
+    ) -> Vec<u8> {
+        let empty =
+            encode_rich_history_section(&empty_rich_samples(&empty_rich_intervals())).unwrap();
+        let witness_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES;
+        let mut writer = CanonicalWriter::new(MAX_RICH_HISTORY_SECTION_BYTES);
+        writer.put_bytes(&empty[..witness_offset]).unwrap();
+        match witness {
+            None => writer.put_u8(0).unwrap(),
+            Some((score, key)) => {
+                writer.put_u8(1).unwrap();
+                encode_sample_score(&mut writer, score).unwrap();
+                encode_rich_history_key(&mut writer, &key).unwrap();
+            }
+        }
+        writer
+            .put_u32(u32::try_from(entries.len()).unwrap())
+            .unwrap();
+        for (score, key) in entries {
+            encode_sample_score(&mut writer, *score).unwrap();
+            encode_rich_history_key(&mut writer, key).unwrap();
+            writer.put_u64(1).unwrap();
+            writer.put_u8(0).unwrap();
         }
         writer.finish()
     }
