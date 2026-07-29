@@ -30,7 +30,11 @@ use crate::run_state::StateStore;
 use crate::runtime_schema::{RuntimeSchema, SchemaMode};
 use crate::workload::Final2026Workload;
 
-const DIAGNOSTIC_STAGE: StageId = StageId::custom(0x6469_6167_3230_3236);
+// ASCII "diagwarm" and "diagobsv". Each diagnostic process starts its client
+// sequences at zero, so the two public segments need independent routing
+// domains rather than replaying the same deterministic transaction prefix.
+const DIAGNOSTIC_WARMUP_STAGE: StageId = StageId::custom(0x6469_6167_7761_726d);
+const DIAGNOSTIC_OBSERVATION_STAGE: StageId = StageId::custom(0x6469_6167_6f62_7376);
 const DIAGNOSTIC_FAMILIES: [(TransactionKind, &str); 5] = [
     (TransactionKind::NewOrder, "new_order"),
     (TransactionKind::Payment, "payment"),
@@ -38,6 +42,13 @@ const DIAGNOSTIC_FAMILIES: [(TransactionKind, &str); 5] = [
     (TransactionKind::Delivery, "delivery"),
     (TransactionKind::StockLevel, "stock_level"),
 ];
+
+const fn diagnostic_stage(segment: DiagnosticSegment) -> StageId {
+    match segment {
+        DiagnosticSegment::Warmup => DIAGNOSTIC_WARMUP_STAGE,
+        DiagnosticSegment::Observation => DIAGNOSTIC_OBSERVATION_STAGE,
+    }
+}
 
 pub struct DiagnosticExecutor {
     config: Config,
@@ -71,7 +82,7 @@ impl DiagnosticExecutor {
         let phase_tail_grace = Duration::from_secs(self.config.phase_tail_grace_seconds);
         let duration = Duration::from_secs(duration_seconds);
         let router = OfficialRouter::new(WorkloadSeed(seed));
-        let wheel = router.wheel(DIAGNOSTIC_STAGE);
+        let wheel = router.wheel(diagnostic_stage(segment));
         let router = Arc::new(DiagnosticRouting { router, wheel });
 
         info!(
@@ -558,6 +569,32 @@ impl DiagnosticRunResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_segments_restart_at_zero_in_distinct_routing_domains() {
+        let router = OfficialRouter::new(WorkloadSeed(0x2026_0715));
+        let warmup_stage = diagnostic_stage(DiagnosticSegment::Warmup);
+        let observation_stage = diagnostic_stage(DiagnosticSegment::Observation);
+        assert_ne!(warmup_stage, observation_stage);
+
+        let warmup_wheel = router.wheel(warmup_stage);
+        let observation_wheel = router.wheel(observation_stage);
+        let mut warmup_sequence = ClientSequence::new(0).unwrap();
+        let mut observation_sequence = ClientSequence::new(0).unwrap();
+        let warmup_ticket = Final2026Workload::new(&router, &warmup_wheel)
+            .select(&mut warmup_sequence)
+            .unwrap();
+        let observation_ticket = Final2026Workload::new(&router, &observation_wheel)
+            .select(&mut observation_sequence)
+            .unwrap();
+
+        assert_eq!(warmup_ticket.route().txn_no, 0);
+        assert_eq!(observation_ticket.route().txn_no, 0);
+        assert_eq!(warmup_ticket.route().stage, warmup_stage);
+        assert_eq!(observation_ticket.route().stage, observation_stage);
+        assert_eq!(warmup_sequence.next_txn_no(), 1);
+        assert_eq!(observation_sequence.next_txn_no(), 1);
+    }
 
     #[test]
     fn absolute_attempt_deadline_is_the_phase_drain_deadline() {
