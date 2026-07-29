@@ -23,7 +23,7 @@ const CUSTOMERS_PER_DISTRICT: usize = 3_000;
 const DISTRICTS_PER_WAREHOUSE: usize = 10;
 const MAX_EDGES_PER_TERMINAL: usize = 15;
 const SAMPLE_LIMIT: usize = 64;
-pub const INTERVAL_SAMPLE_POLICY_VERSION: u32 = 1;
+pub const INTERVAL_SAMPLE_POLICY_VERSION: u32 = 2;
 const CUSTOMER_INITIAL_BALANCE_BITS: u32 = (-10.0_f32).to_bits();
 const CUSTOMER_INITIAL_YTD_BITS: u32 = 10.0_f32.to_bits();
 const CUSTOMER_INITIAL_PAYMENT_COUNT: i32 = 1;
@@ -481,6 +481,26 @@ struct StockSample {
     slot: StockSlot,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRejectedSample {
+    rank: u64,
+    key_index: u32,
+}
+
+impl CanonicalRejectedSample {
+    pub(crate) fn new(rank: u64, key_index: u32) -> Self {
+        Self { rank, key_index }
+    }
+
+    pub(crate) fn rank(self) -> u64 {
+        self.rank
+    }
+
+    pub(crate) fn key_index(self) -> u32 {
+        self.key_index
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ValidatedCustomer {
     key_index: u32,
@@ -520,6 +540,8 @@ pub struct IntervalCollector {
     pending_scratch: Vec<PendingSegment>,
     customer_updates: u64,
     stock_updates: u64,
+    customer_rejected: Option<CanonicalRejectedSample>,
+    stock_rejected: Option<CanonicalRejectedSample>,
     poisoned: Option<String>,
 }
 
@@ -567,6 +589,8 @@ impl IntervalCollector {
             pending_scratch: Vec::with_capacity(pending_capacity),
             customer_updates: 0,
             stock_updates: 0,
+            customer_rejected: None,
+            stock_rejected: None,
             poisoned: None,
         })
     }
@@ -668,6 +692,8 @@ impl IntervalCollector {
             stocks: self.stocks,
             customer_updates: self.customer_updates,
             stock_updates: self.stock_updates,
+            customer_rejected: self.customer_rejected,
+            stock_rejected: self.stock_rejected,
         })
     }
 
@@ -681,6 +707,7 @@ impl IntervalCollector {
             .checked_add(updates.len() as u64)
             .ok_or(CollectorError::Overflow("customer update count"))?;
         self.reset_customer_scratch();
+        let mut next_rejected = self.customer_rejected;
 
         let mut validated = [None; MAX_EDGES_PER_TERMINAL];
         for (position, mutation) in updates.iter().enumerate() {
@@ -695,6 +722,7 @@ impl IntervalCollector {
                 &mut self.pending_scratch,
                 edge.key_index,
                 rank,
+                &mut next_rejected,
             );
         }
         for edge in validated[..updates.len()].iter().flatten() {
@@ -718,6 +746,7 @@ impl IntervalCollector {
         self.customer_scratch.clear();
         self.pending_scratch.clear();
         self.customer_updates = next_updates;
+        self.customer_rejected = next_rejected;
         Ok(())
     }
 
@@ -728,6 +757,7 @@ impl IntervalCollector {
             .checked_add(updates.len() as u64)
             .ok_or(CollectorError::Overflow("stock update count"))?;
         self.reset_stock_scratch();
+        let mut next_rejected = self.stock_rejected;
 
         let mut validated = [None; MAX_EDGES_PER_TERMINAL];
         for (position, mutation) in updates.iter().enumerate() {
@@ -749,6 +779,7 @@ impl IntervalCollector {
                 &mut self.pending_scratch,
                 edge.key_index,
                 rank,
+                &mut next_rejected,
             );
         }
         for edge in validated[..updates.len()].iter().flatten() {
@@ -774,6 +805,7 @@ impl IntervalCollector {
         self.stock_scratch.clear();
         self.pending_scratch.clear();
         self.stock_updates = next_updates;
+        self.stock_rejected = next_rejected;
         Ok(())
     }
 
@@ -836,14 +868,18 @@ impl CollectorStorage {
 
 /// Canonical persisted form of one selected Customer chain endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CanonicalCustomerChain {
+pub(crate) struct CanonicalCustomerChain {
     key: CustomerKey,
     sample_rank: u64,
     endpoint: CustomerUpdateEndpoint,
 }
 
 impl CanonicalCustomerChain {
-    pub fn new(key: CustomerKey, sample_rank: u64, endpoint: CustomerUpdateEndpoint) -> Self {
+    pub(crate) fn new(
+        key: CustomerKey,
+        sample_rank: u64,
+        endpoint: CustomerUpdateEndpoint,
+    ) -> Self {
         Self {
             key,
             sample_rank,
@@ -851,22 +887,22 @@ impl CanonicalCustomerChain {
         }
     }
 
-    pub fn key(&self) -> CustomerKey {
+    pub(crate) fn key(&self) -> CustomerKey {
         self.key
     }
 
-    pub fn sample_rank(&self) -> u64 {
+    pub(crate) fn sample_rank(&self) -> u64 {
         self.sample_rank
     }
 
-    pub fn endpoint(&self) -> CustomerUpdateEndpoint {
+    pub(crate) fn endpoint(&self) -> CustomerUpdateEndpoint {
         self.endpoint
     }
 }
 
 /// Canonical persisted form of one selected Stock chain endpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CanonicalStockChain {
+pub(crate) struct CanonicalStockChain {
     key: StockKey,
     sample_rank: u64,
     initial: StockVersion,
@@ -874,7 +910,7 @@ pub struct CanonicalStockChain {
 }
 
 impl CanonicalStockChain {
-    pub fn new(
+    pub(crate) fn new(
         key: StockKey,
         sample_rank: u64,
         initial: StockVersion,
@@ -888,19 +924,19 @@ impl CanonicalStockChain {
         }
     }
 
-    pub fn key(&self) -> StockKey {
+    pub(crate) fn key(&self) -> StockKey {
         self.key
     }
 
-    pub fn sample_rank(&self) -> u64 {
+    pub(crate) fn sample_rank(&self) -> u64 {
         self.sample_rank
     }
 
-    pub fn initial(&self) -> &StockVersion {
+    pub(crate) fn initial(&self) -> &StockVersion {
         &self.initial
     }
 
-    pub fn endpoint(&self) -> &StockVersion {
+    pub(crate) fn endpoint(&self) -> &StockVersion {
         &self.endpoint
     }
 }
@@ -916,6 +952,8 @@ pub struct SealedIntervalEvidence {
     stocks: Vec<StockSample>,
     customer_updates: u64,
     stock_updates: u64,
+    customer_rejected: Option<CanonicalRejectedSample>,
+    stock_rejected: Option<CanonicalRejectedSample>,
 }
 
 impl SealedIntervalEvidence {
@@ -944,14 +982,21 @@ impl SealedIntervalEvidence {
     /// Binary/text codecs must reject oversized section counts before
     /// allocating their input vectors. This constructor then rechecks the
     /// semantic capacity, seed-derived ranks, strict order, setup roots,
-    /// endpoints, and global edge-count bounds.
+    /// endpoints, global edge counts, and the bottom-k cutoff witness.
+    ///
+    /// Endpoint checks here are deliberately necessary structural checks, not
+    /// a claim that an arbitrary FLOAT32 update sequence can be reconstructed
+    /// from its endpoint. Exact provenance comes from the live collector and
+    /// the outer artifact checksum binding.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_canonical_entries(
+    pub(crate) fn from_canonical_entries(
         warehouses: u16,
         sample_seed: u64,
         policy_version: u32,
         customer_updates: u64,
         stock_updates: u64,
+        customer_rejected: Option<CanonicalRejectedSample>,
+        stock_rejected: Option<CanonicalRejectedSample>,
         customers: Vec<CanonicalCustomerChain>,
         stocks: Vec<CanonicalStockChain>,
         stock_roots: &dyn StockRootProvider,
@@ -980,7 +1025,7 @@ impl SealedIntervalEvidence {
                 &mut previous_customer,
             )?;
             let endpoint = entry.endpoint;
-            require_finite("sealed customer balance", endpoint.balance_bits)?;
+            let balance = require_finite("sealed customer balance", endpoint.balance_bits)?;
             let ytd = require_finite("sealed customer YTD", endpoint.ytd_payment_bits)?;
             if endpoint.version.payment_count < CUSTOMER_INITIAL_PAYMENT_COUNT
                 || endpoint.version.delivery_count < CUSTOMER_INITIAL_DELIVERY_COUNT
@@ -1012,6 +1057,28 @@ impl SealedIntervalEvidence {
                     "selected customer has no update",
                 ));
             }
+            let root_balance = f32::from_bits(CUSTOMER_INITIAL_BALANCE_BITS);
+            let root_ytd = f32::from_bits(CUSTOMER_INITIAL_YTD_BITS);
+            if payment_updates == 0 && endpoint.ytd_payment_bits != CUSTOMER_INITIAL_YTD_BITS {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "Delivery-only customer changed Payment YTD",
+                ));
+            }
+            if payment_updates > 0 && ytd <= root_ytd {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "Payment customer YTD did not advance",
+                ));
+            }
+            if payment_updates > 0 && delivery_updates == 0 && balance >= root_balance {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "Payment-only customer balance did not decrease",
+                ));
+            }
+            if payment_updates == 0 && delivery_updates > 0 && balance <= root_balance {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "Delivery-only customer balance did not increase",
+                ));
+            }
             selected_customer_updates = selected_customer_updates
                 .checked_add(updates)
                 .ok_or(CollectorError::Overflow("sealed selected customer updates"))?;
@@ -1026,11 +1093,17 @@ impl SealedIntervalEvidence {
                 },
             });
         }
-        if selected_customer_updates > customer_updates {
-            return Err(CollectorError::InvalidSealedEvidence(
-                "selected customer updates exceed the global edge count",
-            ));
-        }
+        validate_selection_witness(
+            "customer",
+            warehouses,
+            sample_seed,
+            CUSTOMER_SAMPLE_DOMAIN,
+            customer_updates,
+            selected_customer_updates,
+            customer_samples.len(),
+            previous_customer,
+            customer_rejected,
+        )?;
 
         let mut stock_samples = Vec::with_capacity(stocks.len());
         let mut previous_stock = None;
@@ -1060,6 +1133,24 @@ impl SealedIntervalEvidence {
             let updates = u64::try_from(endpoint.order_count).map_err(|_| {
                 CollectorError::InvalidSealedEvidence("Stock update count is negative")
             })?;
+            if updates == 1 {
+                let ordered_quantity = (1_u8..=10)
+                    .find(|quantity| f32::from(*quantity).to_bits() == endpoint.ytd_bits)
+                    .ok_or(CollectorError::InvalidSealedEvidence(
+                        "single-update Stock YTD is not an exact quantity in 1..=10",
+                    ))?;
+                let ordered_quantity = i32::from(ordered_quantity);
+                let expected_quantity = if initial.quantity >= ordered_quantity + 10 {
+                    initial.quantity - ordered_quantity
+                } else {
+                    initial.quantity + 91 - ordered_quantity
+                };
+                if endpoint.quantity != expected_quantity {
+                    return Err(CollectorError::InvalidSealedEvidence(
+                        "single-update Stock quantity transition is impossible",
+                    ));
+                }
+            }
             selected_stock_updates = selected_stock_updates
                 .checked_add(updates)
                 .ok_or(CollectorError::Overflow("sealed selected Stock updates"))?;
@@ -1075,11 +1166,17 @@ impl SealedIntervalEvidence {
                 },
             });
         }
-        if selected_stock_updates > stock_updates {
-            return Err(CollectorError::InvalidSealedEvidence(
-                "selected Stock updates exceed the global edge count",
-            ));
-        }
+        validate_selection_witness(
+            "stock",
+            warehouses,
+            sample_seed,
+            STOCK_SAMPLE_DOMAIN,
+            stock_updates,
+            selected_stock_updates,
+            stock_samples.len(),
+            previous_stock,
+            stock_rejected,
+        )?;
 
         Ok(Self {
             warehouses,
@@ -1089,6 +1186,8 @@ impl SealedIntervalEvidence {
             stocks: stock_samples,
             customer_updates,
             stock_updates,
+            customer_rejected,
+            stock_rejected,
         })
     }
 
@@ -1098,6 +1197,14 @@ impl SealedIntervalEvidence {
 
     pub fn stock_sample_count(&self) -> usize {
         self.stocks.len()
+    }
+
+    pub(crate) fn customer_rejected_sample(&self) -> Option<CanonicalRejectedSample> {
+        self.customer_rejected
+    }
+
+    pub(crate) fn stock_rejected_sample(&self) -> Option<CanonicalRejectedSample> {
+        self.stock_rejected
     }
 
     pub fn customer(
@@ -1227,6 +1334,7 @@ fn select_customer(
     pending: &mut Vec<PendingSegment>,
     key_index: u32,
     rank: u64,
+    rejected: &mut Option<CanonicalRejectedSample>,
 ) -> Option<usize> {
     if let Some(position) = samples
         .iter()
@@ -1242,9 +1350,11 @@ fn select_customer(
             .map(|(position, _)| position)
             .expect("a full reservoir is nonempty");
         if (rank, key_index) >= (samples[worst].rank, samples[worst].key_index) {
+            observe_rejected(rejected, rank, key_index);
             return None;
         }
         let evicted = samples.swap_remove(worst);
+        observe_rejected(rejected, evicted.rank, evicted.key_index);
         pending.retain(|entry| {
             !matches!(
                 entry,
@@ -1268,6 +1378,7 @@ fn select_stock(
     pending: &mut Vec<PendingSegment>,
     key_index: u32,
     rank: u64,
+    rejected: &mut Option<CanonicalRejectedSample>,
 ) -> Option<usize> {
     if let Some(position) = samples
         .iter()
@@ -1283,9 +1394,11 @@ fn select_stock(
             .map(|(position, _)| position)
             .expect("a full reservoir is nonempty");
         if (rank, key_index) >= (samples[worst].rank, samples[worst].key_index) {
+            observe_rejected(rejected, rank, key_index);
             return None;
         }
         let evicted = samples.swap_remove(worst);
+        observe_rejected(rejected, evicted.rank, evicted.key_index);
         pending.retain(|entry| {
             !matches!(
                 entry,
@@ -1302,6 +1415,15 @@ fn select_stock(
         slot: StockSlot::EMPTY,
     });
     Some(samples.len() - 1)
+}
+
+fn observe_rejected(rejected: &mut Option<CanonicalRejectedSample>, rank: u64, key_index: u32) {
+    let candidate = CanonicalRejectedSample::new(rank, key_index);
+    if rejected.map_or(true, |current| {
+        (candidate.rank(), candidate.key_index()) < (current.rank(), current.key_index())
+    }) {
+        *rejected = Some(candidate);
+    }
 }
 
 fn insert_customer(
@@ -1707,6 +1829,82 @@ fn validate_sealed_presence(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_selection_witness(
+    domain: &'static str,
+    warehouses: u16,
+    sample_seed: u64,
+    rank_domain: u64,
+    global_updates: u64,
+    selected_updates: u64,
+    sample_count: usize,
+    selected_cutoff: Option<(u64, u32)>,
+    rejected: Option<CanonicalRejectedSample>,
+) -> Result<(), CollectorError> {
+    if selected_updates > global_updates {
+        return Err(CollectorError::InvalidSealedEvidence(match domain {
+            "customer" => "selected customer updates exceed the global edge count",
+            _ => "selected Stock updates exceed the global edge count",
+        }));
+    }
+
+    let Some(rejected) = rejected else {
+        if selected_updates != global_updates {
+            return Err(CollectorError::InvalidSealedEvidence(match domain {
+                "customer" => "complete customer samples do not cover the global edge count",
+                _ => "complete Stock samples do not cover the global edge count",
+            }));
+        }
+        return Ok(());
+    };
+
+    if sample_count != SAMPLE_LIMIT {
+        return Err(CollectorError::InvalidSealedEvidence(match domain {
+            "customer" => "customer rejection witness requires a full sample reservoir",
+            _ => "Stock rejection witness requires a full sample reservoir",
+        }));
+    }
+    if selected_updates == global_updates {
+        return Err(CollectorError::InvalidSealedEvidence(match domain {
+            "customer" => "customer rejection witness has no unselected global update",
+            _ => "Stock rejection witness has no unselected global update",
+        }));
+    }
+
+    let key_space = match domain {
+        "customer" => {
+            u64::from(warehouses) * DISTRICTS_PER_WAREHOUSE as u64 * CUSTOMERS_PER_DISTRICT as u64
+        }
+        _ => u64::from(warehouses) * u64::from(ITEM_COUNT),
+    };
+    if u64::from(rejected.key_index()) >= key_space {
+        return Err(CollectorError::InvalidSealedEvidence(match domain {
+            "customer" => "customer rejection witness key is outside the configured domain",
+            _ => "Stock rejection witness key is outside the configured domain",
+        }));
+    }
+    let expected_rank = sample_rank(sample_seed, rank_domain, rejected.key_index());
+    if rejected.rank() != expected_rank {
+        return Err(CollectorError::ForgedSampleRank {
+            domain,
+            key_index: rejected.key_index(),
+            actual: rejected.rank(),
+            expected: expected_rank,
+        });
+    }
+
+    let cutoff = selected_cutoff.ok_or(CollectorError::InvalidSealedEvidence(
+        "rejection witness exists without selected samples",
+    ))?;
+    if cutoff >= (rejected.rank(), rejected.key_index()) {
+        return Err(CollectorError::InvalidSealedEvidence(match domain {
+            "customer" => "customer rejection witness does not follow the selected cutoff",
+            _ => "Stock rejection witness does not follow the selected cutoff",
+        }));
+    }
+    Ok(())
+}
+
 fn validate_canonical_rank(
     domain: &'static str,
     key_index: u32,
@@ -2019,17 +2217,61 @@ mod tests {
             .iter()
             .map(|key| {
                 let index = stock_index(50, *key).unwrap();
-                (sample_rank(TEST_SEED, STOCK_SAMPLE_DOMAIN, index), *key)
+                (
+                    sample_rank(TEST_SEED, STOCK_SAMPLE_DOMAIN, index),
+                    index,
+                    *key,
+                )
             })
             .collect::<Vec<_>>();
         expected.sort_unstable();
+        let first_rejected = expected[SAMPLE_LIMIT];
         expected.truncate(SAMPLE_LIMIT);
         let actual = sealed
             .stocks()
-            .map(|chain| (chain.sample_rank(), chain.key()))
+            .map(|chain| {
+                (
+                    chain.sample_rank(),
+                    stock_index(50, chain.key()).unwrap(),
+                    chain.key(),
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
         assert_eq!(sealed.sample_seed(), TEST_SEED);
+        assert_eq!(
+            sealed.stock_rejected_sample(),
+            Some(CanonicalRejectedSample::new(
+                first_rejected.0,
+                first_rejected.1
+            ))
+        );
+
+        let stocks = sealed
+            .stocks()
+            .map(|chain| {
+                CanonicalStockChain::new(
+                    chain.key(),
+                    chain.sample_rank(),
+                    chain.initial(),
+                    chain.endpoint(),
+                )
+            })
+            .collect();
+        let rebuilt = SealedIntervalEvidence::from_canonical_entries(
+            50,
+            TEST_SEED,
+            INTERVAL_SAMPLE_POLICY_VERSION,
+            0,
+            1_000,
+            None,
+            sealed.stock_rejected_sample(),
+            Vec::new(),
+            stocks,
+            &root_for,
+        )
+        .unwrap();
+        assert_eq!(rebuilt.stock_sample_count(), SAMPLE_LIMIT);
     }
 
     #[test]
@@ -2038,11 +2280,25 @@ mod tests {
         let mut reverse = Vec::with_capacity(SAMPLE_LIMIT);
         let mut forward_pending = Vec::new();
         let mut reverse_pending = Vec::new();
+        let mut forward_rejected = None;
+        let mut reverse_rejected = None;
         for key_index in 0..=SAMPLE_LIMIT as u32 {
-            let _ = select_stock(&mut forward, &mut forward_pending, key_index, 7);
+            let _ = select_stock(
+                &mut forward,
+                &mut forward_pending,
+                key_index,
+                7,
+                &mut forward_rejected,
+            );
         }
         for key_index in (0..=SAMPLE_LIMIT as u32).rev() {
-            let _ = select_stock(&mut reverse, &mut reverse_pending, key_index, 7);
+            let _ = select_stock(
+                &mut reverse,
+                &mut reverse_pending,
+                key_index,
+                7,
+                &mut reverse_rejected,
+            );
         }
         let mut forward_keys = forward
             .iter()
@@ -2058,7 +2314,13 @@ mod tests {
         assert_eq!(reverse_keys, forward_keys);
 
         let before = reverse_keys;
-        let _ = select_stock(&mut reverse, &mut reverse_pending, SAMPLE_LIMIT as u32, 7);
+        let _ = select_stock(
+            &mut reverse,
+            &mut reverse_pending,
+            SAMPLE_LIMIT as u32,
+            7,
+            &mut reverse_rejected,
+        );
         let mut after = reverse
             .iter()
             .map(|sample| sample.key_index)
@@ -2565,6 +2827,8 @@ mod tests {
             INTERVAL_SAMPLE_POLICY_VERSION,
             1,
             1,
+            None,
+            None,
             customers.clone(),
             stocks.clone(),
             &root_for,
@@ -2589,6 +2853,8 @@ mod tests {
                 INTERVAL_SAMPLE_POLICY_VERSION + 1,
                 1,
                 1,
+                None,
+                None,
                 customers.clone(),
                 stocks.clone(),
                 &root_for,
@@ -2605,6 +2871,8 @@ mod tests {
                 INTERVAL_SAMPLE_POLICY_VERSION,
                 1,
                 1,
+                None,
+                None,
                 forged_rank,
                 stocks.clone(),
                 &root_for,
@@ -2623,6 +2891,8 @@ mod tests {
                 INTERVAL_SAMPLE_POLICY_VERSION,
                 2,
                 1,
+                None,
+                None,
                 duplicate,
                 stocks.clone(),
                 &root_for,
@@ -2639,11 +2909,269 @@ mod tests {
                 INTERVAL_SAMPLE_POLICY_VERSION,
                 1,
                 1,
+                None,
+                None,
                 customers,
                 forged_root,
                 &root_for,
             ),
             Err(CollectorError::StockRootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn sealed_reconstruction_requires_the_live_bottom_k_cutoff_witness() {
+        let keys = (1..=SAMPLE_LIMIT as i32 + 1)
+            .map(|customer_id| CustomerKey {
+                warehouse_id: 1,
+                district_id: 1,
+                customer_id,
+            })
+            .collect::<Vec<_>>();
+        let mut collector = collector(32);
+        for chunk in keys.chunks(MAX_EDGES_PER_TERMINAL) {
+            let updates = chunk
+                .iter()
+                .map(|key| {
+                    CustomerMutation::new(
+                        *key,
+                        payment_edge(customer_version(1, 0), -10.0, 10.0, 1.0),
+                    )
+                })
+                .collect::<Vec<_>>();
+            collector
+                .record_terminal(TerminalEvidence::customers(&updates))
+                .unwrap();
+        }
+        let sealed = collector.seal().unwrap();
+        let witness = sealed.customer_rejected_sample().unwrap();
+        let mut all_ranks = keys
+            .iter()
+            .map(|key| {
+                let key_index = customer_index(50, *key).unwrap();
+                (
+                    sample_rank(TEST_SEED, CUSTOMER_SAMPLE_DOMAIN, key_index),
+                    key_index,
+                )
+            })
+            .collect::<Vec<_>>();
+        all_ranks.sort_unstable();
+        assert_eq!(
+            (witness.rank(), witness.key_index()),
+            all_ranks[SAMPLE_LIMIT]
+        );
+
+        let customers = sealed
+            .customers()
+            .map(|chain| {
+                CanonicalCustomerChain::new(chain.key(), chain.sample_rank(), chain.endpoint())
+            })
+            .collect::<Vec<_>>();
+        SealedIntervalEvidence::from_canonical_entries(
+            50,
+            TEST_SEED,
+            INTERVAL_SAMPLE_POLICY_VERSION,
+            (SAMPLE_LIMIT + 1) as u64,
+            0,
+            Some(witness),
+            None,
+            customers.clone(),
+            Vec::new(),
+            &root_for,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                (SAMPLE_LIMIT + 1) as u64,
+                0,
+                None,
+                None,
+                customers.clone(),
+                Vec::new(),
+                &root_for,
+            ),
+            Err(CollectorError::InvalidSealedEvidence(
+                "complete customer samples do not cover the global edge count"
+            ))
+        ));
+
+        let mut forged_witness = witness;
+        forged_witness.rank ^= 1;
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                (SAMPLE_LIMIT + 1) as u64,
+                0,
+                Some(forged_witness),
+                None,
+                customers.clone(),
+                Vec::new(),
+                &root_for,
+            ),
+            Err(CollectorError::ForgedSampleRank {
+                domain: "customer",
+                ..
+            })
+        ));
+
+        let endpoint = customers[0].endpoint();
+        let rejected_key = customer_key_from_index(50, witness.key_index());
+        let mut omitted_lowest = customers[1..].to_vec();
+        omitted_lowest.push(CanonicalCustomerChain::new(
+            rejected_key,
+            witness.rank(),
+            endpoint,
+        ));
+        omitted_lowest.sort_unstable_by_key(|entry| (entry.sample_rank(), entry.key()));
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                (SAMPLE_LIMIT + 1) as u64,
+                0,
+                Some(witness),
+                None,
+                omitted_lowest,
+                Vec::new(),
+                &root_for,
+            ),
+            Err(CollectorError::InvalidSealedEvidence(
+                "customer rejection witness does not follow the selected cutoff"
+            ))
+        ));
+    }
+
+    #[test]
+    fn sealed_reconstruction_rejects_count_inflation_and_impossible_endpoints() {
+        let customer_key = CustomerKey {
+            warehouse_id: 1,
+            district_id: 1,
+            customer_id: 1,
+        };
+        let customer_index = customer_index(50, customer_key).unwrap();
+        let valid_customer = CanonicalCustomerChain::new(
+            customer_key,
+            sample_rank(TEST_SEED, CUSTOMER_SAMPLE_DOMAIN, customer_index),
+            CustomerUpdateEndpoint {
+                version: customer_version(2, 0),
+                balance_bits: (-11.0_f32).to_bits(),
+                ytd_payment_bits: 11.0_f32.to_bits(),
+            },
+        );
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                2,
+                0,
+                None,
+                None,
+                vec![valid_customer],
+                Vec::new(),
+                &root_for,
+            ),
+            Err(CollectorError::InvalidSealedEvidence(
+                "complete customer samples do not cover the global edge count"
+            ))
+        ));
+
+        let impossible_customer = CanonicalCustomerChain::new(
+            customer_key,
+            sample_rank(TEST_SEED, CUSTOMER_SAMPLE_DOMAIN, customer_index),
+            CustomerUpdateEndpoint {
+                version: customer_version(2, 0),
+                balance_bits: (-10.0_f32).to_bits(),
+                ytd_payment_bits: 11.0_f32.to_bits(),
+            },
+        );
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                1,
+                0,
+                None,
+                None,
+                vec![impossible_customer],
+                Vec::new(),
+                &root_for,
+            ),
+            Err(CollectorError::InvalidSealedEvidence(
+                "Payment-only customer balance did not decrease"
+            ))
+        ));
+
+        let stock_key = StockKey {
+            warehouse_id: 1,
+            item_id: 42,
+        };
+        let stock_index = stock_index(50, stock_key).unwrap();
+        let stock_root = stock_root(stock_key);
+        let half_ytd = CanonicalStockChain::new(
+            stock_key,
+            sample_rank(TEST_SEED, STOCK_SAMPLE_DOMAIN, stock_index),
+            stock_root.version(),
+            StockVersion {
+                quantity: stock_root.quantity,
+                ytd_bits: 0.5_f32.to_bits(),
+                order_count: 1,
+                remote_count: 0,
+            },
+        );
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                0,
+                1,
+                None,
+                None,
+                Vec::new(),
+                vec![half_ytd],
+                &root_for,
+            ),
+            Err(CollectorError::InvalidSealedEvidence(
+                "single-update Stock YTD is not an exact quantity in 1..=10"
+            ))
+        ));
+
+        let impossible_quantity = CanonicalStockChain::new(
+            stock_key,
+            sample_rank(TEST_SEED, STOCK_SAMPLE_DOMAIN, stock_index),
+            stock_root.version(),
+            StockVersion {
+                quantity: stock_root.quantity,
+                ytd_bits: 3.0_f32.to_bits(),
+                order_count: 1,
+                remote_count: 0,
+            },
+        );
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                0,
+                1,
+                None,
+                None,
+                Vec::new(),
+                vec![impossible_quantity],
+                &root_for,
+            ),
+            Err(CollectorError::InvalidSealedEvidence(
+                "single-update Stock quantity transition is impossible"
+            ))
         ));
     }
 
@@ -2677,6 +3205,8 @@ mod tests {
                 INTERVAL_SAMPLE_POLICY_VERSION,
                 customers.len() as u64,
                 0,
+                None,
+                None,
                 customers,
                 Vec::new(),
                 &root_for,
@@ -2709,6 +3239,8 @@ mod tests {
                 INTERVAL_SAMPLE_POLICY_VERSION,
                 1,
                 0,
+                None,
+                None,
                 vec![two_updates],
                 Vec::new(),
                 &root_for,
