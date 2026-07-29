@@ -91,6 +91,31 @@ class WorkflowSafetyTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("requires --mode all", result.stderr)
 
+    def test_readiness_deviation_requires_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            rejected = self.run_script(
+                "--plan-only",
+                "--target-dir",
+                root,
+                "--ready-timeout-seconds",
+                "5",
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("require --allow-deviation", rejected.stderr)
+
+            accepted = self.run_script(
+                "--plan-only",
+                "--target-dir",
+                root,
+                "--ready-timeout-seconds",
+                "5",
+                "--allow-deviation",
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("conformance=non_ranked_deviation", accepted.stdout)
+            self.assertIn("ranked_configuration=0", accepted.stdout)
+
     def test_tools_mode_preserves_existing_database_and_source_csv(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)
@@ -301,9 +326,6 @@ while :; do sleep 0.05; done
                 server,
                 "--tpcc-bin",
                 tester,
-                "--ready-timeout-seconds",
-                "5",
-                "--diagnostics",
                 env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -471,9 +493,6 @@ while :; do sleep 0.05; done
                 server,
                 "--tpcc-bin",
                 tester,
-                "--ready-timeout-seconds",
-                "5",
-                "--diagnostics",
                 "--seed",
                 "7331",
                 env=env,

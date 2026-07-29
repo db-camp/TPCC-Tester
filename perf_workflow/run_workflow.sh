@@ -68,6 +68,7 @@ PUBLIC_CLIENTS=32
 PUBLIC_WARMUP_SECONDS=30
 PUBLIC_WINDOWS=3
 PUBLIC_WINDOW_SECONDS=150
+PUBLIC_READY_TIMEOUT_SECONDS=90
 DIAGNOSTIC_WARMUP_SECONDS=10
 DIAGNOSTIC_OBSERVATION_SECONDS=60
 
@@ -102,9 +103,9 @@ Paths/build:
 
 Lifecycle:
   --init-db                    Initialize before --mode rank
-  --ready-timeout-seconds <n>  Default: 90
-  --diagnostics                Request non-ranked diagnostics after a fully
-                               successful --mode all lifecycle
+  --ready-timeout-seconds <n>  Public default: 90; other values are deviations
+  --diagnostics                Compatibility flag; --mode all automatically
+                               runs non-ranked diagnostics after every gate
   --keep-db-artifacts
   --clean-db-on-exit
   --label <safe-single-component>
@@ -271,6 +272,9 @@ esac
 if [[ "${DIAGNOSTICS_REQUESTED}" == "1" && "${MODE}" != "all" ]]; then
   die "--diagnostics requires --mode all so rank, online, and recovery gates complete first"
 fi
+if [[ "${MODE}" == "all" ]]; then
+  DIAGNOSTICS_REQUESTED=1
+fi
 
 validate_component "--db-name" "${DB_NAME}"
 validate_component "--label" "${LABEL}"
@@ -281,9 +285,10 @@ validate_positive_integer "--port" "${PORT}"
 (( 10#${PORT} <= 65535 )) || die "--port must be at most 65535"
 validate_positive_integer "--ready-timeout-seconds" "${READY_TIMEOUT_SECONDS}"
 
-if [[ -n "${SCALE}${CLIENTS}${WARMUP_SECONDS}${WINDOW_SECONDS}" ]] \
+if [[ -n "${SCALE}${CLIENTS}${WARMUP_SECONDS}${WINDOW_SECONDS}" \
+  || "${READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]] \
   && [[ "${ALLOW_DEVIATION}" != "1" ]]; then
-  die "local sizing/timing overrides require --allow-deviation"
+  die "local sizing/timing/readiness overrides require --allow-deviation"
 fi
 if [[ "${ALLOW_DEVIATION}" == "1" ]]; then
   [[ -z "${SCALE}" ]] || validate_positive_integer "--scale" "${SCALE}"
@@ -302,8 +307,14 @@ RANKED_CONFIGURATION=1
 if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_CLIENTS}" != "${PUBLIC_CLIENTS}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
-  || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" ]]; then
+  || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
+  || "${READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
+fi
+if [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
+  CONFORMANCE="public_spec_aligned"
+else
+  CONFORMANCE="non_ranked_deviation"
 fi
 
 RMDB_DIR="$(canonical_existing_dir "${RMDB_DIR}")" \
@@ -401,7 +412,7 @@ print_plan() {
   cat <<EOF
 mode=${MODE}
 profile=${PROFILE}
-conformance=public_spec_aligned
+conformance=${CONFORMANCE}
 ranked_configuration=${RANKED_CONFIGURATION}
 seed=${SEED}
 seed_caller_supplied=${SEED_CALLER_SUPPLIED}
@@ -525,7 +536,11 @@ import sys
 
 payload = {
     "schema_version": 1,
-    "conformance": "public_spec_aligned",
+    "conformance": (
+        "public_spec_aligned"
+        if ranked_configuration == "1"
+        else "non_ranked_deviation"
+    ),
     "embeds_unpublished_official_values": False,
     "status": workflow_status,
     "mode": mode,
@@ -1009,7 +1024,7 @@ run_crash_restart() {
   set_phase_status crash_restart passed
 }
 
-run_optional_diagnostics() {
+run_final_diagnostics() {
   [[ "${DIAGNOSTICS_REQUESTED}" == "1" ]] || return 0
   if [[ "${PHASE_RANK}" != "passed" \
     || "${PHASE_ONLINE}" != "passed" \
@@ -1019,7 +1034,7 @@ run_optional_diagnostics() {
 
   set_phase_status diagnostics running
   if ! command -v strace >/dev/null 2>&1; then
-    warn "strace is unavailable; skipping optional non-ranked 10s warmup + 60s observation"
+    warn "strace is unavailable; skipping non-ranked 10s warmup + 60s observation"
     set_phase_status diagnostics unavailable
     return 0
   fi
@@ -1071,7 +1086,7 @@ write_summary() {
     echo "- seed: ${SEED}"
     echo "- status: success"
     echo "- Rust owns warmup, all three formal windows, and semantic gates."
-    echo "- optional diagnostics: ${PHASE_DIAGNOSTICS} (never ranked)"
+    echo "- final diagnostics: ${PHASE_DIAGNOSTICS} (never ranked)"
   } >"${RESULT_DIR}/summary.md"
 }
 
@@ -1118,7 +1133,7 @@ case "${MODE}" in
     run_check online
     run_crash_restart
     run_check recovery
-    run_optional_diagnostics
+    run_final_diagnostics
     stop_server
     ;;
 esac
