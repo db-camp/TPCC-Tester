@@ -141,6 +141,12 @@ import sys
 
 with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
     output.write("\\t".join(sys.argv[1:]) + "\\n")
+if "--lifecycle-event" in sys.argv:
+    event = sys.argv[sys.argv.index("--lifecycle-event") + 1]
+    with open(
+        os.environ["FAKE_SERVER_EVENTS"], "a", encoding="utf-8"
+    ) as output:
+        output.write(f"lifecycle {event}\\n")
 """,
         )
         env = os.environ.copy()
@@ -1141,6 +1147,29 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             graceful = [
                 line.split() for line in events if line.startswith("graceful ")
             ]
+            timeline = [
+                (
+                    "start"
+                    if line.startswith("start ")
+                    else "graceful"
+                    if line.startswith("graceful ")
+                    else line
+                )
+                for line in events
+            ]
+            self.assertEqual(
+                timeline,
+                [
+                    "lifecycle setup-intent",
+                    "start",
+                    "lifecycle crash-intent",
+                    "lifecycle crash-killed",
+                    "lifecycle restart-started",
+                    "start",
+                    "lifecycle restart-ready",
+                    "graceful",
+                ],
+            )
             self.assertEqual(len(starts), 2, events)
             self.assertEqual([row[2] for row in starts], ["0", "1"])
             self.assertEqual(

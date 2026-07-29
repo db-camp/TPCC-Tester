@@ -2864,6 +2864,16 @@ run_profile_tester() {
   run_tester "${log_path}" "${command[@]}"
 }
 
+record_lifecycle_event() {
+  local event="$1"
+  log "recording fail-closed lifecycle event ${event}"
+  if ! run_profile_tester "${RESULT_DIR}/lifecycle_${event}.log" \
+      --lifecycle-event "${event}" --profile "${PROFILE}" \
+      --seed "${SEED}" --state-dir "${STATE_DIR}"; then
+    die "could not persist lifecycle event ${event}; see ${RESULT_DIR}/lifecycle_${event}.log"
+  fi
+}
+
 run_setup() {
   log "creating and loading final2026 dataset"
   set_phase_status setup running
@@ -2914,8 +2924,12 @@ run_check() {
 
 run_crash_restart() {
   set_phase_status crash_restart running
+  record_lifecycle_event crash-intent
   crash_server
+  record_lifecycle_event crash-killed
+  record_lifecycle_event restart-started
   start_existing_database
+  record_lifecycle_event restart-ready
   set_phase_status crash_restart passed
 }
 
@@ -3070,12 +3084,14 @@ ensure_binaries
 
 case "${MODE}" in
   init)
+    record_lifecycle_event setup-intent
     start_new_database
     run_setup
     stop_server
     ;;
   rank)
     if [[ "${INIT_BEFORE_RUN}" == "1" ]]; then
+      record_lifecycle_event setup-intent
       start_new_database
       run_setup
     else
@@ -3091,6 +3107,7 @@ case "${MODE}" in
     stop_server
     ;;
   all)
+    record_lifecycle_event setup-intent
     start_new_database
     run_setup
     run_rank
