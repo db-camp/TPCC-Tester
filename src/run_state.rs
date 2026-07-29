@@ -2615,26 +2615,41 @@ impl Drop for StateDirectoryLock {
 fn lock_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
     let directory = File::open(root)?;
     directory.lock()?;
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir() {
-        return Err(StateError::Invalid(format!(
-            "state path changed while locking: {}",
-            root.display()
-        )));
-    }
+    validate_locked_directory_identity(root, &directory)?;
     Ok(StateDirectoryLock(directory))
 }
 
 fn lock_clean_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
     let directory_lock = lock_state_directory(root)?;
-    cleanup_orphan_temporary_files(root)?;
+    cleanup_orphan_temporary_files(root, &directory_lock.0)?;
+    validate_locked_directory_identity(root, &directory_lock.0)?;
     Ok(directory_lock)
 }
 
-fn cleanup_orphan_temporary_files(root: &Path) -> Result<(), StateError> {
-    let mut removed = false;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
+fn cleanup_orphan_temporary_files(root: &Path, directory: &File) -> Result<(), StateError> {
+    cleanup_orphan_temporary_files_with_fault(root, directory, |_| Ok(()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrphanCleanupStep {
+    BeforeTargetSync,
+    BeforeCleanupSync,
+}
+
+struct OrphanTemporary {
+    path: PathBuf,
+    linked_to_target: bool,
+}
+
+fn cleanup_orphan_temporary_files_with_fault(
+    root: &Path,
+    directory: &File,
+    mut inject_fault: impl FnMut(OrphanCleanupStep) -> std::io::Result<()>,
+) -> Result<(), StateError> {
+    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut temporaries = Vec::new();
+    for entry in entries {
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
             continue;
@@ -2654,7 +2669,7 @@ fn cleanup_orphan_temporary_files(root: &Path) -> Result<(), StateError> {
         validate_temporary_owner(root, &temporary, &temporary_metadata)?;
 
         let target = root.join(target_name);
-        match fs::symlink_metadata(&target) {
+        let linked_to_target = match fs::symlink_metadata(&target) {
             Ok(target_metadata) => {
                 if target_metadata.file_type().is_symlink() || !target_metadata.is_file() {
                     return Err(StateError::Invalid(format!(
@@ -2668,17 +2683,65 @@ fn cleanup_orphan_temporary_files(root: &Path) -> Result<(), StateError> {
                     &target,
                     &target_metadata,
                 )?;
+                true
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 validate_unlinked_temporary(&temporary, &temporary_metadata)?;
+                false
             }
             Err(error) => return Err(StateError::Io(error)),
-        }
-        fs::remove_file(&temporary)?;
-        removed = true;
+        };
+        temporaries.push(OrphanTemporary {
+            path: temporary,
+            linked_to_target,
+        });
     }
-    if removed {
-        File::open(root)?.sync_all()?;
+
+    if temporaries
+        .iter()
+        .any(|temporary| temporary.linked_to_target)
+    {
+        inject_fault(OrphanCleanupStep::BeforeTargetSync)?;
+        directory.sync_all()?;
+    }
+    for temporary in &temporaries {
+        fs::remove_file(&temporary.path)?;
+    }
+    if !temporaries.is_empty() {
+        inject_fault(OrphanCleanupStep::BeforeCleanupSync)?;
+        directory.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_locked_directory_identity(root: &Path, directory: &File) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path_metadata = fs::symlink_metadata(root)?;
+    validate_real_directory(root, &path_metadata)?;
+    let locked_metadata = directory.metadata()?;
+    if !locked_metadata.is_dir()
+        || locked_metadata.dev() != path_metadata.dev()
+        || locked_metadata.ino() != path_metadata.ino()
+    {
+        return Err(StateError::Invalid(format!(
+            "state path changed while locking: {}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_locked_directory_identity(root: &Path, directory: &File) -> Result<(), StateError> {
+    let path_metadata = fs::symlink_metadata(root)?;
+    validate_real_directory(root, &path_metadata)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(StateError::Invalid(format!(
+            "state path changed while locking: {}",
+            root.display()
+        )));
     }
     Ok(())
 }
@@ -3734,6 +3797,104 @@ mod tests {
             .publish_setup_intent("run-clean-orphan", 51, &contract)
             .unwrap();
         assert!(directory.0.join(SETUP_INTENT_FILE).is_file());
+    }
+
+    #[test]
+    fn orphan_cleanup_validates_the_complete_batch_before_unlinking() {
+        let directory = TestDirectory::new();
+        let valid = directory
+            .0
+            .join(format!(".{DATASET_FILE}.{}.90.tmp", std::process::id()));
+        fs::write(&valid, b"valid-unlinked-orphan").unwrap();
+
+        let invalid = directory.0.join(format!(
+            ".{SETUP_INTENT_FILE}.{}.91.tmp",
+            std::process::id()
+        ));
+        let target = directory.0.join(SETUP_INTENT_FILE);
+        fs::write(&invalid, b"unrelated-temporary").unwrap();
+        fs::write(&target, b"different-target-inode").unwrap();
+
+        let directory_file = File::open(&directory.0).unwrap();
+        assert!(cleanup_orphan_temporary_files(&directory.0, &directory_file).is_err());
+        assert_eq!(fs::read(&valid).unwrap(), b"valid-unlinked-orphan");
+        assert_eq!(fs::read(&invalid).unwrap(), b"unrelated-temporary");
+        assert_eq!(fs::read(&target).unwrap(), b"different-target-inode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_orphan_target_sync_failure_preserves_provenance_pair() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = TestDirectory::new();
+        let temporary = directory
+            .0
+            .join(format!(".{DATASET_FILE}.{}.92.tmp", std::process::id()));
+        let target = directory.0.join(DATASET_FILE);
+        fs::write(&temporary, b"provisional-target").unwrap();
+        fs::hard_link(&temporary, &target).unwrap();
+
+        let directory_file = File::open(&directory.0).unwrap();
+        let result =
+            cleanup_orphan_temporary_files_with_fault(&directory.0, &directory_file, |step| {
+                if step == OrphanCleanupStep::BeforeTargetSync {
+                    Err(std::io::Error::other("injected target sync failure"))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(result.is_err());
+        let temporary_metadata = fs::symlink_metadata(&temporary).unwrap();
+        let target_metadata = fs::symlink_metadata(&target).unwrap();
+        assert_eq!(temporary_metadata.dev(), target_metadata.dev());
+        assert_eq!(temporary_metadata.ino(), target_metadata.ino());
+        assert_eq!(temporary_metadata.nlink(), 2);
+        assert_eq!(target_metadata.nlink(), 2);
+        assert_eq!(fs::read(&temporary).unwrap(), b"provisional-target");
+        assert_eq!(fs::read(&target).unwrap(), b"provisional-target");
+    }
+
+    #[test]
+    fn linked_orphan_cleanup_sync_failure_keeps_the_durable_target() {
+        let directory = TestDirectory::new();
+        let temporary = directory
+            .0
+            .join(format!(".{DATASET_FILE}.{}.93.tmp", std::process::id()));
+        let target = directory.0.join(DATASET_FILE);
+        fs::write(&temporary, b"durable-target").unwrap();
+        fs::hard_link(&temporary, &target).unwrap();
+
+        let directory_file = File::open(&directory.0).unwrap();
+        let result =
+            cleanup_orphan_temporary_files_with_fault(&directory.0, &directory_file, |step| {
+                if step == OrphanCleanupStep::BeforeCleanupSync {
+                    Err(std::io::Error::other("injected cleanup sync failure"))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(result.is_err());
+        assert!(!temporary.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"durable-target");
+        cleanup_orphan_temporary_files(&directory.0, &directory_file).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"durable-target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_state_directory_rejects_path_replacement() {
+        let parent = TestDirectory::new();
+        let root = parent.0.join("state");
+        let moved = parent.0.join("moved-state");
+        fs::create_dir(&root).unwrap();
+        let locked = File::open(&root).unwrap();
+        locked.lock().unwrap();
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+
+        assert!(validate_locked_directory_identity(&root, &locked).is_err());
+        locked.unlock().unwrap();
     }
 
     #[cfg(unix)]
