@@ -95,6 +95,10 @@ pub struct Config {
     #[arg(long)]
     pub seed: Option<u64>,
 
+    /// Use the public logical TPC-C identifiers (non-ranked compatibility mode)
+    #[arg(long = "canonical-schema")]
+    pub canonical_schema: bool,
+
     /// Scale factor / 仓库数量
     #[arg(short = 's', long = "scale", default_value_t = 50)]
     pub scale_factor: i32,
@@ -231,8 +235,8 @@ pub enum ConfigError {
     DeviationRequiresOptIn { fields: String },
 
     #[error(
-        "--seed is required for --init, --benchmark, --diagnostic-workload-seconds, \
-         and --lifecycle-event \
+        "--seed is required for --create-schema, --init, --benchmark, \
+         --diagnostic-workload-seconds, and --lifecycle-event \
          (no grader seed is embedded)"
     )]
     MissingSeed,
@@ -307,6 +311,7 @@ impl Config {
                 || self.lifecycle_event.is_some()
                 || self.allow_deviation
                 || self.seed.is_some()
+                || self.canonical_schema
                 || self.expected_new_orders.is_some()
                 || self.warmup_seconds.is_some()
                 || self.window_seconds.is_some()
@@ -325,6 +330,7 @@ impl Config {
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
                 || self.diagnose
+                || self.canonical_schema
                 || self.expected_new_orders.is_some()
                 || self.warmup_seconds.is_some()
                 || self.window_seconds.is_some()
@@ -360,7 +366,11 @@ impl Config {
 
         self.resolved_profile()?;
 
-        if (self.init || self.benchmark || diagnostic_workload || self.lifecycle_event.is_some())
+        if (self.create_schema
+            || self.init
+            || self.benchmark
+            || diagnostic_workload
+            || self.lifecycle_event.is_some())
             && self.seed.is_none()
         {
             return Err(ConfigError::MissingSeed);
@@ -409,6 +419,13 @@ impl Config {
                 field: "setup_actions",
                 official: "--create-schema --init".to_owned(),
                 effective: "--create-schema without --init".to_owned(),
+            });
+        }
+        if self.canonical_schema {
+            extra_deviations.push(EffectiveDeviation {
+                field: "runtime_schema",
+                official: "local_seed_opaque_v1".to_owned(),
+                effective: "canonical".to_owned(),
             });
         }
 
@@ -601,9 +618,45 @@ mod tests {
     }
 
     #[test]
-    fn init_and_benchmark_never_guess_the_hidden_seed() {
-        let config = Config::try_parse_from(["tpcc-tester", "--init"]).unwrap();
-        assert!(matches!(config.validate(), Err(ConfigError::MissingSeed)));
+    fn setup_and_ranked_actions_never_guess_the_hidden_seed() {
+        for action in ["--create-schema", "--init", "--benchmark"] {
+            let config = Config::try_parse_from(["tpcc-tester", action]).unwrap();
+            assert!(matches!(config.validate(), Err(ConfigError::MissingSeed)));
+        }
+    }
+
+    #[test]
+    fn canonical_schema_is_an_explicit_non_ranked_deviation() {
+        let rejected = Config::try_parse_from([
+            "tpcc-tester",
+            "--benchmark",
+            "--seed",
+            "73",
+            "--canonical-schema",
+            "--state-dir",
+            "/tmp/tpcc-final2026-canonical-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            rejected.validate(),
+            Err(ConfigError::DeviationRequiresOptIn { .. })
+        ));
+
+        let accepted = Config {
+            allow_deviation: true,
+            ..rejected
+        };
+        accepted.validate().unwrap();
+        let resolved = accepted.resolved_profile().unwrap();
+        assert!(!resolved.is_ranked_configuration());
+        assert_eq!(
+            resolved.extra_deviations(),
+            &[EffectiveDeviation {
+                field: "runtime_schema",
+                official: "local_seed_opaque_v1".to_owned(),
+                effective: "canonical".to_owned(),
+            }]
+        );
     }
 
     #[test]
