@@ -1,72 +1,107 @@
-# RMDB final2026 TPC-C workflow
+# final2026 `public_spec_aligned` 工作流
 
-`run_workflow.sh` is a lifecycle wrapper for the Rust `tpcc-tester`. It builds
-the two binaries, starts only the RMDB process it registered, delegates one
-complete benchmark invocation to Rust, performs the prescribed crash/restart,
-and collects logs.
+`run_workflow.sh` 是 RMDB 与 Rust `tpcc-tester` 的安全生命周期封装。Shell 只负责构建、数据库目录、进程、日志、`SIGKILL` 和同库重启；事务选择、32 个持久连接、Wire v3、预热、连续三窗口、重试、语义门槛和排名都由一次 Rust benchmark 调用完成。
 
-The shell does **not** implement transaction selection, warmup, measurement
-windows, retry deadlines, semantic checks, or ranking. Those are one coherent
-`--profile final2026` contract in the Rust tester.
+这是公开决赛契约的本地等价实现，不是官方隐藏客户端。官方 seed、精确校验 SQL/答案、运行与连接标识符，以及未公开的 socket response deadline 无法从公开赛题复刻。脚本默认 `--seed 2026` 仅用于本地可复现性；结果应标记为 `public_spec_aligned`。
 
-## Official profile
+## 默认契约
 
-The default `final2026` profile is expected to enforce:
+- SF=50，32 个无 think time 的饱和客户端；
+- setup 创建 9 张表与 10 个索引，装载 9 张表并执行公开检查，共用一个不超过 900 秒的绝对预算；
+- 一次 30 秒预热，随后无间隔地连续执行 3 个 150 秒正式窗口；
+- NewOrder / Payment / OrderStatus / Delivery / StockLevel 为 `45 / 43 / 4 / 4 / 4`；
+- 每个连接先设置 Snapshot Isolation，再以 Wire v3 `PREPARE_SET` 安装语句，并通过带 `AUTO_ABORT` 的 `EXEC_BATCH` 执行事务；
+- 公开的 160 槽热点轮盘、参数冻结、逐窗口事务/Delivery/warehouse 覆盖门槛，以及三个 NewOrder/min 的中位数排名；
+- 在线校验通过后，向本次工作流登记的 RMDB PID 发送 `SIGKILL`；
+- 以同一数据库目录重启，最多 90 秒内通过完整 Wire `show tables;` readiness，随后执行恢复校验。
 
-- 50 warehouses and 32 clients;
-- one 30-second warmup followed by three consecutive 150-second windows;
-- transaction mix `45 / 43 / 4 / 4 / 4`;
-- the deterministic 160-slot warehouse routing wheel;
-- per-window coverage and transaction-family gates;
-- online checks, then SIGKILL, a 90-second exact `show tables;` readiness
-  budget, and the full recovery checks.
+脚本不提供事务数、事务混合、输出文件、窗口数量或窗口内 timeout 选项，避免 Shell 与 Rust 产生两套时间线。官方未公开的 response deadline 和 phase-tail grace 使用 Rust 的本地安全默认值，不能视作官方参数。
 
-The public seed defaults to `2026` for reproducible local runs. It replaces the
-grader's hidden seed; it does not claim to reveal that seed.
+## 完整流程
 
-## Common commands
-
-Run the complete official lifecycle:
+从 RMDB 仓库根目录执行：
 
 ```bash
-./deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode all \
-  --db-name tpcc_final2026 \
+  --db-name tpcc_final2026_local \
   --seed 2026
 ```
 
-Create and retain a database, then rank it in another invocation:
+`all` 是唯一执行完整 crash transition 的模式，顺序固定为：
+
+1. 校验路径和端口，构建 release tester 与 `RelWithDebInfo` RMDB；
+2. 创建一个此前不存在的数据库并登记所有权；
+3. 通过 Wire v3 handshake 与完整 `show tables;` 确认 readiness；
+4. 在同一个 900 秒 setup 预算内建表、建索引、装载并校验；
+5. 启动一次 Rust benchmark，完成一次 30 秒预热和连续 `3 × 150` 秒正式窗口；
+6. 执行在线一致性与 FLOAT32 语义校验并落盘崩溃基线；
+7. 只对本次登记的 RMDB PID 执行 `SIGKILL`；
+8. 原数据库目录重启，并在 90 秒内通过同一个精确 readiness probe；
+9. 载入同一个 `state-dir` 执行恢复校验；
+10. 写出结果；成功时默认仅清理本次创建且所有权标记匹配的数据库。
+
+需要保留成功后的数据库时添加：
 
 ```bash
-./deps/TPCC-Tester/perf_workflow/run_workflow.sh \
-  --mode init \
-  --db-name tpcc_final2026
-
-./deps/TPCC-Tester/perf_workflow/run_workflow.sh \
-  --mode rank \
-  --db-name tpcc_final2026
-```
-
-Run recovery checks against an existing database:
-
-```bash
-./deps/TPCC-Tester/perf_workflow/run_workflow.sh \
-  --mode recovery \
-  --db-name tpcc_final2026
-```
-
-Inspect the resolved paths without building, starting, killing, or deleting
-anything:
-
-```bash
-./deps/TPCC-Tester/perf_workflow/run_workflow.sh --plan-only
-```
-
-For a deliberately short local smoke test, deviations must be explicit:
-
-```bash
-./deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode all \
+  --db-name tpcc_final2026_keep \
+  --seed 2026 \
+  --keep-db-artifacts
+```
+
+失败的数据库始终保留供诊断。`--clean-db-on-exit` 可要求其他模式在成功后清理本次创建的数据库；它不会接管或删除已有数据库。
+
+## `state-dir` 与拆分运行
+
+`state-dir` 是数据库状态的一部分，保存版本化的装载形状、确认提交 ledger 和崩溃前校验基线。它必须与同一个数据库、scale 和 seed 一起保留，不能编辑、跨数据库复用或在 rank/recovery 之间删除。
+
+- `all`、`init`，以及带 `--init-db` 的 `rank` 默认创建
+  `<result-dir>/state`；
+- 对已有数据库执行 `rank` 或 `recovery` 时，必须用
+  `--state-dir` 指向原 setup 的现有真实目录；
+- 显式状态目录必须预先存在；脚本会通过 `pwd -P` 将目录链接规范化为真实目录。
+
+用于分阶段诊断的真实命令如下：
+
+```bash
+STATE_DIR=/tmp/tpcc-final2026-state
+mkdir -p "${STATE_DIR}"
+
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+  --mode init \
+  --db-name tpcc_final2026_split \
+  --seed 2026 \
+  --state-dir "${STATE_DIR}"
+
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+  --mode rank \
+  --db-name tpcc_final2026_split \
+  --seed 2026 \
+  --state-dir "${STATE_DIR}"
+
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+  --mode recovery \
+  --db-name tpcc_final2026_split \
+  --seed 2026 \
+  --state-dir "${STATE_DIR}"
+```
+
+这里 `rank` 执行正式测量与在线检查后会正常停止服务，`recovery` 只启动已有数据库并运行恢复检查；这三条拆分命令不等价于 `all` 中相邻的在线检查 → `SIGKILL` → 同库恢复链路。需要验证公开 crash lifecycle 时必须使用 `--mode all`。
+
+`--mode benchmark` 是 `rank` 的兼容别名。`--mode rank --init-db` 可在一次诊断调用中先创建/装载新数据库，再执行 rank 与在线检查。
+
+## 明确非排名的 smoke
+
+任何规模、并发或时间覆盖都需要 `--allow-deviation`，否则脚本直接拒绝。
+本地 smoke 的有效范围为 `scale=1..50`、`clients=1..32`：
+
+```bash
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+  --mode all \
+  --db-name tpcc_final2026_smoke \
+  --seed 7 \
   --allow-deviation \
   --scale 1 \
   --clients 2 \
@@ -74,42 +109,66 @@ For a deliberately short local smoke test, deviations must be explicit:
   --window-seconds 3
 ```
 
-`benchmark` remains an alias for `rank`, and `--threads` /
-`--measure-seconds` remain aliases for `--clients` /
-`--window-seconds`.
+smoke 保留三窗口、Wire、事务与校验路径，但 profile 和结果会明确标记 `NON-RANKED`。`--threads` 是 `--clients` 的别名，`--measure-seconds` 是 `--window-seconds` 的别名。它们只为兼容旧调用保留。
 
-## Safety contract
+## 模式与常用检查
 
-- The default RMDB root is exactly three levels above this directory:
-  `<RMDB>/deps/TPCC-Tester/perf_workflow/../../..`.
-- `--db-name`, `--label`, and `--build-dir` must be safe single path
-  components. A database path can therefore never escape the RMDB root.
-- An existing database is never replaced automatically. A successful `all`
-  run cleans its new database by default; `init`, `rank`, and `recovery` retain
-  databases. `--keep-db-artifacts` and `--clean-db-on-exit` make this explicit.
-  A failed run retains its database for diagnosis.
-- Database cleanup requires an ownership marker whose token exactly matches
-  the current run. Symlinks are rejected.
-- Generated CSV files live under the current run's
-  `<RMDB>/.tpcc-workflow/<run-id>/csv` directory. The workflow never removes
-  source-tree CSV files.
-- Port conflicts fail closed. The script never discovers or kills a process by
-  port; shutdown signals target only the PID registered by this invocation.
-- A pre-existing CMake cache whose `CMAKE_HOME_DIRECTORY` points elsewhere
-  causes a clear failure. The workflow never deletes or silently rewrites that
-  cache.
-- Readiness is the Rust tester's `--probe-ready`, which executes the exact
-  `show tables;` protocol check. Each probe subprocess has a portable two-second
-  watchdog inside the overall 90-second budget. A successful TCP connection
-  alone is not readiness.
-- The script is compatible with macOS Bash 3.2 and has no dependency on
-  `ss`, `nproc`, or GNU `timeout`.
+| 模式 | 行为 |
+| --- | --- |
+| `all` | 新建/装载、rank、在线检查、`SIGKILL`、同库重启、恢复检查 |
+| `init` | 新建并装载数据库，成功后保留 |
+| `rank` | 对已有数据库 rank 并执行在线检查；`--init-db` 可先新建/装载 |
+| `recovery` | 启动已有数据库并执行恢复检查 |
+| `tools` | 仅记录可用工具和系统信息 |
 
-Each invocation writes its manifest, tool status, server log, probe log, tester
-logs, and summary under:
+查看解析后的绝对路径和命令，不构建、不启动、不发送信号、不创建结果目录：
+
+```bash
+deps/TPCC-Tester/perf_workflow/run_workflow.sh --plan-only
+```
+
+检查全部参数：
+
+```bash
+deps/TPCC-Tester/perf_workflow/run_workflow.sh --help
+```
+
+使用已有二进制时，两条路径都必须指向现有普通文件：
+
+```bash
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+  --mode all \
+  --skip-build \
+  --server-bin /absolute/path/to/rmdb \
+  --tpcc-bin /absolute/path/to/tpcc-tester
+```
+
+## 安全边界
+
+- 默认 RMDB 根目录是 `perf_workflow/` 向上三级；可用 `--target-dir` 显式覆盖。
+- `--db-name`、`--label` 和 `--build-dir` 必须是安全的单一路径组件，数据库路径不能逃逸 RMDB 根目录。
+- 已存在的数据库绝不会被自动替换。新库清理需要当前 run 的精确所有权 token，符号链接会被拒绝。
+- CSV 只生成在 `<RMDB>/.tpcc-workflow/<run-id>/csv`，工作流结束时按本次所有权清理，不触碰源码树中的 CSV。
+- 端口被占用时 fail closed。脚本不按端口发现或杀进程，只向本次登记的 server/probe PID 发送信号。
+- 发现指向其他源码目录的旧 CMake cache 时直接失败，不删除也不静默改写 cache。
+- readiness 使用 tester 的 `--probe-ready`：Wire v3 handshake 后完整执行 `show tables;`。单次 probe 有 2 秒便携 watchdog；总体默认预算为 90 秒。仅 TCP connect 不算 ready。若显式覆盖 `--ready-timeout-seconds`，该生命周期已偏离公开 90 秒契约；此 Shell 覆盖不会自动进入 Rust 的 `NON-RANKED` profile 标签。
+- 脚本兼容 macOS Bash 3.2，不依赖 `ss`、`nproc` 或 GNU `timeout`。
+
+## 结果与日志
+
+默认结果目录：
 
 ```text
 <RMDB>/performance_test_record/<UTC-run-id>_<label>/
 ```
 
-Use `--record-root` to place these artifacts elsewhere.
+可用 `--record-root` 覆盖。目录包含：
+
+- `manifest.txt`、`tool_status.txt`、`system_info.txt`；
+- tester/RMDB 构建日志；
+- `server.log`、`ready_probe.log` 和登记过的 `server.pid`；
+- `setup.log`、`rank.log`、`check_online.log`、`check_recovery.log`（按所选模式生成）；
+- `state/`（未指定外部 `--state-dir` 时）；
+- 成功后的 `summary.md`。
+
+日志和本地状态只用于复现与诊断，不能据此推断官方隐藏 seed、SQL、答案、标识符或未公开 deadline。
