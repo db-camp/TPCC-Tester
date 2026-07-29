@@ -24,6 +24,7 @@ use crate::phases::{
 };
 use crate::ranking::dispatch::{self, FrozenTransaction};
 use crate::ranking::ledger::{LedgerError, RunLedger};
+use crate::ranking::preflight;
 use crate::ranking::runner::RankedTransactionOutcome;
 use crate::ranking::session::open_ranked_session;
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
@@ -193,9 +194,21 @@ impl BenchmarkExecutor {
             "preparing {} persistent Wire v3 sessions before the timing barrier",
             profile.clients
         );
-        let sessions = self
+        let mut sessions = self
             .open_sessions(profile.clients, response_timeout)
             .await?;
+        info!(
+            "all {} sessions completed SNAPSHOT ISOLATION and PREPARE_SET schema verification; \
+             running untimed prepared semantic preflight",
+            profile.clients
+        );
+        let preflight_session = sessions.first_mut().ok_or_else(|| {
+            TpccError::Protocol(
+                "ranked semantic preflight requires at least one prepared session".to_owned(),
+            )
+        })?;
+        preflight::run(preflight_session, seed, profile.warehouses).await?;
+        info!("prepared semantic preflight passed before timing-barrier release");
         {
             let mut state = lock_scheduler(&scheduler)?;
             for worker in 0..profile.clients {

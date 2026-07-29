@@ -8,6 +8,7 @@ pub mod ledger;
 pub mod new_order;
 pub mod order_status;
 pub mod payment;
+pub mod preflight;
 pub mod runner;
 pub mod session;
 pub mod stock_level;
