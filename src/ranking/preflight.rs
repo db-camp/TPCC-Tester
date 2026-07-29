@@ -28,14 +28,26 @@ const STOCK_LEVEL_RECENT_ORDERS: i32 = 20;
 const STOCK_LEVEL_MIN_THRESHOLD: i32 = 10;
 const STOCK_LEVEL_THRESHOLD_SPAN: u64 = 11;
 const MAX_DETAIL_BATCH_OPERATIONS: usize = 200;
+const PAYMENT_PROBE_AMOUNT_BITS: u32 = 1.0_f32.to_bits();
+const PAYMENT_PROBE_RESTORE_BITS: u32 = (-1.0_f32).to_bits();
+const INITIAL_WAREHOUSE_YTD_BITS: u32 = 300_000.0_f32.to_bits();
+const STALE_PAYMENT_QUERY_INDEX: u16 = 0;
+const STALE_PAYMENT_UPDATE_INDEX: u16 = 1;
+const STALE_PAYMENT_COMMIT_INDEX: u16 = 2;
 
-/// Run the deterministic, non-measured semantic preflight on one already
-/// configured and prepared ranked connection.
-pub async fn run(client: &mut RmdbClient, seed: u64, warehouses: u16) -> Result<(), TpccError> {
+/// Run the deterministic, non-measured semantic preflight on two already
+/// configured and prepared ranked connections.
+pub async fn run(
+    primary: &mut RmdbClient,
+    contender: &mut RmdbClient,
+    seed: u64,
+    warehouses: u16,
+) -> Result<(), TpccError> {
     let selection = PreflightSelection::derive(seed, warehouses)?;
-    verify_stock_level(client, &selection).await?;
-    verify_new_order_rollback(client, &selection).await?;
-    verify_new_order_auto_abort(client, &selection).await
+    verify_stock_level(primary, &selection).await?;
+    verify_new_order_rollback(primary, &selection).await?;
+    verify_new_order_auto_abort(primary, &selection).await?;
+    verify_payment_stale_write(primary, contender, selection.warehouse_id).await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -524,6 +536,326 @@ fn validate_expected_auto_abort_error(
              ERROR: {diagnostic}"
         ))),
     }
+}
+
+async fn verify_payment_stale_write(
+    primary: &mut RmdbClient,
+    contender: &mut RmdbClient,
+    warehouse_id: i32,
+) -> Result<(), TpccError> {
+    let original_bits =
+        begin_payment_warehouse_snapshot(primary, warehouse_id, "Payment primary snapshot").await?;
+    if original_bits != INITIAL_WAREHOUSE_YTD_BITS {
+        return semantic_abort(
+            primary,
+            format!(
+                "Payment warehouse {warehouse_id} initial w_ytd was {} (0x{original_bits:08x}), \
+                 expected bit-exact binary32 300000 (0x{INITIAL_WAREHOUSE_YTD_BITS:08x})",
+                f32::from_bits(original_bits)
+            ),
+        )
+        .await;
+    }
+    let incremented_bits = match f32_add_bits(original_bits, PAYMENT_PROBE_AMOUNT_BITS) {
+        Ok(bits) => bits,
+        Err(error) => return semantic_abort(primary, error.to_string()).await,
+    };
+    let reversible_bits = match f32_add_bits(incremented_bits, PAYMENT_PROBE_RESTORE_BITS) {
+        Ok(bits) => bits,
+        Err(error) => return semantic_abort(primary, error.to_string()).await,
+    };
+    if reversible_bits != original_bits {
+        return semantic_abort(
+            primary,
+            format!(
+                "Payment warehouse {warehouse_id} probe is not binary32 reversible: \
+                 0x{original_bits:08x} + 1.0 - 1.0 = 0x{reversible_bits:08x}"
+            ),
+        )
+        .await;
+    }
+
+    let contender_bits =
+        match begin_payment_warehouse_snapshot(contender, warehouse_id, "Payment stale snapshot")
+            .await
+        {
+            Ok(bits) => bits,
+            Err(error) => return abort_after_error(primary, error).await,
+        };
+    if contender_bits != original_bits {
+        return semantic_abort_pair(
+            primary,
+            contender,
+            format!(
+                "Payment dual snapshots disagree for warehouse {warehouse_id}: \
+                 primary 0x{original_bits:08x}, contender 0x{contender_bits:08x}"
+            ),
+        )
+        .await;
+    }
+
+    if let Err(error) = update_open_payment_warehouse(
+        primary,
+        warehouse_id,
+        PAYMENT_PROBE_AMOUNT_BITS,
+        incremented_bits,
+        "Payment primary +1.0",
+    )
+    .await
+    {
+        return abort_after_error(contender, error).await;
+    }
+    if let Err(error) = commit_open_transaction(primary, "Payment primary +1.0 COMMIT").await {
+        return abort_after_error(contender, error).await;
+    }
+
+    // Operation zero would produce a stale-snapshot query result.  The typed
+    // TRANSACTION_ABORT terminal carries no results, proving that it is
+    // discarded whether the conflict surfaces at UPDATE or COMMIT.
+    let stale_operations = [
+        payment_warehouse_operation(warehouse_id),
+        payment_update_warehouse_operation(PAYMENT_PROBE_AMOUNT_BITS, warehouse_id),
+        operation(StatementId::Commit, []),
+    ];
+    debug_assert_eq!(STALE_PAYMENT_QUERY_INDEX, 0);
+    let response = contender.exec_batch(&stale_operations).await?;
+    validate_expected_stale_payment_abort(response)?;
+
+    // AUTO_ABORT must have ended the stale transaction.  The very next
+    // prepared batch on the same connection starts and completes normally.
+    let reusable_bits = read_payment_warehouse_value(
+        contender,
+        warehouse_id,
+        "Payment contender reuse after stale abort",
+    )
+    .await?;
+    require_exact_f32(
+        reusable_bits,
+        incremented_bits,
+        "Payment contender reuse observed committed +1.0",
+    )?;
+
+    let restore_before =
+        begin_payment_warehouse_snapshot(primary, warehouse_id, "Payment restore snapshot").await?;
+    if restore_before != incremented_bits {
+        return semantic_abort(
+            primary,
+            exact_f32_mismatch(
+                restore_before,
+                incremented_bits,
+                "Payment restore predecessor",
+            ),
+        )
+        .await;
+    }
+    update_open_payment_warehouse(
+        primary,
+        warehouse_id,
+        PAYMENT_PROBE_RESTORE_BITS,
+        original_bits,
+        "Payment primary -1.0 restore",
+    )
+    .await?;
+    commit_open_transaction(primary, "Payment primary restore COMMIT").await?;
+
+    let final_bits =
+        read_payment_warehouse_value(contender, warehouse_id, "Payment final restored value")
+            .await?;
+    require_exact_f32(
+        final_bits,
+        original_bits,
+        "Payment warehouse final 0-ULP restoration",
+    )
+}
+
+async fn begin_payment_warehouse_snapshot(
+    client: &mut RmdbClient,
+    warehouse_id: i32,
+    stage: &str,
+) -> Result<u32, TpccError> {
+    let operations = [
+        operation(StatementId::Begin, []),
+        payment_warehouse_operation(warehouse_id),
+    ];
+    let results = execute_preflight_batch(client, stage, &operations).await?;
+    match parse_payment_warehouse_bits(&results, 1, stage) {
+        Ok(bits) => Ok(bits),
+        Err(error) => semantic_abort(client, error).await,
+    }
+}
+
+async fn update_open_payment_warehouse(
+    client: &mut RmdbClient,
+    warehouse_id: i32,
+    amount_bits: u32,
+    expected_bits: u32,
+    stage: &str,
+) -> Result<(), TpccError> {
+    let operations = [
+        payment_update_warehouse_operation(amount_bits, warehouse_id),
+        payment_warehouse_operation(warehouse_id),
+    ];
+    let results = execute_preflight_batch(client, stage, &operations).await?;
+    let actual_bits = match parse_payment_warehouse_bits(&results, 1, stage) {
+        Ok(bits) => bits,
+        Err(error) => return semantic_abort(client, error).await,
+    };
+    if actual_bits != expected_bits {
+        return semantic_abort(
+            client,
+            exact_f32_mismatch(actual_bits, expected_bits, stage),
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn read_payment_warehouse_value(
+    client: &mut RmdbClient,
+    warehouse_id: i32,
+    stage: &str,
+) -> Result<u32, TpccError> {
+    let operations = [
+        operation(StatementId::Begin, []),
+        payment_warehouse_operation(warehouse_id),
+        operation(StatementId::Abort, []),
+    ];
+    let results = execute_preflight_batch(client, stage, &operations).await?;
+    parse_payment_warehouse_bits(&results, 1, stage).map_err(preflight_semantic)
+}
+
+fn parse_payment_warehouse_bits(
+    results: &BatchResults,
+    operation_index: usize,
+    context: &str,
+) -> Result<u32, String> {
+    let row = exactly_one_row(
+        results
+            .rows(operation_index)
+            .map_err(|error| error.to_string())?,
+        context,
+    )?;
+    if row.len() != 7 {
+        return Err(format!(
+            "{context} returned {} warehouse columns, expected 7",
+            row.len()
+        ));
+    }
+    row_f32_bits(row, 0, context).map_err(|error| error.to_string())
+}
+
+fn payment_warehouse_operation(warehouse_id: i32) -> Operation {
+    operation(
+        StatementId::PaymentWarehouse,
+        [WireValue::Int32(warehouse_id)],
+    )
+}
+
+fn payment_update_warehouse_operation(amount_bits: u32, warehouse_id: i32) -> Operation {
+    operation(
+        StatementId::PaymentUpdateWarehouse,
+        [
+            WireValue::Float32(amount_bits),
+            WireValue::Int32(warehouse_id),
+        ],
+    )
+}
+
+fn validate_expected_stale_payment_abort(response: BatchResponse) -> Result<(), TpccError> {
+    match response {
+        BatchResponse::TransactionAbort {
+            executed_operations,
+            failed_operation,
+            ..
+        } if executed_operations == failed_operation
+            && matches!(
+                failed_operation,
+                STALE_PAYMENT_UPDATE_INDEX | STALE_PAYMENT_COMMIT_INDEX
+            ) =>
+        {
+            Ok(())
+        }
+        BatchResponse::TransactionAbort {
+            executed_operations,
+            failed_operation,
+            diagnostic,
+        } => Err(preflight_semantic(format!(
+            "Payment stale write returned TRANSACTION_ABORT at \
+             ({executed_operations}, {failed_operation}), expected conflict at UPDATE index \
+             {STALE_PAYMENT_UPDATE_INDEX} or COMMIT index {STALE_PAYMENT_COMMIT_INDEX}: \
+             {diagnostic}"
+        ))),
+        BatchResponse::Error {
+            executed_operations,
+            failed_operation,
+            diagnostic,
+        } => Err(preflight_semantic(format!(
+            "Payment stale write returned ERROR at ({executed_operations}, \
+             {failed_operation}), expected TRANSACTION_ABORT: {diagnostic}"
+        ))),
+        BatchResponse::Ok {
+            executed_operations,
+            results,
+        } => Err(preflight_semantic(format!(
+            "Payment stale write unexpectedly succeeded after {executed_operations} operations \
+             with {} query result(s)",
+            results.len()
+        ))),
+        BatchResponse::TopLevelError { diagnostic } => Err(preflight_semantic(format!(
+            "Payment stale write returned top-level ERROR instead of TRANSACTION_ABORT: \
+             {diagnostic}"
+        ))),
+    }
+}
+
+async fn commit_open_transaction(client: &mut RmdbClient, stage: &str) -> Result<(), TpccError> {
+    let operations = [operation(StatementId::Commit, [])];
+    let results = execute_preflight_batch(client, stage, &operations).await?;
+    if results.operation_count() != 1 {
+        return Err(preflight_protocol(format!(
+            "{stage} executed {} operations, expected 1",
+            results.operation_count()
+        )));
+    }
+    Ok(())
+}
+
+async fn semantic_abort_pair<T>(
+    primary: &mut RmdbClient,
+    contender: &mut RmdbClient,
+    error: String,
+) -> Result<T, TpccError> {
+    let contender_cleanup =
+        abort_open_transaction(contender, "dual-session semantic preflight cleanup").await;
+    let primary_cleanup =
+        abort_open_transaction(primary, "dual-session semantic preflight cleanup").await;
+    match (primary_cleanup, contender_cleanup) {
+        (Ok(()), Ok(())) => Err(preflight_semantic(error)),
+        (primary, contender) => Err(preflight_semantic(format!(
+            "{error}; cleanup results: primary={primary:?}, contender={contender:?}"
+        ))),
+    }
+}
+
+fn require_exact_f32(actual_bits: u32, expected_bits: u32, context: &str) -> Result<(), TpccError> {
+    if actual_bits == expected_bits {
+        Ok(())
+    } else {
+        Err(preflight_semantic(exact_f32_mismatch(
+            actual_bits,
+            expected_bits,
+            context,
+        )))
+    }
+}
+
+fn exact_f32_mismatch(actual_bits: u32, expected_bits: u32, context: &str) -> String {
+    format!(
+        "{context}: observed {} (0x{actual_bits:08x}), expected {} \
+         (0x{expected_bits:08x}, 0 ULP tolerance)",
+        f32::from_bits(actual_bits),
+        f32::from_bits(expected_bits)
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1590,6 +1922,70 @@ mod tests {
             1,
         )
         .is_err());
+    }
+
+    #[test]
+    fn stale_payment_probe_accepts_only_update_or_commit_transaction_abort() {
+        for failed_operation in [STALE_PAYMENT_UPDATE_INDEX, STALE_PAYMENT_COMMIT_INDEX] {
+            assert!(
+                validate_expected_stale_payment_abort(BatchResponse::TransactionAbort {
+                    executed_operations: failed_operation,
+                    failed_operation,
+                    diagnostic: "write-write conflict".to_owned(),
+                })
+                .is_ok()
+            );
+        }
+        assert!(
+            validate_expected_stale_payment_abort(BatchResponse::TransactionAbort {
+                executed_operations: STALE_PAYMENT_QUERY_INDEX,
+                failed_operation: STALE_PAYMENT_QUERY_INDEX,
+                diagnostic: "wrong operation".to_owned(),
+            })
+            .is_err()
+        );
+        assert!(validate_expected_stale_payment_abort(BatchResponse::Error {
+            executed_operations: STALE_PAYMENT_UPDATE_INDEX,
+            failed_operation: STALE_PAYMENT_UPDATE_INDEX,
+            diagnostic: "wrong terminal".to_owned(),
+        })
+        .is_err());
+        assert!(validate_expected_stale_payment_abort(BatchResponse::Ok {
+            executed_operations: 3,
+            results: Vec::new(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn payment_probe_uses_reversible_binary32_transition_and_full_projection() {
+        let incremented =
+            f32_add_bits(INITIAL_WAREHOUSE_YTD_BITS, PAYMENT_PROBE_AMOUNT_BITS).unwrap();
+        assert_eq!(incremented, 300_001.0_f32.to_bits());
+        assert_eq!(
+            f32_add_bits(incremented, PAYMENT_PROBE_RESTORE_BITS).unwrap(),
+            INITIAL_WAREHOUSE_YTD_BITS
+        );
+
+        let operations = [payment_warehouse_operation(1)];
+        let mut row = vec![WireValue::Float32(INITIAL_WAREHOUSE_YTD_BITS)];
+        row.extend((0..6).map(|_| WireValue::Char(Vec::new())));
+        let results = accept_batch(
+            BatchResponse::Ok {
+                executed_operations: 1,
+                results: vec![BatchQueryResult {
+                    operation_index: 0,
+                    rows: vec![row],
+                }],
+            },
+            &operations,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_payment_warehouse_bits(&results, 0, "test").unwrap(),
+            INITIAL_WAREHOUSE_YTD_BITS
+        );
+        assert_eq!(StatementId::ALL.len(), 42);
     }
 
     #[test]

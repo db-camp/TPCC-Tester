@@ -221,12 +221,23 @@ impl BenchmarkExecutor {
              running untimed prepared semantic preflight",
             profile.clients
         );
-        let preflight_session = sessions.first_mut().ok_or_else(|| {
+        if sessions.len() < 2 {
+            return Err(TpccError::Protocol(
+                "ranked semantic preflight requires at least two prepared sessions".to_owned(),
+            ));
+        }
+        let (primary_sessions, contender_sessions) = sessions.split_at_mut(1);
+        let primary_session = primary_sessions.first_mut().ok_or_else(|| {
             TpccError::Protocol(
-                "ranked semantic preflight requires at least one prepared session".to_owned(),
+                "ranked semantic preflight lost its primary prepared session".to_owned(),
             )
         })?;
-        preflight::run(preflight_session, seed, profile.warehouses).await?;
+        let contender_session = contender_sessions.first_mut().ok_or_else(|| {
+            TpccError::Protocol(
+                "ranked semantic preflight lost its contender prepared session".to_owned(),
+            )
+        })?;
+        preflight::run(primary_session, contender_session, seed, profile.warehouses).await?;
         info!("prepared semantic preflight passed before timing-barrier release");
         {
             let mut state = lock_scheduler(&scheduler)?;
