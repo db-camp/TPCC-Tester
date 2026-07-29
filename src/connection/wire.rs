@@ -573,23 +573,41 @@ where
         deadline: Option<ResponseReadDeadline>,
         request_name: &'static str,
     ) -> WireResult<Frame> {
-        let read = self.read_response_frame();
         match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline.at, read).await {
-                Ok(result) => result,
-                Err(_) => {
-                    self.timeout_poison = Some(TimeoutPoison {
-                        request: request_name,
-                        phase: WireTimeoutPhase::ResponseRead,
-                    });
-                    Err(WireError::Timeout {
-                        request: request_name,
-                        phase: WireTimeoutPhase::ResponseRead,
-                        timeout: deadline.timeout,
-                    })
+            Some(deadline) => {
+                if Instant::now() >= deadline.at {
+                    return Err(self.response_read_timeout(request_name, deadline.timeout));
                 }
-            },
-            None => read.await,
+
+                let read = self.read_response_frame();
+                match tokio::time::timeout_at(deadline.at, read).await {
+                    Ok(result) => {
+                        if Instant::now() >= deadline.at {
+                            Err(self.response_read_timeout(request_name, deadline.timeout))
+                        } else {
+                            result
+                        }
+                    }
+                    Err(_) => Err(self.response_read_timeout(request_name, deadline.timeout)),
+                }
+            }
+            None => self.read_response_frame().await,
+        }
+    }
+
+    fn response_read_timeout(
+        &mut self,
+        request_name: &'static str,
+        timeout: Duration,
+    ) -> WireError {
+        self.timeout_poison = Some(TimeoutPoison {
+            request: request_name,
+            phase: WireTimeoutPhase::ResponseRead,
+        });
+        WireError::Timeout {
+            request: request_name,
+            phase: WireTimeoutPhase::ResponseRead,
+            timeout,
         }
     }
 
@@ -1430,6 +1448,57 @@ mod tests {
             }
         ));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(connection
+            .exec_stream("show tables;")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be reused"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn folded_ready_terminal_cannot_cross_deadline_during_callback() {
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let mut row = Vec::new();
+        encode_value(SqlType::Int32, &WireValue::Int32(42), &mut row).unwrap();
+        let mut response = frame(FrameTag::Meta, 0, 0, &columns);
+        response.extend(frame(FrameTag::Row, 0, 0, &row));
+        response.extend(frame(FrameTag::ResultEnd, 0, 0, &1_u64.to_be_bytes()));
+
+        let (client_io, mut server_io) = duplex(128);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io.write_all(&response).await.unwrap();
+        });
+
+        let callback_calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls_for_fold = Arc::clone(&callback_calls);
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let error = connection
+            .exec_stream_fold_with_timeout(
+                "select i from t;",
+                Duration::from_millis(100),
+                (),
+                |_, _| Ok(()),
+                move |_, _, _| {
+                    callback_calls_for_fold.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(150));
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            error,
+            WireError::Timeout {
+                phase: WireTimeoutPhase::ResponseRead,
+                ..
+            }
+        ));
         assert!(connection
             .exec_stream("show tables;")
             .await
