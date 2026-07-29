@@ -641,7 +641,8 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
     /// Synchronizes phase events to the supplied monotonic clock.
     pub fn poll(&mut self) -> Result<(), SchedulerError> {
         let now = self.observe_now()?;
-        self.sync_to(now)
+        self.sync_to(now)?;
+        self.expire_response_grace(now)
     }
 
     /// Reserves exactly one stage-local number for parameter generation.
@@ -817,6 +818,25 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
                 completed_at,
                 attempt_started_at,
             });
+        }
+        let response_deadline = checked_add(attempt_started_at, self.limits.response_timeout)?;
+        let grace_deadline = checked_add(ticket.phase_deadline(), self.limits.phase_tail_grace)?;
+        let attempt_deadline = response_deadline.min(grace_deadline);
+        if completed_at >= attempt_deadline {
+            self.fail_worker_at(
+                ticket.worker(),
+                Some(ticket.phase()),
+                format!(
+                    "local response/grace deadline expired at {:?}; this is not an official timeout",
+                    attempt_deadline
+                ),
+                completed_at,
+            );
+            return Err(SchedulerError::RunFailed(
+                self.failure
+                    .clone()
+                    .expect("fail_worker_at always stores a failure"),
+            ));
         }
 
         let outcome_matches_identity = match outcome {
@@ -1015,7 +1035,6 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             }
         }
 
-        self.expire_response_grace(now)?;
         Ok(())
     }
 
@@ -1704,6 +1723,68 @@ mod tests {
                 } if *completed == ticket && *at == completed_at
             )
         }));
+    }
+
+    #[test]
+    fn later_worker_cannot_expire_an_already_arrived_terminal() {
+        let (clock, mut scheduler) = ready_scheduler_with_limits(
+            LocalRuntimeLimits::new(Duration::from_secs(3), Duration::from_secs(10)).unwrap(),
+        );
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(30));
+        let first = start_payment(&mut scheduler, WorkerId::new(5).unwrap(), 0x61);
+        let first_completed_at = Duration::from_secs(32);
+
+        clock.set(Duration::from_secs(32));
+        let second = start_payment(&mut scheduler, WorkerId::new(6).unwrap(), 0x62);
+        scheduler
+            .finish_attempt_at(
+                second,
+                AttemptOutcome::Commit {
+                    delivery_processed: 0,
+                },
+                Duration::from_secs(34),
+            )
+            .unwrap();
+
+        assert_eq!(
+            scheduler
+                .finish_attempt_at(
+                    first,
+                    AttemptOutcome::Commit {
+                        delivery_processed: 0,
+                    },
+                    first_completed_at,
+                )
+                .unwrap(),
+            AttemptDisposition::Finished
+        );
+        assert_eq!(scheduler.windows()[0].committed, 2);
+    }
+
+    #[test]
+    fn sampled_terminal_at_attempt_deadline_is_fatal() {
+        let (clock, mut scheduler) = ready_scheduler_with_limits(
+            LocalRuntimeLimits::new(Duration::from_secs(2), Duration::from_secs(10)).unwrap(),
+        );
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(30));
+        let ticket = start_payment(&mut scheduler, WorkerId::new(5).unwrap(), 0x63);
+
+        let error = scheduler
+            .finish_attempt_at(
+                ticket,
+                AttemptOutcome::Commit {
+                    delivery_processed: 0,
+                },
+                Duration::from_secs(32),
+            )
+            .unwrap_err();
+        let SchedulerError::RunFailed(failure) = error else {
+            panic!("expected absolute attempt deadline failure");
+        };
+        assert!(failure.reason.contains("not an official timeout"));
+        assert_eq!(scheduler.windows()[0].abandoned, 1);
     }
 
     #[test]
