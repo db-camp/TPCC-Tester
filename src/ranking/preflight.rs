@@ -829,12 +829,20 @@ async fn semantic_abort_pair<T>(
         abort_open_transaction(contender, "dual-session semantic preflight cleanup").await;
     let primary_cleanup =
         abort_open_transaction(primary, "dual-session semantic preflight cleanup").await;
-    match (primary_cleanup, contender_cleanup) {
-        (Ok(()), Ok(())) => Err(preflight_semantic(error)),
-        (primary, contender) => Err(preflight_semantic(format!(
-            "{error}; cleanup results: primary={primary:?}, contender={contender:?}"
-        ))),
+    let mut failure = preflight_semantic(error);
+    if let Err(cleanup) = primary_cleanup {
+        failure = combine_cleanup_failure(
+            failure,
+            attach_error_context(cleanup, "primary-session cleanup"),
+        );
     }
+    if let Err(cleanup) = contender_cleanup {
+        failure = combine_cleanup_failure(
+            failure,
+            attach_error_context(cleanup, "contender-session cleanup"),
+        );
+    }
+    Err(failure)
 }
 
 fn require_exact_f32(actual_bits: u32, expected_bits: u32, context: &str) -> Result<(), TpccError> {
@@ -1560,18 +1568,65 @@ fn map_preflight_batch_error(stage: &str, error: BatchExecutionError) -> TpccErr
 async fn semantic_abort<T>(client: &mut RmdbClient, error: String) -> Result<T, TpccError> {
     match abort_open_transaction(client, "semantic preflight cleanup").await {
         Ok(()) => Err(preflight_semantic(error)),
-        Err(cleanup) => Err(preflight_semantic(format!(
-            "{error}; explicit ABORT cleanup also failed: {cleanup}"
-        ))),
+        Err(cleanup) => Err(combine_cleanup_failure(preflight_semantic(error), cleanup)),
     }
 }
 
 async fn abort_after_error<T>(client: &mut RmdbClient, error: TpccError) -> Result<T, TpccError> {
     match abort_open_transaction(client, "semantic preflight cleanup").await {
         Ok(()) => Err(error),
-        Err(cleanup) => Err(preflight_semantic(format!(
-            "{error}; explicit ABORT cleanup also failed: {cleanup}"
-        ))),
+        Err(cleanup) => Err(combine_cleanup_failure(error, cleanup)),
+    }
+}
+
+fn combine_cleanup_failure(original: TpccError, cleanup: TpccError) -> TpccError {
+    let original_text = original.to_string();
+    let cleanup_text = cleanup.to_string();
+    if is_transport_or_protocol_error(&original) {
+        attach_error_context(
+            original,
+            &format!("explicit ABORT cleanup also failed: {cleanup_text}"),
+        )
+    } else if is_transport_or_protocol_error(&cleanup) {
+        attach_error_context(
+            cleanup,
+            &format!("while cleaning up prior failure: {original_text}"),
+        )
+    } else {
+        attach_error_context(
+            original,
+            &format!("explicit ABORT cleanup also failed: {cleanup_text}"),
+        )
+    }
+}
+
+fn is_transport_or_protocol_error(error: &TpccError) -> bool {
+    matches!(
+        error,
+        TpccError::Connection(_)
+            | TpccError::ParseError(_)
+            | TpccError::Protocol(_)
+            | TpccError::Io(_)
+            | TpccError::Timeout { .. }
+    )
+}
+
+fn attach_error_context(error: TpccError, context: &str) -> TpccError {
+    match error {
+        TpccError::Connection(message) => TpccError::Connection(format!("{message}; {context}")),
+        TpccError::Abort(message) => TpccError::Abort(format!("{message}; {context}")),
+        TpccError::QueryError(message) => TpccError::QueryError(format!("{message}; {context}")),
+        TpccError::ParseError(message) => TpccError::ParseError(format!("{message}; {context}")),
+        TpccError::Protocol(message) => TpccError::Protocol(format!("{message}; {context}")),
+        TpccError::Io(error) => TpccError::Io(std::io::Error::new(
+            error.kind(),
+            format!("{error}; {context}"),
+        )),
+        TpccError::Timeout {
+            context: timeout_context,
+        } => TpccError::Timeout {
+            context: format!("{timeout_context}; {context}"),
+        },
     }
 }
 
@@ -1879,6 +1934,42 @@ mod tests {
                 },
             ),
             TpccError::QueryError(_)
+        ));
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_transport_timeout_and_protocol_classes() {
+        assert!(matches!(
+            combine_cleanup_failure(
+                TpccError::Connection("socket closed".to_owned()),
+                TpccError::QueryError("ABORT failed".to_owned()),
+            ),
+            TpccError::Connection(_)
+        ));
+        assert!(matches!(
+            combine_cleanup_failure(
+                TpccError::QueryError("semantic mismatch".to_owned()),
+                TpccError::Timeout {
+                    context: "ABORT response".to_owned(),
+                },
+            ),
+            TpccError::Timeout { .. }
+        ));
+        assert!(matches!(
+            combine_cleanup_failure(
+                TpccError::Protocol("bad batch".to_owned()),
+                TpccError::Timeout {
+                    context: "ABORT response".to_owned(),
+                },
+            ),
+            TpccError::Protocol(_)
+        ));
+        assert!(matches!(
+            combine_cleanup_failure(
+                TpccError::QueryError("semantic mismatch".to_owned()),
+                TpccError::Protocol("bad ABORT frame".to_owned()),
+            ),
+            TpccError::Protocol(_)
         ));
     }
 
