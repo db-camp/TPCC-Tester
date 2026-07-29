@@ -183,6 +183,9 @@ pub enum ConfigError {
     #[error("--probe-ready must be used by itself")]
     ProbeReadyMustBeExclusive,
 
+    #[error("--diagnose must be used by itself")]
+    DiagnoseMustBeExclusive,
+
     #[error("--diagnostic-workload-seconds must be used by itself")]
     DiagnosticWorkloadMustBeExclusive,
 
@@ -197,6 +200,24 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_raw()?;
         let diagnostic_workload = self.diagnostic_workload_seconds.is_some();
+        if self.diagnose
+            && (self.create_schema
+                || self.init
+                || self.check
+                || self.stats
+                || self.benchmark
+                || diagnostic_workload
+                || self.probe_ready
+                || self.allow_deviation
+                || self.seed.is_some()
+                || self.expected_new_orders.is_some()
+                || self.warmup_seconds.is_some()
+                || self.window_seconds.is_some()
+                || self.state_dir.is_some()
+                || self.check_scope != CheckScope::Setup)
+        {
+            return Err(ConfigError::DiagnoseMustBeExclusive);
+        }
         if diagnostic_workload
             && (self.create_schema
                 || self.init
@@ -438,6 +459,17 @@ mod tests {
             config.validate(),
             Err(ConfigError::ProbeReadyMustBeExclusive)
         ));
+    }
+
+    #[test]
+    fn diagnose_is_exclusive() {
+        for action in ["--benchmark", "--init", "--stats", "--probe-ready"] {
+            let config = Config::try_parse_from(["tpcc-tester", "--diagnose", action]).unwrap();
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::DiagnoseMustBeExclusive)
+            ));
+        }
     }
 
     #[test]

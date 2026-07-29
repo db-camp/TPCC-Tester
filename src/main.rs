@@ -21,6 +21,7 @@ mod workload;
 
 use std::future::Future;
 use std::process;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing::{error, info, warn};
@@ -78,7 +79,12 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             "执行 Wire v3 readiness probe: {}:{}",
             config.host, config.port
         );
-        let mut client = RmdbClient::connect(&config.host, config.port).await?;
+        let mut client = RmdbClient::connect_with_timeout(
+            &config.host,
+            config.port,
+            Duration::from_secs(config.response_timeout_seconds),
+        )
+        .await?;
         client.ping().await?;
         info!("Wire v3 readiness probe 通过（完整执行 `show tables;`）");
         return Ok(());
@@ -121,7 +127,12 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         config.create_schema || config.init || config.check || config.stats;
     if needs_control_connection {
         info!("连接 RMDB: {}:{} ...", config.host, config.port);
-        let client = RmdbClient::connect(&config.host, config.port).await?;
+        let client = RmdbClient::connect_with_timeout(
+            &config.host,
+            config.port,
+            Duration::from_secs(config.response_timeout_seconds),
+        )
+        .await?;
         let mut cursor = RmdbCursor::new(client);
         cursor.client_mut().ping().await?;
         info!("RMDB 连接正常");
@@ -336,17 +347,24 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
 
     // 1. Connection test
     info!("[1/6] 连接测试");
-    let client = match RmdbClient::connect(&config.host, config.port).await {
+    let client = match RmdbClient::connect_with_timeout(
+        &config.host,
+        config.port,
+        Duration::from_secs(config.response_timeout_seconds),
+    )
+    .await
+    {
         Ok(c) => {
             info!("  连接成功: {}:{}", config.host, config.port);
             c
         }
         Err(e) => {
             error!("  连接失败: {e}");
-            return Ok(());
+            return Err(e.into());
         }
     };
     let mut cursor = RmdbCursor::new(client);
+    let mut failures = 0_usize;
 
     // 2. Basic SQL
     info!("[2/6] 基础 SQL 能力检测");
@@ -364,7 +382,10 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     for (name, sql) in &tests {
         match cursor.execute_update(sql, &[]).await {
             Ok(_) => info!("  {name:>15}: PASS"),
-            Err(e) => error!("  {name:>15}: FAIL - {e}"),
+            Err(e) => {
+                failures += 1;
+                error!("  {name:>15}: FAIL - {e}");
+            }
         }
     }
 
@@ -377,7 +398,10 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     ] {
         match cursor.execute_update(cmd, &[]).await {
             Ok(_) => info!("  {:>15}: PASS", *cmd),
-            Err(e) => error!("  {:>15}: FAIL - {e}", *cmd),
+            Err(e) => {
+                failures += 1;
+                error!("  {:>15}: FAIL - {e}", *cmd);
+            }
         }
     }
 
@@ -388,7 +412,10 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     ] {
         match cursor.execute_update(cmd, &[]).await {
             Ok(_) => info!("  {:>15}: PASS", *cmd),
-            Err(e) => error!("  {:>15}: FAIL - {e}", *cmd),
+            Err(e) => {
+                failures += 1;
+                error!("  {:>15}: FAIL - {e}", *cmd);
+            }
         }
     }
 
@@ -412,7 +439,10 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
         match cursor.execute(sql, &[]).await {
             Ok(r) if !r.is_empty() => info!("  {name:>15}: PASS (result={})", r.rows[0][0]),
             Ok(_) => warn!("  {name:>15}: WARN - 返回空结果 (rmdb 可能不支持此功能)"),
-            Err(e) => error!("  {name:>15}: FAIL - {e}"),
+            Err(e) => {
+                failures += 1;
+                error!("  {name:>15}: FAIL - {e}");
+            }
         }
     }
 
@@ -428,7 +458,10 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
         match cursor.execute(sql, &[]).await {
             Ok(r) if !r.is_empty() => info!("  {name:>15}: PASS ({} rows)", r.len()),
             Ok(_) => warn!("  {name:>15}: WARN - 返回空结果 (rmdb 可能不支持此功能)"),
-            Err(e) => error!("  {name:>15}: FAIL - {e}"),
+            Err(e) => {
+                failures += 1;
+                error!("  {name:>15}: FAIL - {e}");
+            }
         }
     }
 
@@ -450,7 +483,10 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     {
         Ok(r) if !r.is_empty() => info!("  交叉表查询: PASS ({} rows)", r.len()),
         Ok(_) => warn!("  交叉表查询: WARN - 返回空结果"),
-        Err(e) => error!("  交叉表查询: FAIL - {e}"),
+        Err(e) => {
+            failures += 1;
+            error!("  交叉表查询: FAIL - {e}");
+        }
     }
 
     // Cleanup - best effort
@@ -461,5 +497,9 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     info!("   诊断完成");
     info!("========================================");
 
-    Ok(())
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!("兼容性诊断有 {failures} 项 SQL 操作失败").into())
+    }
 }
