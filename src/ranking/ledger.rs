@@ -1186,6 +1186,19 @@ impl RunLedger {
         debug_assert!(self.validate().is_ok());
         debug_assert!(other.validate().is_ok());
 
+        let mut identities: std::collections::BTreeSet<_> = self
+            .events
+            .iter()
+            .map(|event| event.meta().identity())
+            .collect();
+        for event in &other.events {
+            if !identities.insert(event.meta().identity()) {
+                return Err(LedgerError::Inconsistent(
+                    "duplicate terminal event identity across worker ledgers".to_owned(),
+                ));
+            }
+        }
+
         let new_orders = checked_add(self.new_orders, other.new_orders, "new_orders")?;
         let new_order_lines = checked_add(
             self.new_order_lines,
@@ -2563,6 +2576,29 @@ mod tests {
         assert_eq!(merged.delivered_orders(), 1);
         assert_eq!(merged.events().len(), 4);
         assert_eq!(merged.to_committed_ledger().delivered_order_lines, 6);
+    }
+
+    #[test]
+    fn merge_rejects_duplicate_terminal_identity_atomically() {
+        let payment_ticket = ticket(
+            TransactionKind::Payment,
+            None,
+            StageId::measurement(0),
+            0,
+            25,
+        );
+        let mut first = RunLedger::default();
+        first
+            .record(&payment_ticket, &payment(&payment_ticket))
+            .unwrap();
+        let duplicate = first.clone();
+        let before = first.clone();
+        assert!(matches!(
+            first.merge(&duplicate),
+            Err(LedgerError::Inconsistent(message))
+                if message.contains("duplicate terminal event identity")
+        ));
+        assert_eq!(first, before);
     }
 
     #[test]
