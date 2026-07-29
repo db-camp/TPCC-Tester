@@ -952,6 +952,7 @@ else
   validate_component "derived database name" "${DB_NAME}"
   if [[ "${MODE}" == "tools" ]]; then
     DB_IDENTITY_STATUS="not_applicable"
+    DB_IDENTITY_BINDING_STATUS="not_applicable"
   fi
 fi
 
@@ -1051,7 +1052,18 @@ build_dir=${RMDB_DIR}/${BUILD_DIR}
 server_bin=${SERVER_BIN}
 tpcc_bin=${TPCC_BIN}
 db_name=${DB_NAME}
+db_name_source=${DB_IDENTITY_SOURCE}
+db_name_caller_supplied=${DB_NAME_CALLER_SUPPLIED}
+db_name_deviation_active=${DB_NAME_DEVIATION_ACTIVE}
 db_path=${DB_PATH}
+db_identity_status=${DB_IDENTITY_STATUS}
+db_identity_binding_status=${DB_IDENTITY_BINDING_STATUS}
+db_device=${DB_DEVICE}
+db_inode=${DB_INODE}
+db_path_fingerprint=${DB_PATH_FINGERPRINT}
+runtime_schema_fingerprint=${RUNTIME_SCHEMA_FINGERPRINT}
+dataset_state_fingerprint=${DATASET_STATE_FINGERPRINT}
+db_identity_fingerprint=${DB_IDENTITY_FINGERPRINT}
 result_dir=${RESULT_DIR}
 csv_dir=${CSV_DIR}
 state_dir=${STATE_DIR}
@@ -1135,6 +1147,11 @@ write_manifest() {
     "${EFFECTIVE_WARMUP_SECONDS}" "${PUBLIC_WINDOWS}" \
     "${EFFECTIVE_WINDOW_SECONDS}" "${RMDB_SHA}" "${TPCC_SHA}" \
     "${RMDB_DIR}" "${TPCC_DIR}" "${DB_PATH}" "${RESULT_DIR}" "${STATE_DIR}" \
+    "${DB_NAME}" "${DB_NAME_CALLER_SUPPLIED}" "${DB_IDENTITY_SOURCE}" \
+    "${DB_NAME_DEVIATION_ACTIVE}" "${DB_IDENTITY_STATUS}" \
+    "${DB_IDENTITY_BINDING_STATUS}" "${DB_DEVICE}" "${DB_INODE}" \
+    "${DB_PATH_FINGERPRINT}" "${RUNTIME_SCHEMA_FINGERPRINT}" \
+    "${DATASET_STATE_FINGERPRINT}" "${DB_IDENTITY_FINGERPRINT}" \
     "${PHASE_SETUP}" "${PHASE_RANK}" "${PHASE_ONLINE}" \
     "${PHASE_CRASH_RESTART}" "${PHASE_RECOVERY}" "${PHASE_DIAGNOSTICS}" \
     "${DIAGNOSTICS_REQUESTED}" "${DIAGNOSTIC_WARMUP_SECONDS}" \
@@ -1168,6 +1185,18 @@ import sys
     db_path,
     result_dir,
     state_dir,
+    db_name,
+    db_name_caller_supplied,
+    db_name_source,
+    db_name_deviation_active,
+    db_identity_status,
+    db_identity_binding_status,
+    db_device,
+    db_inode,
+    db_path_fingerprint,
+    runtime_schema_fingerprint,
+    dataset_state_fingerprint,
+    db_identity_fingerprint,
     phase_setup,
     phase_rank,
     phase_online,
@@ -1327,9 +1356,46 @@ else:
         "valid": resource_metrics["valid_server_generations"],
     }
 
+database_identity = {
+    "status": db_identity_status,
+    "binding_status": db_identity_binding_status,
+    "opaque_name": db_name_source == "derived_opaque",
+    "name": db_name,
+    "path_basename": Path(db_path).name,
+    "name_source": db_name_source,
+    "name_algorithm": (
+        "sha256_domain_run_id_seed_v1"
+        if db_name_source == "derived_opaque"
+        else "caller_supplied_deviation"
+    ),
+    "caller_supplied_this_invocation": db_name_caller_supplied == "1",
+    "deviation_active": db_name_deviation_active == "1",
+    "filesystem": {
+        "device": int(db_device) if db_device else None,
+        "inode": int(db_inode) if db_inode else None,
+        "path_fingerprint": db_path_fingerprint or None,
+    },
+    "dataset_binding": {
+        "dataset_run_id": dataset_run_id,
+        "seed": int(seed),
+        "runtime_schema_fingerprint": (
+            runtime_schema_fingerprint
+            if runtime_schema_fingerprint != "unsealed"
+            else None
+        ),
+        "dataset_state_fingerprint": (
+            dataset_state_fingerprint
+            if dataset_state_fingerprint != "unsealed"
+            else None
+        ),
+    },
+    "identity_fingerprint": db_identity_fingerprint or None,
+    "state_artifact": "database.identity",
+    "database_marker": ".tpcc-workflow-database-identity",
+}
 
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "conformance": (
         "public_spec_aligned"
         if ranked_configuration == "1"
@@ -1379,6 +1445,7 @@ payload = {
         "result": result_dir,
         "state": state_dir,
     },
+    "database_identity": database_identity,
     "phases": {
         "setup": phase_setup,
         "rank": phase_rank,
@@ -3819,10 +3886,22 @@ write_summary() {
   } >"${RESULT_DIR}/summary.md"
 }
 
+assert_database_identity_ready_for_success() {
+  [[ "${MODE}" != "tools" ]] || return 0
+  verify_database_identity
+  [[ "${DB_IDENTITY_STATUS}" == "verified" \
+    && "${DB_IDENTITY_BINDING_STATUS}" == "sealed" \
+    && "${RUNTIME_SCHEMA_FINGERPRINT}" =~ ^[0-9a-f]{16}$ \
+    && "${DATASET_STATE_FINGERPRINT}" =~ ^[0-9a-f]{64}$ \
+    && "${DB_IDENTITY_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "workflow cannot succeed without a sealed database identity"
+}
+
 write_manifest
 record_tools
 
 if [[ "${MODE}" == "tools" ]]; then
+  assert_database_identity_ready_for_success
   WORKFLOW_STATUS="success"
   write_manifest
   write_summary
@@ -3871,6 +3950,7 @@ case "${MODE}" in
 esac
 
 finalize_resource_metrics
+assert_database_identity_ready_for_success
 WORKFLOW_STATUS="success"
 write_manifest
 write_summary

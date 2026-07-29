@@ -1592,6 +1592,13 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 "missing",
             )
             self.assertFalse((result_dir / "resource_metrics.json").exists())
+            self.assertEqual(
+                manifest["database_identity"]["status"],
+                "not_applicable",
+            )
+            self.assertIsNone(
+                manifest["database_identity"]["filesystem"]["device"]
+            )
 
     def test_resource_helper_failure_is_warning_only(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2857,6 +2864,7 @@ while :; do sleep 0.05; done
                 else "failed"
             )
             self.assertEqual(manifest["conformance"], "public_spec_aligned")
+            self.assertEqual(manifest["schema_version"], 2)
             self.assertFalse(manifest["embeds_unpublished_official_values"])
             self.assertEqual(manifest["status"], "success")
             self.assertEqual(resource_metrics["status"], "partial")
@@ -3007,6 +3015,69 @@ while :; do sleep 0.05; done
             self.assertEqual(
                 manifest["paths"]["state"],
                 str(result_dirs[0] / "state"),
+            )
+            database_identity = manifest["database_identity"]
+            state_identity = dict(
+                line.split("=", 1)
+                for line in (
+                    result_dirs[0] / "state" / "database.identity"
+                )
+                .read_text(encoding="ascii")
+                .splitlines()
+            )
+            self.assertEqual(
+                {
+                    key: database_identity[key]
+                    for key in (
+                        "status",
+                        "binding_status",
+                        "opaque_name",
+                        "name",
+                        "path_basename",
+                        "name_source",
+                        "name_algorithm",
+                        "caller_supplied_this_invocation",
+                        "deviation_active",
+                    )
+                },
+                {
+                    "status": "verified",
+                    "binding_status": "sealed",
+                    "opaque_name": True,
+                    "name": state_identity["db_name"],
+                    "path_basename": state_identity["db_name"],
+                    "name_source": "derived_opaque",
+                    "name_algorithm": "sha256_domain_run_id_seed_v1",
+                    "caller_supplied_this_invocation": False,
+                    "deviation_active": False,
+                },
+            )
+            self.assertEqual(
+                database_identity["filesystem"],
+                {
+                    "device": int(state_identity["db_device"]),
+                    "inode": int(state_identity["db_inode"]),
+                    "path_fingerprint": state_identity[
+                        "db_path_fingerprint"
+                    ],
+                },
+            )
+            self.assertEqual(
+                database_identity["dataset_binding"],
+                {
+                    "dataset_run_id": manifest["dataset_run_id"],
+                    "seed": 2026,
+                    "runtime_schema_fingerprint": "0123456789abcdef",
+                    "dataset_state_fingerprint": hashlib.sha256(
+                        (
+                            result_dirs[0] / "state" / "dataset.state"
+                        ).read_bytes()
+                    ).hexdigest(),
+                },
+            )
+            self.assertEqual(
+                database_identity["identity_fingerprint"],
+                state_identity["identity_fingerprint"],
             )
             self.assertEqual(
                 manifest["source"]["rmdb_sha"],
