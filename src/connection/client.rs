@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -17,24 +18,46 @@ pub struct RmdbClient {
 }
 
 impl RmdbClient {
-    /// Run the exact readiness request without imposing a client-local
-    /// connect or response timeout.
+    /// Run the exact readiness request under one client-local deadline.
     ///
     /// The workflow supervisor owns the single monotonic deadline that also
-    /// covers server launch, process registration, and listener ownership.
-    /// Keeping this path unbounded internally lets an already connected
-    /// fragmented response consume all of that remaining shared budget.
-    pub async fn probe_readiness(host: &str, port: u16) -> Result<(), TpccError> {
-        let addr = format!("{host}:{port}");
+    /// covers server launch, process registration, and listener ownership,
+    /// then passes this process the remaining portion. One Tokio deadline
+    /// covers connect, handshake, request send, and the complete terminal.
+    pub async fn probe_readiness(
+        host: &str,
+        port: u16,
+        shared_budget: Duration,
+    ) -> Result<(), TpccError> {
+        let ip = host.parse::<IpAddr>().map_err(|_| {
+            TpccError::Connection(format!(
+                "readiness host must be a numeric IPv4 or IPv6 address: {host}"
+            ))
+        })?;
+        let addr = SocketAddr::new(ip, port);
         debug!("正在连接 RMDB readiness endpoint: {addr}");
-        let mut connection = WireConnection::connect(&addr)
+        let probe = async {
+            let mut connection = WireConnection::connect(addr)
+                .await
+                .map_err(map_wire_error)?;
+            let response = connection
+                .exec_stream("show tables;")
+                .await
+                .map_err(|error| map_exec_wire_error(error, "show tables;"))?;
+            validate_readiness_response(response)
+        };
+        let local_deadline = tokio::time::Instant::now()
+            .checked_add(shared_budget)
+            .ok_or_else(|| TpccError::Timeout {
+                context: "shared readiness budget cannot be represented".to_owned(),
+            })?;
+        tokio::time::timeout_at(local_deadline, probe)
             .await
-            .map_err(map_wire_error)?;
-        let response = connection
-            .exec_stream("show tables;")
-            .await
-            .map_err(|error| map_exec_wire_error(error, "show tables;"))?;
-        validate_readiness_response(response)
+            .map_err(|_| TpccError::Timeout {
+                context: format!(
+                    "shared readiness deadline exhausted after remaining {shared_budget:?}"
+                ),
+            })?
     }
 
     pub async fn connect(host: &str, port: u16) -> Result<Self, TpccError> {
@@ -46,15 +69,16 @@ impl RmdbClient {
         port: u16,
         response_timeout: Duration,
     ) -> Result<Self, TpccError> {
-        let addr = format!("{host}:{port}");
+        let addr = display_endpoint(host, port);
         debug!("正在连接 RMDB: {addr}");
 
-        let connection = tokio::time::timeout(CONNECT_TIMEOUT, WireConnection::connect(&addr))
-            .await
-            .map_err(|_| TpccError::Timeout {
-                context: format!("连接及 Wire v3 握手 {addr} 超时 ({CONNECT_TIMEOUT:?})"),
-            })?
-            .map_err(map_wire_error)?;
+        let connection =
+            tokio::time::timeout(CONNECT_TIMEOUT, WireConnection::connect((host, port)))
+                .await
+                .map_err(|_| TpccError::Timeout {
+                    context: format!("连接及 Wire v3 握手 {addr} 超时 ({CONNECT_TIMEOUT:?})"),
+                })?
+                .map_err(map_wire_error)?;
 
         debug!("已连接到 RMDB 且完成 Wire v3 握手: {addr}");
         Ok(Self {
@@ -110,6 +134,14 @@ impl RmdbClient {
     /// not merely a successful TCP connect.
     pub async fn ping(&mut self) -> Result<(), TpccError> {
         validate_readiness_response(self.exec_stream("show tables;").await?)
+    }
+}
+
+fn display_endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -252,8 +284,7 @@ mod tests {
             let mut header = [0_u8; 8];
             socket.read_exact(&mut header).await.unwrap();
             assert_eq!(header[4], 0x20);
-            let payload_bytes =
-                u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let payload_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
             let mut payload = vec![0_u8; payload_bytes];
             socket.read_exact(&mut payload).await.unwrap();
             assert_eq!(payload, b"show tables;");
@@ -267,7 +298,7 @@ mod tests {
         let started = Instant::now();
         tokio::time::timeout(
             Duration::from_secs(4),
-            RmdbClient::probe_readiness("127.0.0.1", port),
+            RmdbClient::probe_readiness("127.0.0.1", port, Duration::from_secs(4)),
         )
         .await
         .expect("test safety timeout elapsed")
@@ -288,7 +319,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(1),
-            RmdbClient::probe_readiness("127.0.0.1", port),
+            RmdbClient::probe_readiness("127.0.0.1", port, Duration::from_secs(1)),
         )
         .await
         .expect("readiness EOF did not fail promptly")
@@ -296,5 +327,114 @@ mod tests {
         .to_string();
         assert!(error.contains("连接失败"), "{error}");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_shared_budget_covers_handshake_and_terminal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; HANDSHAKE.len()];
+            socket.read_exact(&mut handshake).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            socket.write_all(&handshake).await.unwrap();
+
+            let mut header = [0_u8; 8];
+            socket.read_exact(&mut header).await.unwrap();
+            let payload_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let mut payload = vec![0_u8; payload_bytes];
+            socket.read_exact(&mut payload).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = socket.write_all(&[0_u8, 0, 0, 0, 0x10, 0, 0, 0]).await;
+        });
+
+        let started = Instant::now();
+        let error = RmdbClient::probe_readiness("127.0.0.1", port, Duration::from_millis(100))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("shared readiness deadline"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.await.unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; HANDSHAKE.len()];
+            socket.read_exact(&mut handshake).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            socket.write_all(&handshake).await.unwrap();
+
+            let mut header = [0_u8; 8];
+            socket.read_exact(&mut header).await.unwrap();
+            let payload_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let mut payload = vec![0_u8; payload_bytes];
+            socket.read_exact(&mut payload).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            socket
+                .write_all(&[0_u8, 0, 0, 0, 0x10, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+
+        RmdbClient::probe_readiness("127.0.0.1", port, Duration::from_millis(200))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_refused_connect_for_supervisor_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let started = Instant::now();
+        let error = RmdbClient::probe_readiness("127.0.0.1", port, Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("连接失败"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn readiness_accepts_numeric_ipv6_endpoint() {
+        let listener = match TcpListener::bind("[::1]:0").await {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; HANDSHAKE.len()];
+            socket.read_exact(&mut handshake).await.unwrap();
+            socket.write_all(&handshake).await.unwrap();
+            let mut header = [0_u8; 8];
+            socket.read_exact(&mut header).await.unwrap();
+            let payload_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let mut payload = vec![0_u8; payload_bytes];
+            socket.read_exact(&mut payload).await.unwrap();
+            socket
+                .write_all(&[0_u8, 0, 0, 0, 0x10, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+
+        RmdbClient::probe_readiness("::1", port, Duration::from_secs(1))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_non_numeric_host_without_dns() {
+        let error = RmdbClient::probe_readiness("localhost", 8765, Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("numeric IPv4 or IPv6"), "{error}");
     }
 }

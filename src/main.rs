@@ -85,7 +85,12 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             "执行 Wire v3 readiness probe: {}:{}",
             config.host, config.port
         );
-        RmdbClient::probe_readiness(&config.host, config.port).await?;
+        let shared_budget = Duration::from_millis(
+            config
+                .probe_budget_millis
+                .ok_or("validated readiness probe lost its shared budget")?,
+        );
+        RmdbClient::probe_readiness(&config.host, config.port, shared_budget).await?;
         info!("Wire v3 readiness probe 通过（完整执行 `show tables;`）");
         return Ok(());
     }

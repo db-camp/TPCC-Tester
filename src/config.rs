@@ -151,6 +151,10 @@ pub struct Config {
     #[arg(long = "probe-ready")]
     pub probe_ready: bool,
 
+    /// Remaining portion of the workflow-owned monotonic readiness budget
+    #[arg(long = "probe-budget-millis", hide = true)]
+    pub probe_budget_millis: Option<u64>,
+
     /// Persist one write-once workflow lifecycle transition, then exit
     #[arg(long = "lifecycle-event", value_enum)]
     pub lifecycle_event: Option<LifecycleEvent>,
@@ -249,6 +253,9 @@ pub enum ConfigError {
 
     #[error("--probe-ready must be used by itself")]
     ProbeReadyMustBeExclusive,
+
+    #[error("--probe-ready and --probe-budget-millis must be supplied together")]
+    ProbeBudgetMustMatchProbe,
 
     #[error("--lifecycle-event must be used by itself")]
     LifecycleEventMustBeExclusive,
@@ -396,6 +403,9 @@ impl Config {
         {
             return Err(ConfigError::ProbeReadyMustBeExclusive);
         }
+        if self.probe_ready != self.probe_budget_millis.is_some() {
+            return Err(ConfigError::ProbeBudgetMustMatchProbe);
+        }
 
         Ok(())
     }
@@ -472,6 +482,12 @@ impl Config {
         if self.response_timeout_seconds == 0 {
             return Err(ConfigError::OutOfRange {
                 field: "response-timeout-seconds",
+                range: "1..",
+            });
+        }
+        if self.probe_budget_millis == Some(0) {
+            return Err(ConfigError::OutOfRange {
+                field: "probe-budget-millis",
                 range: "1..",
             });
         }
@@ -689,6 +705,42 @@ mod tests {
             config.validate(),
             Err(ConfigError::ProbeReadyMustBeExclusive)
         ));
+    }
+
+    #[test]
+    fn probe_ready_requires_one_positive_shared_budget() {
+        let missing = Config::try_parse_from(["tpcc-tester", "--probe-ready"]).unwrap();
+        assert!(matches!(
+            missing.validate(),
+            Err(ConfigError::ProbeBudgetMustMatchProbe)
+        ));
+
+        let detached =
+            Config::try_parse_from(["tpcc-tester", "--probe-budget-millis", "1000"]).unwrap();
+        assert!(matches!(
+            detached.validate(),
+            Err(ConfigError::ProbeBudgetMustMatchProbe)
+        ));
+
+        let zero =
+            Config::try_parse_from(["tpcc-tester", "--probe-ready", "--probe-budget-millis", "0"])
+                .unwrap();
+        assert!(matches!(
+            zero.validate(),
+            Err(ConfigError::OutOfRange {
+                field: "probe-budget-millis",
+                ..
+            })
+        ));
+
+        let valid = Config::try_parse_from([
+            "tpcc-tester",
+            "--probe-ready",
+            "--probe-budget-millis",
+            "5000",
+        ])
+        .unwrap();
+        valid.validate().unwrap();
     }
 
     #[test]
