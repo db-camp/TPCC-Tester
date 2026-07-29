@@ -153,7 +153,7 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 - CSV 只生成在 `<RMDB>/.tpcc-workflow/<run-id>/csv`，工作流结束时按本次所有权清理，不触碰源码树中的 CSV。
 - 端口被占用时 fail closed。脚本不按端口发现或杀进程，只向本次登记的 server/probe PID 发送信号。
 - 发现指向其他源码目录的旧 CMake cache 时直接失败，不删除也不静默改写 cache。
-- readiness 使用 tester 的 `--probe-ready`：Wire v3 handshake 后完整执行 `show tables;`。每次 RMDB 启动都在启动命令之前建立唯一 monotonic 绝对 deadline，进程登记、listener ownership、TCP connect、握手和完整 terminal 共用其剩余预算；Shell 与 Rust probe 均不另设更短的单次截止。首次 setup/rank 启动使用本地 `--startup-ready-timeout-seconds` 安全预算；只有崩溃后的同库重启及独立 recovery 模式使用公开 90 秒 `--ready-timeout-seconds` 契约。仅 TCP connect 不算 ready。显式覆盖公开恢复预算会使生命周期偏离正式配置；本地首次启动预算不属于公开评分参数。
+- readiness 使用 tester 的 `--probe-ready`：Wire v3 handshake 后完整执行 `show tables;`。每次 RMDB 启动都在启动命令之前建立唯一、纳秒精度的 monotonic 绝对 deadline，进程登记、listener ownership、TCP connect、握手和完整 terminal 共用其剩余预算；Shell 在 exec probe 前传入向上取整的剩余毫秒，Rust 用一次 deadline 覆盖完整 Wire future，Shell supervisor 仍按原始绝对 deadline 执行最终边界，不另设更短或重置的 connect/response 截止。首次 setup/rank 启动使用本地 `--startup-ready-timeout-seconds` 安全预算；只有崩溃后的同库重启及独立 recovery 模式使用公开 90 秒 `--ready-timeout-seconds` 契约。仅 TCP connect 不算 ready。显式覆盖公开恢复预算会使生命周期偏离正式配置；本地首次启动预算不属于公开评分参数。
 - 脚本兼容 macOS Bash 3.2，不依赖 `ss`、`nproc` 或 GNU `timeout`。
 
 ## 结果与日志

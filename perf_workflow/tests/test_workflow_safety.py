@@ -1722,6 +1722,17 @@ if "--probe-ready" in sys.argv:
                 args for args in invocations if "--probe-ready" in args
             ]
             self.assertGreaterEqual(len(probes), 2)
+            budgets = [
+                int(args[args.index("--probe-budget-millis") + 1])
+                for args in probes
+            ]
+            self.assertTrue(
+                all(
+                    later < earlier
+                    for earlier, later in zip(budgets, budgets[1:])
+                ),
+                budgets,
+            )
 
     def test_hung_probe_exec_path_respects_deadline_and_leaves_no_processes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2479,14 +2490,13 @@ while :; do sleep 0.05; done
             self.assertGreaterEqual(len(probes), 2)
             self.assertTrue(
                 all(
-                    args
-                    == [
-                        "--probe-ready",
-                        "--host",
-                        "127.0.0.1",
-                        "--port",
-                        "8765",
-                    ]
+                    len(args) == 7
+                    and args[0] == "--probe-ready"
+                    and args[1] == "--probe-budget-millis"
+                    and args[2].isdigit()
+                    and 0 < int(args[2]) <= 90_000
+                    and args[3:]
+                    == ["--host", "127.0.0.1", "--port", "8765"]
                     for args in probes
                 )
             )

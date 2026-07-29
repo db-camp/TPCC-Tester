@@ -106,16 +106,17 @@ RMDB_TPCC_RUN_ID=local-final2026-01 \
   --state-dir /tmp/tpcc-final2026-state
 ```
 
-崩溃与同库重启应交给 `run_workflow.sh --mode all`，避免误杀其他进程或恢复到错误数据库。readiness 可单独探测：
+崩溃与同库重启应交给 `run_workflow.sh --mode all`，避免误杀其他进程或恢复到错误数据库。下面只是在 5 秒本地诊断预算内单独探测；正式恢复的 90 秒 deadline 必须由 workflow 在启动 RMDB 前建立并传递：
 
 ```bash
 ./target/release/tpcc-tester \
   --probe-ready \
+  --probe-budget-millis 5000 \
   --host 127.0.0.1 \
   --port 8765
 ```
 
-`--probe-ready` 必须单独使用，它会完成 Wire v3 handshake 并完整执行 `show tables;`，而不是只测试 TCP connect。
+`--probe-ready` 必须和正数 `--probe-budget-millis` 成对使用，且不能混入其他动作；它会完成 Wire v3 handshake 并完整执行 `show tables;`，而不是只测试 TCP connect。
 
 ## 明确标记的本地 smoke
 

@@ -493,7 +493,7 @@ csv_dir=${CSV_DIR}
 state_dir=${STATE_DIR}
 host=${HOST}
 port=${PORT}
-ready_probe=tpcc-tester --probe-ready --host ${HOST} --port ${PORT}
+ready_probe=tpcc-tester --probe-ready --probe-budget-millis <remaining-ms> --host ${HOST} --port ${PORT}
 startup_ready_budget_seconds=${STARTUP_READY_TIMEOUT_SECONDS}
 recovery_ready_budget_seconds=${RECOVERY_READY_TIMEOUT_SECONDS}
 schedule_owner=rust
@@ -931,6 +931,14 @@ monotonic_millis() {
 import time
 
 print(time.monotonic_ns() // 1_000_000)
+PY
+}
+
+monotonic_nanos() {
+  python3 - <<'PY'
+import time
+
+print(time.monotonic_ns())
 PY
 }
 
@@ -2592,18 +2600,17 @@ ensure_port_available() {
 }
 
 probe_ready() {
-  local absolute_deadline_millis="$1"
-  python3 - "${absolute_deadline_millis}" "${TPCC_DIR}" "${TPCC_BIN}" \
+  local absolute_deadline_nanos="$1"
+  python3 - "${absolute_deadline_nanos}" "${TPCC_DIR}" "${TPCC_BIN}" \
     "${HOST}" "${PORT}" <<'PY' >>"${RESULT_DIR}/ready_probe.log" 2>&1 &
 import os
 import signal
 import sys
 import time
 
-deadline_millis = int(sys.argv[1])
+deadline_nanos = int(sys.argv[1])
 working_directory, executable, host, port = sys.argv[2:]
-started_millis = time.monotonic_ns() // 1_000_000
-if started_millis >= deadline_millis:
+if time.monotonic_ns() >= deadline_nanos:
     raise SystemExit(124)
 
 probe_pid = None
@@ -2643,11 +2650,20 @@ try:
             os.setsid()
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked_signals)
             os.chdir(working_directory)
+            remaining_ns = deadline_nanos - time.monotonic_ns()
+            if remaining_ns <= 0:
+                os._exit(124)
+            remaining_millis = max(
+                1,
+                (remaining_ns + 999_999) // 1_000_000,
+            )
             os.execv(
                 executable,
                 [
                     executable,
                     "--probe-ready",
+                    "--probe-budget-millis",
+                    str(remaining_millis),
                     "--host",
                     host,
                     "--port",
@@ -2668,16 +2684,18 @@ while True:
     waited_pid, status = os.waitpid(probe_pid, os.WNOHANG)
     if waited_pid == probe_pid:
         exit_code = os.waitstatus_to_exitcode(status)
+        if exit_code == 0 and time.monotonic_ns() >= deadline_nanos:
+            raise SystemExit(124)
         raise SystemExit(exit_code if exit_code >= 0 else 128 - exit_code)
-    now_millis = time.monotonic_ns() // 1_000_000
-    if now_millis >= deadline_millis:
+    remaining_ns = deadline_nanos - time.monotonic_ns()
+    if remaining_ns <= 0:
         kill_probe()
         try:
             os.waitpid(probe_pid, 0)
         except ChildProcessError:
             pass
         raise SystemExit(124)
-    time.sleep(min(0.01, (deadline_millis - now_millis) / 1000.0))
+    time.sleep(min(0.01, remaining_ns / 1_000_000_000))
 PY
   PROBE_PID=$!
   local probe_rc=0
@@ -2687,24 +2705,27 @@ PY
 }
 
 wait_for_ready() {
-  local deadline_millis="$1"
-  local now_millis=""
+  local deadline_nanos="$1"
+  local inspection_deadline_millis="$2"
+  local now_nanos=""
   local listener_status=0
   while true; do
-    now_millis="$(monotonic_millis)"
-    (( now_millis < deadline_millis )) || return 1
+    now_nanos="$(monotonic_nanos)"
+    (( now_nanos < deadline_nanos )) || return 1
     if [[ -z "${SERVER_PID}" ]] \
-      || ! server_process_helper root-alive "" "${deadline_millis}"; then
+      || ! server_process_helper root-alive "" \
+        "${inspection_deadline_millis}"; then
       return 1
     fi
 
-    if server_process_helper listener "" "${deadline_millis}"; then
-      if probe_ready "${deadline_millis}"; then
-        now_millis="$(monotonic_millis)"
-        (( now_millis <= deadline_millis )) || return 1
-        server_process_helper listener "" "${deadline_millis}" || return 1
-        now_millis="$(monotonic_millis)"
-        (( now_millis <= deadline_millis )) || return 1
+    if server_process_helper listener "" "${inspection_deadline_millis}"; then
+      if probe_ready "${deadline_nanos}"; then
+        now_nanos="$(monotonic_nanos)"
+        (( now_nanos < deadline_nanos )) || return 1
+        server_process_helper listener "" \
+          "${inspection_deadline_millis}" || return 1
+        now_nanos="$(monotonic_nanos)"
+        (( now_nanos < deadline_nanos )) || return 1
         return 0
       fi
     else
@@ -2713,13 +2734,13 @@ wait_for_ready() {
         return 1
       fi
     fi
-    now_millis="$(monotonic_millis)"
-    (( now_millis < deadline_millis )) || return 1
-    python3 - "${deadline_millis}" <<'PY'
+    now_nanos="$(monotonic_nanos)"
+    (( now_nanos < deadline_nanos )) || return 1
+    python3 - "${deadline_nanos}" <<'PY'
 import sys
 import time
 
-remaining = (int(sys.argv[1]) - time.monotonic_ns() // 1_000_000) / 1000.0
+remaining = (int(sys.argv[1]) - time.monotonic_ns()) / 1_000_000_000
 if remaining > 0:
     time.sleep(min(0.25, remaining))
 PY
@@ -2777,14 +2798,18 @@ start_server() {
   local purpose="$1"
   local readiness_budget_seconds="$2"
   local readiness_budget_kind="$3"
-  local readiness_started_millis=""
+  local readiness_started_nanos=""
+  local readiness_deadline_nanos=""
   local readiness_deadline_millis=""
   ensure_port_available
   printf '\n[server start: %s]\n' "${purpose}" >>"${SERVER_LOG}"
   log "starting RMDB for ${purpose} (${readiness_budget_kind} readiness budget)"
-  readiness_started_millis="$(monotonic_millis)"
-  readiness_deadline_millis=$(( (10#${readiness_budget_seconds} * 1000) \
-    + readiness_started_millis ))
+  readiness_started_nanos="$(monotonic_nanos)"
+  readiness_deadline_nanos=$(( \
+    (10#${readiness_budget_seconds} * 1000000000) \
+    + readiness_started_nanos ))
+  readiness_deadline_millis=$(( \
+    (readiness_deadline_nanos + 999999) / 1000000 ))
   (
     cd "${RMDB_DIR}"
     exec env RMDB_PORT="${PORT}" \
@@ -2805,9 +2830,14 @@ os.execv(sys.argv[1], sys.argv[1:])' \
     fi
     die "RMDB process registration exceeded the shared readiness budget"
   fi
+  (( $(monotonic_nanos) < readiness_deadline_nanos )) || {
+    force_stop_server 1000 || true
+    die "RMDB process registration exceeded the shared readiness budget"
+  }
   start_resource_monitor
   printf '%s\n' "${SERVER_PID}" >"${RESULT_DIR}/server.pid"
-  if ! wait_for_ready "${readiness_deadline_millis}"; then
+  if ! wait_for_ready \
+      "${readiness_deadline_nanos}" "${readiness_deadline_millis}"; then
     force_stop_server 1000 || true
     die "RMDB did not pass the exact show-tables readiness probe within ${readiness_budget_seconds}s (${readiness_budget_kind} budget); see ${SERVER_LOG}"
   fi
