@@ -16,6 +16,7 @@ mod ranking;
 mod report;
 mod routing;
 mod run_state;
+mod runtime_schema;
 mod transaction;
 mod workload;
 
