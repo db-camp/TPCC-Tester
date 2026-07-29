@@ -1532,7 +1532,7 @@ if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
   || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
   || "${DB_NAME_DEVIATION_ACTIVE}" == "1" \
-  || "${READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
+  || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
 if [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
@@ -4173,7 +4173,7 @@ start_new_database() {
   start_server "new database setup" \
     "${STARTUP_READY_TIMEOUT_SECONDS}" "local startup"
   claim_new_database
-  capture_resource_database_identity || true
+  RESOURCE_DATABASE_IDENTITY="${DB_DEVICE}:${DB_INODE}"
 }
 
 start_existing_database() {

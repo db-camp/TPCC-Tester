@@ -2035,16 +2035,11 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
     def test_rank_cpu_uses_the_published_three_window_timeline(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
-            root = self.make_root(temp)
-            database = root / "tpcc_final2026"
-            database.mkdir()
+            fixture = self.provision_identity_fixture(temp)
+            root = fixture["root"]
+            database = fixture["database"]
+            state = fixture["state"]
             (database / "page").write_bytes(b"x" * 8_192)
-            state = temp_path / "state"
-            state.mkdir()
-            (state / "dataset.state").write_text(
-                "version=2\nrun_id=resource.timeline.test\n",
-                encoding="utf-8",
-            )
             server = self.make_python_executable(
                 temp_path / "busy-rmdb",
                 """
@@ -2217,12 +2212,42 @@ if "--benchmark" in sys.argv:
             tester = self.make_python_executable(
                 temp_path / "three-second-tpcc",
                 f"""
+import os
+from pathlib import Path
 import sys
 import time
 
 if "--probe-ready" in sys.argv:
     time.sleep(3)
     open({str(probe_completed)!r}, "w", encoding="utf-8").close()
+if "--create-schema" in sys.argv:
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    run_id = os.environ["RMDB_TPCC_RUN_ID"]
+    seed = int(sys.argv[sys.argv.index("--seed") + 1])
+    (state_dir / "dataset.state").write_text(
+        "\\n".join(
+            (
+                "version=4",
+                f"run_id={{run_id}}",
+                f"seed={{seed}}",
+                "warehouses=50",
+                "order_line_rows=1",
+                "undelivered_order_line_rows=1",
+                "order_line_amount_terms=1",
+                "order_line_amount_words=0000000000000000",
+                "runtime_schema_begin",
+                "version=1",
+                "mode=local_seed_opaque_v1",
+                f"seed={{seed}}",
+                "fingerprint=0123456789abcdef",
+                "runtime_schema_end",
+                "setup_evidence=00",
+                "partition=1,1,1,1",
+            )
+        )
+        + "\\n",
+        encoding="ascii",
+    )
 """,
             )
             started = time.time()
