@@ -47,6 +47,10 @@ pub async fn run(
     verify_stock_level(primary, &selection).await?;
     verify_new_order_rollback(primary, &selection).await?;
     verify_new_order_auto_abort(primary, &selection).await?;
+    // Reinsert the exact same prospective keys after AUTO_ABORT.  Read-only
+    // residue checks cannot expose an invisible heap/index ghost that still
+    // rejects a duplicate key; a second full write prefix does.
+    verify_new_order_rollback(primary, &selection).await?;
     verify_payment_stale_write(primary, contender, selection.warehouse_id).await
 }
 
