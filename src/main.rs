@@ -5,6 +5,7 @@ mod data_gen;
 mod error;
 mod executor;
 mod loader;
+pub mod measurement;
 mod model;
 mod report;
 mod transaction;
