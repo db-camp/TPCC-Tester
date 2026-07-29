@@ -110,14 +110,15 @@ impl RmdbClient {
     /// Official readiness is a complete framed execution of this exact SQL,
     /// not merely a successful TCP connect.
     pub async fn ping(&mut self) -> Result<(), TpccError> {
-        match self.exec_stream("show tables;").await? {
-            StreamResponse::Query { .. } => Ok(()),
-            StreamResponse::CommandOk => Err(TpccError::Protocol(
-                "show tables; 必须返回 META/RESULT_END 查询响应".to_owned(),
-            )),
-            StreamResponse::TransactionAbort { diagnostic } => Err(TpccError::Abort(diagnostic)),
-            StreamResponse::Error { diagnostic } => Err(TpccError::QueryError(diagnostic)),
-        }
+        validate_readiness_response(self.exec_stream("show tables;").await?)
+    }
+}
+
+fn validate_readiness_response(response: StreamResponse) -> Result<(), TpccError> {
+    match response {
+        StreamResponse::CommandOk | StreamResponse::Query { .. } => Ok(()),
+        StreamResponse::TransactionAbort { diagnostic } => Err(TpccError::Abort(diagnostic)),
+        StreamResponse::Error { diagnostic } => Err(TpccError::QueryError(diagnostic)),
     }
 }
 
@@ -160,5 +161,34 @@ fn wire_value_text(value: WireValue) -> String {
         WireValue::Int32(value) => value.to_string(),
         WireValue::Float32(bits) => f32::from_bits(bits).to_string(),
         WireValue::Char(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_accepts_both_published_success_terminals() {
+        assert!(validate_readiness_response(StreamResponse::CommandOk).is_ok());
+        assert!(validate_readiness_response(StreamResponse::Query {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn readiness_rejects_abort_and_error_terminals() {
+        assert!(
+            validate_readiness_response(StreamResponse::TransactionAbort {
+                diagnostic: "conflict".to_owned(),
+            })
+            .is_err()
+        );
+        assert!(validate_readiness_response(StreamResponse::Error {
+            diagnostic: "failed".to_owned(),
+        })
+        .is_err());
     }
 }
