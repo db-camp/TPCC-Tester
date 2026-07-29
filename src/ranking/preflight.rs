@@ -958,25 +958,8 @@ fn parse_new_order_stage_one(
     plan: &NewOrderStageOnePlan,
     results: &BatchResults,
 ) -> Result<MaterializedNewOrder, String> {
-    let home = exactly_one_row(
-        results
-            .rows(plan.home_result)
-            .map_err(|error| error.to_string())?,
-        "NewOrder preflight home",
-    )?;
-    if home.len() != 6 {
-        return Err(format!(
-            "NewOrder preflight home returned {} columns, expected 6",
-            home.len()
-        ));
-    }
     let order_id =
-        row_int32(home, 4, "NewOrder preflight home").map_err(|error| error.to_string())?;
-    if order_id <= 0 {
-        return Err(format!(
-            "NewOrder preflight d_next_o_id must be positive, got {order_id}"
-        ));
-    }
+        parse_new_order_home_order_id(results, plan.home_result, "NewOrder preflight home")?;
 
     let all_items: Vec<_> = selection.all_item_ids().collect();
     if plan.line_results.len() != all_items.len() {
@@ -1245,7 +1228,7 @@ fn parse_new_order_state(
     selection: &PreflightSelection,
 ) -> Result<NewOrderState, String> {
     let district_next_order_id =
-        parse_positive_scalar(results, probe.home_result, "NewOrder rollback d_next_o_id")?;
+        parse_new_order_home_order_id(results, probe.home_result, "NewOrder rollback home")?;
 
     let mut stocks = BTreeMap::new();
     for (item_id, operation_index) in &probe.stock_results {
@@ -1330,7 +1313,8 @@ async fn read_prospective_order_id(
     ];
     let results =
         execute_preflight_batch(client, "NewOrder rollback prospective order", &operations).await?;
-    parse_positive_scalar(&results, 1, "NewOrder rollback d_next_o_id").map_err(preflight_semantic)
+    parse_new_order_home_order_id(&results, 1, "NewOrder rollback prospective home")
+        .map_err(preflight_semantic)
 }
 
 fn require_pristine_order_slot(
@@ -1533,6 +1517,32 @@ fn exactly_one_row<'a>(
     }
 }
 
+fn parse_new_order_home_order_id(
+    results: &BatchResults,
+    operation_index: usize,
+    context: &str,
+) -> Result<i32, String> {
+    let row = exactly_one_row(
+        results
+            .rows(operation_index)
+            .map_err(|error| error.to_string())?,
+        context,
+    )?;
+    if row.len() != 6 {
+        return Err(format!(
+            "{context} returned {} columns, expected 6",
+            row.len()
+        ));
+    }
+    let value = row_int32(row, 4, context).map_err(|error| error.to_string())?;
+    if value <= 0 {
+        return Err(format!(
+            "{context} d_next_o_id must be positive, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
 fn parse_positive_scalar(
     results: &BatchResults,
     operation_index: usize,
@@ -1710,6 +1720,17 @@ mod tests {
         row
     }
 
+    fn new_order_home_row(next_order_id: i32) -> Vec<WireValue> {
+        vec![
+            WireValue::Float32(0.1_f32.to_bits()),
+            WireValue::Char(b"LAST".to_vec()),
+            WireValue::Char(b"GC".to_vec()),
+            WireValue::Float32(0.2_f32.to_bits()),
+            WireValue::Int32(next_order_id),
+            WireValue::Float32(0.3_f32.to_bits()),
+        ]
+    }
+
     #[test]
     fn selection_is_deterministic_domain_separated_and_in_range() {
         let left = test_selection();
@@ -1799,6 +1820,79 @@ mod tests {
         let results = accept_batch(response, &operations).unwrap();
         let items = collect_distinct_line_items(&results, &[2_999, 3_000]).unwrap();
         assert_eq!(items, BTreeSet::from([17, 23]));
+    }
+
+    #[test]
+    fn new_order_home_parser_reads_index_four_from_the_full_projection() {
+        let operations = [operation(StatementId::NewOrderHome, [])];
+        let results_for = |row| {
+            accept_batch(
+                BatchResponse::Ok {
+                    executed_operations: 1,
+                    results: vec![BatchQueryResult {
+                        operation_index: 0,
+                        rows: vec![row],
+                    }],
+                },
+                &operations,
+            )
+            .unwrap()
+        };
+
+        let valid = results_for(new_order_home_row(3_001));
+        assert_eq!(
+            parse_new_order_home_order_id(&valid, 0, "test home").unwrap(),
+            3_001
+        );
+
+        let scalar = results_for(vec![WireValue::Int32(3_001)]);
+        assert!(parse_new_order_home_order_id(&scalar, 0, "test home").is_err());
+
+        let mut wrong_type = new_order_home_row(3_001);
+        wrong_type[4] = WireValue::Float32(3_001.0_f32.to_bits());
+        let wrong_type = results_for(wrong_type);
+        assert!(parse_new_order_home_order_id(&wrong_type, 0, "test home").is_err());
+
+        let non_positive = results_for(new_order_home_row(0));
+        assert!(parse_new_order_home_order_id(&non_positive, 0, "test home").is_err());
+    }
+
+    #[test]
+    fn new_order_state_probe_accepts_the_full_home_projection() {
+        let selection = test_selection();
+        let mut operations = Vec::new();
+        let probe = append_new_order_state_probe(&mut operations, &selection, 3_001);
+        let stock = test_stock(50, 0.0, 0, 0);
+        let query_results = (0..operations.len())
+            .map(|operation_index| {
+                let rows = if operation_index == probe.home_result {
+                    vec![new_order_home_row(3_001)]
+                } else if probe
+                    .stock_results
+                    .iter()
+                    .any(|(_, index)| *index == operation_index)
+                {
+                    vec![stock_row(&stock)]
+                } else {
+                    Vec::new()
+                };
+                BatchQueryResult {
+                    operation_index: operation_index as u16,
+                    rows,
+                }
+            })
+            .collect();
+        let results = accept_batch(
+            BatchResponse::Ok {
+                executed_operations: operations.len() as u16,
+                results: query_results,
+            },
+            &operations,
+        )
+        .unwrap();
+
+        let state = parse_new_order_state(&results, &probe, &selection).unwrap();
+        assert_eq!(state.district_next_order_id, 3_001);
     }
 
     #[test]
