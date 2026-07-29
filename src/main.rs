@@ -271,26 +271,13 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         };
 
         info!("连接 RMDB: {}:{} ...", config.host, config.port);
-        let client = RmdbClient::connect_with_timeout(
-            &config.host,
-            config.port,
-            Duration::from_secs(config.response_timeout_seconds),
-        )
-        .await?;
+        let response_timeout = control_response_timeout(&config, &effective);
+        let client =
+            RmdbClient::connect_with_timeout(&config.host, config.port, response_timeout).await?;
         let setup_deadline = (config.create_schema || config.init)
             .then(|| tokio::time::Instant::now() + effective.final2026.load_budget);
         let mut cursor = RmdbCursor::new(client);
-        if setup_deadline.is_some() {
-            setup_step(
-                setup_deadline,
-                "complete setup Wire readiness probe",
-                cursor.client_mut().ping(),
-            )
-            .await?;
-        } else {
-            cursor.client_mut().ping().await?;
-        }
-        info!("RMDB 连接正常");
+        info!("RMDB Wire v3 连接正常");
 
         if config.create_schema {
             info!("创建 TPC-C 表和索引");
@@ -500,6 +487,17 @@ fn run_contract(config: &Config, effective: &ResolvedProfile) -> RunContract {
     }
 }
 
+fn control_response_timeout(config: &Config, effective: &ResolvedProfile) -> Duration {
+    if config.create_schema || config.init {
+        // The public setup contract has one absolute 900-second SQL budget but
+        // does not publish a stricter per-request response deadline.  The
+        // outer `setup_step` deadline below remains the single authority.
+        effective.final2026.load_budget
+    } else {
+        Duration::from_secs(config.response_timeout_seconds)
+    }
+}
+
 async fn setup_step<T, F>(
     deadline: Option<tokio::time::Instant>,
     context: &'static str,
@@ -518,6 +516,54 @@ where
                 ),
             })?,
         None => future.await,
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn setup_uses_the_public_absolute_budget_as_its_response_ceiling() {
+        let config = Config::try_parse_from([
+            "tpcc-tester",
+            "--create-schema",
+            "--init",
+            "--seed",
+            "73",
+            "--state-dir",
+            "/tmp/tpcc-final2026-setup-timeout",
+        ])
+        .unwrap();
+        let effective = config.resolved_profile().unwrap();
+
+        assert_eq!(
+            control_response_timeout(&config, &effective),
+            effective.final2026.load_budget
+        );
+        assert!(
+            control_response_timeout(&config, &effective)
+                > Duration::from_secs(config.response_timeout_seconds)
+        );
+    }
+
+    #[test]
+    fn non_setup_control_requests_keep_the_local_response_deadline() {
+        let config = Config::try_parse_from([
+            "tpcc-tester",
+            "--check",
+            "--state-dir",
+            "/tmp/tpcc-final2026-check-timeout",
+            "--response-timeout-seconds",
+            "17",
+        ])
+        .unwrap();
+        let effective = config.resolved_profile().unwrap();
+
+        assert_eq!(
+            control_response_timeout(&config, &effective),
+            Duration::from_secs(17)
+        );
     }
 }
 
