@@ -340,9 +340,10 @@ impl std::error::Error for ValidationError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlanError {
     NonPositiveWarehouseCount(i32),
+    WarehouseCountExceedsPublicMaximum { actual: i32, maximum: i32 },
     NegativeCount(&'static str),
     ArithmeticOverflow(&'static str),
-    InvalidPartitionCount(usize),
+    InvalidPartitionCount { expected: usize, actual: usize },
     InvalidPartitionKey(PartitionKey),
     DuplicatePartition(PartitionKey),
     MissingPartition(PartitionKey),
@@ -355,11 +356,16 @@ impl fmt::Display for PlanError {
             Self::NonPositiveWarehouseCount(value) => {
                 write!(f, "warehouse count must be positive, got {value}")
             }
+            Self::WarehouseCountExceedsPublicMaximum { actual, maximum } => write!(
+                f,
+                "warehouse count {actual} exceeds public maximum {maximum}"
+            ),
             Self::NegativeCount(name) => write!(f, "{name} must not be negative"),
             Self::ArithmeticOverflow(name) => write!(f, "{name} overflowed i64"),
-            Self::InvalidPartitionCount(count) => {
-                write!(f, "expected 500 partition expectations, got {count}")
-            }
+            Self::InvalidPartitionCount { expected, actual } => write!(
+                f,
+                "expected {expected} partition expectations, got {actual}"
+            ),
             Self::InvalidPartitionKey(key) => {
                 write!(
                     f,
@@ -971,7 +977,7 @@ pub struct PartitionAudit {
     pub checks: Vec<CheckQuery>,
 }
 
-/// Generate the mandatory local audit shape for all 50*10 partitions.
+/// Generate the mandatory final-2026 local audit shape for all 50*10 partitions.
 ///
 /// The expected values must come from the caller's committed transaction
 /// ledger.  Every predicate carries both warehouse and district keys, and the
@@ -979,14 +985,38 @@ pub struct PartitionAudit {
 pub fn recovery_partition_audits(
     expected: Vec<PartitionExpectation>,
 ) -> Result<Vec<PartitionAudit>, PlanError> {
-    let required = (FINAL_WAREHOUSES * DISTRICTS_PER_WAREHOUSE) as usize;
+    recovery_partition_audits_for_warehouses(FINAL_WAREHOUSES, expected)
+}
+
+/// Generate the same recovery audit for a public-scale non-ranked smoke run.
+///
+/// The official final-2026 wrapper remains fixed at 50 warehouses. This
+/// scale-aware form exists only so smaller local smoke datasets validate their
+/// complete keyspace instead of being rejected by the official fixed scale.
+pub fn recovery_partition_audits_for_warehouses(
+    warehouses: i32,
+    expected: Vec<PartitionExpectation>,
+) -> Result<Vec<PartitionAudit>, PlanError> {
+    if warehouses <= 0 {
+        return Err(PlanError::NonPositiveWarehouseCount(warehouses));
+    }
+    if warehouses > FINAL_WAREHOUSES {
+        return Err(PlanError::WarehouseCountExceedsPublicMaximum {
+            actual: warehouses,
+            maximum: FINAL_WAREHOUSES,
+        });
+    }
+    let required = (warehouses * DISTRICTS_PER_WAREHOUSE) as usize;
     if expected.len() != required {
-        return Err(PlanError::InvalidPartitionCount(expected.len()));
+        return Err(PlanError::InvalidPartitionCount {
+            expected: required,
+            actual: expected.len(),
+        });
     }
 
     let mut by_key = BTreeMap::new();
     for item in expected {
-        if !(1..=FINAL_WAREHOUSES).contains(&item.key.warehouse_id)
+        if !(1..=warehouses).contains(&item.key.warehouse_id)
             || !(1..=DISTRICTS_PER_WAREHOUSE).contains(&item.key.district_id)
         {
             return Err(PlanError::InvalidPartitionKey(item.key));
@@ -1046,7 +1076,7 @@ pub fn recovery_partition_audits(
     }
 
     let mut audits = Vec::with_capacity(required);
-    for warehouse_id in 1..=FINAL_WAREHOUSES {
+    for warehouse_id in 1..=warehouses {
         for district_id in 1..=DISTRICTS_PER_WAREHOUSE {
             let key = PartitionKey {
                 warehouse_id,
@@ -2228,6 +2258,52 @@ fn add_to_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn partition_expectations(warehouses: i32) -> Vec<PartitionExpectation> {
+        (1..=warehouses)
+            .flat_map(|warehouse_id| {
+                (1..=DISTRICTS_PER_WAREHOUSE).map(move |district_id| PartitionExpectation {
+                    key: PartitionKey {
+                        warehouse_id,
+                        district_id,
+                    },
+                    order_count: 3_000,
+                    order_line_count: 15_000,
+                    new_order_count: 900,
+                    empty_delivery_time_count: 4_500,
+                    carrier_zero_count: 900,
+                    next_order_id: 3_001,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scaled_recovery_audit_covers_smoke_keyspace_and_caps_public_scale() {
+        let audits =
+            recovery_partition_audits_for_warehouses(1, partition_expectations(1)).unwrap();
+        assert_eq!(audits.len(), DISTRICTS_PER_WAREHOUSE as usize);
+        assert_eq!(audits.first().unwrap().key.warehouse_id, 1);
+        assert_eq!(
+            audits.last().unwrap().key,
+            PartitionKey {
+                warehouse_id: 1,
+                district_id: DISTRICTS_PER_WAREHOUSE,
+            }
+        );
+
+        assert!(matches!(
+            recovery_partition_audits_for_warehouses(0, Vec::new()),
+            Err(PlanError::NonPositiveWarehouseCount(0))
+        ));
+        assert!(matches!(
+            recovery_partition_audits_for_warehouses(
+                FINAL_WAREHOUSES + 1,
+                partition_expectations(FINAL_WAREHOUSES + 1)
+            ),
+            Err(PlanError::WarehouseCountExceedsPublicMaximum { .. })
+        ));
+    }
 
     #[test]
     fn mergeable_accumulator_round_trips_canonical_words() {

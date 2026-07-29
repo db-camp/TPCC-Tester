@@ -7,13 +7,14 @@ use tracing::{info, warn};
 use crate::connection::client::RmdbClient;
 use crate::connection::wire::{StreamResponse, WireValue};
 use crate::consistency::{
-    float32_matches, float_aggregate_plan, public_online_integer_plan, recovery_partition_audits,
-    recovery_plan, setup_plan, validate_crash_float_baseline, validate_increment_chain,
-    validate_public_float_ledger, validate_relative_update_chain_from_initial, CheckQuery,
-    CheckScope, ConsistencyPlan, FloatAggregateId, NonNegativeF32Accumulator, PartitionExpectation,
-    PartitionKey, PublicFloatLedgerEvidence, RecoveryExpectations, RelativeUpdateEvidence,
-    SetupExpectations, TypedResult, TypedValue, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES,
-    FLOAT_AGGREGATES, NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
+    float32_matches, float_aggregate_plan, public_online_integer_plan,
+    recovery_partition_audits_for_warehouses, recovery_plan, setup_plan,
+    validate_crash_float_baseline, validate_increment_chain, validate_public_float_ledger,
+    validate_relative_update_chain_from_initial, CheckQuery, CheckScope, ConsistencyPlan,
+    FloatAggregateId, NonNegativeF32Accumulator, PartitionExpectation, PartitionKey,
+    PublicFloatLedgerEvidence, RecoveryExpectations, RelativeUpdateEvidence, SetupExpectations,
+    TypedResult, TypedValue, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES, FLOAT_AGGREGATES,
+    NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
 };
 use crate::error::TpccError;
 use crate::ranking::ledger::{LedgerEvent, RunLedger};
@@ -64,8 +65,9 @@ pub async fn run_final_online(
 ///
 /// This reruns full public integer checks, compares all seven raw FLOAT32
 /// aggregate values to the online baseline with the per-category ULP limits,
-/// verifies Payment warehouse/district endpoints at 0 ULP, and audits all 500
-/// warehouse/district partitions in six grouped round trips.
+/// verifies Payment warehouse/district endpoints at 0 ULP, and audits every
+/// warehouse/district partition (500 at the official scale) in six grouped
+/// round trips.
 pub async fn run_final_recovery(
     client: &mut RmdbClient,
     dataset: &DatasetState,
@@ -82,15 +84,15 @@ pub async fn run_final_recovery(
     let endpoints = validate_transaction_evidence(ledger)?;
     let recovered = read_float_aggregates(client, CheckScope::Recovery).await?;
     validate_float_baseline(online_baseline, &recovered)?;
-    validate_payment_endpoints(client, &endpoints).await?;
+    validate_payment_endpoints(client, dataset.warehouses, &endpoints).await?;
     validate_customer_endpoint_sample(client, &endpoints).await?;
 
     let partitions = partition_expectations(dataset, ledger)?;
     // Reuse the transport-neutral generator as a strict completeness and
     // invariant validator, but execute the equivalent audit in six grouped
     // queries rather than 3,000 scalar requests.
-    recovery_partition_audits(partitions.clone())
-        .map_err(|error| protocol_error("invalid 500-partition ledger", error))?;
+    recovery_partition_audits_for_warehouses(dataset.warehouses, partitions.clone())
+        .map_err(|error| protocol_error("invalid recovery partition ledger", error))?;
     run_grouped_partition_audit(client, &partitions).await?;
     info!(
         "public recovery consistency PASS; hidden official 37 SQL, generated keys, seed, and answers remain unavailable"
@@ -144,12 +146,7 @@ fn final_expectations(
     ledger: &RunLedger,
     initial_order_line_amounts: &NonNegativeF32Accumulator,
 ) -> Result<RecoveryExpectations, TpccError> {
-    if dataset.warehouses != FINAL_WAREHOUSES {
-        return Err(TpccError::Protocol(format!(
-            "final-2026 consistency requires {FINAL_WAREHOUSES} warehouses, state has {}",
-            dataset.warehouses
-        )));
-    }
+    validate_consistency_warehouse_count(dataset.warehouses)?;
     let initial_terms = u64::try_from(dataset.order_line_rows).map_err(|_| {
         TpccError::Protocol("dataset order-line count is negative or too large".to_owned())
     })?;
@@ -167,6 +164,15 @@ fn final_expectations(
         },
         committed: ledger.to_committed_ledger(),
     })
+}
+
+fn validate_consistency_warehouse_count(warehouses: i32) -> Result<usize, TpccError> {
+    if !(1..=FINAL_WAREHOUSES).contains(&warehouses) {
+        return Err(TpccError::Protocol(format!(
+            "public consistency requires 1..={FINAL_WAREHOUSES} warehouses, state has {warehouses}"
+        )));
+    }
+    Ok((warehouses * DISTRICTS_PER_WAREHOUSE) as usize)
 }
 
 #[derive(Debug, Default)]
@@ -448,6 +454,7 @@ fn require_zero_ulp(name: &str, expected_bits: u32, actual_bits: u32) -> Result<
 
 async fn validate_payment_endpoints(
     client: &mut RmdbClient,
+    warehouse_count: i32,
     endpoints: &RelativeEndpoints,
 ) -> Result<(), TpccError> {
     let warehouses = execute_typed_sql(
@@ -459,7 +466,7 @@ async fn validate_payment_endpoints(
     validate_float_endpoint_rows(
         "warehouse w_ytd",
         warehouses,
-        (1..=FINAL_WAREHOUSES).map(|warehouse| {
+        (1..=warehouse_count).map(|warehouse| {
             (
                 PartitionKey {
                     warehouse_id: warehouse,
@@ -484,7 +491,7 @@ async fn validate_payment_endpoints(
     validate_float_endpoint_rows(
         "district d_ytd",
         districts,
-        (1..=FINAL_WAREHOUSES).flat_map(|warehouse| {
+        (1..=warehouse_count).flat_map(|warehouse| {
             (1..=DISTRICTS_PER_WAREHOUSE).map(move |district| {
                 (
                     PartitionKey {
@@ -702,10 +709,12 @@ fn partition_expectations(
     dataset: &DatasetState,
     ledger: &RunLedger,
 ) -> Result<Vec<PartitionExpectation>, TpccError> {
-    if dataset.partitions.len() != (FINAL_WAREHOUSES * DISTRICTS_PER_WAREHOUSE) as usize {
+    let expected_partitions = validate_consistency_warehouse_count(dataset.warehouses)?;
+    if dataset.partitions.len() != expected_partitions {
         return Err(TpccError::Protocol(format!(
-            "final recovery requires 500 load partitions, state has {}",
-            dataset.partitions.len()
+            "recovery requires {expected_partitions} load partitions for {} warehouses, state has {}",
+            dataset.warehouses,
+            dataset.partitions.len(),
         )));
     }
     dataset
@@ -821,7 +830,10 @@ async fn run_grouped_partition_audit(
     ] {
         let result = execute_typed_sql(client, id, sql).await?;
         validate_grouped_partition_counts(id, result, partitions, metric)?;
-        info!("consistency PASS: {id} (500 partitions in one typed response)");
+        info!(
+            "consistency PASS: {id} ({} partitions in one typed response)",
+            partitions.len()
+        );
     }
 
     let result = execute_typed_sql(
@@ -832,7 +844,8 @@ async fn run_grouped_partition_audit(
     .await?;
     validate_partition_next_order_ids(result, partitions)?;
     info!(
-        "consistency PASS: recovery.partition.grouped.next_order_id (500 partitions in one typed response)"
+        "consistency PASS: recovery.partition.grouped.next_order_id ({} partitions in one typed response)",
+        partitions.len()
     );
     Ok(())
 }
@@ -992,6 +1005,57 @@ fn terminated_sql(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loader::{LoadSummary, PartitionLoadSummary};
+
+    fn smoke_dataset(warehouses: i32) -> DatasetState {
+        let partitions = (1..=warehouses)
+            .flat_map(|warehouse_id| {
+                (1..=DISTRICTS_PER_WAREHOUSE).map(move |district_id| PartitionLoadSummary {
+                    warehouse_id,
+                    district_id,
+                    order_line_rows: 15_000,
+                    undelivered_order_line_rows: 4_500,
+                })
+            })
+            .collect::<Vec<_>>();
+        let order_line_rows = i64::from(warehouses) * 10 * 15_000;
+        let undelivered_order_line_rows = i64::from(warehouses) * 10 * 4_500;
+        let mut order_line_amounts = NonNegativeF32Accumulator::default();
+        order_line_amounts
+            .add_repeated_bits(1.0_f32.to_bits(), order_line_rows as u64)
+            .unwrap();
+        DatasetState::from_load(
+            format!("smoke-sf{warehouses}"),
+            1,
+            warehouses,
+            LoadSummary {
+                order_line_rows,
+                undelivered_order_line_rows,
+                order_line_amounts,
+                partitions,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sf1_smoke_uses_its_complete_dataset_keyspace() {
+        let dataset = smoke_dataset(1);
+        let ledger = RunLedger::default();
+        let expectations =
+            final_expectations(&dataset, &ledger, dataset.initial_order_line_amounts()).unwrap();
+        assert_eq!(expectations.setup.warehouses, 1);
+
+        let partitions = partition_expectations(&dataset, &ledger).unwrap();
+        assert_eq!(partitions.len(), DISTRICTS_PER_WAREHOUSE as usize);
+        assert_eq!(
+            recovery_partition_audits_for_warehouses(dataset.warehouses, partitions)
+                .unwrap()
+                .len(),
+            DISTRICTS_PER_WAREHOUSE as usize
+        );
+        assert!(validate_consistency_warehouse_count(FINAL_WAREHOUSES + 1).is_err());
+    }
 
     #[test]
     fn sql_is_terminated_once_and_float_bits_are_not_formatted() {
