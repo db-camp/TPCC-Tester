@@ -706,11 +706,13 @@ async fn check_bad_credit_samples(
     schema: &RuntimeSchema,
     rich: &SealedRichRecoverySamples,
 ) -> Result<(), TpccError> {
-    require_nonempty_samples(
+    if !require_samples_if_observed(
         SampleDomain::BadCredit,
         rich.bad_credit_payment_count(),
         rich.bad_credit_customers().len(),
-    )?;
+    )? {
+        return Ok(());
+    }
     for (sample_index, sample) in rich.bad_credit_customers().iter().enumerate() {
         let ordinal = checked_query_ordinal(SampleDomain::BadCredit, sample_index, 1)?;
         let expected = BadCreditExpected::from_sealed(sample, ordinal)?;
@@ -1119,6 +1121,25 @@ fn require_nonempty_samples(
         )))
     } else {
         Ok(())
+    }
+}
+
+fn require_samples_if_observed(
+    domain: SampleDomain,
+    observed_count: u64,
+    sample_count: usize,
+) -> Result<bool, TpccError> {
+    match (observed_count, sample_count) {
+        (0, 0) => Ok(false),
+        (0, _) => Err(TpccError::Protocol(format!(
+            "recovery {} sample evidence is inconsistent",
+            domain.label()
+        ))),
+        (_, 0) => Err(TpccError::Protocol(format!(
+            "recovery {} sample evidence is empty",
+            domain.label()
+        ))),
+        (_, _) => Ok(true),
     }
 }
 
@@ -1713,7 +1734,10 @@ mod tests {
         assert!(require_nonempty_samples(SampleDomain::BadCredit, 1, 1).is_ok());
         assert!(require_nonempty_samples(SampleDomain::Stock, 1, 0).is_err());
         assert!(require_nonempty_samples(SampleDomain::Customer, 0, 1).is_err());
-        assert!(require_nonempty_samples(SampleDomain::BadCredit, 0, 0).is_err());
+        assert!(!require_samples_if_observed(SampleDomain::BadCredit, 0, 0).unwrap());
+        assert!(require_samples_if_observed(SampleDomain::BadCredit, 0, 1).is_err());
+        assert!(require_samples_if_observed(SampleDomain::BadCredit, 1, 0).is_err());
+        assert!(require_samples_if_observed(SampleDomain::BadCredit, 1, 1).unwrap());
     }
 
     #[test]
