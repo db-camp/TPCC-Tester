@@ -1,5 +1,6 @@
 //! Public final-2026 ranked workload building blocks.
 
+pub mod bounded_stats;
 pub mod catalog;
 pub mod common;
 pub mod delivery;
