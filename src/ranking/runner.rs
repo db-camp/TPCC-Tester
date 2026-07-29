@@ -30,6 +30,16 @@ pub struct PaymentEvidence {
     pub customer_district_id: u8,
     pub customer_id: i32,
     pub amount_bits: u32,
+    pub warehouse_before_bits: u32,
+    pub warehouse_after_bits: u32,
+    pub district_before_bits: u32,
+    pub district_after_bits: u32,
+    pub customer_balance_before_bits: u32,
+    pub customer_balance_after_bits: u32,
+    pub customer_ytd_before_bits: u32,
+    pub customer_ytd_after_bits: u32,
+    pub customer_payment_count_before: i32,
+    pub customer_payment_count_after: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

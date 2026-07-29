@@ -93,7 +93,7 @@ pub async fn execute(
 
     // COMMIT is the last operation in stage two.  A semantic mismatch found
     // while inspecting its already-returned results must not send ABORT.
-    validate_stage_two(
+    let customer_after = validate_stage_two(
         &stage_two_results,
         amount_bits,
         &snapshot,
@@ -109,6 +109,16 @@ pub async fn execute(
             customer_district_id: input.customer_district(),
             customer_id: snapshot.customer.id,
             amount_bits,
+            warehouse_before_bits: snapshot.warehouse_before_bits,
+            warehouse_after_bits: snapshot.warehouse_after_bits,
+            district_before_bits: snapshot.district_before_bits,
+            district_after_bits: snapshot.district_after_bits,
+            customer_balance_before_bits: snapshot.customer.balance_bits,
+            customer_balance_after_bits: customer_after.balance_bits,
+            customer_ytd_before_bits: snapshot.customer.ytd_payment_bits,
+            customer_ytd_after_bits: customer_after.ytd_payment_bits,
+            customer_payment_count_before: snapshot.customer.payment_count,
+            customer_payment_count_after: customer_after.payment_count,
         },
     )))
 }
@@ -260,6 +270,10 @@ struct CustomerSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaymentSnapshot {
+    warehouse_before_bits: u32,
+    warehouse_after_bits: u32,
+    district_before_bits: u32,
+    district_after_bits: u32,
     warehouse_name: Vec<u8>,
     district_name: Vec<u8>,
     customer: CustomerSnapshot,
@@ -310,6 +324,10 @@ fn validate_stage_one(
     let customer = select_customer(customer_rows, selector)?;
 
     Ok(PaymentSnapshot {
+        warehouse_before_bits,
+        warehouse_after_bits,
+        district_before_bits,
+        district_after_bits,
         warehouse_name,
         district_name,
         customer,
@@ -547,24 +565,33 @@ fn bad_credit_data(
     value
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CustomerAfter {
+    balance_bits: u32,
+    ytd_payment_bits: u32,
+    payment_count: i32,
+}
+
 fn validate_stage_two(
     results: &BatchResults,
     amount_bits: u32,
     snapshot: &PaymentSnapshot,
     expected_customer_data: &[u8],
-) -> SemanticResult<()> {
+) -> SemanticResult<CustomerAfter> {
     let row = results.single_row(STAGE_TWO_CUSTOMER_AFTER)?;
     expect_width(row, CUSTOMER_AFTER_COLUMNS, "Payment customer after")?;
+    let balance_bits = row_f32_bits(row, 0, "Payment customer after")?;
+    let ytd_payment_bits = row_f32_bits(row, 1, "Payment customer after")?;
     expect_f32_sub(
         snapshot.customer.balance_bits,
         amount_bits,
-        row_f32_bits(row, 0, "Payment customer after")?,
+        balance_bits,
         "Payment customer.c_balance",
     )?;
     expect_f32_add(
         snapshot.customer.ytd_payment_bits,
         amount_bits,
-        row_f32_bits(row, 1, "Payment customer after")?,
+        ytd_payment_bits,
         "Payment customer.c_ytd_payment",
     )?;
     let expected_count = snapshot
@@ -587,7 +614,11 @@ fn validate_stage_two(
             actual_data.len()
         )));
     }
-    Ok(())
+    Ok(CustomerAfter {
+        balance_bits,
+        ytd_payment_bits,
+        payment_count: actual_count,
+    })
 }
 
 fn expect_width(row: &[WireValue], expected: usize, context: &str) -> SemanticResult<()> {
@@ -676,6 +707,10 @@ mod tests {
 
     fn snapshot(credit: CustomerCredit) -> PaymentSnapshot {
         PaymentSnapshot {
+            warehouse_before_bits: 100.0_f32.to_bits(),
+            warehouse_after_bits: 101.0_f32.to_bits(),
+            district_before_bits: 200.0_f32.to_bits(),
+            district_after_bits: 201.0_f32.to_bits(),
             warehouse_name: b"WAREHOUSE".to_vec(),
             district_name: b"DISTRICT".to_vec(),
             customer: CustomerSnapshot {
