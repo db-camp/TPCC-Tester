@@ -25,9 +25,13 @@
 ```bash
 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode all \
-  --db-name tpcc_final2026_local \
   --seed 2026
 ```
+
+默认数据库名不是公开固定名称。工作流使用带域分隔的
+`SHA-256(run_id, seed)` 为本次 setup 确定性生成安全的不透明名称，并把该名称和
+数据库目录身份密封到状态工件中。对新库显式指定 `--db-name` 属于本地偏差，必须
+同时指定 `--allow-deviation`，结果不会标记为排名配置。
 
 `all` 是唯一执行完整 crash transition 的模式，顺序固定为：
 
@@ -48,7 +52,6 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 ```bash
 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode all \
-  --db-name tpcc_final2026_keep \
   --seed 2026 \
   --keep-db-artifacts
 ```
@@ -57,7 +60,11 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 
 ## `state-dir` 与拆分运行
 
-`state-dir` 是数据库状态的一部分，保存版本化的装载形状、确认提交 ledger 和崩溃前校验基线。它必须与同一个数据库、scale 和 seed 一起保留，不能编辑、跨数据库复用或在 rank/recovery 之间删除。
+`state-dir` 是数据库状态的一部分，保存版本化的装载形状、确认提交 ledger、崩溃前校验基线和 `database.identity`。setup 完成后，
+`database.identity` 会同时绑定 dataset run id、seed、不透明库名、数据库路径指纹、
+文件系统 device/inode、完整 `dataset.state` SHA-256 和 runtime schema 指纹；数据库
+目录内保存一份字节一致的 marker。它必须与同一个数据库一起保留，不能编辑、
+跨数据库复用或在 rank/recovery 之间删除。
 
 - `all`、`init`，以及带 `--init-db` 的 `rank` 默认创建
   `<result-dir>/state`；
@@ -73,22 +80,23 @@ mkdir -p "${STATE_DIR}"
 
 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode init \
-  --db-name tpcc_final2026_split \
   --seed 2026 \
   --state-dir "${STATE_DIR}"
 
 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode rank \
-  --db-name tpcc_final2026_split \
   --seed 2026 \
   --state-dir "${STATE_DIR}"
 
 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode recovery \
-  --db-name tpcc_final2026_split \
   --seed 2026 \
   --state-dir "${STATE_DIR}"
 ```
+
+`rank` 和 `recovery` 从 setup 的 `database.identity` 复用库名，不会根据当前运行重新
+推导。为兼容旧的调用包装，可以再次传入 `--db-name`，但它只作为断言使用，必须与
+状态中的名称完全一致；不一致会在启动 RMDB 前失败。
 
 这里 `rank` 执行正式测量与在线检查后会正常停止服务，`recovery` 只启动已有数据库并运行恢复检查；这三条拆分命令不等价于 `all` 中相邻的在线检查 → `SIGKILL` → 同库恢复链路。需要验证公开 crash lifecycle 时必须使用 `--mode all`。
 
@@ -148,8 +156,13 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 ## 安全边界
 
 - 默认 RMDB 根目录是 `perf_workflow/` 向上三级；可用 `--target-dir` 显式覆盖。
-- `--db-name`、`--label` 和 `--build-dir` 必须是安全的单一路径组件，数据库路径不能逃逸 RMDB 根目录。
+- 默认库名由本次 run id 和 seed 派生。新库显式 `--db-name` 必须和
+  `--allow-deviation` 一起使用；所有库名、`--label` 和 `--build-dir` 都必须是安全的
+  单一路径组件，数据库路径不能逃逸 RMDB 根目录。
 - 已存在的数据库绝不会被自动替换。新库清理需要当前 run 的精确所有权 token，符号链接会被拒绝。
+- 已有数据库在启动前、readiness 后和每个状态阶段入口都会校验同一份 sealed
+  identity；库名、路径、device/inode、dataset 或 DB 内 marker 任一变化都会
+  fail closed，而不会对新目录继续执行恢复校验。
 - CSV 只生成在 `<RMDB>/.tpcc-workflow/<run-id>/csv`，工作流结束时按本次所有权清理，不触碰源码树中的 CSV。
 - 端口被占用时 fail closed。脚本不按端口发现或杀进程，只向本次登记的 server/probe PID 发送信号。
 - 发现指向其他源码目录的旧 CMake cache 时直接失败，不删除也不静默改写 cache。
@@ -166,12 +179,13 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 
 可用 `--record-root` 覆盖。目录包含：
 
-- `manifest.txt`、`tool_status.txt`、`system_info.txt`；
+- `manifest.txt`、`manifest.json`、`tool_status.txt`、`system_info.txt`；
 - tester/RMDB 构建日志；
 - `server.log`、`ready_probe.log` 和登记过的 `server.pid`；
 - `setup.log`、`rank.log`、`check_online.log`、`check_recovery.log`（按所选模式生成）；
 - `resource_segment_<n>.json`（每代服务）、`rank_timeline.state`、`rank_completion.json` 和汇总后的 `resource_metrics.json`；
-- `state/`（未指定外部 `--state-dir` 时）；
+- `state/`（未指定外部 `--state-dir` 时，其中含 sealed
+  `database.identity`）；
 - 成功后的 `summary.md`。
 
 资源工件始终标记 `ranked=false`、`score_effect=none`。RSS 是登记 RMDB
