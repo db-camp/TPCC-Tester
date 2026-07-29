@@ -1753,6 +1753,9 @@ import subprocess
 import sys
 import time
 
+if "--probe-ready" not in sys.argv:
+    raise SystemExit(0)
+
 Path(os.environ["HUNG_EXEC_PROBE_PID"]).write_text(
     str(os.getpid()),
     encoding="utf-8",
