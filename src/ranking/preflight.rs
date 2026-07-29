@@ -17,8 +17,11 @@ use crate::profile::{DISTRICTS_PER_WAREHOUSE, ITEM_COUNT};
 use crate::workload::{CUSTOMERS_PER_DISTRICT, INVALID_ITEM_ID};
 
 use super::catalog::{StatementId, UNDELIVERED_CARRIER_ID, UNDELIVERED_DATE};
-use super::common::{operation, row_char, row_f32_bits, row_int32, BatchResults};
-use super::runner::{execute_batch, StockVersion};
+use super::common::{
+    accept_batch, f32_add_bits, operation, row_char, row_f32_bits, row_int32, BatchExecutionError,
+    BatchResults,
+};
+use super::runner::StockVersion;
 
 const PREFLIGHT_VALID_LINES: usize = 5;
 const STOCK_LEVEL_RECENT_ORDERS: i32 = 20;
@@ -344,8 +347,12 @@ async fn verify_new_order_rollback(
     selection: &PreflightSelection,
 ) -> Result<(), TpccError> {
     let prospective_order_id = read_prospective_order_id(client, selection).await?;
-    let before = read_rollback_snapshot(client, selection, prospective_order_id).await?;
-    require_pristine_order_slot(&before, "before NewOrder rollback probe")?;
+    let before = read_new_order_state(client, selection, prospective_order_id).await?;
+    require_pristine_order_slot(
+        &before,
+        prospective_order_id,
+        "before NewOrder rollback probe",
+    )?;
 
     let stage_one_plan = build_new_order_stage_one(selection);
     let stage_one_results = execute_preflight_batch(
@@ -370,16 +377,21 @@ async fn verify_new_order_rollback(
         .await;
     }
 
-    let stage_two = build_new_order_abort_stage(selection, &materialized)?;
-    execute_preflight_batch(
-        client,
-        "NewOrder valid write prefix followed by ABORT",
-        &stage_two,
-    )
-    .await?;
+    let stage_two = build_new_order_write_stage(selection, &materialized)?;
+    execute_preflight_batch(client, "NewOrder valid write prefix", &stage_two).await?;
 
-    let after = read_rollback_snapshot(client, selection, materialized.order_id).await?;
-    require_pristine_order_slot(&after, "after NewOrder rollback probe")?;
+    let visible = read_open_new_order_state(client, selection, materialized.order_id).await?;
+    if let Err(error) = validate_visible_new_order_state(selection, &materialized, &visible) {
+        return semantic_abort(client, error).await;
+    }
+    abort_open_transaction(client, "NewOrder explicit rollback").await?;
+
+    let after = read_new_order_state(client, selection, materialized.order_id).await?;
+    require_pristine_order_slot(
+        &after,
+        materialized.order_id,
+        "after NewOrder rollback probe",
+    )?;
     if after != before {
         return Err(preflight_semantic(format!(
             "NewOrder ABORT left a visible change: before {before:?}, after {after:?}"
@@ -569,7 +581,7 @@ fn parse_new_order_stage_one(
     Ok(MaterializedNewOrder { order_id, lines })
 }
 
-fn build_new_order_abort_stage(
+fn build_new_order_write_stage(
     selection: &PreflightSelection,
     materialized: &MaterializedNewOrder,
 ) -> Result<Vec<Operation>, TpccError> {
@@ -644,25 +656,36 @@ fn build_new_order_abort_stage(
             ],
         ));
     }
-    operations.push(operation(StatementId::Abort, []));
     Ok(operations)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RollbackSnapshot {
+struct NewOrderState {
     district_next_order_id: i32,
     stocks: BTreeMap<i32, StockVersion>,
     order_rows: Vec<Vec<WireValue>>,
+    delivery_order_rows: Vec<Vec<WireValue>>,
+    latest_order_rows: Vec<Vec<WireValue>>,
     order_line_rows: Vec<Vec<WireValue>>,
     queue_rows: Vec<Vec<WireValue>>,
 }
 
-async fn read_rollback_snapshot(
-    client: &mut RmdbClient,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NewOrderStateProbe {
+    home_result: usize,
+    stock_results: Vec<(i32, usize)>,
+    order_result: usize,
+    delivery_order_result: usize,
+    latest_order_result: usize,
+    line_result: usize,
+    queue_result: usize,
+}
+
+fn append_new_order_state_probe(
+    operations: &mut Vec<Operation>,
     selection: &PreflightSelection,
     order_id: i32,
-) -> Result<RollbackSnapshot, TpccError> {
-    let mut operations = vec![operation(StatementId::Begin, [])];
+) -> NewOrderStateProbe {
     let home_result = operations.len();
     operations.push(new_order_home_operation(selection));
 
@@ -683,6 +706,20 @@ async fn read_rollback_snapshot(
         StatementId::OrderStatusOrder,
         order_key_parameters(selection, order_id),
     ));
+    let delivery_order_result = operations.len();
+    operations.push(operation(
+        StatementId::DeliveryOrder,
+        order_key_parameters(selection, order_id),
+    ));
+    let latest_order_result = operations.len();
+    operations.push(operation(
+        StatementId::OrderStatusLatestOrder,
+        [
+            WireValue::Int32(selection.warehouse_id),
+            WireValue::Int32(selection.district_id),
+            WireValue::Int32(selection.customer_id),
+        ],
+    ));
     let line_result = operations.len();
     operations.push(operation(
         StatementId::OrderStatusLines,
@@ -693,51 +730,96 @@ async fn read_rollback_snapshot(
         StatementId::DeliveryConfirmQueue,
         order_key_parameters(selection, order_id),
     ));
-    operations.push(operation(StatementId::Abort, []));
 
-    let results =
-        execute_preflight_batch(client, "NewOrder rollback residue probes", &operations).await?;
+    NewOrderStateProbe {
+        home_result,
+        stock_results,
+        order_result,
+        delivery_order_result,
+        latest_order_result,
+        line_result,
+        queue_result,
+    }
+}
+
+fn parse_new_order_state(
+    results: &BatchResults,
+    probe: &NewOrderStateProbe,
+    selection: &PreflightSelection,
+) -> Result<NewOrderState, String> {
     let district_next_order_id =
-        parse_positive_scalar(&results, home_result, "NewOrder rollback d_next_o_id")
-            .map_err(preflight_semantic)?;
+        parse_positive_scalar(results, probe.home_result, "NewOrder rollback d_next_o_id")?;
 
     let mut stocks = BTreeMap::new();
-    for (item_id, operation_index) in stock_results {
+    for (item_id, operation_index) in &probe.stock_results {
         let row = exactly_one_row(
             results
-                .rows(operation_index)
-                .map_err(|error| preflight_semantic(error.to_string()))?,
+                .rows(*operation_index)
+                .map_err(|error| error.to_string())?,
             &format!(
                 "NewOrder rollback stock ({}, {item_id})",
                 selection.warehouse_id
             ),
-        )
-        .map_err(preflight_semantic)?;
-        let stock = parse_stock_version(row, selection.warehouse_id, item_id)
-            .map_err(preflight_semantic)?;
-        if stocks.insert(item_id, stock).is_some() {
-            return Err(preflight_protocol(format!(
-                "duplicate NewOrder preflight stock key {item_id}"
-            )));
+        )?;
+        let stock = parse_stock_version(row, selection.warehouse_id, *item_id)?;
+        if stocks.insert(*item_id, stock).is_some() {
+            return Err(format!("duplicate NewOrder preflight stock key {item_id}"));
         }
     }
 
-    Ok(RollbackSnapshot {
+    Ok(NewOrderState {
         district_next_order_id,
         stocks,
         order_rows: results
-            .rows(order_result)
-            .map_err(|error| preflight_semantic(error.to_string()))?
+            .rows(probe.order_result)
+            .map_err(|error| error.to_string())?
+            .to_vec(),
+        delivery_order_rows: results
+            .rows(probe.delivery_order_result)
+            .map_err(|error| error.to_string())?
+            .to_vec(),
+        latest_order_rows: results
+            .rows(probe.latest_order_result)
+            .map_err(|error| error.to_string())?
             .to_vec(),
         order_line_rows: results
-            .rows(line_result)
-            .map_err(|error| preflight_semantic(error.to_string()))?
+            .rows(probe.line_result)
+            .map_err(|error| error.to_string())?
             .to_vec(),
         queue_rows: results
-            .rows(queue_result)
-            .map_err(|error| preflight_semantic(error.to_string()))?
+            .rows(probe.queue_result)
+            .map_err(|error| error.to_string())?
             .to_vec(),
     })
+}
+
+async fn read_new_order_state(
+    client: &mut RmdbClient,
+    selection: &PreflightSelection,
+    order_id: i32,
+) -> Result<NewOrderState, TpccError> {
+    let mut operations = vec![operation(StatementId::Begin, [])];
+    let probe = append_new_order_state_probe(&mut operations, selection, order_id);
+    operations.push(operation(StatementId::Abort, []));
+
+    let results =
+        execute_preflight_batch(client, "NewOrder rollback residue probes", &operations).await?;
+    parse_new_order_state(&results, &probe, selection).map_err(preflight_semantic)
+}
+
+async fn read_open_new_order_state(
+    client: &mut RmdbClient,
+    selection: &PreflightSelection,
+    order_id: i32,
+) -> Result<NewOrderState, TpccError> {
+    let mut operations = Vec::new();
+    let probe = append_new_order_state_probe(&mut operations, selection, order_id);
+    let results =
+        execute_preflight_batch(client, "NewOrder visible write probes", &operations).await?;
+    match parse_new_order_state(&results, &probe, selection) {
+        Ok(state) => Ok(state),
+        Err(error) => semantic_abort(client, error).await,
+    }
 }
 
 async fn read_prospective_order_id(
@@ -755,20 +837,133 @@ async fn read_prospective_order_id(
 }
 
 fn require_pristine_order_slot(
-    snapshot: &RollbackSnapshot,
+    snapshot: &NewOrderState,
+    prospective_order_id: i32,
     context: &str,
 ) -> Result<(), TpccError> {
     if !snapshot.order_rows.is_empty()
+        || !snapshot.delivery_order_rows.is_empty()
         || !snapshot.order_line_rows.is_empty()
         || !snapshot.queue_rows.is_empty()
     {
         return Err(preflight_semantic(format!(
             "{context}: prospective order slot is not empty \
-             (orders={}, order_line={}, new_orders={})",
+             (orders={}, delivery_order={}, order_line={}, new_orders={})",
             snapshot.order_rows.len(),
+            snapshot.delivery_order_rows.len(),
             snapshot.order_line_rows.len(),
             snapshot.queue_rows.len()
         )));
+    }
+    if snapshot.latest_order_rows.iter().any(
+        |row| matches!(row.as_slice(), [WireValue::Int32(value)] if *value == prospective_order_id),
+    ) {
+        return Err(preflight_semantic(format!(
+            "{context}: prospective order {prospective_order_id} is reachable through \
+             OrderStatusLatestOrder"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_visible_new_order_state(
+    selection: &PreflightSelection,
+    materialized: &MaterializedNewOrder,
+    state: &NewOrderState,
+) -> Result<(), String> {
+    let expected_next_order_id = materialized
+        .order_id
+        .checked_add(1)
+        .ok_or_else(|| "NewOrder visible d_next_o_id overflow".to_owned())?;
+    if state.district_next_order_id != expected_next_order_id {
+        return Err(format!(
+            "NewOrder write prefix did not advance district: observed {}, expected {}",
+            state.district_next_order_id, expected_next_order_id
+        ));
+    }
+
+    let expected_order_rows = vec![vec![
+        WireValue::Int32(materialized.order_id),
+        WireValue::Char(selection.timestamp.clone()),
+        WireValue::Int32(UNDELIVERED_CARRIER_ID),
+    ]];
+    if state.order_rows != expected_order_rows {
+        return Err(format!(
+            "NewOrder write prefix exact order point probe mismatch: {:?}",
+            state.order_rows
+        ));
+    }
+    let expected_delivery_rows = vec![vec![WireValue::Int32(selection.customer_id)]];
+    if state.delivery_order_rows != expected_delivery_rows {
+        return Err(format!(
+            "NewOrder write prefix heap/order lookup mismatch: {:?}",
+            state.delivery_order_rows
+        ));
+    }
+    let expected_latest_rows = vec![vec![WireValue::Int32(materialized.order_id)]];
+    if state.latest_order_rows != expected_latest_rows {
+        return Err(format!(
+            "NewOrder write prefix secondary order index mismatch: {:?}",
+            state.latest_order_rows
+        ));
+    }
+    let expected_queue_rows = vec![vec![WireValue::Int32(materialized.order_id)]];
+    if state.queue_rows != expected_queue_rows {
+        return Err(format!(
+            "NewOrder write prefix queue mismatch: {:?}",
+            state.queue_rows
+        ));
+    }
+
+    let expected_line_rows: Vec<_> = materialized
+        .lines
+        .iter()
+        .map(|line| {
+            vec![
+                WireValue::Int32(line.plan.number),
+                WireValue::Int32(line.plan.item_id),
+                WireValue::Int32(selection.warehouse_id),
+                WireValue::Int32(line.plan.quantity),
+                WireValue::Float32(line.amount_bits),
+                WireValue::Char(UNDELIVERED_DATE.as_bytes().to_vec()),
+            ]
+        })
+        .collect();
+    if state.order_line_rows != expected_line_rows {
+        return Err(format!(
+            "NewOrder write prefix line rows mismatch: {:?}",
+            state.order_line_rows
+        ));
+    }
+
+    let mut expected_stocks = BTreeMap::new();
+    for line in &materialized.lines {
+        let quantity = if line.stock.quantity >= line.plan.quantity + 10 {
+            line.stock.quantity - line.plan.quantity
+        } else {
+            line.stock.quantity + 91 - line.plan.quantity
+        };
+        let ytd_bits = f32_add_bits(line.stock.ytd_bits, (line.plan.quantity as f32).to_bits())
+            .map_err(|error| error.to_string())?;
+        let order_count =
+            line.stock.order_count.checked_add(1).ok_or_else(|| {
+                format!("NewOrder stock {} order count overflow", line.plan.item_id)
+            })?;
+        expected_stocks.insert(
+            line.plan.item_id,
+            StockVersion {
+                quantity,
+                ytd_bits,
+                order_count,
+                remote_count: line.stock.remote_count,
+            },
+        );
+    }
+    if state.stocks != expected_stocks {
+        return Err(format!(
+            "NewOrder write prefix stock versions mismatch: observed {:?}, expected {:?}",
+            state.stocks, expected_stocks
+        ));
     }
     Ok(())
 }
@@ -879,9 +1074,23 @@ async fn execute_preflight_batch(
             "{stage} attempted an empty EXEC_BATCH"
         )));
     }
-    execute_batch(client, operations)
-        .await
-        .map_err(|error| preflight_semantic(format!("{stage} failed: {error}")))
+    let response = client.exec_batch(operations).await?;
+    accept_batch(response, operations).map_err(|error| map_preflight_batch_error(stage, error))
+}
+
+fn map_preflight_batch_error(stage: &str, error: BatchExecutionError) -> TpccError {
+    match error {
+        error @ BatchExecutionError::RetryableAbort { .. } => {
+            TpccError::Abort(format!("{stage} failed: {error}"))
+        }
+        BatchExecutionError::FatalProtocol(message) => {
+            preflight_protocol(format!("{stage} failed: {message}"))
+        }
+        error @ (BatchExecutionError::FatalOperation { .. }
+        | BatchExecutionError::FatalTopLevel { .. }) => {
+            preflight_semantic(format!("{stage} failed: {error}"))
+        }
+    }
 }
 
 async fn semantic_abort<T>(client: &mut RmdbClient, error: String) -> Result<T, TpccError> {
@@ -1049,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn new_order_abort_batch_writes_every_valid_prefix_before_abort() {
+    fn new_order_write_batch_contains_every_valid_prefix_mutation() {
         let selection = test_selection();
         let materialized = MaterializedNewOrder {
             order_id: 3_001,
@@ -1065,7 +1274,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let operations = build_new_order_abort_stage(&selection, &materialized).unwrap();
+        let operations = build_new_order_write_stage(&selection, &materialized).unwrap();
         let ids: Vec<_> = operations
             .iter()
             .map(|operation| operation.statement_id)
@@ -1079,21 +1288,23 @@ mod tests {
                 .count(),
             PREFLIGHT_VALID_LINES
         );
-        assert_eq!(ids.last(), Some(&StatementId::Abort.wire_id()));
+        assert!(!ids.contains(&StatementId::Abort.wire_id()));
     }
 
     #[test]
-    fn rollback_snapshot_comparison_covers_all_mutated_stock_fields_and_residue() {
+    fn new_order_state_comparison_covers_both_order_indexes_and_all_mutable_fields() {
         let selection = test_selection();
         let stocks = selection
             .valid_lines
             .iter()
             .map(|line| (line.item_id, test_stock(50, 0.0, 0, 0)))
             .collect();
-        let before = RollbackSnapshot {
+        let before = NewOrderState {
             district_next_order_id: 3_001,
             stocks,
             order_rows: Vec::new(),
+            delivery_order_rows: Vec::new(),
+            latest_order_rows: vec![vec![WireValue::Int32(3_000)]],
             order_line_rows: Vec::new(),
             queue_rows: Vec::new(),
         };
@@ -1105,7 +1316,106 @@ mod tests {
         indexed_residue
             .order_rows
             .push(vec![WireValue::Int32(3_001)]);
-        assert!(require_pristine_order_slot(&indexed_residue, "test").is_err());
+        assert!(require_pristine_order_slot(&indexed_residue, 3_001, "test").is_err());
+
+        let mut secondary_residue = before.clone();
+        secondary_residue.latest_order_rows = vec![vec![WireValue::Int32(3_001)]];
+        assert!(require_pristine_order_slot(&secondary_residue, 3_001, "test").is_err());
+    }
+
+    #[test]
+    fn visible_new_order_state_requires_exact_heap_index_line_queue_and_stock_values() {
+        let selection = test_selection();
+        let materialized = MaterializedNewOrder {
+            order_id: 3_001,
+            lines: selection
+                .valid_lines
+                .iter()
+                .cloned()
+                .map(|plan| MaterializedLine {
+                    plan,
+                    stock: test_stock(50, 2.0, 7, 3),
+                    amount_bits: 10.0_f32.to_bits(),
+                    district_info: vec![b'd'; 24],
+                })
+                .collect(),
+        };
+        let stocks = materialized
+            .lines
+            .iter()
+            .map(|line| {
+                (
+                    line.plan.item_id,
+                    StockVersion {
+                        quantity: 50 - line.plan.quantity,
+                        ytd_bits: (2.0_f32 + line.plan.quantity as f32).to_bits(),
+                        order_count: 8,
+                        remote_count: 3,
+                    },
+                )
+            })
+            .collect();
+        let state = NewOrderState {
+            district_next_order_id: 3_002,
+            stocks,
+            order_rows: vec![vec![
+                WireValue::Int32(3_001),
+                WireValue::Char(selection.timestamp.clone()),
+                WireValue::Int32(UNDELIVERED_CARRIER_ID),
+            ]],
+            delivery_order_rows: vec![vec![WireValue::Int32(selection.customer_id)]],
+            latest_order_rows: vec![vec![WireValue::Int32(3_001)]],
+            order_line_rows: materialized
+                .lines
+                .iter()
+                .map(|line| {
+                    vec![
+                        WireValue::Int32(line.plan.number),
+                        WireValue::Int32(line.plan.item_id),
+                        WireValue::Int32(selection.warehouse_id),
+                        WireValue::Int32(line.plan.quantity),
+                        WireValue::Float32(line.amount_bits),
+                        WireValue::Char(Vec::new()),
+                    ]
+                })
+                .collect(),
+            queue_rows: vec![vec![WireValue::Int32(3_001)]],
+        };
+        assert!(validate_visible_new_order_state(&selection, &materialized, &state).is_ok());
+        let mut wrong = state;
+        wrong.stocks.values_mut().next().unwrap().remote_count += 1;
+        assert!(validate_visible_new_order_state(&selection, &materialized, &wrong).is_err());
+    }
+
+    #[test]
+    fn preflight_batch_error_mapping_preserves_abort_protocol_and_semantic_classes() {
+        assert!(matches!(
+            map_preflight_batch_error(
+                "stage",
+                BatchExecutionError::RetryableAbort {
+                    executed_operations: 0,
+                    failed_operation: 0,
+                    diagnostic: "conflict".to_owned(),
+                },
+            ),
+            TpccError::Abort(_)
+        ));
+        assert!(matches!(
+            map_preflight_batch_error(
+                "stage",
+                BatchExecutionError::FatalProtocol("bad frame".to_owned()),
+            ),
+            TpccError::Protocol(_)
+        ));
+        assert!(matches!(
+            map_preflight_batch_error(
+                "stage",
+                BatchExecutionError::FatalTopLevel {
+                    diagnostic: "server error".to_owned(),
+                },
+            ),
+            TpccError::QueryError(_)
+        ));
     }
 
     #[test]
