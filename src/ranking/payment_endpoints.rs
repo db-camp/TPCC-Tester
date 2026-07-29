@@ -980,9 +980,243 @@ impl SealedPaymentEvidence {
     }
 }
 
+/// Read-only Warehouse/District endpoint surface shared by live and restored
+/// terminal evidence.
+///
+/// This trait exposes only the recovery oracle. It deliberately does not claim
+/// that a restored endpoint set can reproduce the live paired-edge ordering
+/// proof held by [`SealedPaymentEvidence`].
+pub trait PaymentEndpointView {
+    fn warehouses(&self) -> u16;
+    fn terminal_count(&self) -> u64;
+    fn warehouse_edge_count(&self) -> u64;
+    fn district_edge_count(&self) -> u64;
+    fn warehouse_endpoint_bits(&self, warehouse_id: u16) -> Option<u32>;
+    fn warehouse_update_count(&self, warehouse_id: u16) -> Option<u64>;
+    fn district_endpoint_bits(&self, warehouse_id: u16, district_id: u8) -> Option<u32>;
+    fn district_update_count(&self, warehouse_id: u16, district_id: u8) -> Option<u64>;
+}
+
+impl PaymentEndpointView for SealedPaymentEvidence {
+    fn warehouses(&self) -> u16 {
+        self.warehouses()
+    }
+
+    fn terminal_count(&self) -> u64 {
+        self.terminal_count()
+    }
+
+    fn warehouse_edge_count(&self) -> u64 {
+        self.warehouse_edge_count()
+    }
+
+    fn district_edge_count(&self) -> u64 {
+        self.district_edge_count()
+    }
+
+    fn warehouse_endpoint_bits(&self, warehouse_id: u16) -> Option<u32> {
+        self.warehouse_endpoint_bits(warehouse_id)
+    }
+
+    fn warehouse_update_count(&self, warehouse_id: u16) -> Option<u64> {
+        self.warehouse_update_count(warehouse_id)
+    }
+
+    fn district_endpoint_bits(&self, warehouse_id: u16, district_id: u8) -> Option<u32> {
+        self.district_endpoint_bits(warehouse_id, district_id)
+    }
+
+    fn district_update_count(&self, warehouse_id: u16, district_id: u8) -> Option<u64> {
+        self.district_update_count(warehouse_id, district_id)
+    }
+}
+
+/// Structurally validated endpoint oracle restored from the checksum-bound
+/// terminal artifact.
+///
+/// This remains a distinct type: endpoints and counts alone cannot recreate
+/// the paired Warehouse/District amounts or their one common live order.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PersistedPaymentEndpoints {
+    warehouses: u16,
+    terminal_count: u64,
+    warehouse_edge_count: u64,
+    district_edge_count: u64,
+    warehouse_endpoints: Box<[(u32, u64)]>,
+    district_endpoints: Box<[(u32, u64)]>,
+}
+
+impl PersistedPaymentEndpoints {
+    pub(crate) fn from_canonical_endpoints(
+        warehouses: u16,
+        terminal_count: u64,
+        warehouse_edge_count: u64,
+        district_edge_count: u64,
+        warehouse_endpoints: Vec<(u32, u64)>,
+        district_endpoints: Vec<(u32, u64)>,
+    ) -> Result<Self, PaymentEndpointError> {
+        if warehouses == 0 || warehouses > MAX_PAYMENT_WAREHOUSES {
+            return Err(PaymentEndpointError::InvalidConfiguration(
+                "warehouses must be in 1..=50",
+            ));
+        }
+        if warehouse_edge_count != terminal_count || district_edge_count != terminal_count {
+            return Err(PaymentEndpointError::InvalidInvariant(
+                "persisted edge totals differ from terminal total",
+            ));
+        }
+        let warehouse_chains = warehouse_endpoints
+            .iter()
+            .map(|(endpoint_bits, update_count)| EndpointChain {
+                root_bits: WAREHOUSE_YTD_ROOT_BITS,
+                endpoint_bits: *endpoint_bits,
+                update_count: *update_count,
+            })
+            .collect::<Vec<_>>();
+        let district_chains = district_endpoints
+            .iter()
+            .map(|(endpoint_bits, update_count)| EndpointChain {
+                root_bits: DISTRICT_YTD_ROOT_BITS,
+                endpoint_bits: *endpoint_bits,
+                update_count: *update_count,
+            })
+            .collect::<Vec<_>>();
+        validate_chain_totals(
+            warehouses,
+            terminal_count,
+            &warehouse_chains,
+            &district_chains,
+        )?;
+        Ok(Self {
+            warehouses,
+            terminal_count,
+            warehouse_edge_count,
+            district_edge_count,
+            warehouse_endpoints: warehouse_endpoints.into_boxed_slice(),
+            district_endpoints: district_endpoints.into_boxed_slice(),
+        })
+    }
+}
+
+impl PaymentEndpointView for PersistedPaymentEndpoints {
+    fn warehouses(&self) -> u16 {
+        self.warehouses
+    }
+
+    fn terminal_count(&self) -> u64 {
+        self.terminal_count
+    }
+
+    fn warehouse_edge_count(&self) -> u64 {
+        self.warehouse_edge_count
+    }
+
+    fn district_edge_count(&self) -> u64 {
+        self.district_edge_count
+    }
+
+    fn warehouse_endpoint_bits(&self, warehouse_id: u16) -> Option<u32> {
+        warehouse_id
+            .checked_sub(1)
+            .and_then(|index| self.warehouse_endpoints.get(usize::from(index)))
+            .map(|(bits, _)| *bits)
+    }
+
+    fn warehouse_update_count(&self, warehouse_id: u16) -> Option<u64> {
+        warehouse_id
+            .checked_sub(1)
+            .and_then(|index| self.warehouse_endpoints.get(usize::from(index)))
+            .map(|(_, count)| *count)
+    }
+
+    fn district_endpoint_bits(&self, warehouse_id: u16, district_id: u8) -> Option<u32> {
+        district_index(self.warehouses, warehouse_id, district_id)
+            .and_then(|index| self.district_endpoints.get(index))
+            .map(|(bits, _)| *bits)
+    }
+
+    fn district_update_count(&self, warehouse_id: u16, district_id: u8) -> Option<u64> {
+        district_index(self.warehouses, warehouse_id, district_id)
+            .and_then(|index| self.district_endpoints.get(index))
+            .map(|(_, count)| *count)
+    }
+}
+
+fn district_index(warehouses: u16, warehouse_id: u16, district_id: u8) -> Option<usize> {
+    if warehouse_id == 0
+        || warehouse_id > warehouses
+        || district_id == 0
+        || district_id > DISTRICTS_PER_WAREHOUSE
+    {
+        return None;
+    }
+    Some(
+        usize::from(warehouse_id - 1) * usize::from(DISTRICTS_PER_WAREHOUSE)
+            + usize::from(district_id - 1),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_endpoint_view_revalidates_fixed_roots_and_counts() {
+        let warehouse_endpoints = vec![((300_000.0_f32 + 1.0).to_bits(), 1)];
+        let mut district_endpoints =
+            vec![(DISTRICT_YTD_ROOT_BITS, 0); usize::from(DISTRICTS_PER_WAREHOUSE)];
+        district_endpoints[0] = ((30_000.0_f32 + 1.0).to_bits(), 1);
+        let restored = PersistedPaymentEndpoints::from_canonical_endpoints(
+            1,
+            1,
+            1,
+            1,
+            warehouse_endpoints.clone(),
+            district_endpoints.clone(),
+        )
+        .unwrap();
+        let view: &dyn PaymentEndpointView = &restored;
+        assert_eq!(view.warehouses(), 1);
+        assert_eq!(view.terminal_count(), 1);
+        assert_eq!(
+            view.warehouse_endpoint_bits(1),
+            Some((300_000.0_f32 + 1.0).to_bits())
+        );
+        assert_eq!(
+            view.district_endpoint_bits(1, 1),
+            Some((30_000.0_f32 + 1.0).to_bits())
+        );
+        assert_eq!(view.district_endpoint_bits(1, 11), None);
+
+        assert!(matches!(
+            PersistedPaymentEndpoints::from_canonical_endpoints(
+                1,
+                1,
+                0,
+                1,
+                warehouse_endpoints.clone(),
+                district_endpoints.clone(),
+            ),
+            Err(PaymentEndpointError::InvalidInvariant(
+                "persisted edge totals differ from terminal total"
+            ))
+        ));
+        let mut non_finite = warehouse_endpoints;
+        non_finite[0].0 = f32::NAN.to_bits();
+        assert!(matches!(
+            PersistedPaymentEndpoints::from_canonical_endpoints(
+                1,
+                1,
+                1,
+                1,
+                non_finite,
+                district_endpoints,
+            ),
+            Err(PaymentEndpointError::InvalidInvariant(
+                "endpoint is outside the rooted finite domain"
+            ))
+        ));
+    }
 
     fn edge(before: f32, amount: f32) -> PaymentFloatEdge {
         PaymentFloatEdge {
