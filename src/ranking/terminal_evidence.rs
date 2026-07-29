@@ -26,6 +26,7 @@ use super::payment_endpoints::{
     PaymentAckReceipt, PaymentEndpointCollector, PaymentEndpointError, PaymentFloatEdge,
     PaymentTerminalEvidence, SealedPaymentEvidence,
 };
+use super::preflight::StalePaymentPreflightProof;
 use super::runner::{CustomerVersion, RankedCommit, RankedTransactionOutcome};
 
 pub const TERMINAL_EVIDENCE_POLICY_VERSION: u32 = 2;
@@ -175,21 +176,18 @@ impl TerminalEvidenceCollector {
     /// Construct the shared gate only after the controlled stale-Writer
     /// Payment preflight has succeeded.
     ///
-    /// `stale_payment_preflight_verified` is intentionally explicit until the
-    /// preflight module exposes its unforgeable success token. Passing `false`
-    /// fails closed and no collector is created.
     pub fn new<P>(
         warehouses: u16,
         clients: u16,
         sample_seed: u64,
         stock_roots: P,
-        stale_payment_preflight_verified: bool,
+        stale_payment_preflight: StalePaymentPreflightProof,
     ) -> Result<Self, TerminalEvidenceError>
     where
         P: StockRootProvider + 'static,
     {
-        if !stale_payment_preflight_verified {
-            return Err(TerminalEvidenceError::MissingStalePaymentPreflight);
+        if !stale_payment_preflight.matches(sample_seed, warehouses) {
+            return Err(TerminalEvidenceError::StalePaymentPreflightBinding);
         }
         let intervals = IntervalCollector::new(warehouses, clients, sample_seed, stock_roots)?;
         let payment = PaymentEndpointCollector::new(warehouses, clients)?;
@@ -697,8 +695,8 @@ pub enum TerminalEvidenceError {
     WorkersNotFinished,
     #[error("terminal evidence collector is already sealed")]
     AlreadySealed,
-    #[error("controlled stale-Writer Payment preflight did not pass")]
-    MissingStalePaymentPreflight,
+    #[error("controlled stale-Writer Payment preflight proof has the wrong run binding")]
+    StalePaymentPreflightBinding,
 }
 
 fn prepare_terminal(
@@ -864,7 +862,16 @@ mod tests {
     }
 
     fn collector(clients: u16) -> Arc<TerminalEvidenceCollector> {
-        Arc::new(TerminalEvidenceCollector::new(50, clients, TEST_SEED, stock_roots, true).unwrap())
+        Arc::new(
+            TerminalEvidenceCollector::new(
+                50,
+                clients,
+                TEST_SEED,
+                stock_roots,
+                StalePaymentPreflightProof::verified_for_test(TEST_SEED, 50),
+            )
+            .unwrap(),
+        )
     }
 
     fn customer_key() -> CustomerKey {
@@ -1178,10 +1185,16 @@ mod tests {
     }
 
     #[test]
-    fn stale_payment_preflight_is_a_hard_constructor_gate() {
+    fn stale_payment_preflight_is_bound_to_the_collector_configuration() {
         assert!(matches!(
-            TerminalEvidenceCollector::new(50, 1, TEST_SEED, stock_roots, false),
-            Err(TerminalEvidenceError::MissingStalePaymentPreflight)
+            TerminalEvidenceCollector::new(
+                50,
+                1,
+                TEST_SEED,
+                stock_roots,
+                StalePaymentPreflightProof::verified_for_test(TEST_SEED ^ 1, 50),
+            ),
+            Err(TerminalEvidenceError::StalePaymentPreflightBinding)
         ));
     }
 }

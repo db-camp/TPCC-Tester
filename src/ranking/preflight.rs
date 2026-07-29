@@ -35,6 +35,26 @@ const STALE_PAYMENT_QUERY_INDEX: u16 = 0;
 const STALE_PAYMENT_UPDATE_INDEX: u16 = 1;
 const STALE_PAYMENT_COMMIT_INDEX: u16 = 2;
 
+/// Proof that the controlled stale-Writer Payment probe passed.
+///
+/// Private fields bind the proof to one workload seed and warehouse domain.
+/// Production code can obtain this value only by completing `run`.
+pub struct StalePaymentPreflightProof {
+    seed: u64,
+    warehouses: u16,
+}
+
+impl StalePaymentPreflightProof {
+    pub(crate) fn matches(&self, seed: u64, warehouses: u16) -> bool {
+        self.seed == seed && self.warehouses == warehouses
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verified_for_test(seed: u64, warehouses: u16) -> Self {
+        Self { seed, warehouses }
+    }
+}
+
 /// Run the deterministic, non-measured semantic preflight on two already
 /// configured and prepared ranked connections.
 pub async fn run(
@@ -42,7 +62,7 @@ pub async fn run(
     contender: &mut RmdbClient,
     seed: u64,
     warehouses: u16,
-) -> Result<(), TpccError> {
+) -> Result<StalePaymentPreflightProof, TpccError> {
     let selection = PreflightSelection::derive(seed, warehouses)?;
     verify_stock_level(primary, &selection).await?;
     verify_new_order_rollback(primary, &selection).await?;
@@ -51,7 +71,8 @@ pub async fn run(
     // residue checks cannot expose an invisible heap/index ghost that still
     // rejects a duplicate key; a second full write prefix does.
     verify_new_order_rollback(primary, &selection).await?;
-    verify_payment_stale_write(primary, contender, selection.warehouse_id).await
+    verify_payment_stale_write(primary, contender, selection.warehouse_id).await?;
+    Ok(StalePaymentPreflightProof { seed, warehouses })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

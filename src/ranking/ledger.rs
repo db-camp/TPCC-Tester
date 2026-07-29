@@ -121,7 +121,7 @@ impl LedgerClass {
         matches!(self, Self::RankedWindow(_))
     }
 
-    fn normal_for_stage(stage: StageId) -> Self {
+    pub(crate) fn normal_for_stage(stage: StageId) -> Self {
         match stage.value() {
             0 => Self::Warmup,
             value @ 1..=3 => Self::RankedWindow((value - 1) as u8),
@@ -129,7 +129,7 @@ impl LedgerClass {
         }
     }
 
-    fn tail_for_stage(stage: StageId) -> Self {
+    pub(crate) fn tail_for_stage(stage: StageId) -> Self {
         match stage.value() {
             0 => Self::WarmupTail,
             value @ 1..=3 => Self::RankedTail((value - 1) as u8),

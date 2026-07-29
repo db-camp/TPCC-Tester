@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 use crate::config::{Config, ResolvedProfile};
 use crate::connection::client::RmdbClient;
+use crate::data_gen::TpccDataGen;
 use crate::error::TpccError;
 use crate::measurement::{MeasurementSummary, WindowStats, FORMAL_WINDOW_COUNT};
 use crate::phases::{
@@ -25,10 +26,14 @@ use crate::phases::{
 use crate::ranking::catalog::RuntimeCatalog;
 use crate::ranking::common::install_statement_layout;
 use crate::ranking::dispatch::{self, FrozenTransaction};
-use crate::ranking::ledger::{LedgerError, RunLedger};
+use crate::ranking::evidence_collector::StockKey;
+use crate::ranking::ledger::{LedgerClass, LedgerError, RunLedger};
 use crate::ranking::preflight;
-use crate::ranking::runner::RankedTransactionOutcome;
+use crate::ranking::runner::{RankedTransactionOutcome, StockVersion};
 use crate::ranking::session::open_ranked_session;
+use crate::ranking::terminal_evidence::{
+    SealedTerminalEvidence, TerminalEvidenceCollector, TerminalEvidenceError,
+};
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
 use crate::runtime_schema::RuntimeSchema;
 use crate::transaction::TransactionType;
@@ -237,8 +242,27 @@ impl BenchmarkExecutor {
                 "ranked semantic preflight lost its contender prepared session".to_owned(),
             )
         })?;
-        preflight::run(primary_session, contender_session, seed, profile.warehouses).await?;
+        let stale_payment_preflight =
+            preflight::run(primary_session, contender_session, seed, profile.warehouses).await?;
         info!("prepared semantic preflight passed before timing-barrier release");
+        let stock_roots = TpccDataGen::with_seed(i32::from(profile.warehouses), seed);
+        let terminal_evidence = Arc::new(
+            TerminalEvidenceCollector::new(
+                profile.warehouses,
+                profile.clients,
+                seed,
+                move |key: StockKey| {
+                    Some(StockVersion {
+                        quantity: stock_roots.initial_stock_quantity(key.warehouse_id, key.item_id),
+                        ytd_bits: 0.0_f32.to_bits(),
+                        order_count: 0,
+                        remote_count: 0,
+                    })
+                },
+                stale_payment_preflight,
+            )
+            .map_err(terminal_evidence_error)?,
+        );
         {
             let mut state = lock_scheduler(&scheduler)?;
             for worker in 0..profile.clients {
@@ -262,6 +286,7 @@ impl BenchmarkExecutor {
             let ready_barrier = Arc::clone(&ready_barrier);
             let start_barrier = Arc::clone(&start_barrier);
             let monotonic_clock = monotonic_clock.clone();
+            let terminal_evidence = Arc::clone(&terminal_evidence);
             workers.spawn(async move {
                 run_worker(
                     worker_index as u16,
@@ -272,6 +297,7 @@ impl BenchmarkExecutor {
                     ready_barrier,
                     start_barrier,
                     monotonic_clock,
+                    terminal_evidence,
                 )
                 .await
             });
@@ -299,6 +325,9 @@ impl BenchmarkExecutor {
                     let index = usize::from(worker);
                     if index >= worker_ledgers.len() {
                         cancelled.store(true, Ordering::Release);
+                        terminal_evidence
+                            .poison(format!("ranked worker returned out-of-range id {worker}"))
+                            .await;
                         if first_error.is_none() {
                             first_error = Some(TpccError::Protocol(format!(
                                 "ranked worker returned out-of-range id {worker}"
@@ -306,6 +335,11 @@ impl BenchmarkExecutor {
                         }
                     } else if worker_ledgers[index].replace(ledger).is_some() {
                         cancelled.store(true, Ordering::Release);
+                        terminal_evidence
+                            .poison(format!(
+                                "ranked worker returned duplicate ledger for id {worker}"
+                            ))
+                            .await;
                         if first_error.is_none() {
                             first_error = Some(TpccError::Protocol(format!(
                                 "ranked worker returned duplicate ledger for id {worker}"
@@ -315,12 +349,18 @@ impl BenchmarkExecutor {
                 }
                 Ok(Err(error)) => {
                     cancelled.store(true, Ordering::Release);
+                    terminal_evidence
+                        .poison(format!("ranked worker returned error: {error}"))
+                        .await;
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
                 }
                 Err(error) => {
                     cancelled.store(true, Ordering::Release);
+                    terminal_evidence
+                        .poison(format!("ranked worker task failed: {error}"))
+                        .await;
                     if first_error.is_none() {
                         first_error = Some(TpccError::Protocol(format!(
                             "ranked worker task failed: {error}"
@@ -344,6 +384,10 @@ impl BenchmarkExecutor {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let ledger = RunLedger::merge_all(worker_ledgers).map_err(ledger_error)?;
+        let terminal_evidence = terminal_evidence
+            .seal()
+            .await
+            .map_err(terminal_evidence_error)?;
 
         let (windows, summary) = {
             let mut state = lock_scheduler(&scheduler)?;
@@ -365,6 +409,7 @@ impl BenchmarkExecutor {
             response_timeout,
             phase_tail_grace: limits.phase_tail_grace,
             ledger,
+            terminal_evidence,
         };
 
         if result.ranked && !result.summary.passed() {
@@ -462,6 +507,48 @@ async fn run_worker(
     ready_barrier: Arc<Barrier>,
     start_barrier: Arc<Barrier>,
     monotonic_clock: SystemMonotonicClock,
+    terminal_evidence: Arc<TerminalEvidenceCollector>,
+) -> Result<(u16, RunLedger), TpccError> {
+    let failure_scheduler = Arc::clone(&scheduler);
+    let failure_cancelled = Arc::clone(&cancelled);
+    let failure_evidence = Arc::clone(&terminal_evidence);
+    let result = run_worker_inner(
+        worker_value,
+        &mut client,
+        scheduler,
+        routing,
+        cancelled,
+        ready_barrier,
+        start_barrier,
+        monotonic_clock,
+        terminal_evidence,
+    )
+    .await;
+    if let Err(error) = &result {
+        failure_cancelled.store(true, Ordering::Release);
+        failure_evidence
+            .poison(format!("ranked worker {worker_value} failed: {error}"))
+            .await;
+        if let Ok(worker) = WorkerId::new(worker_value) {
+            if let Ok(mut state) = failure_scheduler.lock() {
+                let _ = state.worker_failed(worker, error.to_string());
+            }
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_worker_inner(
+    worker_value: u16,
+    client: &mut RmdbClient,
+    scheduler: Arc<Mutex<Scheduler>>,
+    routing: Arc<RunRouting>,
+    cancelled: Arc<AtomicBool>,
+    ready_barrier: Arc<Barrier>,
+    start_barrier: Arc<Barrier>,
+    monotonic_clock: SystemMonotonicClock,
+    terminal_evidence: Arc<TerminalEvidenceCollector>,
 ) -> Result<(u16, RunLedger), TpccError> {
     let worker = WorkerId::new(worker_value).map_err(scheduler_error)?;
     wait_for_timing_release(&ready_barrier, &start_barrier).await;
@@ -476,13 +563,20 @@ async fn run_worker(
             return Ok((worker_value, ledger));
         }
 
-        let reservation = {
+        let reservation_result = {
             let mut state = lock_scheduler(&scheduler)?;
-            match state.reserve_transaction(worker) {
-                Ok(reservation) => reservation,
-                Err(SchedulerError::TimelineEnded) => return Ok((worker_value, ledger)),
-                Err(error) => return Err(scheduler_error(error)),
+            state.reserve_transaction(worker)
+        };
+        let reservation = match reservation_result {
+            Ok(reservation) => reservation,
+            Err(SchedulerError::TimelineEnded) => {
+                terminal_evidence
+                    .worker_finished(worker_value)
+                    .await
+                    .map_err(terminal_evidence_error)?;
+                return Ok((worker_value, ledger));
             }
+            Err(error) => return Err(scheduler_error(error)),
         };
 
         if sequence_phase != Some(reservation.phase) {
@@ -540,7 +634,7 @@ async fn run_worker(
                     .map_err(scheduler_error)?,
             );
             let result =
-                tokio::time::timeout_at(deadline, dispatch::execute(&mut client, &frozen)).await;
+                tokio::time::timeout_at(deadline, dispatch::execute(client, &frozen)).await;
             let completed_at = monotonic_clock.now();
             match result {
                 Err(_) => {
@@ -571,10 +665,12 @@ async fn run_worker(
                             .finish_attempt_at(phase_ticket, attempt, completed_at)
                             .map_err(scheduler_error)?
                     };
-                    let record_result = match disposition {
-                        AttemptDisposition::Finished => ledger.record(frozen.ticket(), &outcome),
+                    let class = match disposition {
+                        AttemptDisposition::Finished => {
+                            LedgerClass::normal_for_stage(frozen.ticket().route().stage)
+                        }
                         AttemptDisposition::GraceTail => {
-                            ledger.record_grace_tail(frozen.ticket(), &outcome)
+                            LedgerClass::tail_for_stage(frozen.ticket().route().stage)
                         }
                         other => {
                             return fail_worker(
@@ -587,6 +683,24 @@ async fn run_worker(
                                 ),
                             );
                         }
+                    };
+                    if let Err(error) = terminal_evidence
+                        .record_terminal(worker_value, class, frozen.ticket(), &outcome)
+                        .await
+                    {
+                        return fail_worker(
+                            &scheduler,
+                            &cancelled,
+                            worker,
+                            format!("bounded terminal evidence rejected terminal: {error}"),
+                        );
+                    }
+                    let record_result = match disposition {
+                        AttemptDisposition::Finished => ledger.record(frozen.ticket(), &outcome),
+                        AttemptDisposition::GraceTail => {
+                            ledger.record_grace_tail(frozen.ticket(), &outcome)
+                        }
+                        _ => unreachable!("terminal disposition was validated above"),
                     };
                     if let Err(error) = record_result {
                         return fail_worker(
@@ -672,6 +786,10 @@ fn ledger_error(error: LedgerError) -> TpccError {
     TpccError::Protocol(format!("ranked physical commit ledger: {error}"))
 }
 
+fn terminal_evidence_error(error: TerminalEvidenceError) -> TpccError {
+    TpccError::Protocol(format!("ranked bounded terminal evidence: {error}"))
+}
+
 fn median_of_three(mut values: [f64; FORMAL_WINDOW_COUNT]) -> f64 {
     values.sort_by(f64::total_cmp);
     values[1]
@@ -686,11 +804,16 @@ pub struct Final2026RunResult {
     response_timeout: Duration,
     phase_tail_grace: Duration,
     ledger: RunLedger,
+    terminal_evidence: SealedTerminalEvidence,
 }
 
 impl Final2026RunResult {
     pub fn ledger(&self) -> &RunLedger {
         &self.ledger
+    }
+
+    pub fn terminal_evidence(&self) -> &SealedTerminalEvidence {
+        &self.terminal_evidence
     }
 
     pub fn print_report(&self) {
