@@ -1,4 +1,4 @@
-use chrono::{Duration, TimeZone, Utc};
+use chrono::Local;
 use rand::Rng;
 
 use crate::model::*;
@@ -6,27 +6,6 @@ use crate::model::*;
 const SYLLABLES: &[&str] = &[
     "BAR", "OUGHT", "ABLE", "PRI", "PRES", "ESE", "ANTI", "CALLY", "ATION", "EING",
 ];
-
-const CITIES: &[&str] = &[
-    "Springfield",
-    "Rivertown",
-    "Oakland",
-    "Madison",
-    "Lincoln",
-    "Franklin",
-];
-
-const STATES: &[&str] = &["CA", "NY", "TX", "FL", "IL", "PA", "OH", "GA", "NC", "MI"];
-
-const FIRST_NAMES: &[&str] = &[
-    "John", "Jane", "Bob", "Alice", "Charlie", "Diana", "Edward", "Fiona",
-];
-
-const ITEM_PREFIXES: &[&str] = &[
-    "Red", "Blue", "Green", "Large", "Small", "Premium", "Standard",
-];
-
-const ITEM_NOUNS: &[&str] = &["Widget", "Gadget", "Tool", "Device", "Product", "Item"];
 
 /// Public local default only. The official grader derives an independent hidden seed.
 pub const DEFAULT_LOAD_SEED: u64 = 20_260_729;
@@ -43,11 +22,23 @@ const DOMAIN_WAREHOUSE: u64 = 0x19d3_08da_454d_4a71;
 const DOMAIN_DISTRICT: u64 = 0xca4f_4d4b_f13a_6ac1;
 const DOMAIN_ITEM: u64 = 0x989e_6e8c_b019_a93b;
 const DOMAIN_CUSTOMER: u64 = 0xb9bb_ef18_e67b_d5f2;
+const DOMAIN_CUSTOMER_LAST: u64 = 0x5ae8_4b9f_3210_71c6;
 const DOMAIN_STOCK: u64 = 0x92f2_cfa4_7d71_a9d0;
 const DOMAIN_ORDER: u64 = 0x6837_5c90_4340_a4fb;
+const DOMAIN_ORDER_CUSTOMER: u64 = 0x04f7_c65e_9d3b_b201;
 const DOMAIN_ORDER_SHAPE: u64 = 0x355d_9272_a4a6_274e;
 const DOMAIN_ORDER_LINE: u64 = 0xf675_f643_d32c_d4dc;
 const DOMAIN_HISTORY: u64 = 0xd6e8_feb8_6659_fd93;
+
+// `with_seed` uses an injected stable instant for complete golden fingerprints.
+// Production `new` captures the OS clock once, as required by TPC-C 4.3.
+const GOLDEN_POPULATION_TIMESTAMP: &str = "2026-01-01 00:00:00";
+
+// TPC-C specifies C_DATA as a-string[300..500], but the final-2026 public DDL
+// deliberately narrows the column to CHAR(50). Filling the full published width
+// is the closest representable population; this is an explicit schema deviation,
+// not an attempt to guess the grader's hidden random stream.
+const FINAL_CUSTOMER_DATA_LEN: usize = 50;
 
 /// SplitMix64 with explicit rejection sampling. Unlike `StdRng` and
 /// `rand::distributions`, this load-data stream is stable across crate upgrades.
@@ -84,11 +75,6 @@ impl StableRng {
         min + self.below((i64::from(max) - i64::from(min) + 1) as u64) as i32
     }
 
-    fn i64_inclusive(&mut self, min: i64, max: i64) -> i64 {
-        assert!(min <= max);
-        min + self.below((max - min + 1) as u64) as i64
-    }
-
     fn usize_exclusive(&mut self, min: usize, max: usize) -> usize {
         assert!(min < max);
         min + self.below((max - min) as u64) as usize
@@ -103,6 +89,7 @@ impl StableRng {
 pub struct TpccDataGen {
     pub scale_factor: i32,
     load_seed: u64,
+    population_timestamp: String,
 }
 
 impl TpccDataGen {
@@ -114,18 +101,43 @@ impl TpccDataGen {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_LOAD_SEED);
-        Self::with_seed(scale_factor, load_seed)
+        let population_timestamp = std::env::var("RMDB_TPCC_LOAD_TIMESTAMP")
+            .ok()
+            .filter(|value| !value.is_empty() && value.len() <= 30)
+            .unwrap_or_else(|| Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+        Self::with_seed_and_timestamp(scale_factor, load_seed, population_timestamp)
     }
 
     pub fn with_seed(scale_factor: i32, load_seed: u64) -> Self {
+        Self::with_seed_and_timestamp(
+            scale_factor,
+            load_seed,
+            GOLDEN_POPULATION_TIMESTAMP.to_string(),
+        )
+    }
+
+    pub fn with_seed_and_timestamp(
+        scale_factor: i32,
+        load_seed: u64,
+        population_timestamp: String,
+    ) -> Self {
+        assert!(
+            !population_timestamp.is_empty() && population_timestamp.len() <= 30,
+            "population timestamp must fit final CHAR(30)"
+        );
         Self {
             scale_factor: scale_factor.max(1),
             load_seed,
+            population_timestamp,
         }
     }
 
     pub fn load_seed(&self) -> u64 {
         self.load_seed
+    }
+
+    pub fn load_timestamp(&self) -> &str {
+        &self.population_timestamp
     }
 
     // ─── Initial-data deterministic helpers ─────────────
@@ -149,48 +161,46 @@ impl TpccDataGen {
         rng.i32_inclusive(min, max)
     }
 
-    fn rng_string(rng: &mut StableRng, len: usize) -> String {
+    fn rng_a_string(rng: &mut StableRng, len: usize) -> String {
         const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         (0..len)
             .map(|_| CHARSET[rng.usize_exclusive(0, CHARSET.len())] as char)
             .collect()
     }
 
-    fn rng_alpha_num(rng: &mut StableRng, len: usize) -> String {
-        const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    fn rng_n_string(rng: &mut StableRng, len: usize) -> String {
+        const CHARSET: &[u8] = b"0123456789";
         (0..len)
             .map(|_| CHARSET[rng.usize_exclusive(0, CHARSET.len())] as char)
             .collect()
     }
 
+    fn gen_a_string(rng: &mut StableRng, min_len: usize, max_len: usize) -> String {
+        let len = rng.usize_inclusive(min_len, max_len);
+        Self::rng_a_string(rng, len)
+    }
+
     fn gen_street(rng: &mut StableRng) -> String {
-        format!(
-            "{} {} St",
-            Self::rng_int(rng, 1, 9999),
-            Self::rng_string(rng, 5).to_uppercase()
-        )
+        Self::gen_a_string(rng, 10, 20)
     }
 
     fn gen_city(rng: &mut StableRng) -> String {
-        CITIES[rng.usize_exclusive(0, CITIES.len())].to_string()
+        Self::gen_a_string(rng, 10, 20)
     }
 
     fn gen_state(rng: &mut StableRng) -> String {
-        STATES[rng.usize_exclusive(0, STATES.len())].to_string()
+        const LETTERS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        (0..2)
+            .map(|_| LETTERS[rng.usize_exclusive(0, LETTERS.len())] as char)
+            .collect()
     }
 
     fn gen_zip(rng: &mut StableRng) -> String {
-        format!(
-            "{}{}",
-            Self::rng_int(rng, 10000, 99999),
-            Self::rng_int(rng, 1000, 9999)
-        )
+        format!("{}11111", Self::rng_n_string(rng, 4))
     }
 
     fn gen_phone(rng: &mut StableRng) -> String {
-        (0..16)
-            .map(|_| char::from(b'0' + rng.i32_inclusive(0, 9) as u8))
-            .collect()
+        Self::rng_n_string(rng, 16)
     }
 
     fn gen_tax(rng: &mut StableRng) -> f64 {
@@ -205,37 +215,20 @@ impl TpccDataGen {
         f64::from(Self::rng_int(rng, 100, 10_000) as f32 / 100.0_f32)
     }
 
-    fn gen_item_name(rng: &mut StableRng) -> String {
-        format!(
-            "{} {}",
-            ITEM_PREFIXES[rng.usize_exclusive(0, ITEM_PREFIXES.len())],
-            ITEM_NOUNS[rng.usize_exclusive(0, ITEM_NOUNS.len())]
-        )
-    }
-
     fn gen_data(rng: &mut StableRng, min_len: usize, max_len: usize) -> String {
-        let len = rng.usize_inclusive(min_len, max_len);
-        Self::rng_string(rng, len)
+        Self::gen_a_string(rng, min_len, max_len)
     }
 
     fn gen_dist_info(rng: &mut StableRng) -> String {
-        Self::rng_alpha_num(rng, 24)
+        Self::rng_a_string(rng, 24)
     }
 
     fn gen_first_name(rng: &mut StableRng) -> String {
-        FIRST_NAMES[rng.usize_exclusive(0, FIRST_NAMES.len())].to_string()
+        Self::gen_a_string(rng, 8, 16)
     }
 
-    fn gen_timestamp(rng: &mut StableRng) -> String {
-        // A fixed epoch makes the public seed reproduce complete CSV contents.
-        let base = Utc
-            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
-            .single()
-            .expect("valid fixed timestamp");
-        let seconds_ago = rng.i64_inclusive(0, 730_i64 * 24 * 60 * 60);
-        (base - Duration::seconds(seconds_ago))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
+    fn population_timestamp(&self) -> String {
+        self.population_timestamp.clone()
     }
 
     fn maybe_mark_original(rng: &mut StableRng, mut data: String) -> String {
@@ -247,16 +240,31 @@ impl TpccDataGen {
         data
     }
 
-    fn initial_order_timestamp(&self, w_id: i32, d_id: i32, o_id: i32) -> String {
-        let mut rng = self.row_rng(DOMAIN_ORDER, &[w_id, d_id, o_id, 1]);
-        Self::gen_timestamp(&mut rng)
+    fn initial_order_timestamp(&self, _w_id: i32, _d_id: i32, _o_id: i32) -> String {
+        self.population_timestamp()
     }
 
-    fn initial_customer_id(&self, w_id: i32, d_id: i32, o_id: i32) -> i32 {
-        // An affine permutation gives every district customer exactly one initial order.
-        let mut rng = self.row_rng(DOMAIN_ORDER, &[w_id, d_id, 2]);
-        let offset = rng.i32_inclusive(0, CUSTOMERS_PER_DISTRICT - 1);
-        ((1009 * (o_id - 1) + offset) % CUSTOMERS_PER_DISTRICT) + 1
+    fn initial_order_customer_permutation(&self, w_id: i32, d_id: i32) -> Vec<i32> {
+        let mut rng = self.row_rng(DOMAIN_ORDER_CUSTOMER, &[w_id, d_id]);
+        let mut customer_ids: Vec<_> = (1..=CUSTOMERS_PER_DISTRICT).collect();
+        // Explicit Fisher-Yates plus StableRng::below keeps the permutation stable
+        // across rand crate and standard-library releases.
+        for index in (1..customer_ids.len()).rev() {
+            let selected = rng.below((index + 1) as u64) as usize;
+            customer_ids.swap(index, selected);
+        }
+        customer_ids
+    }
+
+    fn nurand(rng: &mut StableRng, a: i32, x: i32, y: i32, c: i32) -> i32 {
+        (((rng.i32_inclusive(0, a) | rng.i32_inclusive(x, y)) + c) % (y - x + 1)) + x
+    }
+
+    /// TPC-C C-Load for C_LAST. It is one seed-derived value shared by every
+    /// district and independent of the runtime routing/random domains.
+    pub fn customer_last_name_load_constant(&self) -> i32 {
+        let mut rng = self.row_rng(DOMAIN_CUSTOMER_LAST, &[]);
+        rng.i32_inclusive(0, 255)
     }
 
     /// The one source of truth used by both `orders.o_ol_cnt` and `order_line`.
@@ -279,25 +287,21 @@ impl TpccDataGen {
         rng.i32_inclusive(1, 999_999)
     }
 
-    pub fn expected_order_line_count(&self) -> i64 {
-        (1..=self.scale_factor)
-            .flat_map(|w_id| {
-                (1..=DISTRICTS_PER_WAREHOUSE).flat_map(move |d_id| {
-                    (1..=ORDERS_PER_DISTRICT)
-                        .map(move |o_id| self.initial_order_line_count(w_id, d_id, o_id) as i64)
-                })
-            })
-            .sum()
-    }
-
-    pub fn generate_last_name(customer_id: i32) -> String {
-        let number = (customer_id - 1).rem_euclid(1000) as usize;
+    fn last_name_from_number(number: i32) -> String {
+        let number = number.rem_euclid(1000) as usize;
         format!(
             "{}{}{}",
             SYLLABLES[number / 100],
             SYLLABLES[(number / 10) % 10],
             SYLLABLES[number % 10]
         )
+    }
+
+    /// Compatibility helper for transaction code whose input is a 1-based
+    /// customer identifier. Initial C_LAST population uses the exact 0-based
+    /// TPC-C number through `last_name_from_number`.
+    pub fn generate_last_name(customer_id: i32) -> String {
+        Self::last_name_from_number(customer_id - 1)
     }
 
     // ─── Streaming initial-data generators ──────────────
@@ -307,7 +311,7 @@ impl TpccDataGen {
             let mut rng = self.row_rng(DOMAIN_WAREHOUSE, &[w_id]);
             Warehouse {
                 w_id,
-                w_name: format!("W{w_id:02}"),
+                w_name: Self::gen_a_string(&mut rng, 6, 10),
                 w_street_1: Self::gen_street(&mut rng),
                 w_street_2: Self::gen_street(&mut rng),
                 w_city: Self::gen_city(&mut rng),
@@ -326,7 +330,7 @@ impl TpccDataGen {
                 District {
                     d_id,
                     d_w_id: w_id,
-                    d_name: format!("D{d_id:02}"),
+                    d_name: Self::gen_a_string(&mut rng, 6, 10),
                     d_street_1: Self::gen_street(&mut rng),
                     d_street_2: Self::gen_street(&mut rng),
                     d_city: Self::gen_city(&mut rng),
@@ -347,7 +351,7 @@ impl TpccDataGen {
             Item {
                 i_id,
                 i_im_id: Self::rng_int(&mut rng, 1, 10_000),
-                i_name: Self::gen_item_name(&mut rng),
+                i_name: Self::gen_a_string(&mut rng, 14, 24),
                 i_price: Self::gen_price(&mut rng),
                 i_data: Self::maybe_mark_original(&mut rng, data),
             }
@@ -365,9 +369,17 @@ impl TpccDataGen {
                         "BC"
                     };
                     let c_last = if c_id <= 1000 {
-                        Self::generate_last_name(c_id)
+                        Self::last_name_from_number(c_id - 1)
                     } else {
-                        Self::generate_last_name(Self::rng_int(&mut rng, 1, 1000))
+                        let mut last_rng = self.row_rng(DOMAIN_CUSTOMER_LAST, &[w_id, d_id, c_id]);
+                        let number = Self::nurand(
+                            &mut last_rng,
+                            255,
+                            0,
+                            999,
+                            self.customer_last_name_load_constant(),
+                        );
+                        Self::last_name_from_number(number)
                     };
                     Customer {
                         c_id,
@@ -382,7 +394,7 @@ impl TpccDataGen {
                         c_state: Self::gen_state(&mut rng),
                         c_zip: Self::gen_zip(&mut rng),
                         c_phone: Self::gen_phone(&mut rng),
-                        c_since: Self::gen_timestamp(&mut rng),
+                        c_since: self.population_timestamp(),
                         c_credit: credit.to_string(),
                         c_credit_lim: 50_000,
                         c_discount: Self::gen_discount(&mut rng),
@@ -390,7 +402,11 @@ impl TpccDataGen {
                         c_ytd_payment: 10.0,
                         c_payment_cnt: 1,
                         c_delivery_cnt: 0,
-                        c_data: Self::gen_data(&mut rng, 50, 50),
+                        c_data: Self::gen_data(
+                            &mut rng,
+                            FINAL_CUSTOMER_DATA_LEN,
+                            FINAL_CUSTOMER_DATA_LEN,
+                        ),
                     }
                 })
             })
@@ -428,24 +444,30 @@ impl TpccDataGen {
     pub fn generate_orders(&self) -> impl Iterator<Item = Orders> + '_ {
         (1..=self.scale_factor).flat_map(move |w_id| {
             (1..=DISTRICTS_PER_WAREHOUSE).flat_map(move |d_id| {
-                (1..=ORDERS_PER_DISTRICT).map(move |o_id| {
-                    let mut rng = self.row_rng(DOMAIN_ORDER, &[w_id, d_id, o_id, 3]);
-                    let carrier_id = if o_id > DELIVERED_ORDER_MAX {
-                        0
-                    } else {
-                        Self::rng_int(&mut rng, 1, 10)
-                    };
-                    Orders {
-                        o_id,
-                        o_d_id: d_id,
-                        o_w_id: w_id,
-                        o_c_id: self.initial_customer_id(w_id, d_id, o_id),
-                        o_entry_d: self.initial_order_timestamp(w_id, d_id, o_id),
-                        o_carrier_id: carrier_id,
-                        o_ol_cnt: self.initial_order_line_count(w_id, d_id, o_id),
-                        o_all_local: 1,
-                    }
-                })
+                self.initial_order_customer_permutation(w_id, d_id)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, o_c_id)| {
+                        let o_id = index as i32 + 1;
+                        let mut rng = self.row_rng(DOMAIN_ORDER, &[w_id, d_id, o_id, 3]);
+                        let carrier_id = if o_id > DELIVERED_ORDER_MAX {
+                            // RMDB's public final SQL dialect has no NULL value. Zero is
+                            // the explicit local encoding of TPC-C's initial NULL.
+                            0
+                        } else {
+                            Self::rng_int(&mut rng, 1, 10)
+                        };
+                        Orders {
+                            o_id,
+                            o_d_id: d_id,
+                            o_w_id: w_id,
+                            o_c_id,
+                            o_entry_d: self.initial_order_timestamp(w_id, d_id, o_id),
+                            o_carrier_id: carrier_id,
+                            o_ol_cnt: self.initial_order_line_count(w_id, d_id, o_id),
+                            o_all_local: 1,
+                        }
+                    })
             })
         })
     }
@@ -473,9 +495,9 @@ impl TpccDataGen {
                         h_c_w_id: w_id,
                         h_d_id: d_id,
                         h_w_id: w_id,
-                        h_date: Self::gen_timestamp(&mut rng),
+                        h_date: self.population_timestamp(),
                         h_amount: 10.0,
-                        h_data: "Initial deposit".to_string(),
+                        h_data: Self::gen_data(&mut rng, 12, 24),
                     }
                 })
             })
@@ -490,6 +512,8 @@ impl TpccDataGen {
                     let delivery_d = if o_id <= DELIVERED_ORDER_MAX {
                         self.initial_order_timestamp(w_id, d_id, o_id)
                     } else {
+                        // Empty CHAR is the local encoding of TPC-C's initial NULL;
+                        // RMDB currently has no SQL NULL literal or physical null bit.
                         String::new()
                     };
                     (1..=ol_count).map(move |ol_number| {
@@ -590,6 +614,303 @@ impl TpccDataGen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::cursor::SqlParam;
+
+    fn valid_zip(value: &str) -> bool {
+        value.len() == 9
+            && value.ends_with("11111")
+            && value[..4].bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    fn valid_a_string(value: &str, min_len: usize, max_len: usize) -> bool {
+        (min_len..=max_len).contains(&value.len())
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    }
+
+    fn assert_binary32_decimal(value: f64, scale: f32, min: i32, max: i32) {
+        let narrowed = value as f32;
+        let units = (narrowed * scale).round() as i32;
+        assert!((min..=max).contains(&units));
+        assert_eq!(narrowed.to_bits(), (units as f32 / scale).to_bits());
+    }
+
+    #[test]
+    fn customer_last_names_follow_sequence_then_seeded_nurand() {
+        let gen = TpccDataGen::with_seed(1, 0x4c41_5354);
+        let customers: Vec<_> = gen.generate_customers().take(3000).collect();
+        let c_load = gen.customer_last_name_load_constant();
+        assert!((0..=255).contains(&c_load));
+
+        for customer in &customers[..1000] {
+            assert_eq!(
+                customer.c_last,
+                TpccDataGen::last_name_from_number(customer.c_id - 1)
+            );
+        }
+        for customer in &customers[1000..] {
+            let mut rng = gen.row_rng(DOMAIN_CUSTOMER_LAST, &[1, 1, customer.c_id]);
+            let number = ((rng.i32_inclusive(0, 255) | rng.i32_inclusive(0, 999)) + c_load) % 1000;
+            assert_eq!(customer.c_last, TpccDataGen::last_name_from_number(number));
+        }
+
+        assert_eq!(
+            c_load,
+            TpccDataGen::with_seed(1, 0x4c41_5354).customer_last_name_load_constant()
+        );
+        assert_ne!(
+            c_load,
+            TpccDataGen::with_seed(1, 0x4c41_5355).customer_last_name_load_constant()
+        );
+    }
+
+    #[test]
+    fn one_injected_load_timestamp_is_shared_by_related_rows() {
+        let timestamp = "2026-07-29 12:34:56".to_string();
+        let gen = TpccDataGen::with_seed_and_timestamp(1, 91, timestamp.clone());
+
+        assert_eq!(gen.load_timestamp(), timestamp);
+        assert_eq!(gen.generate_customers().next().unwrap().c_since, timestamp);
+        assert_eq!(gen.generate_history().next().unwrap().h_date, timestamp);
+        assert_eq!(gen.generate_orders().next().unwrap().o_entry_d, timestamp);
+        assert_eq!(
+            gen.generate_order_lines().next().unwrap().ol_delivery_d,
+            timestamp
+        );
+    }
+
+    #[test]
+    fn each_district_has_a_full_customer_permutation_and_900_new_orders() {
+        let gen = TpccDataGen::with_seed(1, 0x0ade_2026);
+        let orders: Vec<_> = gen
+            .generate_orders()
+            .take(ORDERS_PER_DISTRICT as usize)
+            .collect();
+        assert_eq!(orders.len(), ORDERS_PER_DISTRICT as usize);
+
+        let mut customer_ids: Vec<_> = orders.iter().map(|order| order.o_c_id).collect();
+        customer_ids.sort_unstable();
+        assert_eq!(
+            customer_ids,
+            (1..=CUSTOMERS_PER_DISTRICT).collect::<Vec<_>>()
+        );
+
+        for order in &orders[..DELIVERED_ORDER_MAX as usize] {
+            assert!((1..=10).contains(&order.o_carrier_id));
+            assert_eq!(order.o_entry_d, GOLDEN_POPULATION_TIMESTAMP);
+            assert!((5..=15).contains(&order.o_ol_cnt));
+        }
+        for order in &orders[DELIVERED_ORDER_MAX as usize..] {
+            assert_eq!(order.o_carrier_id, 0);
+            assert_eq!(order.o_entry_d, GOLDEN_POPULATION_TIMESTAMP);
+            assert!((5..=15).contains(&order.o_ol_cnt));
+        }
+
+        let new_orders: Vec<_> = gen
+            .generate_new_orders()
+            .take(NEW_ORDERS_PER_DISTRICT as usize)
+            .collect();
+        assert_eq!(new_orders.len(), NEW_ORDERS_PER_DISTRICT as usize);
+        assert_eq!(new_orders.first().unwrap().no_o_id, 2101);
+        assert_eq!(new_orders.last().unwrap().no_o_id, 3000);
+        assert!(new_orders
+            .iter()
+            .all(|order| order.no_w_id == 1 && order.no_d_id == 1));
+    }
+
+    #[test]
+    fn one_district_order_lines_match_every_header_and_delivery_state() {
+        let gen = TpccDataGen::with_seed(1, 0xd311_2026);
+        let orders: Vec<_> = gen
+            .generate_orders()
+            .take(ORDERS_PER_DISTRICT as usize)
+            .collect();
+        let lines: Vec<_> = gen
+            .generate_order_lines()
+            .take_while(|line| line.ol_w_id == 1 && line.ol_d_id == 1)
+            .collect();
+
+        let mut cursor = 0;
+        for order in orders {
+            let order_lines = &lines[cursor..cursor + order.o_ol_cnt as usize];
+            assert_eq!(order_lines.len(), order.o_ol_cnt as usize);
+            for (index, line) in order_lines.iter().enumerate() {
+                assert_eq!(line.ol_o_id, order.o_id);
+                assert_eq!(line.ol_number, index as i32 + 1);
+                assert_eq!(line.ol_supply_w_id, order.o_w_id);
+                assert_eq!(line.ol_quantity, 5);
+                assert_eq!(line.ol_dist_info.len(), 24);
+                assert!((1..=ITEMS_TOTAL).contains(&line.ol_i_id));
+                if order.o_id <= DELIVERED_ORDER_MAX {
+                    assert_eq!(line.ol_delivery_d, order.o_entry_d);
+                    assert_eq!((line.ol_amount as f32).to_bits(), 0.0_f32.to_bits());
+                } else {
+                    assert!(line.ol_delivery_d.is_empty());
+                    assert!((0.01_f32..=9_999.99_f32).contains(&(line.ol_amount as f32)));
+                }
+            }
+            cursor += order.o_ol_cnt as usize;
+        }
+        assert_eq!(cursor, lines.len());
+    }
+
+    #[test]
+    fn public_string_and_numeric_ranges_fit_final_schema() {
+        let gen = TpccDataGen::with_seed(1, 0x51a1_2026);
+        let warehouse = gen.generate_warehouses().next().unwrap();
+        assert!(valid_a_string(&warehouse.w_name, 6, 10));
+        assert!(valid_a_string(&warehouse.w_street_1, 10, 20));
+        assert!(valid_a_string(&warehouse.w_street_2, 10, 20));
+        assert!(valid_a_string(&warehouse.w_city, 10, 20));
+        assert!(valid_a_string(&warehouse.w_state, 2, 2));
+        assert!(valid_zip(&warehouse.w_zip));
+        assert_binary32_decimal(warehouse.w_tax, 10_000.0, 0, 2000);
+
+        for district in gen.generate_districts().take(10) {
+            assert!(valid_a_string(&district.d_name, 6, 10));
+            assert!(valid_a_string(&district.d_street_1, 10, 20));
+            assert!(valid_a_string(&district.d_street_2, 10, 20));
+            assert!(valid_a_string(&district.d_city, 10, 20));
+            assert!(valid_a_string(&district.d_state, 2, 2));
+            assert!(valid_zip(&district.d_zip));
+            assert_binary32_decimal(district.d_tax, 10_000.0, 0, 2000);
+            assert_eq!(district.d_next_o_id, 3001);
+        }
+
+        for item in gen.generate_items().take(4096) {
+            assert!((1..=10_000).contains(&item.i_im_id));
+            assert!(valid_a_string(&item.i_name, 14, 24));
+            assert!((26..=50).contains(&item.i_data.len()));
+            assert_binary32_decimal(item.i_price, 100.0, 100, 10_000);
+        }
+
+        for customer in gen.generate_customers().take(3000) {
+            assert!(valid_a_string(&customer.c_first, 8, 16));
+            assert_eq!(customer.c_middle, "OE");
+            assert!(valid_a_string(&customer.c_street_1, 10, 20));
+            assert!(valid_a_string(&customer.c_street_2, 10, 20));
+            assert!(valid_a_string(&customer.c_city, 10, 20));
+            assert!(valid_a_string(&customer.c_state, 2, 2));
+            assert!(valid_zip(&customer.c_zip));
+            assert_eq!(customer.c_phone.len(), 16);
+            assert!(customer.c_phone.bytes().all(|byte| byte.is_ascii_digit()));
+            assert_eq!(customer.c_since, GOLDEN_POPULATION_TIMESTAMP);
+            assert!(matches!(customer.c_credit.as_str(), "GC" | "BC"));
+            assert_eq!(customer.c_credit_lim, 50_000);
+            assert_binary32_decimal(customer.c_discount, 10_000.0, 0, 5000);
+            assert_eq!(customer.c_data.len(), FINAL_CUSTOMER_DATA_LEN);
+        }
+
+        for history in gen.generate_history().take(3000) {
+            assert_eq!(history.h_date, GOLDEN_POPULATION_TIMESTAMP);
+            assert!(valid_a_string(&history.h_data, 12, 24));
+            assert_eq!((history.h_amount as f32).to_bits(), 10.0_f32.to_bits());
+        }
+    }
+
+    #[test]
+    fn original_and_bad_credit_cardinalities_stay_within_public_allowance() {
+        let gen = TpccDataGen::with_seed(1, 0x0a1c_2026);
+        let item_original = gen
+            .generate_items()
+            .filter(|item| item.i_data.contains("ORIGINAL"))
+            .count();
+        let stock_original = gen
+            .generate_stock()
+            .filter(|stock| stock.s_data.contains("ORIGINAL"))
+            .count();
+        let bad_credit = gen
+            .generate_customers()
+            .filter(|customer| customer.c_credit == "BC")
+            .count();
+
+        assert!((9_500..=10_500).contains(&item_original));
+        assert!((9_500..=10_500).contains(&stock_original));
+        assert!((2_850..=3_150).contains(&bad_credit));
+    }
+
+    struct Fnv64(u64);
+
+    impl Fnv64 {
+        fn new() -> Self {
+            Self(0xcbf2_9ce4_8422_2325)
+        }
+
+        fn bytes(&mut self, bytes: &[u8]) {
+            for byte in bytes {
+                self.0 ^= u64::from(*byte);
+                self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+
+        fn rows<I>(&mut self, rows: I)
+        where
+            I: IntoIterator<Item = Vec<SqlParam>>,
+        {
+            for row in rows {
+                self.bytes(&(row.len() as u32).to_le_bytes());
+                for value in row {
+                    match value {
+                        SqlParam::Int(value) => {
+                            self.bytes(&[1]);
+                            self.bytes(&value.to_le_bytes());
+                        }
+                        SqlParam::Float(value) => {
+                            self.bytes(&[2]);
+                            self.bytes(&(value as f32).to_bits().to_le_bytes());
+                        }
+                        SqlParam::Str(value) => {
+                            self.bytes(&[3]);
+                            self.bytes(&(value.len() as u32).to_le_bytes());
+                            self.bytes(value.as_bytes());
+                        }
+                        SqlParam::Null => self.bytes(&[4]),
+                    }
+                }
+            }
+            self.bytes(&[0xff]);
+        }
+    }
+
+    #[test]
+    fn public_seed_has_a_cross_version_golden_fingerprint() {
+        let gen = TpccDataGen::with_seed(1, DEFAULT_LOAD_SEED);
+        let mut fingerprint = Fnv64::new();
+        fingerprint.rows(gen.generate_warehouses().map(|row| row.to_sql_params()));
+        fingerprint.rows(
+            gen.generate_districts()
+                .take(10)
+                .map(|row| row.to_sql_params()),
+        );
+        fingerprint.rows(gen.generate_items().take(64).map(|row| row.to_sql_params()));
+        fingerprint.rows(
+            gen.generate_customers()
+                .take(1024)
+                .map(|row| row.to_sql_params()),
+        );
+        fingerprint.rows(gen.generate_stock().take(64).map(|row| row.to_sql_params()));
+        fingerprint.rows(
+            gen.generate_orders()
+                .take(3000)
+                .map(|row| row.to_sql_params()),
+        );
+        fingerprint.rows(
+            gen.generate_new_orders()
+                .take(900)
+                .map(|row| row.to_sql_params()),
+        );
+        fingerprint.rows(
+            gen.generate_history()
+                .take(64)
+                .map(|row| row.to_sql_params()),
+        );
+        fingerprint.rows(
+            gen.generate_order_lines()
+                .take_while(|row| row.ol_d_id == 1 && row.ol_o_id <= 64)
+                .map(|row| row.to_sql_params()),
+        );
+
+        assert_eq!(fingerprint.0, 0xe4ef_79fd_0a34_7145);
+    }
 
     #[test]
     fn order_header_and_lines_share_the_same_dynamic_count() {

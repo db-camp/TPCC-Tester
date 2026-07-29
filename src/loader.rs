@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs::{create_dir_all, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -78,8 +79,9 @@ impl<'a> Loader<'a> {
         );
         let gen = TpccDataGen::new(self.scale_factor);
         info!(
-            "[数据加载] 使用公开可配置本地 seed={} (RMDB_TPCC_SEED；非官方隐藏 seed)",
-            gen.load_seed()
+            "[数据加载] 使用公开可配置本地 seed={}、装载时间={} (RMDB_TPCC_SEED/RMDB_TPCC_LOAD_TIMESTAMP；非官方隐藏配置)",
+            gen.load_seed(),
+            gen.load_timestamp()
         );
         let default_csv_dir = std::env::temp_dir().join(format!(
             "rmdb-tpcc-sf{}-seed{}-pid{}",
@@ -207,6 +209,9 @@ impl<'a> Loader<'a> {
             gen.generate_stock().into_iter().map(|s| s.to_sql_params()),
         )
         .await?;
+        // Sum O_OL_CNT while the order CSV is already being streamed. This
+        // avoids a second 1.5-million-order shape traversal at final SF=50.
+        let expected_order_line_count = Cell::new(0_u64);
         self.write_and_load_table(
             csv_dir,
             load_dir,
@@ -221,7 +226,10 @@ impl<'a> Loader<'a> {
                 "o_ol_cnt",
                 "o_all_local",
             ],
-            gen.generate_orders().into_iter().map(|o| o.to_sql_params()),
+            gen.generate_orders().into_iter().map(|o| {
+                expected_order_line_count.set(expected_order_line_count.get() + o.o_ol_cnt as u64);
+                o.to_sql_params()
+            }),
         )
         .await?;
         self.write_and_load_table(
@@ -269,7 +277,7 @@ impl<'a> Loader<'a> {
                     .map(|ol| ol.to_sql_params()),
             )
             .await?;
-        let expected_order_line_count = gen.expected_order_line_count() as u64;
+        let expected_order_line_count = expected_order_line_count.get();
         if generated_order_line_count != expected_order_line_count {
             return Err(TpccError::QueryError(format!(
                 "order_line 生成计数不一致: generated={generated_order_line_count}, expected={expected_order_line_count}"
