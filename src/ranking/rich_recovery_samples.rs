@@ -1690,6 +1690,11 @@ impl RichRecoveryCollector {
                         .expect("preflight validated the new bad-credit data edge");
                         self.pending_customer_edges += state.pending.len();
                         assert!(self.customers.ensure(score, customer.key, || state));
+                    } else {
+                        self.customers.observe_rejected(RankedKey {
+                            score,
+                            key: customer.key,
+                        });
                     }
                     self.bad_credit_payments += 1;
                 }
@@ -2839,6 +2844,44 @@ mod tests {
             .collect()
     }
 
+    fn distinct_bad_credit_customers(count: usize) -> RichRecoveryCollector {
+        let ticket = local_payment_ticket();
+        let TransactionParameters::Payment(input) = ticket.parameters() else {
+            unreachable!();
+        };
+        let mut collector = collector();
+        for customer_id in 1..=count as i32 {
+            let mut evidence = payment_evidence(
+                &ticket,
+                true,
+                CustomerVersion {
+                    payment_count: CUSTOMER_INITIAL_PAYMENT_COUNT,
+                    delivery_count: CUSTOMER_INITIAL_DELIVERY_COUNT,
+                },
+                TEST_TIMESTAMP,
+                b"DISTINCT-BC",
+                b"old-data".to_vec(),
+            );
+            evidence.customer_id = customer_id;
+            evidence.customer_data_after = expected_bad_credit_data(
+                customer_id,
+                input.customer_district(),
+                input.customer_warehouse(),
+                ticket.route().home_district,
+                ticket.route().home_warehouse,
+                input.amount_cents(),
+                &evidence.customer_data_before,
+            );
+            collector
+                .offer_terminal(
+                    &ticket,
+                    &RankedTransactionOutcome::Committed(RankedCommit::Payment(evidence)),
+                )
+                .unwrap();
+        }
+        collector
+    }
+
     fn unrooted_customer_state(start: i32) -> CustomerDataState {
         let mut state = CustomerDataState::new(b"old-data".to_vec());
         state.update_count = 1;
@@ -3547,6 +3590,49 @@ mod tests {
         let history = build(0..3, RICH_HISTORY_SAMPLE_CAPACITY);
         assert_eq!(history.entries.len(), RICH_HISTORY_SAMPLE_CAPACITY);
         assert!(history.rejected.is_some());
+
+        let tied_score = SampleScore { high: 7, low: 11 };
+        let mut tied = RankedReservoir::new(2);
+        for key in [3, 1, 2] {
+            tied.ensure(tied_score, key, || key);
+        }
+        assert_eq!(
+            tied.entries
+                .keys()
+                .map(|ranked| ranked.key)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(tied.rejected.as_ref().unwrap().key, 3);
+    }
+
+    #[test]
+    fn real_bad_credit_cutoff_seals_at_k_and_k_plus_one() {
+        let exact = distinct_bad_credit_customers(RICH_RECOVERY_SAMPLE_CAPACITY)
+            .seal(&empty_intervals())
+            .unwrap();
+        assert_eq!(
+            exact.bad_credit_payment_count(),
+            RICH_RECOVERY_SAMPLE_CAPACITY as u64
+        );
+        assert_eq!(
+            exact.bad_credit_customers().len(),
+            RICH_RECOVERY_SAMPLE_CAPACITY
+        );
+        assert!(exact.bad_customer_rejected_witness().is_none());
+
+        let sealed = distinct_bad_credit_customers(RICH_RECOVERY_SAMPLE_CAPACITY + 1)
+            .seal(&empty_intervals())
+            .unwrap();
+        assert_eq!(
+            sealed.bad_credit_payment_count(),
+            (RICH_RECOVERY_SAMPLE_CAPACITY + 1) as u64
+        );
+        assert_eq!(
+            sealed.bad_credit_customers().len(),
+            RICH_RECOVERY_SAMPLE_CAPACITY
+        );
+        assert!(sealed.bad_customer_rejected_witness().is_some());
     }
 
     #[test]
