@@ -700,10 +700,10 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         let worker_index = self.worker_index(reservation.worker)?;
         let now = self.observe_now()?;
         self.sync_to(now)?;
-        self.ensure_running()?;
         if now >= reservation.phase_deadline {
             return Err(SchedulerError::ReservationDeadlinePassed);
         }
+        self.ensure_running()?;
 
         let worker_state = &mut self.workers[worker_index];
         match worker_state.selection {
@@ -737,10 +737,10 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         let worker_index = self.worker_index(ticket.worker())?;
         let now = self.observe_now()?;
         self.sync_to(now)?;
-        self.ensure_running()?;
         if now >= ticket.phase_deadline() {
             return Err(SchedulerError::RetryDeadlinePassed);
         }
+        self.ensure_running()?;
 
         let worker_state = &mut self.workers[worker_index];
         match worker_state.selection {
@@ -1650,6 +1650,36 @@ mod tests {
         assert_eq!(scheduler.windows()[0].attempted, 0);
         let next = start_payment(&mut scheduler, worker, 61);
         assert_eq!((next.phase(), next.txn_no()), (PhaseId::FormalWindow(1), 0));
+    }
+
+    #[test]
+    fn final_deadline_reports_normal_reservation_and_retry_cutoffs() {
+        let (clock, mut scheduler) = ready_scheduler(Duration::from_secs(5));
+        scheduler.start().unwrap();
+        let final_deadline = Duration::from_secs(30 + 3 * 150);
+        let worker = WorkerId::new(6).unwrap();
+
+        clock.set(final_deadline - Duration::from_millis(1));
+        let reservation = scheduler.reserve_transaction(worker).unwrap();
+        let identity = TransactionIdentity::new(TransactionType::Payment, 1, 60, false).unwrap();
+        clock.set(final_deadline);
+        assert_eq!(
+            scheduler.start_transaction(reservation, identity),
+            Err(SchedulerError::ReservationDeadlinePassed)
+        );
+
+        let (retry_clock, mut retry_scheduler) = ready_scheduler(Duration::from_secs(5));
+        retry_scheduler.start().unwrap();
+        retry_clock.set(final_deadline - Duration::from_millis(1));
+        let ticket = start_payment(&mut retry_scheduler, worker, 61);
+        retry_scheduler
+            .finish_attempt(ticket, AttemptOutcome::RetryableAbort)
+            .unwrap();
+        retry_clock.set(final_deadline);
+        assert_eq!(
+            retry_scheduler.start_retry(ticket),
+            Err(SchedulerError::RetryDeadlinePassed)
+        );
     }
 
     #[test]
