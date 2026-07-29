@@ -10,7 +10,9 @@ use crate::connection::wire::{
     Column, FoldStreamResponse, SqlType, WireError, WireResult, WireValue,
 };
 use crate::error::TpccError;
-use crate::ranking::rich_recovery_samples::{SealedNewOrderSample, SealedRichRecoverySamples};
+use crate::ranking::rich_recovery_samples::{
+    SealedDeliverySample, SealedNewOrderSample, SealedRichRecoverySamples,
+};
 use crate::runtime_schema::RuntimeSchema;
 
 const MAX_EXACT_POINT_ROWS: usize = 15;
@@ -357,6 +359,160 @@ fn new_order_point_queries(
     Ok(vec![order, queue, lines])
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct DeliveryLineExpected {
+    number: i32,
+    delivery_timestamp: Vec<u8>,
+    amount_bits: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DeliveryExpected {
+    warehouse_id: i32,
+    district_id: i32,
+    order_id: i32,
+    customer_id: i32,
+    carrier_id: i32,
+    queue_present: bool,
+    delivery_timestamp: Vec<u8>,
+    lines: Vec<DeliveryLineExpected>,
+}
+
+impl DeliveryExpected {
+    fn from_sealed(sample: &SealedDeliverySample, ordinal: usize) -> Result<Self, TpccError> {
+        let scope = QueryScope::new(SampleDomain::Delivery, ordinal);
+        let key = sample.key();
+        let delivery_timestamp = sample.delivery_timestamp().to_vec();
+        let lines = sample
+            .lines()
+            .iter()
+            .map(|line| {
+                if line.delivery_timestamp() != delivery_timestamp {
+                    return Err(TpccError::Protocol(
+                        scope.message("has invalid sealed evidence"),
+                    ));
+                }
+                Ok(DeliveryLineExpected {
+                    number: i32::from(line.number()),
+                    delivery_timestamp: line.delivery_timestamp().to_vec(),
+                    amount_bits: line.amount_bits(),
+                })
+            })
+            .collect::<Result<Vec<_>, TpccError>>()?;
+        if sample.queue_present() || lines.is_empty() || lines.len() > MAX_EXACT_POINT_ROWS {
+            return Err(TpccError::Protocol(
+                scope.message("has invalid sealed evidence"),
+            ));
+        }
+        Ok(Self {
+            warehouse_id: i32::from(key.warehouse_id()),
+            district_id: i32::from(key.district_id()),
+            order_id: key.order_id(),
+            customer_id: sample.customer_id(),
+            carrier_id: i32::from(sample.carrier_id()),
+            queue_present: sample.queue_present(),
+            delivery_timestamp,
+            lines,
+        })
+    }
+}
+
+async fn check_delivery_samples(
+    client: &mut RmdbClient,
+    schema: &RuntimeSchema,
+    rich: &SealedRichRecoverySamples,
+) -> Result<(), TpccError> {
+    require_nonempty_samples(
+        SampleDomain::Delivery,
+        rich.delivered_order_count(),
+        rich.deliveries().len(),
+    )?;
+    for (sample_index, sample) in rich.deliveries().iter().enumerate() {
+        let base_ordinal = checked_query_ordinal(SampleDomain::Delivery, sample_index, 3)?;
+        let expected = DeliveryExpected::from_sealed(sample, base_ordinal)?;
+        for query in delivery_point_queries(&expected, base_ordinal)? {
+            execute_exact_point_query(client, schema, query).await?;
+        }
+    }
+    Ok(())
+}
+
+fn delivery_point_queries(
+    sample: &DeliveryExpected,
+    base_ordinal: usize,
+) -> Result<Vec<ExpectedPointQuery>, TpccError> {
+    let orders_scope = QueryScope::new(SampleDomain::Delivery, base_ordinal);
+    let queue_scope = QueryScope::new(SampleDomain::Delivery, base_ordinal + 1);
+    let lines_scope = QueryScope::new(SampleDomain::Delivery, base_ordinal + 2);
+    if sample.queue_present
+        || sample.lines.is_empty()
+        || sample
+            .lines
+            .iter()
+            .any(|line| line.delivery_timestamp != sample.delivery_timestamp)
+    {
+        return Err(TpccError::Protocol(
+            orders_scope.message("has invalid sealed evidence"),
+        ));
+    }
+    let order = ExpectedPointQuery::new(
+        orders_scope,
+        format!(
+            "SELECT orders.o_id, orders.o_d_id, orders.o_w_id, orders.o_c_id, orders.o_carrier_id, orders.o_ol_cnt FROM orders WHERE orders.o_w_id = {} AND orders.o_d_id = {} AND orders.o_id = {}",
+            sample.warehouse_id, sample.district_id, sample.order_id
+        ),
+        vec![SqlType::Int32; 6],
+        vec![vec![
+            WireValue::Int32(sample.order_id),
+            WireValue::Int32(sample.district_id),
+            WireValue::Int32(sample.warehouse_id),
+            WireValue::Int32(sample.customer_id),
+            WireValue::Int32(sample.carrier_id),
+            WireValue::Int32(sample.lines.len() as i32),
+        ]],
+    )?;
+    let queue = ExpectedPointQuery::new(
+        queue_scope,
+        format!(
+            "SELECT new_orders.no_o_id, new_orders.no_d_id, new_orders.no_w_id FROM new_orders WHERE new_orders.no_w_id = {} AND new_orders.no_d_id = {} AND new_orders.no_o_id = {}",
+            sample.warehouse_id, sample.district_id, sample.order_id
+        ),
+        vec![SqlType::Int32, SqlType::Int32, SqlType::Int32],
+        Vec::new(),
+    )?;
+    let line_rows = sample
+        .lines
+        .iter()
+        .map(|line| {
+            vec![
+                WireValue::Int32(sample.order_id),
+                WireValue::Int32(sample.district_id),
+                WireValue::Int32(sample.warehouse_id),
+                WireValue::Int32(line.number),
+                WireValue::Char(line.delivery_timestamp.clone()),
+                WireValue::Float32(line.amount_bits),
+            ]
+        })
+        .collect();
+    let lines = ExpectedPointQuery::new(
+        lines_scope,
+        format!(
+            "SELECT order_line.ol_o_id, order_line.ol_d_id, order_line.ol_w_id, order_line.ol_number, order_line.ol_delivery_d, order_line.ol_amount FROM order_line WHERE order_line.ol_w_id = {} AND order_line.ol_d_id = {} AND order_line.ol_o_id = {}",
+            sample.warehouse_id, sample.district_id, sample.order_id
+        ),
+        vec![
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Char,
+            SqlType::Float32,
+        ],
+        line_rows,
+    )?;
+    Ok(vec![order, queue, lines])
+}
+
 async fn execute_exact_point_query(
     client: &mut RmdbClient,
     schema: &RuntimeSchema,
@@ -544,6 +700,30 @@ mod tests {
                     quantity: 6,
                     amount_bits: 0x3f80_0001,
                     district_info: b"abcdefghijklmnopqrstuvwx".to_vec(),
+                },
+            ],
+        }
+    }
+
+    fn delivery_expected() -> DeliveryExpected {
+        DeliveryExpected {
+            warehouse_id: 4,
+            district_id: 8,
+            order_id: 3_777,
+            customer_id: 812,
+            carrier_id: 9,
+            queue_present: false,
+            delivery_timestamp: b"2026-07-29 13:14:15".to_vec(),
+            lines: vec![
+                DeliveryLineExpected {
+                    number: 1,
+                    delivery_timestamp: b"2026-07-29 13:14:15".to_vec(),
+                    amount_bits: 0x4120_0001,
+                },
+                DeliveryLineExpected {
+                    number: 2,
+                    delivery_timestamp: b"2026-07-29 13:14:15".to_vec(),
+                    amount_bits: (-0.0_f32).to_bits(),
                 },
             ],
         }
@@ -781,5 +961,75 @@ mod tests {
             checked_query_ordinal(SampleDomain::NewOrder, 2, 3).unwrap(),
             7
         );
+    }
+
+    #[test]
+    fn delivery_queries_require_final_order_queue_and_line_state() {
+        let expected = delivery_expected();
+        let queries = delivery_point_queries(&expected, 20).unwrap();
+        assert_eq!(queries.len(), 3);
+        assert_eq!(queries[0].column_types, vec![SqlType::Int32; 6]);
+        assert_eq!(
+            queries[0].expected_rows,
+            vec![vec![
+                WireValue::Int32(3_777),
+                WireValue::Int32(8),
+                WireValue::Int32(4),
+                WireValue::Int32(812),
+                WireValue::Int32(9),
+                WireValue::Int32(2),
+            ]]
+        );
+        assert!(queries[1].expected_rows.is_empty());
+        assert_eq!(queries[2].expected_rows.len(), 2);
+        assert_eq!(
+            queries[2].expected_rows[0][4],
+            WireValue::Char(b"2026-07-29 13:14:15".to_vec())
+        );
+        assert_eq!(
+            queries[2].expected_rows[0][5],
+            WireValue::Float32(0x4120_0001)
+        );
+        assert_eq!(
+            queries[2].expected_rows[1][5],
+            WireValue::Float32((-0.0_f32).to_bits())
+        );
+    }
+
+    #[test]
+    fn delivery_query_builder_rejects_queue_or_timestamp_regression() {
+        let mut queued = delivery_expected();
+        queued.queue_present = true;
+        assert!(delivery_point_queries(&queued, 1).is_err());
+
+        let mut stale_line = delivery_expected();
+        stale_line.lines[0].delivery_timestamp = b"2026-07-29 00:00:00".to_vec();
+        assert!(delivery_point_queries(&stale_line, 1).is_err());
+    }
+
+    #[test]
+    fn delivery_queries_are_opaque_and_and_only_points() {
+        let schema = RuntimeSchema::opaque(0xabcd).unwrap();
+        let queries = delivery_point_queries(&delivery_expected(), 1).unwrap();
+        for query in queries {
+            let rendered =
+                render_and_only_point_sql(&schema, query.scope, &query.logical_sql).unwrap();
+            for logical in [
+                "orders",
+                "new_orders",
+                "order_line",
+                "o_carrier_id",
+                "no_o_id",
+                "ol_delivery_d",
+            ] {
+                assert!(!rendered
+                    .split(|character: char| {
+                        !(character.is_ascii_alphanumeric() || character == '_')
+                    })
+                    .any(|token| token == logical));
+            }
+        }
+        assert!(require_nonempty_samples(SampleDomain::Delivery, 0, 0).is_err());
+        assert!(require_nonempty_samples(SampleDomain::Delivery, 1, 1).is_ok());
     }
 }
