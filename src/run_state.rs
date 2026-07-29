@@ -4,22 +4,210 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::consistency::{FloatAggregateId, NonNegativeF32Accumulator, FLOAT_AGGREGATES};
 use crate::loader::{LoadSummary, PartitionLoadSummary};
+use crate::profile::{
+    MEASUREMENT_SECONDS, MEASUREMENT_WINDOWS, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES, WARMUP_SECONDS,
+};
 use crate::ranking::ledger::RunLedger;
 
 const STATE_VERSION: u32 = 2;
 const DATASET_FILE: &str = "dataset.state";
 const MAX_DATASET_STATE_BYTES: usize = 256 * 1024;
 const ARTIFACT_VERSION: u32 = 1;
+const RUN_CONTRACT_ARTIFACT: &str = "run_contract";
+const RUN_CONTRACT_FILE: &str = "run_contract.state";
+const SETUP_CLAIM_ARTIFACT: &str = "setup_check_claim";
+const SETUP_CLAIM_FILE: &str = "setup_check.started";
+const SETUP_RECEIPT_ARTIFACT: &str = "setup_check_receipt";
+const SETUP_RECEIPT_FILE: &str = "setup_check.passed";
+const RANK_CLAIM_ARTIFACT: &str = "rank_claim";
+const RANK_CLAIM_FILE: &str = "rank.started";
+const RANKED_LEDGER_ARTIFACT: &str = "ranked_run_ledger";
+const NON_RANKED_LEDGER_ARTIFACT: &str = "non_ranked_run_ledger";
 const LEDGER_ARTIFACT: &str = "run_ledger";
 const LEDGER_FILE: &str = "run_ledger.state";
+const ONLINE_CLAIM_ARTIFACT: &str = "online_check_claim";
+const ONLINE_CLAIM_FILE: &str = "online_check.started";
 const FLOAT_BASELINE_ARTIFACT: &str = "float_baseline";
 const FLOAT_BASELINE_FILE: &str = "float_baseline.state";
+const RECOVERY_CLAIM_ARTIFACT: &str = "recovery_check_claim";
+const RECOVERY_CLAIM_FILE: &str = "recovery_check.started";
+const RECOVERY_RECEIPT_ARTIFACT: &str = "recovery_check_receipt";
+const RECOVERY_RECEIPT_FILE: &str = "recovery_check.passed";
+const DIAGNOSTIC_WARMUP_CLAIM_ARTIFACT: &str = "diagnostic_warmup_claim";
+const DIAGNOSTIC_WARMUP_CLAIM_FILE: &str = "diagnostic_warmup.started";
+const DIAGNOSTIC_WARMUP_RECEIPT_ARTIFACT: &str = "diagnostic_warmup_receipt";
+const DIAGNOSTIC_WARMUP_RECEIPT_FILE: &str = "diagnostic_warmup.passed";
+const DIAGNOSTIC_OBSERVATION_CLAIM_ARTIFACT: &str = "diagnostic_observation_claim";
+const DIAGNOSTIC_OBSERVATION_CLAIM_FILE: &str = "diagnostic_observation.started";
+const DIAGNOSTIC_OBSERVATION_RECEIPT_ARTIFACT: &str = "diagnostic_observation_receipt";
+const DIAGNOSTIC_OBSERVATION_RECEIPT_FILE: &str = "diagnostic_observation.passed";
 const MAX_ARTIFACT_HEADER_BYTES: u64 = 4 * 1024;
 const MAX_LEDGER_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FLOAT_BASELINE_PAYLOAD_BYTES: usize = 4 * 1024;
+const MAX_CONTRACT_PAYLOAD_BYTES: usize = 4 * 1024;
+const MAX_MARKER_PAYLOAD_BYTES: usize = 256;
+static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunConformance {
+    PublicSpecAligned,
+    NonRankedDeviation,
+}
+
+impl RunConformance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PublicSpecAligned => "public_spec_aligned",
+            Self::NonRankedDeviation => "non_ranked_deviation",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StateError> {
+        match value {
+            "public_spec_aligned" => Ok(Self::PublicSpecAligned),
+            "non_ranked_deviation" => Ok(Self::NonRankedDeviation),
+            _ => Err(StateError::Invalid(format!(
+                "unknown run conformance {value:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunContract {
+    pub warehouses: u16,
+    pub clients: u16,
+    pub warmup_seconds: u64,
+    pub measurement_windows: u8,
+    pub window_seconds: u64,
+    pub response_timeout_seconds: u64,
+    pub phase_tail_grace_seconds: u64,
+    pub conformance: RunConformance,
+}
+
+impl RunContract {
+    fn validate(&self, dataset: &DatasetState) -> Result<(), StateError> {
+        if i32::from(self.warehouses) != dataset.warehouses {
+            return Err(StateError::Invalid(
+                "run contract warehouses do not match dataset.state".to_owned(),
+            ));
+        }
+        if self.warehouses == 0
+            || self.clients == 0
+            || self.measurement_windows == 0
+            || self.window_seconds == 0
+            || self.response_timeout_seconds == 0
+            || self.phase_tail_grace_seconds == 0
+        {
+            return Err(StateError::Invalid(
+                "run contract dimensions and positive durations must be non-zero".to_owned(),
+            ));
+        }
+        let public_shape = self.warehouses == OFFICIAL_WAREHOUSES
+            && self.clients == OFFICIAL_CLIENTS
+            && self.warmup_seconds == WARMUP_SECONDS
+            && self.measurement_windows == MEASUREMENT_WINDOWS
+            && self.window_seconds == MEASUREMENT_SECONDS;
+        if (self.conformance == RunConformance::PublicSpecAligned) != public_shape {
+            return Err(StateError::Invalid(
+                "run contract conformance does not match its published profile dimensions"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> String {
+        format!(
+            "contract_version=1\nwarehouses={}\nclients={}\nwarmup_seconds={}\nmeasurement_windows={}\nwindow_seconds={}\nresponse_timeout_seconds={}\nphase_tail_grace_seconds={}\nconformance={}\n",
+            self.warehouses,
+            self.clients,
+            self.warmup_seconds,
+            self.measurement_windows,
+            self.window_seconds,
+            self.response_timeout_seconds,
+            self.phase_tail_grace_seconds,
+            self.conformance.as_str()
+        )
+    }
+
+    fn decode(input: &str) -> Result<Self, StateError> {
+        let mut lines = input.lines();
+        expect_exact(&mut lines, "contract_version", 1_u32)?;
+        let contract = Self {
+            warehouses: parse(value(&mut lines, "warehouses")?, "contract warehouses")?,
+            clients: parse(value(&mut lines, "clients")?, "contract clients")?,
+            warmup_seconds: parse(
+                value(&mut lines, "warmup_seconds")?,
+                "contract warmup seconds",
+            )?,
+            measurement_windows: parse(
+                value(&mut lines, "measurement_windows")?,
+                "contract measurement windows",
+            )?,
+            window_seconds: parse(
+                value(&mut lines, "window_seconds")?,
+                "contract window seconds",
+            )?,
+            response_timeout_seconds: parse(
+                value(&mut lines, "response_timeout_seconds")?,
+                "contract response timeout",
+            )?,
+            phase_tail_grace_seconds: parse(
+                value(&mut lines, "phase_tail_grace_seconds")?,
+                "contract phase tail grace",
+            )?,
+            conformance: RunConformance::parse(value(&mut lines, "conformance")?)?,
+        };
+        if lines.next().is_some() {
+            return Err(StateError::Invalid(
+                "run contract contains trailing fields".to_owned(),
+            ));
+        }
+        Ok(contract)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticStage {
+    Warmup,
+    Observation,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClaimToken {
+    contract_checksum: u64,
+    claim_checksum: u64,
+    predecessor_checksum: u64,
+}
+
+#[derive(Debug)]
+pub struct SetupCheckClaim(ClaimToken);
+
+#[derive(Debug)]
+pub struct RankClaim(ClaimToken);
+
+#[derive(Debug)]
+pub struct OnlineCheckClaim {
+    token: ClaimToken,
+    ledger_checksum: u64,
+}
+
+#[derive(Debug)]
+pub struct RecoveryCheckClaim {
+    token: ClaimToken,
+    baseline_checksum: u64,
+}
+
+#[derive(Debug)]
+pub struct DiagnosticClaim {
+    token: ClaimToken,
+    stage: DiagnosticStage,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatasetState {
@@ -234,6 +422,361 @@ impl StateStore {
         })
     }
 
+    pub fn open_existing(root: &Path) -> Result<Self, StateError> {
+        let metadata = fs::symlink_metadata(root).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                StateError::Invalid(format!(
+                    "state directory does not exist: {}",
+                    root.display()
+                ))
+            } else {
+                StateError::Io(error)
+            }
+        })?;
+        validate_real_directory(root, &metadata)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
+    }
+
+    pub fn initialize_run(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<(), StateError> {
+        dataset.validate()?;
+        contract.validate(dataset)?;
+        self.save_dataset(dataset)?;
+        let encoded = encode_artifact(
+            RUN_CONTRACT_ARTIFACT,
+            dataset,
+            &contract.encode(),
+            MAX_CONTRACT_PAYLOAD_BYTES,
+        )?;
+        atomic_publish_new(&self.root, RUN_CONTRACT_FILE, encoded.as_bytes())
+    }
+
+    pub fn load_bound_dataset(&self, expected: &RunContract) -> Result<DatasetState, StateError> {
+        let dataset = self.load_dataset()?;
+        self.contract_checksum(&dataset, expected)?;
+        Ok(dataset)
+    }
+
+    pub fn begin_setup_check(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<SetupCheckClaim, StateError> {
+        self.ensure_no_diagnostic_drift()?;
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        let claim_checksum = self.publish_marker(
+            SETUP_CLAIM_FILE,
+            SETUP_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            contract_checksum,
+        )?;
+        Ok(SetupCheckClaim(ClaimToken {
+            contract_checksum,
+            claim_checksum,
+            predecessor_checksum: contract_checksum,
+        }))
+    }
+
+    pub fn complete_setup_check(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: SetupCheckClaim,
+    ) -> Result<(), StateError> {
+        self.validate_claim(
+            dataset,
+            contract,
+            claim.0,
+            SETUP_CLAIM_FILE,
+            SETUP_CLAIM_ARTIFACT,
+        )?;
+        self.publish_marker(
+            SETUP_RECEIPT_FILE,
+            SETUP_RECEIPT_ARTIFACT,
+            dataset,
+            claim.0.contract_checksum,
+            claim.0.claim_checksum,
+        )?;
+        Ok(())
+    }
+
+    pub fn begin_rank(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<RankClaim, StateError> {
+        self.ensure_no_diagnostic_drift()?;
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        let setup_claim = self.load_marker(
+            SETUP_CLAIM_FILE,
+            SETUP_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            contract_checksum,
+        )?;
+        let setup_receipt = self.load_marker(
+            SETUP_RECEIPT_FILE,
+            SETUP_RECEIPT_ARTIFACT,
+            dataset,
+            contract_checksum,
+            setup_claim,
+        )?;
+        let claim_checksum = self.publish_marker(
+            RANK_CLAIM_FILE,
+            RANK_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            setup_receipt,
+        )?;
+        Ok(RankClaim(ClaimToken {
+            contract_checksum,
+            claim_checksum,
+            predecessor_checksum: setup_receipt,
+        }))
+    }
+
+    pub fn complete_rank(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: RankClaim,
+        ledger: &RunLedger,
+    ) -> Result<(), StateError> {
+        self.validate_claim(
+            dataset,
+            contract,
+            claim.0,
+            RANK_CLAIM_FILE,
+            RANK_CLAIM_ARTIFACT,
+        )?;
+        let payload = encode_bound_payload(
+            claim.0.contract_checksum,
+            claim.0.claim_checksum,
+            &ledger.encode(),
+        );
+        let artifact = ledger_artifact(contract.conformance);
+        let encoded = encode_artifact(artifact, dataset, &payload, MAX_LEDGER_PAYLOAD_BYTES)?;
+        atomic_publish_new(&self.root, LEDGER_FILE, encoded.as_bytes())
+    }
+
+    pub fn begin_online_check(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<(OnlineCheckClaim, RunLedger), StateError> {
+        self.ensure_no_diagnostic_drift()?;
+        let (contract_checksum, _, ledger, ledger_checksum) =
+            self.load_bound_ledger(dataset, contract)?;
+        let claim_checksum = self.publish_marker(
+            ONLINE_CLAIM_FILE,
+            ONLINE_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            ledger_checksum,
+        )?;
+        Ok((
+            OnlineCheckClaim {
+                token: ClaimToken {
+                    contract_checksum,
+                    claim_checksum,
+                    predecessor_checksum: ledger_checksum,
+                },
+                ledger_checksum,
+            },
+            ledger,
+        ))
+    }
+
+    pub fn complete_online_check(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: OnlineCheckClaim,
+        values: &BTreeMap<FloatAggregateId, u32>,
+    ) -> Result<(), StateError> {
+        self.validate_claim(
+            dataset,
+            contract,
+            claim.token,
+            ONLINE_CLAIM_FILE,
+            ONLINE_CLAIM_ARTIFACT,
+        )?;
+        let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
+        if ledger_checksum != claim.ledger_checksum {
+            return Err(StateError::Invalid(
+                "online claim belongs to a different run ledger".to_owned(),
+            ));
+        }
+        let baseline = encode_float_baseline(values, ledger_checksum)?;
+        let payload = encode_bound_payload(
+            claim.token.contract_checksum,
+            claim.token.claim_checksum,
+            &baseline,
+        );
+        let encoded = encode_artifact(
+            FLOAT_BASELINE_ARTIFACT,
+            dataset,
+            &payload,
+            MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
+        )?;
+        atomic_publish_new(&self.root, FLOAT_BASELINE_FILE, encoded.as_bytes())
+    }
+
+    pub fn begin_recovery_check(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<
+        (
+            RecoveryCheckClaim,
+            RunLedger,
+            BTreeMap<FloatAggregateId, u32>,
+        ),
+        StateError,
+    > {
+        self.ensure_no_diagnostic_drift()?;
+        let (contract_checksum, _, ledger, ledger_checksum) =
+            self.load_bound_ledger(dataset, contract)?;
+        let (baseline, baseline_checksum) =
+            self.load_bound_baseline(dataset, contract, contract_checksum, ledger_checksum)?;
+        let claim_checksum = self.publish_marker(
+            RECOVERY_CLAIM_FILE,
+            RECOVERY_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            baseline_checksum,
+        )?;
+        Ok((
+            RecoveryCheckClaim {
+                token: ClaimToken {
+                    contract_checksum,
+                    claim_checksum,
+                    predecessor_checksum: baseline_checksum,
+                },
+                baseline_checksum,
+            },
+            ledger,
+            baseline,
+        ))
+    }
+
+    pub fn complete_recovery_check(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: RecoveryCheckClaim,
+    ) -> Result<(), StateError> {
+        self.validate_claim(
+            dataset,
+            contract,
+            claim.token,
+            RECOVERY_CLAIM_FILE,
+            RECOVERY_CLAIM_ARTIFACT,
+        )?;
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
+        let (_, baseline_checksum) =
+            self.load_bound_baseline(dataset, contract, contract_checksum, ledger_checksum)?;
+        if baseline_checksum != claim.baseline_checksum {
+            return Err(StateError::Invalid(
+                "recovery claim belongs to a different FLOAT baseline".to_owned(),
+            ));
+        }
+        self.publish_marker(
+            RECOVERY_RECEIPT_FILE,
+            RECOVERY_RECEIPT_ARTIFACT,
+            dataset,
+            claim.token.contract_checksum,
+            claim.token.claim_checksum,
+        )?;
+        Ok(())
+    }
+
+    pub fn begin_diagnostic(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        stage: DiagnosticStage,
+    ) -> Result<DiagnosticClaim, StateError> {
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        let predecessor_checksum = match stage {
+            DiagnosticStage::Warmup => {
+                let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
+                let (_, baseline_checksum) = self.load_bound_baseline(
+                    dataset,
+                    contract,
+                    contract_checksum,
+                    ledger_checksum,
+                )?;
+                let recovery_claim = self.load_marker(
+                    RECOVERY_CLAIM_FILE,
+                    RECOVERY_CLAIM_ARTIFACT,
+                    dataset,
+                    contract_checksum,
+                    baseline_checksum,
+                )?;
+                self.load_marker(
+                    RECOVERY_RECEIPT_FILE,
+                    RECOVERY_RECEIPT_ARTIFACT,
+                    dataset,
+                    contract_checksum,
+                    recovery_claim,
+                )?
+            }
+            DiagnosticStage::Observation => {
+                let warmup_claim = self.load_diagnostic_warmup_claim(dataset, contract)?;
+                self.load_marker(
+                    DIAGNOSTIC_WARMUP_RECEIPT_FILE,
+                    DIAGNOSTIC_WARMUP_RECEIPT_ARTIFACT,
+                    dataset,
+                    contract_checksum,
+                    warmup_claim,
+                )?
+            }
+        };
+        let (file, artifact) = diagnostic_claim_spec(stage);
+        let claim_checksum = self.publish_marker(
+            file,
+            artifact,
+            dataset,
+            contract_checksum,
+            predecessor_checksum,
+        )?;
+        Ok(DiagnosticClaim {
+            token: ClaimToken {
+                contract_checksum,
+                claim_checksum,
+                predecessor_checksum,
+            },
+            stage,
+        })
+    }
+
+    pub fn complete_diagnostic(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: DiagnosticClaim,
+    ) -> Result<(), StateError> {
+        let (claim_file, claim_artifact) = diagnostic_claim_spec(claim.stage);
+        self.validate_claim(dataset, contract, claim.token, claim_file, claim_artifact)?;
+        let (receipt_file, receipt_artifact) = diagnostic_receipt_spec(claim.stage);
+        self.publish_marker(
+            receipt_file,
+            receipt_artifact,
+            dataset,
+            claim.token.contract_checksum,
+            claim.token.claim_checksum,
+        )?;
+        Ok(())
+    }
+
     pub fn save_dataset(&self, state: &DatasetState) -> Result<(), StateError> {
         state.validate()?;
         let encoded = state.encode();
@@ -242,7 +785,7 @@ impl StateStore {
                 "dataset state exceeds {MAX_DATASET_STATE_BYTES} bytes"
             )));
         }
-        atomic_write(&self.root, DATASET_FILE, encoded.as_bytes())
+        atomic_publish_new(&self.root, DATASET_FILE, encoded.as_bytes())
     }
 
     pub fn load_dataset(&self) -> Result<DatasetState, StateError> {
@@ -262,7 +805,7 @@ impl StateStore {
         let payload = ledger.encode();
         let encoded =
             encode_artifact(LEDGER_ARTIFACT, dataset, &payload, MAX_LEDGER_PAYLOAD_BYTES)?;
-        atomic_write(&self.root, LEDGER_FILE, encoded.as_bytes())
+        atomic_publish_new(&self.root, LEDGER_FILE, encoded.as_bytes())
     }
 
     pub fn load_ledger(&self, dataset: &DatasetState) -> Result<RunLedger, StateError> {
@@ -290,7 +833,7 @@ impl StateStore {
             &payload,
             MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
         )?;
-        atomic_write(&self.root, FLOAT_BASELINE_FILE, encoded.as_bytes())
+        atomic_publish_new(&self.root, FLOAT_BASELINE_FILE, encoded.as_bytes())
     }
 
     pub fn load_float_baseline(
@@ -323,6 +866,236 @@ impl StateStore {
             dataset,
             MAX_LEDGER_PAYLOAD_BYTES,
         )
+    }
+
+    fn contract_checksum(
+        &self,
+        dataset: &DatasetState,
+        expected: &RunContract,
+    ) -> Result<u64, StateError> {
+        dataset.validate()?;
+        expected.validate(dataset)?;
+        let input = read_limited(
+            &self.root.join(RUN_CONTRACT_FILE),
+            MAX_CONTRACT_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+        )?;
+        let (payload, checksum) = decode_artifact_and_checksum(
+            &input,
+            RUN_CONTRACT_ARTIFACT,
+            dataset,
+            MAX_CONTRACT_PAYLOAD_BYTES,
+        )?;
+        let actual = RunContract::decode(payload)?;
+        actual.validate(dataset)?;
+        if actual != *expected {
+            return Err(StateError::Invalid(format!(
+                "run contract mismatch: stored={actual:?}, requested={expected:?}"
+            )));
+        }
+        Ok(checksum)
+    }
+
+    fn publish_marker(
+        &self,
+        file: &str,
+        artifact: &str,
+        dataset: &DatasetState,
+        contract_checksum: u64,
+        predecessor_checksum: u64,
+    ) -> Result<u64, StateError> {
+        let payload = encode_bound_payload(contract_checksum, predecessor_checksum, "");
+        let encoded = encode_artifact(artifact, dataset, &payload, MAX_MARKER_PAYLOAD_BYTES)?;
+        atomic_publish_new(&self.root, file, encoded.as_bytes())?;
+        read_artifact_header_checksum(
+            &self.root.join(file),
+            artifact,
+            dataset,
+            MAX_MARKER_PAYLOAD_BYTES,
+        )
+    }
+
+    fn load_marker(
+        &self,
+        file: &str,
+        artifact: &str,
+        dataset: &DatasetState,
+        contract_checksum: u64,
+        predecessor_checksum: u64,
+    ) -> Result<u64, StateError> {
+        let input = read_limited(
+            &self.root.join(file),
+            MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+        )?;
+        let (payload, checksum) =
+            decode_artifact_and_checksum(&input, artifact, dataset, MAX_MARKER_PAYLOAD_BYTES)?;
+        let inner =
+            decode_bound_payload(payload, contract_checksum, predecessor_checksum, artifact)?;
+        if !inner.is_empty() {
+            return Err(StateError::Invalid(format!(
+                "{artifact} marker payload must be empty"
+            )));
+        }
+        Ok(checksum)
+    }
+
+    fn validate_claim(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: ClaimToken,
+        file: &str,
+        artifact: &str,
+    ) -> Result<(), StateError> {
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        if contract_checksum != claim.contract_checksum {
+            return Err(StateError::Invalid(
+                "phase claim belongs to a different run contract".to_owned(),
+            ));
+        }
+        let checksum = self.load_marker(
+            file,
+            artifact,
+            dataset,
+            contract_checksum,
+            claim.predecessor_checksum,
+        )?;
+        if checksum != claim.claim_checksum {
+            return Err(StateError::Invalid(
+                "phase claim checksum changed after it was issued".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_rank_claim(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<(u64, u64), StateError> {
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        let setup_claim = self.load_marker(
+            SETUP_CLAIM_FILE,
+            SETUP_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            contract_checksum,
+        )?;
+        let setup_receipt = self.load_marker(
+            SETUP_RECEIPT_FILE,
+            SETUP_RECEIPT_ARTIFACT,
+            dataset,
+            contract_checksum,
+            setup_claim,
+        )?;
+        let rank_claim = self.load_marker(
+            RANK_CLAIM_FILE,
+            RANK_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            setup_receipt,
+        )?;
+        Ok((contract_checksum, rank_claim))
+    }
+
+    fn load_bound_ledger(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<(u64, u64, RunLedger, u64), StateError> {
+        let (contract_checksum, rank_claim) = self.load_rank_claim(dataset, contract)?;
+        let input = read_limited(
+            &self.root.join(LEDGER_FILE),
+            MAX_LEDGER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+        )?;
+        let artifact = ledger_artifact(contract.conformance);
+        let (payload, ledger_checksum) =
+            decode_artifact_and_checksum(&input, artifact, dataset, MAX_LEDGER_PAYLOAD_BYTES)?;
+        let inner = decode_bound_payload(payload, contract_checksum, rank_claim, "run ledger")?;
+        let ledger = RunLedger::decode(inner)
+            .map_err(|error| StateError::Invalid(format!("invalid run ledger payload: {error}")))?;
+        Ok((contract_checksum, rank_claim, ledger, ledger_checksum))
+    }
+
+    fn load_bound_baseline(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        contract_checksum: u64,
+        ledger_checksum: u64,
+    ) -> Result<(BTreeMap<FloatAggregateId, u32>, u64), StateError> {
+        let online_claim = self.load_marker(
+            ONLINE_CLAIM_FILE,
+            ONLINE_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            ledger_checksum,
+        )?;
+        let input = read_limited(
+            &self.root.join(FLOAT_BASELINE_FILE),
+            MAX_FLOAT_BASELINE_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+        )?;
+        let (payload, baseline_checksum) = decode_artifact_and_checksum(
+            &input,
+            FLOAT_BASELINE_ARTIFACT,
+            dataset,
+            MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
+        )?;
+        let inner =
+            decode_bound_payload(payload, contract_checksum, online_claim, "FLOAT baseline")?;
+        Ok((
+            decode_float_baseline(inner, ledger_checksum)?,
+            baseline_checksum,
+        ))
+    }
+
+    fn load_diagnostic_warmup_claim(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<u64, StateError> {
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
+        let (_, baseline_checksum) =
+            self.load_bound_baseline(dataset, contract, contract_checksum, ledger_checksum)?;
+        let recovery_claim = self.load_marker(
+            RECOVERY_CLAIM_FILE,
+            RECOVERY_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            baseline_checksum,
+        )?;
+        let recovery_receipt = self.load_marker(
+            RECOVERY_RECEIPT_FILE,
+            RECOVERY_RECEIPT_ARTIFACT,
+            dataset,
+            contract_checksum,
+            recovery_claim,
+        )?;
+        self.load_marker(
+            DIAGNOSTIC_WARMUP_CLAIM_FILE,
+            DIAGNOSTIC_WARMUP_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            recovery_receipt,
+        )
+    }
+
+    fn ensure_no_diagnostic_drift(&self) -> Result<(), StateError> {
+        let path = self.root.join(DIAGNOSTIC_WARMUP_CLAIM_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                Err(StateError::Invalid(
+                    "database state is diagnostic-dirty; formal checks and ranking are closed"
+                        .to_owned(),
+                ))
+            }
+            Ok(_) => Err(StateError::Invalid(format!(
+                "unsafe diagnostic state marker: {}",
+                path.display()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(StateError::Io(error)),
+        }
     }
 }
 
@@ -378,6 +1151,67 @@ fn parse<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, StateError>
         .map_err(|_| StateError::Invalid(format!("{name} is not a valid number")))
 }
 
+fn ledger_artifact(conformance: RunConformance) -> &'static str {
+    match conformance {
+        RunConformance::PublicSpecAligned => RANKED_LEDGER_ARTIFACT,
+        RunConformance::NonRankedDeviation => NON_RANKED_LEDGER_ARTIFACT,
+    }
+}
+
+fn diagnostic_claim_spec(stage: DiagnosticStage) -> (&'static str, &'static str) {
+    match stage {
+        DiagnosticStage::Warmup => (
+            DIAGNOSTIC_WARMUP_CLAIM_FILE,
+            DIAGNOSTIC_WARMUP_CLAIM_ARTIFACT,
+        ),
+        DiagnosticStage::Observation => (
+            DIAGNOSTIC_OBSERVATION_CLAIM_FILE,
+            DIAGNOSTIC_OBSERVATION_CLAIM_ARTIFACT,
+        ),
+    }
+}
+
+fn diagnostic_receipt_spec(stage: DiagnosticStage) -> (&'static str, &'static str) {
+    match stage {
+        DiagnosticStage::Warmup => (
+            DIAGNOSTIC_WARMUP_RECEIPT_FILE,
+            DIAGNOSTIC_WARMUP_RECEIPT_ARTIFACT,
+        ),
+        DiagnosticStage::Observation => (
+            DIAGNOSTIC_OBSERVATION_RECEIPT_FILE,
+            DIAGNOSTIC_OBSERVATION_RECEIPT_ARTIFACT,
+        ),
+    }
+}
+
+fn encode_bound_payload(contract_checksum: u64, predecessor_checksum: u64, inner: &str) -> String {
+    format!(
+        "contract_checksum={contract_checksum:016x}\npredecessor_checksum={predecessor_checksum:016x}\n{inner}"
+    )
+}
+
+fn decode_bound_payload<'a>(
+    payload: &'a str,
+    expected_contract_checksum: u64,
+    expected_predecessor_checksum: u64,
+    name: &str,
+) -> Result<&'a str, StateError> {
+    let mut sections = payload.splitn(3, '\n');
+    let contract_checksum = parse_checksum(value(&mut sections, "contract_checksum")?)?;
+    let predecessor_checksum = parse_checksum(value(&mut sections, "predecessor_checksum")?)?;
+    let inner = sections
+        .next()
+        .ok_or_else(|| StateError::Invalid(format!("{name} is missing its bound payload")))?;
+    if contract_checksum != expected_contract_checksum
+        || predecessor_checksum != expected_predecessor_checksum
+    {
+        return Err(StateError::Invalid(format!(
+            "{name} does not match its run contract or predecessor"
+        )));
+    }
+    Ok(inner)
+}
+
 fn encode_artifact(
     artifact: &str,
     dataset: &DatasetState,
@@ -409,6 +1243,16 @@ fn decode_artifact<'a>(
     dataset: &DatasetState,
     payload_limit: usize,
 ) -> Result<&'a str, StateError> {
+    decode_artifact_and_checksum(input, expected_artifact, dataset, payload_limit)
+        .map(|(payload, _)| payload)
+}
+
+fn decode_artifact_and_checksum<'a>(
+    input: &'a str,
+    expected_artifact: &str,
+    dataset: &DatasetState,
+    payload_limit: usize,
+) -> Result<(&'a str, u64), StateError> {
     let (header, payload) =
         parse_artifact_header(input, expected_artifact, dataset, payload_limit)?;
     if payload.as_bytes().len() != header.payload_len {
@@ -433,7 +1277,7 @@ fn decode_artifact<'a>(
             "{expected_artifact} checksum mismatch"
         )));
     }
-    Ok(payload)
+    Ok((payload, header.checksum))
 }
 
 fn parse_artifact_header<'a>(
@@ -822,7 +1666,7 @@ fn read_limited(path: &Path, limit: u64) -> Result<String, StateError> {
     Ok(input)
 }
 
-fn atomic_write(root: &Path, name: &str, bytes: &[u8]) -> Result<(), StateError> {
+fn atomic_publish_new(root: &Path, name: &str, bytes: &[u8]) -> Result<(), StateError> {
     let target = root.join(name);
     match fs::symlink_metadata(&target) {
         Ok(metadata) => {
@@ -843,7 +1687,11 @@ fn atomic_write(root: &Path, name: &str, bytes: &[u8]) -> Result<(), StateError>
             root.display()
         )));
     }
-    let temporary = root.join(format!(".{name}.{}.tmp", std::process::id()));
+    let temporary = root.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -851,7 +1699,18 @@ fn atomic_write(root: &Path, name: &str, bytes: &[u8]) -> Result<(), StateError>
     if let Err(error) = (|| -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, &target)?;
+        match fs::hard_link(&temporary, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("state artifact is write-once: {}", target.display()),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        File::open(root)?.sync_all()?;
+        fs::remove_file(&temporary)?;
         File::open(root)?.sync_all()?;
         Ok(())
     })() {
@@ -890,6 +1749,10 @@ mod tests {
     }
 
     fn sample_dataset(run_id: &str, seed: u64) -> DatasetState {
+        sample_dataset_with_warehouses(run_id, seed, 1)
+    }
+
+    fn sample_dataset_with_warehouses(run_id: &str, seed: u64, warehouses: i32) -> DatasetState {
         let mut order_line_amounts = NonNegativeF32Accumulator::default();
         order_line_amounts
             .add_repeated_bits(1.0_f32.to_bits(), 7)
@@ -898,16 +1761,63 @@ mod tests {
             order_line_rows: 7,
             undelivered_order_line_rows: 7,
             order_line_amounts,
-            partitions: (1..=10)
-                .map(|district_id| PartitionLoadSummary {
-                    warehouse_id: 1,
-                    district_id,
-                    order_line_rows: if district_id == 1 { 7 } else { 0 },
-                    undelivered_order_line_rows: if district_id == 1 { 7 } else { 0 },
+            partitions: (1..=warehouses)
+                .flat_map(|warehouse_id| {
+                    (1..=10).map(move |district_id| PartitionLoadSummary {
+                        warehouse_id,
+                        district_id,
+                        order_line_rows: if warehouse_id == 1 && district_id == 1 {
+                            7
+                        } else {
+                            0
+                        },
+                        undelivered_order_line_rows: if warehouse_id == 1 && district_id == 1 {
+                            7
+                        } else {
+                            0
+                        },
+                    })
                 })
                 .collect(),
         };
-        DatasetState::from_load(run_id.to_owned(), seed, 1, load).unwrap()
+        DatasetState::from_load(run_id.to_owned(), seed, warehouses, load).unwrap()
+    }
+
+    fn sample_contract(warehouses: u16) -> RunContract {
+        RunContract {
+            warehouses,
+            clients: if warehouses == OFFICIAL_WAREHOUSES {
+                OFFICIAL_CLIENTS
+            } else {
+                1
+            },
+            warmup_seconds: if warehouses == OFFICIAL_WAREHOUSES {
+                WARMUP_SECONDS
+            } else {
+                0
+            },
+            measurement_windows: MEASUREMENT_WINDOWS,
+            window_seconds: if warehouses == OFFICIAL_WAREHOUSES {
+                MEASUREMENT_SECONDS
+            } else {
+                1
+            },
+            response_timeout_seconds: 30,
+            phase_tail_grace_seconds: 5,
+            conformance: if warehouses == OFFICIAL_WAREHOUSES {
+                RunConformance::PublicSpecAligned
+            } else {
+                RunConformance::NonRankedDeviation
+            },
+        }
+    }
+
+    fn initialize_checked_run(store: &StateStore, dataset: &DatasetState, contract: &RunContract) {
+        store.initialize_run(dataset, contract).unwrap();
+        let setup = store.begin_setup_check(dataset, contract).unwrap();
+        store
+            .complete_setup_check(dataset, contract, setup)
+            .unwrap();
     }
 
     fn sample_float_baseline() -> BTreeMap<FloatAggregateId, u32> {
@@ -1025,6 +1935,157 @@ mod tests {
             ledger_checksum
         )
         .is_err());
+    }
+
+    #[test]
+    fn append_only_state_chain_gates_recovery_and_two_diagnostic_segments() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset("run-chain", 81);
+        let contract = sample_contract(1);
+        initialize_checked_run(&store, &dataset, &contract);
+
+        assert!(store
+            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Warmup)
+            .is_err());
+
+        let rank = store.begin_rank(&dataset, &contract).unwrap();
+        store
+            .complete_rank(&dataset, &contract, rank, &RunLedger::default())
+            .unwrap();
+        let (online, ledger) = store.begin_online_check(&dataset, &contract).unwrap();
+        assert_eq!(ledger, RunLedger::default());
+        store
+            .complete_online_check(&dataset, &contract, online, &sample_float_baseline())
+            .unwrap();
+
+        assert!(store
+            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Warmup)
+            .is_err());
+        let (recovery, ledger, baseline) = store.begin_recovery_check(&dataset, &contract).unwrap();
+        assert_eq!(ledger, RunLedger::default());
+        assert_eq!(baseline, sample_float_baseline());
+        store
+            .complete_recovery_check(&dataset, &contract, recovery)
+            .unwrap();
+
+        assert!(store
+            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Observation)
+            .is_err());
+        let warmup = store
+            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Warmup)
+            .unwrap();
+        assert!(store.begin_online_check(&dataset, &contract).is_err());
+        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+        store
+            .complete_diagnostic(&dataset, &contract, warmup)
+            .unwrap();
+
+        let reopened = StateStore::open_existing(&directory.0).unwrap();
+        let observation = reopened
+            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Observation)
+            .unwrap();
+        reopened
+            .complete_diagnostic(&dataset, &contract, observation)
+            .unwrap();
+        assert!(reopened.begin_rank(&dataset, &contract).is_err());
+        assert!(reopened
+            .begin_diagnostic(&dataset, &contract, DiagnosticStage::Observation)
+            .is_err());
+    }
+
+    #[test]
+    fn rank_claim_and_ledger_are_write_once_across_contracts() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset_with_warehouses(
+            "run-ranked-write-once",
+            82,
+            i32::from(OFFICIAL_WAREHOUSES),
+        );
+        let contract = sample_contract(OFFICIAL_WAREHOUSES);
+        initialize_checked_run(&store, &dataset, &contract);
+
+        let rank = store.begin_rank(&dataset, &contract).unwrap();
+        store
+            .complete_rank(&dataset, &contract, rank, &RunLedger::default())
+            .unwrap();
+        let ledger_path = directory.0.join(LEDGER_FILE);
+        let original = fs::read(&ledger_path).unwrap();
+
+        let mut non_ranked = contract.clone();
+        non_ranked.clients = 1;
+        non_ranked.conformance = RunConformance::NonRankedDeviation;
+        assert!(store.begin_rank(&dataset, &non_ranked).is_err());
+        assert_eq!(fs::read(ledger_path).unwrap(), original);
+    }
+
+    #[test]
+    fn run_contract_binds_client_timing_deadlines_and_conformance() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset("run-contract-binding", 83);
+        let contract = sample_contract(1);
+        store.initialize_run(&dataset, &contract).unwrap();
+        assert_eq!(store.load_bound_dataset(&contract).unwrap(), dataset);
+
+        let mut mutations = Vec::new();
+        let mut changed = contract.clone();
+        changed.clients += 1;
+        mutations.push(changed);
+        let mut changed = contract.clone();
+        changed.warmup_seconds += 1;
+        mutations.push(changed);
+        let mut changed = contract.clone();
+        changed.window_seconds += 1;
+        mutations.push(changed);
+        let mut changed = contract.clone();
+        changed.response_timeout_seconds += 1;
+        mutations.push(changed);
+        let mut changed = contract.clone();
+        changed.phase_tail_grace_seconds += 1;
+        mutations.push(changed);
+
+        for changed in mutations {
+            assert!(store.load_bound_dataset(&changed).is_err());
+        }
+
+        let mut falsely_ranked = contract;
+        falsely_ranked.conformance = RunConformance::PublicSpecAligned;
+        assert!(store.load_bound_dataset(&falsely_ranked).is_err());
+    }
+
+    #[test]
+    fn incomplete_rank_claim_is_fail_closed() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset("run-incomplete-rank", 84);
+        let contract = sample_contract(1);
+        initialize_checked_run(&store, &dataset, &contract);
+
+        let _claim = store.begin_rank(&dataset, &contract).unwrap();
+        assert!(store.begin_rank(&dataset, &contract).is_err());
+        assert!(store.begin_online_check(&dataset, &contract).is_err());
+        assert!(!directory.0.join(LEDGER_FILE).exists());
+    }
+
+    #[test]
+    fn atomic_publish_new_never_replaces_a_completed_artifact() {
+        let directory = TestDirectory::new();
+        atomic_publish_new(&directory.0, "write-once.state", b"first").unwrap();
+        assert!(atomic_publish_new(&directory.0, "write-once.state", b"second").is_err());
+        assert_eq!(
+            fs::read(directory.0.join("write-once.state")).unwrap(),
+            b"first"
+        );
+    }
+
+    #[test]
+    fn open_existing_does_not_create_a_missing_state_directory() {
+        let directory = TestDirectory::new();
+        let missing = directory.0.join("missing");
+        assert!(StateStore::open_existing(&missing).is_err());
+        assert!(!missing.exists());
     }
 
     #[cfg(unix)]
