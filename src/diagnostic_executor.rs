@@ -27,6 +27,13 @@ use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, Wo
 use crate::workload::Final2026Workload;
 
 const DIAGNOSTIC_STAGE: StageId = StageId::custom(0x6469_6167_3230_3236);
+const DIAGNOSTIC_FAMILIES: [(TransactionKind, &str); 5] = [
+    (TransactionKind::NewOrder, "new_order"),
+    (TransactionKind::Payment, "payment"),
+    (TransactionKind::OrderStatus, "order_status"),
+    (TransactionKind::Delivery, "delivery"),
+    (TransactionKind::StockLevel, "stock_level"),
+];
 
 pub struct DiagnosticExecutor {
     config: Config,
@@ -268,7 +275,7 @@ async fn run_worker(
                 stats.abandoned += 1;
                 break;
             }
-            stats.physical_attempts += 1;
+            stats.record_attempt(kind);
             let attempt_deadline = timeline.attempt_deadline();
             let response =
                 tokio::time::timeout_at(attempt_deadline, dispatch::execute(&mut client, &frozen))
@@ -321,6 +328,33 @@ async fn run_worker(
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticFamilyStats {
+    attempted: u64,
+    committed: u64,
+    terminals: u64,
+    grace_tail_committed: u64,
+}
+
+impl DiagnosticFamilyStats {
+    fn commit_rate(self) -> f64 {
+        if self.attempted == 0 {
+            0.0
+        } else {
+            self.committed as f64 / self.attempted as f64
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.attempted = self.attempted.saturating_add(other.attempted);
+        self.committed = self.committed.saturating_add(other.committed);
+        self.terminals = self.terminals.saturating_add(other.terminals);
+        self.grace_tail_committed = self
+            .grace_tail_committed
+            .saturating_add(other.grace_tail_committed);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DiagnosticStats {
     selected: u64,
     physical_attempts: u64,
@@ -329,49 +363,81 @@ struct DiagnosticStats {
     retryable_aborts: u64,
     abandoned: u64,
     grace_tail: u64,
-    new_order: u64,
-    payment: u64,
-    order_status: u64,
-    delivery: u64,
-    stock_level: u64,
+    families: [DiagnosticFamilyStats; DIAGNOSTIC_FAMILIES.len()],
 }
 
 impl DiagnosticStats {
+    fn record_attempt(&mut self, kind: TransactionKind) {
+        self.physical_attempts = self.physical_attempts.saturating_add(1);
+        let family = &mut self.families[diagnostic_family_index(kind)];
+        family.attempted = family.attempted.saturating_add(1);
+    }
+
     fn record_terminal(
         &mut self,
         kind: TransactionKind,
         outcome: &RankedTransactionOutcome,
         grace_tail: bool,
     ) {
+        let family = &mut self.families[diagnostic_family_index(kind)];
+        family.terminals = family.terminals.saturating_add(1);
         match outcome {
-            RankedTransactionOutcome::Committed(_) => self.committed += 1,
-            RankedTransactionOutcome::ExpectedRollback => self.expected_rollbacks += 1,
+            RankedTransactionOutcome::Committed(_) => {
+                self.committed = self.committed.saturating_add(1);
+                family.committed = family.committed.saturating_add(1);
+                if grace_tail {
+                    family.grace_tail_committed = family.grace_tail_committed.saturating_add(1);
+                }
+            }
+            RankedTransactionOutcome::ExpectedRollback => {
+                self.expected_rollbacks = self.expected_rollbacks.saturating_add(1);
+            }
         }
         if grace_tail {
-            self.grace_tail += 1;
-        }
-        match kind {
-            TransactionKind::NewOrder => self.new_order += 1,
-            TransactionKind::Payment => self.payment += 1,
-            TransactionKind::OrderStatus => self.order_status += 1,
-            TransactionKind::Delivery => self.delivery += 1,
-            TransactionKind::StockLevel => self.stock_level += 1,
+            self.grace_tail = self.grace_tail.saturating_add(1);
         }
     }
 
     fn merge(&mut self, other: Self) {
-        self.selected += other.selected;
-        self.physical_attempts += other.physical_attempts;
-        self.committed += other.committed;
-        self.expected_rollbacks += other.expected_rollbacks;
-        self.retryable_aborts += other.retryable_aborts;
-        self.abandoned += other.abandoned;
-        self.grace_tail += other.grace_tail;
-        self.new_order += other.new_order;
-        self.payment += other.payment;
-        self.order_status += other.order_status;
-        self.delivery += other.delivery;
-        self.stock_level += other.stock_level;
+        self.selected = self.selected.saturating_add(other.selected);
+        self.physical_attempts = self
+            .physical_attempts
+            .saturating_add(other.physical_attempts);
+        self.committed = self.committed.saturating_add(other.committed);
+        self.expected_rollbacks = self
+            .expected_rollbacks
+            .saturating_add(other.expected_rollbacks);
+        self.retryable_aborts = self.retryable_aborts.saturating_add(other.retryable_aborts);
+        self.abandoned = self.abandoned.saturating_add(other.abandoned);
+        self.grace_tail = self.grace_tail.saturating_add(other.grace_tail);
+        for (family, incoming) in self.families.iter_mut().zip(other.families) {
+            family.merge(incoming);
+        }
+    }
+
+    fn family(&self, kind: TransactionKind) -> DiagnosticFamilyStats {
+        self.families[diagnostic_family_index(kind)]
+    }
+
+    fn family_report_line(&self, kind: TransactionKind, label: &str) -> String {
+        let family = self.family(kind);
+        format!(
+            "diagnostic_family={label},attempted={},committed={},commit_rate={:.6},grace_tail_committed={}",
+            family.attempted,
+            family.committed,
+            family.commit_rate(),
+            family.grace_tail_committed
+        )
+    }
+}
+
+const fn diagnostic_family_index(kind: TransactionKind) -> usize {
+    match kind {
+        TransactionKind::NewOrder => 0,
+        TransactionKind::Payment => 1,
+        TransactionKind::OrderStatus => 2,
+        TransactionKind::Delivery => 3,
+        TransactionKind::StockLevel => 4,
     }
 }
 
@@ -400,11 +466,11 @@ impl DiagnosticRunResult {
         );
         println!(
             "terminal_mix=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}",
-            self.stats.new_order,
-            self.stats.payment,
-            self.stats.order_status,
-            self.stats.delivery,
-            self.stats.stock_level
+            self.stats.family(TransactionKind::NewOrder).terminals,
+            self.stats.family(TransactionKind::Payment).terminals,
+            self.stats.family(TransactionKind::OrderStatus).terminals,
+            self.stats.family(TransactionKind::Delivery).terminals,
+            self.stats.family(TransactionKind::StockLevel).terminals
         );
         println!(
             "selected={},physical_attempts={},committed={},expected_rollback={},retry_abort={},abandoned={},grace_tail={}",
@@ -416,6 +482,12 @@ impl DiagnosticRunResult {
             self.stats.abandoned,
             self.stats.grace_tail
         );
+        println!(
+            "diagnostic_commit_semantics=successful_physical_commit_including_grace_tail,expected_rollback_excluded=true"
+        );
+        for (kind, label) in DIAGNOSTIC_FAMILIES {
+            println!("{}", self.stats.family_report_line(kind, label));
+        }
         println!("state_artifacts_written=append_only_phase_claim_and_receipt");
     }
 }
@@ -447,13 +519,15 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_stats_keep_retry_attempts_out_of_terminal_mix() {
+    fn diagnostic_stats_classify_every_dispatch_and_only_successful_commits() {
         let mut stats = DiagnosticStats {
             selected: 2,
-            physical_attempts: 3,
             retryable_aborts: 1,
             ..DiagnosticStats::default()
         };
+        stats.record_attempt(TransactionKind::Payment);
+        stats.record_attempt(TransactionKind::Payment);
+        stats.record_attempt(TransactionKind::NewOrder);
         stats.record_terminal(
             TransactionKind::Payment,
             &RankedTransactionOutcome::Committed(crate::ranking::runner::RankedCommit::OrderStatus),
@@ -465,11 +539,82 @@ mod tests {
             true,
         );
 
-        assert_eq!(stats.payment, 1);
-        assert_eq!(stats.new_order, 1);
+        assert_eq!(
+            stats.family(TransactionKind::Payment),
+            DiagnosticFamilyStats {
+                attempted: 2,
+                committed: 1,
+                terminals: 1,
+                grace_tail_committed: 0,
+            }
+        );
+        assert_eq!(
+            stats.family(TransactionKind::NewOrder),
+            DiagnosticFamilyStats {
+                attempted: 1,
+                committed: 0,
+                terminals: 1,
+                grace_tail_committed: 0,
+            }
+        );
+        assert_eq!(stats.physical_attempts, 3);
         assert_eq!(stats.committed, 1);
         assert_eq!(stats.expected_rollbacks, 1);
         assert_eq!(stats.retryable_aborts, 1);
         assert_eq!(stats.grace_tail, 1);
+    }
+
+    #[test]
+    fn grace_tail_commit_remains_a_physical_diagnostic_commit() {
+        let mut stats = DiagnosticStats::default();
+        stats.record_attempt(TransactionKind::Delivery);
+        stats.record_terminal(
+            TransactionKind::Delivery,
+            &RankedTransactionOutcome::Committed(crate::ranking::runner::RankedCommit::Delivery(
+                Vec::new(),
+            )),
+            true,
+        );
+
+        let family = stats.family(TransactionKind::Delivery);
+        assert_eq!(family.committed, 1);
+        assert_eq!(family.grace_tail_committed, 1);
+        assert_eq!(family.commit_rate(), 1.0);
+        assert_eq!(stats.committed, 1);
+        assert_eq!(stats.grace_tail, 1);
+    }
+
+    #[test]
+    fn family_report_is_stable_and_zero_attempt_rate_is_safe() {
+        let stats = DiagnosticStats::default();
+
+        assert_eq!(
+            stats.family_report_line(TransactionKind::StockLevel, "stock_level"),
+            "diagnostic_family=stock_level,attempted=0,committed=0,commit_rate=0.000000,grace_tail_committed=0"
+        );
+    }
+
+    #[test]
+    fn merge_preserves_per_family_attempt_and_commit_totals() {
+        let mut left = DiagnosticStats::default();
+        left.record_attempt(TransactionKind::OrderStatus);
+
+        let mut right = DiagnosticStats::default();
+        right.record_attempt(TransactionKind::OrderStatus);
+        right.record_terminal(
+            TransactionKind::OrderStatus,
+            &RankedTransactionOutcome::Committed(crate::ranking::runner::RankedCommit::OrderStatus),
+            false,
+        );
+
+        left.merge(right);
+
+        let family = left.family(TransactionKind::OrderStatus);
+        assert_eq!(family.attempted, 2);
+        assert_eq!(family.committed, 1);
+        assert_eq!(family.terminals, 1);
+        assert_eq!(family.commit_rate(), 0.5);
+        assert_eq!(left.physical_attempts, 2);
+        assert_eq!(left.committed, 1);
     }
 }
