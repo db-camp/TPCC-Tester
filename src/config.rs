@@ -747,8 +747,13 @@ mod tests {
 
     #[test]
     fn standalone_formal_schema_creation_is_an_explicit_deviation() {
-        let formal =
-            Config::try_parse_from(["tpcc-tester", "--create-schema"]).expect("valid CLI syntax");
+        let formal = Config::try_parse_from([
+            "tpcc-tester",
+            "--create-schema",
+            "--seed",
+            "7",
+        ])
+        .expect("valid CLI syntax");
         assert!(matches!(
             formal.validate(),
             Err(ConfigError::DeviationRequiresOptIn { .. })
