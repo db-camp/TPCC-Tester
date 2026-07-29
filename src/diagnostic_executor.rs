@@ -182,7 +182,7 @@ impl DiagnosticExecutor {
                 state_dir.display()
             )));
         }
-        let store = StateStore::open_existing(state_dir)
+        let store = StateStore::open_existing_terminal(state_dir)
             .map_err(|error| TpccError::Protocol(format!("diagnostic state: {error}")))?;
         let dataset = store
             .load_dataset()

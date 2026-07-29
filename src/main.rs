@@ -108,7 +108,7 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         match event {
             LifecycleEvent::SetupIntent => {
                 let run_id = run_id_for_seed(seed);
-                let store = run_state::StateStore::open(
+                let store = run_state::StateStore::open_terminal(
                     config
                         .state_dir
                         .as_deref()
@@ -132,7 +132,11 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                     LifecycleEvent::RestartReady => CrashLifecycleEvent::RestartReady,
                     LifecycleEvent::SetupIntent => unreachable!(),
                 };
-                store.record_crash_lifecycle(&dataset, &contract, crash_event)?;
+                store.record_crash_lifecycle_from_terminal_evidence(
+                    &dataset,
+                    &contract,
+                    crash_event,
+                )?;
                 info!(
                     "已持久化 write-once lifecycle transition: {}",
                     event.as_str()
@@ -156,14 +160,14 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             DiagnosticSegment::Warmup => DiagnosticStage::Warmup,
             DiagnosticSegment::Observation => DiagnosticStage::Observation,
         };
-        let claim = store.begin_diagnostic(&dataset, &contract, stage)?;
+        let claim = store.begin_diagnostic_from_terminal_evidence(&dataset, &contract, stage)?;
         info!(
             "启动 final2026 非排名诊断 {}；已持久化数据库漂移 claim",
             segment.as_str()
         );
         let exec = diagnostic_executor::DiagnosticExecutor::new(config, effective);
         let result = exec.run().await?;
-        store.complete_diagnostic(&dataset, &contract, claim)?;
+        store.complete_diagnostic_from_terminal_evidence(&dataset, &contract, claim)?;
         result.print_report();
         return Ok(());
     }
@@ -192,7 +196,7 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                 .seed
                 .ok_or("validated init configuration lost its seed")?;
             let run_id = run_id_for_seed(seed);
-            let store = run_state::StateStore::open(
+            let store = run_state::StateStore::open_terminal(
                 config
                     .state_dir
                     .as_deref()
@@ -225,13 +229,15 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                     setup_check_run = Some((store, dataset, contract, claim));
                 }
                 config::CheckScope::Online => {
-                    let (claim, ledger) = store.begin_online_check(&dataset, &contract)?;
-                    online_check_run = Some((store, dataset, contract, claim, ledger));
+                    let (claim, terminal_evidence) =
+                        store.begin_online_check_from_terminal_evidence(&dataset, &contract)?;
+                    online_check_run = Some((store, dataset, contract, claim, terminal_evidence));
                 }
                 config::CheckScope::Recovery => {
-                    let (claim, ledger, baseline) =
-                        store.begin_recovery_check(&dataset, &contract)?;
-                    recovery_check_run = Some((store, dataset, contract, claim, ledger, baseline));
+                    let (claim, terminal_evidence, baseline) =
+                        store.begin_recovery_check_from_terminal_evidence(&dataset, &contract)?;
+                    recovery_check_run =
+                        Some((store, dataset, contract, claim, terminal_evidence, baseline));
                 }
             }
             info!(
@@ -352,35 +358,40 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                     store.complete_setup_check(&dataset, &contract, claim)?;
                 }
                 config::CheckScope::Online => {
-                    let (store, dataset, contract, claim, ledger) = online_check_run
+                    let (store, dataset, contract, claim, terminal_evidence) = online_check_run
                         .take()
                         .ok_or("independent online check lost its pre-connect claim")?;
-                    let baseline = check_executor::run_final_online(
+                    let baseline = check_executor::run_final_online_from_terminal_evidence(
                         cursor.client_mut(),
                         &dataset,
-                        &ledger,
+                        &terminal_evidence,
                         dataset.initial_order_line_amounts(),
                     )
                     .await?;
-                    store.complete_online_check(&dataset, &contract, claim, &baseline)?;
+                    store.complete_online_check_from_terminal_evidence(
+                        &dataset, &contract, claim, &baseline,
+                    )?;
                     info!(
                         "已原子保存 online FLOAT baseline: {}",
                         store.root().join("float_baseline.state").display()
                     );
                 }
                 config::CheckScope::Recovery => {
-                    let (store, dataset, contract, claim, ledger, baseline) = recovery_check_run
-                        .take()
-                        .ok_or("independent recovery check lost its pre-connect claim")?;
-                    check_executor::run_final_recovery(
+                    let (store, dataset, contract, claim, terminal_evidence, baseline) =
+                        recovery_check_run
+                            .take()
+                            .ok_or("independent recovery check lost its pre-connect claim")?;
+                    check_executor::run_final_recovery_from_terminal_evidence(
                         cursor.client_mut(),
                         &dataset,
-                        &ledger,
+                        &terminal_evidence,
                         dataset.initial_order_line_amounts(),
                         &baseline,
                     )
                     .await?;
-                    store.complete_recovery_check(&dataset, &contract, claim)?;
+                    store.complete_recovery_check_from_terminal_evidence(
+                        &dataset, &contract, claim,
+                    )?;
                     info!(
                         "已原子保存 recovery pass receipt: {}",
                         store.root().join("recovery_check.passed").display()
@@ -420,10 +431,15 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             setup_generator,
         );
         let result = exec.run().await?;
-        store.complete_rank(&dataset, &contract, claim, result.ledger())?;
+        store.complete_rank_with_terminal_evidence(
+            &dataset,
+            &contract,
+            claim,
+            result.terminal_evidence(),
+        )?;
         info!(
-            "已原子保存完整 physical commit ledger: {}",
-            store.root().join("run_ledger.state").display()
+            "已原子保存有界 terminal evidence: {}",
+            store.root().join("terminal_evidence.state").display()
         );
         result.print_report();
     }
@@ -440,7 +456,7 @@ fn load_bound_state(
     effective: &ResolvedProfile,
 ) -> Result<(run_state::StateStore, run_state::DatasetState, RunContract), Box<dyn std::error::Error>>
 {
-    let store = run_state::StateStore::open_existing(
+    let store = run_state::StateStore::open_existing_terminal(
         config
             .state_dir
             .as_deref()
