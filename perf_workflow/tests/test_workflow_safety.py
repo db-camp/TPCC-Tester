@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from copy import deepcopy
+import hashlib
 import importlib.util
 import json
 import os
@@ -137,6 +138,7 @@ while True:
             temp_path / "fake-tpcc",
             """
 import os
+from pathlib import Path
 import sys
 
 with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
@@ -147,6 +149,35 @@ if "--lifecycle-event" in sys.argv:
         os.environ["FAKE_SERVER_EVENTS"], "a", encoding="utf-8"
     ) as output:
         output.write(f"lifecycle {event}\\n")
+if "--create-schema" in sys.argv:
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    run_id = os.environ["RMDB_TPCC_RUN_ID"]
+    seed = sys.argv[sys.argv.index("--seed") + 1]
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "dataset.state").write_text(
+        "\\n".join(
+            (
+                "version=4",
+                f"run_id={run_id}",
+                f"seed={int(seed)}",
+                "warehouses=50",
+                "order_line_rows=1",
+                "undelivered_order_line_rows=1",
+                "order_line_amount_terms=1",
+                "order_line_amount_words=0000000000000000",
+                "runtime_schema_begin",
+                "version=1",
+                "mode=local_seed_opaque_v1",
+                f"seed={int(seed)}",
+                "fingerprint=0123456789abcdef",
+                "runtime_schema_end",
+                "setup_evidence=00",
+                "partition=1,1,1,1",
+            )
+        )
+        + "\\n",
+        encoding="ascii",
+    )
 """,
         )
         env = os.environ.copy()
@@ -1026,6 +1057,62 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                     )
                     self.assertNotEqual(result.returncode, 0)
 
+    def test_default_database_name_is_run_and_seed_derived(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            result = self.run_script(
+                "--plan-only",
+                "--target-dir",
+                root,
+                "--seed",
+                "7331",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = dict(
+                line.split("=", 1)
+                for line in result.stdout.splitlines()
+                if "=" in line
+            )
+            digest = hashlib.sha256()
+            digest.update(b"rmdb-final2026-opaque-database-name-v1\0")
+            for value in (plan["run_id"].encode(), b"7331"):
+                digest.update(len(value).to_bytes(8, "big"))
+                digest.update(value)
+            self.assertEqual(
+                plan["db_name"],
+                "d_" + digest.hexdigest()[:32],
+            )
+            self.assertRegex(plan["db_name"], r"^d_[0-9a-f]{32}$")
+            self.assertNotEqual(plan["db_name"], "tpcc_final2026")
+
+    def test_explicit_new_database_name_requires_deviation_opt_in(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            rejected = self.run_script(
+                "--plan-only",
+                "--target-dir",
+                root,
+                "--db-name",
+                "local_database",
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("--allow-deviation", rejected.stderr)
+
+            accepted = self.run_script(
+                "--plan-only",
+                "--target-dir",
+                root,
+                "--db-name",
+                "local_database",
+                "--allow-deviation",
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("db_name=local_database\n", accepted.stdout)
+            self.assertIn(
+                "conformance=non_ranked_deviation\n",
+                accepted.stdout,
+            )
+
     def test_diagnostics_requires_full_lifecycle(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)
@@ -1255,13 +1342,52 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
 
     def test_existing_database_modes_reuse_dataset_run_identity(self):
         with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
             root = self.make_root(temp)
-            state = Path(temp) / "state"
+            state = temp_path / "state"
             state.mkdir()
-            (state / "dataset.state").write_text(
-                "version=2\nrun_id=original.dataset:42\n",
-                encoding="utf-8",
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
             )
+            initialized = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--state-dir",
+                state,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertEqual(
+                initialized.returncode,
+                0,
+                initialized.stderr,
+            )
+            dataset_run_id = next(
+                line.removeprefix("run_id=")
+                for line in (state / "dataset.state")
+                .read_text(encoding="ascii")
+                .splitlines()
+                if line.startswith("run_id=")
+            )
+            identity = dict(
+                line.split("=", 1)
+                for line in (state / "database.identity")
+                .read_text(encoding="ascii")
+                .splitlines()
+            )
+            self.assertEqual(identity["binding_status"], "sealed")
+            self.assertRegex(identity["db_name"], r"^d_[0-9a-f]{32}$")
 
             for mode in ("rank", "recovery"):
                 with self.subTest(mode=mode):
@@ -1276,9 +1402,148 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn(
-                        "dataset_run_id=original.dataset:42\n",
+                        f"dataset_run_id={dataset_run_id}\n",
                         result.stdout,
                     )
+                    self.assertIn(
+                        f"db_name={identity['db_name']}\n",
+                        result.stdout,
+                    )
+                    compatible = self.run_script(
+                        "--plan-only",
+                        "--mode",
+                        mode,
+                        "--target-dir",
+                        root,
+                        "--state-dir",
+                        state,
+                        "--db-name",
+                        identity["db_name"],
+                    )
+                    self.assertEqual(
+                        compatible.returncode,
+                        0,
+                        compatible.stderr,
+                    )
+
+            mismatch = self.run_script(
+                "--plan-only",
+                "--mode",
+                "recovery",
+                "--target-dir",
+                root,
+                "--state-dir",
+                state,
+                "--db-name",
+                "different_database",
+            )
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn("does not match setup state", mismatch.stderr)
+
+    def test_existing_database_identity_rejects_tampering_and_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            state = temp_path / "state"
+            state.mkdir()
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            initialized = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--state-dir",
+                state,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertEqual(
+                initialized.returncode,
+                0,
+                initialized.stderr,
+            )
+            identity_path = state / "database.identity"
+            identity_bytes = identity_path.read_bytes()
+            identity = dict(
+                line.split("=", 1)
+                for line in identity_bytes.decode("ascii").splitlines()
+            )
+            database_path = root / identity["db_name"]
+            dataset_path = state / "dataset.state"
+            dataset_bytes = dataset_path.read_bytes()
+
+            dataset_path.write_bytes(dataset_bytes + b"#")
+            dataset_tamper = self.run_script(
+                "--plan-only",
+                "--mode",
+                "recovery",
+                "--target-dir",
+                root,
+                "--state-dir",
+                state,
+            )
+            self.assertNotEqual(dataset_tamper.returncode, 0)
+            self.assertIn(
+                "dataset.state changed after identity sealing",
+                dataset_tamper.stderr,
+            )
+            dataset_path.write_bytes(dataset_bytes)
+
+            damaged_identity = bytearray(identity_bytes)
+            fingerprint_offset = identity_bytes.index(
+                b"identity_fingerprint="
+            ) + len(b"identity_fingerprint=")
+            damaged_identity[fingerprint_offset] = (
+                ord("0")
+                if damaged_identity[fingerprint_offset] != ord("0")
+                else ord("1")
+            )
+            identity_path.write_bytes(damaged_identity)
+            marker_tamper = self.run_script(
+                "--plan-only",
+                "--mode",
+                "recovery",
+                "--target-dir",
+                root,
+                "--state-dir",
+                state,
+            )
+            self.assertNotEqual(marker_tamper.returncode, 0)
+            self.assertIn("fingerprint mismatch", marker_tamper.stderr)
+            identity_path.write_bytes(identity_bytes)
+
+            original_database = root / "original-database"
+            database_path.rename(original_database)
+            database_path.mkdir()
+            shutil.copy2(
+                original_database / ".tpcc-workflow-database-identity",
+                database_path / ".tpcc-workflow-database-identity",
+            )
+            replacement = self.run_script(
+                "--plan-only",
+                "--mode",
+                "recovery",
+                "--target-dir",
+                root,
+                "--state-dir",
+                state,
+            )
+            self.assertNotEqual(replacement.returncode, 0)
+            self.assertIn(
+                "inode does not match its state identity",
+                replacement.stderr,
+            )
 
     def test_tools_mode_preserves_existing_database_and_source_csv(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1306,6 +1571,7 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 root,
                 "--db-name",
                 "existing_db",
+                "--allow-deviation",
                 "--record-root",
                 Path(temp) / "records",
                 env=minimal_env,
@@ -1684,6 +1950,34 @@ if "--probe-ready" in sys.argv:
     if count == 0:
         time.sleep(0.25)
         raise SystemExit(124)
+if "--create-schema" in sys.argv:
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    run_id = os.environ["RMDB_TPCC_RUN_ID"]
+    seed = int(sys.argv[sys.argv.index("--seed") + 1])
+    (state_dir / "dataset.state").write_text(
+        "\\n".join(
+            (
+                "version=4",
+                f"run_id={run_id}",
+                f"seed={seed}",
+                "warehouses=50",
+                "order_line_rows=1",
+                "undelivered_order_line_rows=1",
+                "order_line_amount_terms=1",
+                "order_line_amount_words=0000000000000000",
+                "runtime_schema_begin",
+                "version=1",
+                "mode=local_seed_opaque_v1",
+                f"seed={seed}",
+                "fingerprint=0123456789abcdef",
+                "runtime_schema_end",
+                "setup_evidence=00",
+                "partition=1,1,1,1",
+            )
+        )
+        + "\\n",
+        encoding="ascii",
+    )
 """,
             )
             env["FAKE_PROBE_COUNT"] = str(probe_count)
@@ -2348,12 +2642,40 @@ finally:
                 Path(temp) / "fake-tpcc",
                 """
 import os
+from pathlib import Path
 import sys
 
 with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
     output.write("\\t".join(sys.argv[1:]) + "\\n")
-if "--probe-ready" in sys.argv and not os.path.isdir(os.environ["FAKE_DB_PATH"]):
-    raise SystemExit(1)
+if "--create-schema" in sys.argv:
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    run_id = os.environ["RMDB_TPCC_RUN_ID"]
+    seed = sys.argv[sys.argv.index("--seed") + 1]
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "dataset.state").write_text(
+        "\\n".join(
+            (
+                "version=4",
+                f"run_id={run_id}",
+                f"seed={int(seed)}",
+                "warehouses=50",
+                "order_line_rows=1",
+                "undelivered_order_line_rows=1",
+                "order_line_amount_terms=1",
+                "order_line_amount_words=0000000000000000",
+                "runtime_schema_begin",
+                "version=1",
+                "mode=local_seed_opaque_v1",
+                f"seed={int(seed)}",
+                "fingerprint=0123456789abcdef",
+                "runtime_schema_end",
+                "setup_evidence=00",
+                "partition=1,1,1,1",
+            )
+        )
+        + "\\n",
+        encoding="ascii",
+    )
 if "--check-scope" in sys.argv:
     scope = sys.argv[sys.argv.index("--check-scope") + 1]
     if scope == os.environ.get("FAKE_TPCC_FAIL_SCOPE"):
@@ -2396,7 +2718,6 @@ while :; do sleep 0.05; done
             )
             env = os.environ.copy()
             env["FAKE_TPCC_CALLS"] = str(calls)
-            env["FAKE_DB_PATH"] = str(root / "tpcc_final2026")
             env["FAKE_SERVER_CHILDREN"] = str(server_children)
             env["PATH"] = f"{fake_tools}{os.pathsep}{env['PATH']}"
 
@@ -2718,7 +3039,7 @@ while :; do sleep 0.05; done
             )
             self.assertIn("[server start: new database setup]", server_log)
             self.assertIn("[server start: existing database]", server_log)
-            self.assertFalse((root / "tpcc_final2026").exists())
+            self.assertFalse(Path(manifest["paths"]["database"]).exists())
             self.assertEqual(source_csv.read_text(encoding="utf-8"), "tracked csv")
             for sampler_pid in (
                 result_dirs[0] / "resource_sampler.pids"

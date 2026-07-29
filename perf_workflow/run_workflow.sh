@@ -13,7 +13,18 @@ RESOURCE_HELPER="${RMDB_TPCC_RESOURCE_HELPER_OVERRIDE:-${SCRIPT_DIR}/resource_sa
 
 MODE="all"
 LABEL="final2026"
-DB_NAME="tpcc_final2026"
+DB_NAME=""
+DB_NAME_CALLER_SUPPLIED=0
+DB_NAME_DEVIATION_ACTIVE=0
+DB_IDENTITY_SOURCE=""
+DB_IDENTITY_STATUS="pending"
+DB_IDENTITY_BINDING_STATUS="provisioned"
+DB_DEVICE=""
+DB_INODE=""
+DB_PATH_FINGERPRINT=""
+RUNTIME_SCHEMA_FINGERPRINT="unsealed"
+DATASET_STATE_FINGERPRINT="unsealed"
+DB_IDENTITY_FINGERPRINT=""
 RMDB_DIR="${RMDB_DIR_OVERRIDE:-${DEFAULT_RMDB_DIR}}"
 TPCC_DIR="${TPCC_TESTER_DIR:-${DEFAULT_TPCC_DIR}}"
 RECORD_ROOT=""
@@ -63,6 +74,8 @@ LOAD_DIR=""
 STATE_DIR=""
 RUN_MARKER=""
 DB_MARKER=""
+DB_IDENTITY_MARKER=""
+DATABASE_IDENTITY_FILE=""
 OWNER_TOKEN=""
 PROCESS_OWNER_TOKEN=""
 DB_PATH=""
@@ -107,7 +120,9 @@ Official final2026 options:
   --seed <u64>
   --host <numeric-ip>
   --port <port>
-  --db-name <safe-single-component>
+  --db-name <safe-single-component>  Explicit names are local deviations.
+                                     Existing modes accept the matching setup
+                                     name only as a compatibility assertion.
 
 Paths/build:
   --target-dir <RMDB-root>
@@ -219,6 +234,491 @@ git_sha_or_unavailable() {
   fi
 }
 
+database_identity_helper() {
+  python3 - "$@" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+DB_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+RUN_ID = re.compile(r"[A-Za-z0-9._:-]{1,120}")
+IDENTITY_FIELDS = (
+    "version",
+    "dataset_run_id",
+    "seed",
+    "db_name",
+    "name_source",
+    "binding_status",
+    "runtime_schema_fingerprint",
+    "dataset_state_fingerprint",
+    "db_device",
+    "db_inode",
+    "db_path_fingerprint",
+)
+IDENTITY_MARKER_NAME = ".tpcc-workflow-database-identity"
+MAX_IDENTITY_BYTES = 4096
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def parse_seed(value):
+    if not value.isascii() or not value.isdecimal():
+        fail("database identity seed is not an unsigned integer")
+    parsed = int(value)
+    if parsed > (1 << 64) - 1:
+        fail("database identity seed exceeds u64")
+    return parsed
+
+
+def validate_run_id(value):
+    if RUN_ID.fullmatch(value) is None:
+        fail("database identity contains an unsafe dataset run_id")
+
+
+def validate_name(value):
+    if DB_COMPONENT.fullmatch(value) is None or value in (".", ".."):
+        fail("database identity contains an unsafe database name")
+
+
+def identity_prefix(values):
+    return "".join(f"{field}={values[field]}\n" for field in IDENTITY_FIELDS)
+
+
+def identity_fingerprint(prefix):
+    return hashlib.sha256(
+        b"rmdb-final2026-database-identity-v1\0"
+        + prefix.encode("ascii")
+    ).hexdigest()
+
+
+def encode_identity(values):
+    prefix = identity_prefix(values)
+    return (
+        prefix
+        + f"identity_fingerprint={identity_fingerprint(prefix)}\n"
+    ).encode("ascii")
+
+
+def read_regular(path, label, maximum_bytes=MAX_IDENTITY_BYTES):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        fail(f"{label} must be a real regular file")
+    if info.st_size <= 0 or info.st_size > maximum_bytes:
+        fail(f"{label} has an invalid size")
+    try:
+        return Path(path).read_bytes()
+    except OSError as error:
+        fail(f"could not read {label}: {error}")
+
+
+def parse_identity(raw, label):
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        fail(f"{label} is not canonical ASCII")
+    lines = text.splitlines(keepends=True)
+    expected_count = len(IDENTITY_FIELDS) + 1
+    if len(lines) != expected_count or any(
+        not line.endswith("\n") for line in lines
+    ):
+        fail(f"{label} is not canonical")
+    values = {}
+    expected_names = IDENTITY_FIELDS + ("identity_fingerprint",)
+    for expected_name, line in zip(expected_names, lines):
+        prefix = expected_name + "="
+        if not line.startswith(prefix):
+            fail(f"{label} is not canonical")
+        value = line[len(prefix):-1]
+        if not value or "\x00" in value:
+            fail(f"{label} contains an invalid field")
+        values[expected_name] = value
+    if values["version"] != "1":
+        fail(f"{label} has an unsupported version")
+    validate_run_id(values["dataset_run_id"])
+    seed = parse_seed(values["seed"])
+    if values["seed"] != str(seed):
+        fail(f"{label} seed is not canonical")
+    validate_name(values["db_name"])
+    if values["name_source"] not in (
+        "derived_opaque",
+        "explicit_deviation",
+    ):
+        fail(f"{label} has an invalid database-name source")
+    if values["binding_status"] not in ("provisioned", "sealed"):
+        fail(f"{label} has an invalid dataset binding status")
+    if values["binding_status"] == "provisioned":
+        if values["runtime_schema_fingerprint"] != "unsealed":
+            fail(f"{label} has an invalid provisioned schema fingerprint")
+        if values["dataset_state_fingerprint"] != "unsealed":
+            fail(f"{label} has an invalid provisioned dataset fingerprint")
+    else:
+        if re.fullmatch(
+            r"[0-9a-f]{16}",
+            values["runtime_schema_fingerprint"],
+        ) is None:
+            fail(f"{label} has an invalid runtime schema fingerprint")
+        if re.fullmatch(
+            r"[0-9a-f]{64}",
+            values["dataset_state_fingerprint"],
+        ) is None:
+            fail(f"{label} has an invalid dataset state fingerprint")
+    for field in ("db_device", "db_inode"):
+        if not values[field].isdecimal():
+            fail(f"{label} has an invalid {field}")
+        if values[field] != str(int(values[field])):
+            fail(f"{label} has a non-canonical {field}")
+    for field in ("db_path_fingerprint", "identity_fingerprint"):
+        if re.fullmatch(r"[0-9a-f]{64}", values[field]) is None:
+            fail(f"{label} has an invalid {field}")
+    prefix = identity_prefix(values)
+    if values["identity_fingerprint"] != identity_fingerprint(prefix):
+        fail(f"{label} fingerprint mismatch")
+    if raw != encode_identity(values):
+        fail(f"{label} is not canonical")
+    return values
+
+
+def database_stat(db_path):
+    if not os.path.isabs(db_path):
+        fail("database path must be absolute")
+    try:
+        info = os.lstat(db_path)
+    except FileNotFoundError:
+        fail("database directory is missing")
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        fail("database path must be a real directory")
+    real_path = os.path.realpath(db_path)
+    if real_path != db_path:
+        fail("database path is not canonical")
+    path_fingerprint = hashlib.sha256(
+        b"rmdb-final2026-database-path-v1\0"
+        + os.fsencode(real_path)
+    ).hexdigest()
+    return info, path_fingerprint
+
+
+def validate_identity_against_path(values, db_path):
+    info, path_fingerprint = database_stat(db_path)
+    if os.path.basename(db_path) != values["db_name"]:
+        fail("database name does not match its state identity")
+    if int(values["db_device"]) != info.st_dev:
+        fail("database device does not match its state identity")
+    if int(values["db_inode"]) != info.st_ino:
+        fail("database inode does not match its state identity")
+    if values["db_path_fingerprint"] != path_fingerprint:
+        fail("database path does not match its state identity")
+
+
+def validate_expected(values, dataset_run_id, seed):
+    validate_run_id(dataset_run_id)
+    if values["dataset_run_id"] != dataset_run_id:
+        fail("database identity dataset run_id mismatch")
+    if int(values["seed"]) != parse_seed(seed):
+        fail("database identity seed mismatch")
+
+
+def print_identity(values):
+    print(
+        "\t".join(
+            (
+                values["db_name"],
+                values["name_source"],
+                values["binding_status"],
+                values["db_device"],
+                values["db_inode"],
+                values["db_path_fingerprint"],
+                values["runtime_schema_fingerprint"],
+                values["dataset_state_fingerprint"],
+                values["identity_fingerprint"],
+            )
+        )
+    )
+
+
+def load_and_verify(state_file, db_path, dataset_run_id, seed):
+    state_raw = read_regular(state_file, "state database.identity")
+    values = parse_identity(state_raw, "state database.identity")
+    validate_expected(values, dataset_run_id, seed)
+    validate_identity_against_path(values, db_path)
+    marker = os.path.join(db_path, IDENTITY_MARKER_NAME)
+    marker_raw = read_regular(marker, "database identity marker")
+    marker_values = parse_identity(marker_raw, "database identity marker")
+    if marker_raw != state_raw or marker_values != values:
+        fail("state and database identity markers differ")
+    if values["binding_status"] == "sealed":
+        runtime_fingerprint, dataset_fingerprint = inspect_dataset_state(
+            os.path.join(os.path.dirname(state_file), "dataset.state"),
+            dataset_run_id,
+            seed,
+        )
+        if values["runtime_schema_fingerprint"] != runtime_fingerprint:
+            fail("runtime schema fingerprint changed after identity sealing")
+        if values["dataset_state_fingerprint"] != dataset_fingerprint:
+            fail("dataset.state changed after identity sealing")
+    return values
+
+
+def write_exclusive(path, payload, label):
+    parent = os.path.dirname(path)
+    try:
+        parent_info = os.lstat(parent)
+    except FileNotFoundError:
+        fail(f"{label} parent directory is missing")
+    if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
+        fail(f"{label} parent must be a real directory")
+    if os.path.lexists(path):
+        fail(f"{label} already exists")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    fail(f"could not write {label}")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        directory_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as error:
+        fail(f"could not create {label}: {error}")
+
+
+def replace_regular(path, expected, payload, label):
+    if read_regular(path, label) != expected:
+        fail(f"{label} changed before dataset identity sealing")
+    parent = os.path.dirname(path)
+    temporary = os.path.join(
+        parent,
+        f".{os.path.basename(path)}.{os.getpid()}.tmp",
+    )
+    if os.path.lexists(temporary):
+        fail(f"temporary {label} path already exists")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    fail(f"could not write temporary {label}")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if read_regular(path, label) != expected:
+            fail(f"{label} changed during dataset identity sealing")
+        os.replace(temporary, path)
+        directory_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as error:
+        fail(f"could not replace {label}: {error}")
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def inspect_dataset_state(path, dataset_run_id, seed):
+    raw = read_regular(path, "dataset.state", 32 * 1024 * 1024)
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        fail("dataset.state is not ASCII")
+    lines = text.splitlines()
+    if len(lines) < 10 or lines[0].split("=", 1)[0] != "version":
+        fail("dataset.state has an invalid header")
+    if lines[1] != f"run_id={dataset_run_id}":
+        fail("dataset.state run_id does not match the database identity")
+    if lines[2] != f"seed={parse_seed(seed)}":
+        fail("dataset.state seed does not match the database identity")
+    try:
+        begin = lines.index("runtime_schema_begin")
+        end = lines.index("runtime_schema_end", begin + 1)
+    except ValueError:
+        fail("dataset.state is missing its runtime schema block")
+    fingerprints = [
+        line.removeprefix("fingerprint=")
+        for line in lines[begin + 1:end]
+        if line.startswith("fingerprint=")
+    ]
+    if len(fingerprints) != 1 or re.fullmatch(
+        r"[0-9a-f]{16}",
+        fingerprints[0],
+    ) is None:
+        fail("dataset.state has an invalid runtime schema fingerprint")
+    return (
+        fingerprints[0],
+        hashlib.sha256(raw).hexdigest(),
+    )
+
+
+if len(sys.argv) < 2:
+    fail("database identity helper action is missing")
+action = sys.argv[1]
+
+if action == "derive":
+    if len(sys.argv) != 4:
+        fail("derive expects run_id and seed")
+    run_id, seed_text = sys.argv[2:]
+    validate_run_id(run_id)
+    seed = parse_seed(seed_text)
+    digest = hashlib.sha256()
+    digest.update(b"rmdb-final2026-opaque-database-name-v1\0")
+    for value in (run_id.encode("ascii"), str(seed).encode("ascii")):
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    print("d_" + digest.hexdigest()[:32])
+elif action == "create":
+    if len(sys.argv) != 7:
+        fail("create expects state file, database path, run_id, seed, source")
+    state_file, db_path, dataset_run_id, seed_text, source = sys.argv[2:]
+    validate_run_id(dataset_run_id)
+    seed = parse_seed(seed_text)
+    if source not in ("derived_opaque", "explicit_deviation"):
+        fail("invalid database-name source")
+    db_name = os.path.basename(db_path)
+    validate_name(db_name)
+    info, path_fingerprint = database_stat(db_path)
+    values = {
+        "version": "1",
+        "dataset_run_id": dataset_run_id,
+        "seed": str(seed),
+        "db_name": db_name,
+        "name_source": source,
+        "binding_status": "provisioned",
+        "runtime_schema_fingerprint": "unsealed",
+        "dataset_state_fingerprint": "unsealed",
+        "db_device": str(info.st_dev),
+        "db_inode": str(info.st_ino),
+        "db_path_fingerprint": path_fingerprint,
+    }
+    payload = encode_identity(values)
+    values["identity_fingerprint"] = identity_fingerprint(
+        identity_prefix(values)
+    )
+    marker = os.path.join(db_path, IDENTITY_MARKER_NAME)
+    write_exclusive(marker, payload, "database identity marker")
+    write_exclusive(state_file, payload, "state database.identity")
+    print_identity(values)
+elif action == "inspect-existing":
+    if len(sys.argv) != 7:
+        fail(
+            "inspect-existing expects state file, RMDB root, run_id, seed, "
+            "asserted name"
+        )
+    state_file, rmdb_root, dataset_run_id, seed_text, asserted_name = (
+        sys.argv[2:]
+    )
+    state_raw = read_regular(state_file, "state database.identity")
+    values = parse_identity(state_raw, "state database.identity")
+    validate_expected(values, dataset_run_id, seed_text)
+    if values["binding_status"] != "sealed":
+        fail("existing database identity is not sealed to dataset.state")
+    if asserted_name and asserted_name != values["db_name"]:
+        fail("explicit database name does not match setup state")
+    db_path = os.path.join(rmdb_root, values["db_name"])
+    verified = load_and_verify(
+        state_file,
+        db_path,
+        dataset_run_id,
+        seed_text,
+    )
+    print_identity(verified)
+elif action == "seal":
+    if len(sys.argv) != 7:
+        fail(
+            "seal expects state file, database path, run_id, seed, "
+            "dataset.state"
+        )
+    state_file, db_path, dataset_run_id, seed_text, dataset_file = (
+        sys.argv[2:]
+    )
+    state_raw = read_regular(state_file, "state database.identity")
+    values = load_and_verify(
+        state_file,
+        db_path,
+        dataset_run_id,
+        seed_text,
+    )
+    runtime_fingerprint, dataset_fingerprint = inspect_dataset_state(
+        dataset_file,
+        dataset_run_id,
+        seed_text,
+    )
+    if values["binding_status"] == "sealed":
+        if (
+            values["runtime_schema_fingerprint"] != runtime_fingerprint
+            or values["dataset_state_fingerprint"] != dataset_fingerprint
+        ):
+            fail("sealed database identity does not match dataset.state")
+        print_identity(values)
+        raise SystemExit(0)
+    values["binding_status"] = "sealed"
+    values["runtime_schema_fingerprint"] = runtime_fingerprint
+    values["dataset_state_fingerprint"] = dataset_fingerprint
+    payload = encode_identity(values)
+    values["identity_fingerprint"] = identity_fingerprint(
+        identity_prefix(values)
+    )
+    marker = os.path.join(db_path, IDENTITY_MARKER_NAME)
+    marker_raw = read_regular(marker, "database identity marker")
+    if marker_raw != state_raw:
+        fail("state and database identity markers differ before sealing")
+    replace_regular(
+        marker,
+        marker_raw,
+        payload,
+        "database identity marker",
+    )
+    replace_regular(
+        state_file,
+        state_raw,
+        payload,
+        "state database.identity",
+    )
+    print_identity(values)
+elif action == "verify":
+    if len(sys.argv) != 6:
+        fail("verify expects state file, database path, run_id, seed")
+    state_file, db_path, dataset_run_id, seed_text = sys.argv[2:]
+    print_identity(
+        load_and_verify(
+            state_file,
+            db_path,
+            dataset_run_id,
+            seed_text,
+        )
+    )
+else:
+    fail(f"unknown database identity helper action: {action}")
+PY
+}
+
 normalize_numeric_host() {
   python3 - "$1" <<'PY'
 import ipaddress
@@ -239,7 +739,11 @@ while [[ $# -gt 0 ]]; do
     --label)
       need_value "$1" "${2-}"; LABEL="$2"; shift 2 ;;
     --db-name)
-      need_value "$1" "${2-}"; DB_NAME="$2"; shift 2 ;;
+      need_value "$1" "${2-}"
+      DB_NAME="$2"
+      DB_NAME_CALLER_SUPPLIED=1
+      shift 2
+      ;;
     --target-dir)
       need_value "$1" "${2-}"; RMDB_DIR="$2"; shift 2 ;;
     --tpcc-dir)
@@ -308,7 +812,17 @@ esac
 if [[ "${DIAGNOSTICS_REQUESTED}" == "1" && "${MODE}" != "all" ]]; then
   die "--diagnostics requires --mode all so rank, online, and recovery gates complete first"
 fi
-validate_component "--db-name" "${DB_NAME}"
+USES_EXISTING_DATABASE=0
+if [[ "${MODE}" == "recovery" ]] \
+  || { [[ "${MODE}" == "rank" ]] && [[ "${INIT_BEFORE_RUN}" != "1" ]]; }; then
+  USES_EXISTING_DATABASE=1
+fi
+if [[ "${DB_NAME_CALLER_SUPPLIED}" == "1" ]]; then
+  validate_component "--db-name" "${DB_NAME}"
+  if [[ "${USES_EXISTING_DATABASE}" != "1" ]]; then
+    DB_NAME_DEVIATION_ACTIVE=1
+  fi
+fi
 validate_component "--label" "${LABEL}"
 validate_component "--build-dir" "${BUILD_DIR}"
 [[ "${PROFILE}" == "final2026" ]] || die "only --profile final2026 is supported"
@@ -324,9 +838,10 @@ HOST_INFO="$(normalize_numeric_host "${HOST}")" \
 IFS=$'\t' read -r HOST_VERSION HOST <<<"${HOST_INFO}"
 
 if [[ -n "${SCALE}${CLIENTS}${WARMUP_SECONDS}${WINDOW_SECONDS}" \
+  || "${DB_NAME_DEVIATION_ACTIVE}" == "1" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]] \
   && [[ "${ALLOW_DEVIATION}" != "1" ]]; then
-  die "local sizing/timing/readiness overrides require --allow-deviation"
+  die "local database-name/sizing/timing/readiness overrides require --allow-deviation"
 fi
 if [[ "${ALLOW_DEVIATION}" == "1" ]]; then
   [[ -z "${SCALE}" ]] || validate_positive_integer "--scale" "${SCALE}"
@@ -346,6 +861,7 @@ if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_CLIENTS}" != "${PUBLIC_CLIENTS}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
   || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
+  || "${DB_NAME_DEVIATION_ACTIVE}" == "1" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
@@ -354,7 +870,6 @@ if [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
 else
   CONFORMANCE="non_ranked_deviation"
 fi
-
 RMDB_DIR="$(canonical_existing_dir "${RMDB_DIR}")" \
   || die "RMDB root does not exist: ${RMDB_DIR}"
 TPCC_DIR="$(canonical_existing_dir "${TPCC_DIR}")" \
@@ -385,23 +900,17 @@ RUN_TEMP_DIR="${RMDB_DIR}/.tpcc-workflow/${RUN_ID}"
 CSV_DIR="${RUN_TEMP_DIR}/csv"
 LOAD_DIR="../.tpcc-workflow/${RUN_ID}/csv"
 RUN_MARKER="${RUN_TEMP_DIR}/.owner"
-DB_PATH="${RMDB_DIR}/${DB_NAME}"
-DB_MARKER="${DB_PATH}/.tpcc-workflow-owner"
-OWNER_TOKEN="tpcc-final2026:${RUN_ID}:${DB_PATH}"
-PROCESS_OWNER_TOKEN="tpcc-process:${RUN_ID}:$$"
 if [[ -n "${STATE_DIR_OVERRIDE}" ]]; then
   STATE_DIR="${STATE_DIR_OVERRIDE}"
 else
   STATE_DIR="${RESULT_DIR}/state"
 fi
-if [[ "${MODE}" == "recovery" ]] \
-  || { [[ "${MODE}" == "rank" ]] && [[ "${INIT_BEFORE_RUN}" != "1" ]]; }; then
+if [[ "${USES_EXISTING_DATABASE}" == "1" ]]; then
   [[ -n "${STATE_DIR_OVERRIDE}" ]] \
     || die "--mode ${MODE} on an existing database requires --state-dir from its setup run"
 fi
 DATASET_RUN_ID="${RUN_ID}"
-if [[ "${MODE}" == "recovery" ]] \
-  || { [[ "${MODE}" == "rank" ]] && [[ "${INIT_BEFORE_RUN}" != "1" ]]; }; then
+if [[ "${USES_EXISTING_DATABASE}" == "1" ]]; then
   DATASET_FILE="${STATE_DIR}/dataset.state"
   [[ -f "${DATASET_FILE}" && ! -L "${DATASET_FILE}" ]] \
     || die "existing state-dir must contain a real dataset.state file"
@@ -414,6 +923,61 @@ if [[ "${MODE}" == "recovery" ]] \
     *[!A-Za-z0-9._:-]*)
       die "dataset.state contains an unsafe run_id" ;;
   esac
+fi
+DATABASE_IDENTITY_FILE="${STATE_DIR}/database.identity"
+if [[ "${USES_EXISTING_DATABASE}" == "1" ]]; then
+  EXISTING_IDENTITY="$(
+    database_identity_helper inspect-existing \
+      "${DATABASE_IDENTITY_FILE}" "${RMDB_DIR}" "${DATASET_RUN_ID}" \
+      "${SEED}" "${DB_NAME}"
+  )" || die "existing database identity verification failed"
+  IFS=$'\t' read -r DB_NAME DB_IDENTITY_SOURCE \
+    DB_IDENTITY_BINDING_STATUS DB_DEVICE DB_INODE DB_PATH_FINGERPRINT \
+    RUNTIME_SCHEMA_FINGERPRINT DATASET_STATE_FINGERPRINT \
+    DB_IDENTITY_FINGERPRINT <<<"${EXISTING_IDENTITY}"
+  validate_component "state database name" "${DB_NAME}"
+  DB_IDENTITY_STATUS="verified"
+  if [[ "${DB_IDENTITY_SOURCE}" == "explicit_deviation" ]]; then
+    DB_NAME_DEVIATION_ACTIVE=1
+  fi
+else
+  if [[ "${DB_NAME_CALLER_SUPPLIED}" == "1" ]]; then
+    DB_IDENTITY_SOURCE="explicit_deviation"
+  else
+    DB_NAME="$(
+      database_identity_helper derive "${DATASET_RUN_ID}" "${SEED}"
+    )" || die "could not derive an opaque database name"
+    DB_IDENTITY_SOURCE="derived_opaque"
+  fi
+  validate_component "derived database name" "${DB_NAME}"
+  if [[ "${MODE}" == "tools" ]]; then
+    DB_IDENTITY_STATUS="not_applicable"
+  fi
+fi
+
+DB_PATH="${RMDB_DIR}/${DB_NAME}"
+DB_MARKER="${DB_PATH}/.tpcc-workflow-owner"
+DB_IDENTITY_MARKER="${DB_PATH}/.tpcc-workflow-database-identity"
+OWNER_TOKEN="tpcc-final2026:${RUN_ID}:${DB_PATH}"
+PROCESS_OWNER_TOKEN="tpcc-process:${RUN_ID}:$$"
+
+EFFECTIVE_SCALE="${SCALE:-${PUBLIC_SCALE}}"
+EFFECTIVE_CLIENTS="${CLIENTS:-${PUBLIC_CLIENTS}}"
+EFFECTIVE_WARMUP_SECONDS="${WARMUP_SECONDS:-${PUBLIC_WARMUP_SECONDS}}"
+EFFECTIVE_WINDOW_SECONDS="${WINDOW_SECONDS:-${PUBLIC_WINDOW_SECONDS}}"
+RANKED_CONFIGURATION=1
+if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
+  || "${EFFECTIVE_CLIENTS}" != "${PUBLIC_CLIENTS}" \
+  || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
+  || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
+  || "${DB_NAME_DEVIATION_ACTIVE}" == "1" \
+  || "${READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
+  RANKED_CONFIGURATION=0
+fi
+if [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
+  CONFORMANCE="public_spec_aligned"
+else
+  CONFORMANCE="non_ranked_deviation"
 fi
 
 if [[ "${CLEAN_DB_ON_EXIT}" == "auto" ]]; then
@@ -2843,13 +3407,134 @@ os.execv(sys.argv[1], sys.argv[1:])' \
   fi
 }
 
+validate_identity_record_fields() {
+  local name="$1"
+  local source="$2"
+  local binding_status="$3"
+  local device="$4"
+  local inode="$5"
+  local path_fingerprint="$6"
+  local runtime_schema_fingerprint="$7"
+  local dataset_state_fingerprint="$8"
+  local identity_fingerprint="$9"
+  validate_component "database identity name" "${name}"
+  [[ "${source}" == "derived_opaque" \
+    || "${source}" == "explicit_deviation" ]] \
+    || die "database identity has an invalid name source"
+  [[ "${binding_status}" == "provisioned" \
+    || "${binding_status}" == "sealed" ]] \
+    || die "database identity has an invalid binding status"
+  is_uint "${device}" || die "database identity has an invalid device"
+  is_uint "${inode}" || die "database identity has an invalid inode"
+  [[ "${path_fingerprint}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "database identity has an invalid path fingerprint"
+  if [[ "${binding_status}" == "provisioned" ]]; then
+    [[ "${runtime_schema_fingerprint}" == "unsealed" \
+      && "${dataset_state_fingerprint}" == "unsealed" ]] \
+      || die "provisioned database identity has sealed dataset fields"
+  else
+    [[ "${runtime_schema_fingerprint}" =~ ^[0-9a-f]{16}$ ]] \
+      || die "database identity has an invalid runtime schema fingerprint"
+    [[ "${dataset_state_fingerprint}" =~ ^[0-9a-f]{64}$ ]] \
+      || die "database identity has an invalid dataset state fingerprint"
+  fi
+  [[ "${identity_fingerprint}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "database identity has an invalid fingerprint"
+}
+
+set_database_identity_record() {
+  local record="$1"
+  local extra=""
+  IFS=$'\t' read -r DB_NAME DB_IDENTITY_SOURCE \
+    DB_IDENTITY_BINDING_STATUS DB_DEVICE DB_INODE DB_PATH_FINGERPRINT \
+    RUNTIME_SCHEMA_FINGERPRINT DATASET_STATE_FINGERPRINT \
+    DB_IDENTITY_FINGERPRINT extra <<<"${record}"
+  [[ -z "${extra}" ]] || die "database identity helper returned extra fields"
+  validate_identity_record_fields \
+    "${DB_NAME}" "${DB_IDENTITY_SOURCE}" "${DB_IDENTITY_BINDING_STATUS}" \
+    "${DB_DEVICE}" "${DB_INODE}" "${DB_PATH_FINGERPRINT}" \
+    "${RUNTIME_SCHEMA_FINGERPRINT}" "${DATASET_STATE_FINGERPRINT}" \
+    "${DB_IDENTITY_FINGERPRINT}"
+  DB_IDENTITY_STATUS="verified"
+}
+
+verify_database_identity() {
+  local record=""
+  local verified_name=""
+  local verified_source=""
+  local verified_binding_status=""
+  local verified_device=""
+  local verified_inode=""
+  local verified_path_fingerprint=""
+  local verified_runtime_schema_fingerprint=""
+  local verified_dataset_state_fingerprint=""
+  local verified_identity_fingerprint=""
+  local extra=""
+  record="$(
+    database_identity_helper verify \
+      "${DATABASE_IDENTITY_FILE}" "${DB_PATH}" "${DATASET_RUN_ID}" "${SEED}"
+  )" || die "database identity verification failed"
+  IFS=$'\t' read -r verified_name verified_source verified_binding_status \
+    verified_device verified_inode verified_path_fingerprint \
+    verified_runtime_schema_fingerprint verified_dataset_state_fingerprint \
+    verified_identity_fingerprint extra <<<"${record}"
+  [[ -z "${extra}" ]] || die "database identity helper returned extra fields"
+  validate_identity_record_fields \
+    "${verified_name}" "${verified_source}" "${verified_binding_status}" \
+    "${verified_device}" "${verified_inode}" "${verified_path_fingerprint}" \
+    "${verified_runtime_schema_fingerprint}" \
+    "${verified_dataset_state_fingerprint}" \
+    "${verified_identity_fingerprint}"
+  [[ "${verified_name}" == "${DB_NAME}" \
+    && "${verified_source}" == "${DB_IDENTITY_SOURCE}" \
+    && "${verified_binding_status}" == "${DB_IDENTITY_BINDING_STATUS}" \
+    && "${verified_device}" == "${DB_DEVICE}" \
+    && "${verified_inode}" == "${DB_INODE}" \
+    && "${verified_path_fingerprint}" == "${DB_PATH_FINGERPRINT}" \
+    && "${verified_runtime_schema_fingerprint}" \
+      == "${RUNTIME_SCHEMA_FINGERPRINT}" \
+    && "${verified_dataset_state_fingerprint}" \
+      == "${DATASET_STATE_FINGERPRINT}" \
+    && "${verified_identity_fingerprint}" == "${DB_IDENTITY_FINGERPRINT}" ]] \
+    || die "database identity changed during this workflow"
+  DB_IDENTITY_STATUS="verified"
+}
+
+seal_database_identity() {
+  local record=""
+  record="$(
+    database_identity_helper seal \
+      "${DATABASE_IDENTITY_FILE}" "${DB_PATH}" "${DATASET_RUN_ID}" \
+      "${SEED}" "${STATE_DIR}/dataset.state"
+  )" || die "could not seal database identity to dataset.state"
+  set_database_identity_record "${record}"
+  [[ "${DB_IDENTITY_BINDING_STATUS}" == "sealed" ]] \
+    || die "database identity sealing did not reach the sealed state"
+  verify_database_identity
+  write_manifest
+}
+
 claim_new_database() {
+  local identity_record=""
   [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] \
     || die "RMDB did not create the expected database directory: ${DB_PATH}"
-  [[ ! -e "${DB_MARKER}" ]] \
+  [[ ! -e "${DB_MARKER}" && ! -L "${DB_MARKER}" ]] \
     || die "new database unexpectedly already contains an ownership marker"
+  [[ ! -e "${DB_IDENTITY_MARKER}" && ! -L "${DB_IDENTITY_MARKER}" ]] \
+    || die "new database unexpectedly already contains an identity marker"
+  [[ ! -e "${DATABASE_IDENTITY_FILE}" \
+    && ! -L "${DATABASE_IDENTITY_FILE}" ]] \
+    || die "state directory unexpectedly already contains database.identity"
   printf '%s\n' "${OWNER_TOKEN}" >"${DB_MARKER}"
   DB_OWNED=1
+  identity_record="$(
+    database_identity_helper create \
+      "${DATABASE_IDENTITY_FILE}" "${DB_PATH}" "${DATASET_RUN_ID}" \
+      "${SEED}" "${DB_IDENTITY_SOURCE}"
+  )" || die "could not persist the database identity"
+  set_database_identity_record "${identity_record}"
+  verify_database_identity
+  write_manifest
 }
 
 start_new_database() {
@@ -2866,9 +3551,10 @@ start_existing_database() {
   local readiness_scope="$1"
   local readiness_budget_seconds=""
   local readiness_budget_kind=""
+  verify_database_identity
   [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] \
     || die "existing database directory is missing or unsafe: ${DB_PATH}"
-  capture_resource_database_identity || true
+  RESOURCE_DATABASE_IDENTITY="${DB_DEVICE}:${DB_INODE}"
   case "${readiness_scope}" in
     startup)
       readiness_budget_seconds="${STARTUP_READY_TIMEOUT_SECONDS}"
@@ -2884,6 +3570,7 @@ start_existing_database() {
   esac
   start_server "existing database" \
     "${readiness_budget_seconds}" "${readiness_budget_kind}"
+  verify_database_identity
 }
 
 run_tester() {
@@ -2935,12 +3622,14 @@ record_lifecycle_event() {
 }
 
 run_setup() {
+  verify_database_identity
   log "creating and loading final2026 dataset"
   set_phase_status setup running
   if run_profile_tester "${RESULT_DIR}/setup.log" \
       --create-schema --init --check --check-scope setup \
       --profile "${PROFILE}" --seed "${SEED}" --state-dir "${STATE_DIR}" \
       --host "${HOST}" --port "${PORT}"; then
+    seal_database_identity
     set_phase_status setup passed
   else
     set_phase_status setup failed
@@ -2950,6 +3639,7 @@ run_setup() {
 
 run_rank() {
   local rank_rc=0
+  verify_database_identity
   log "running one Rust-owned final2026 benchmark"
   set_phase_status rank running
   TESTER_RESOURCE_TIMELINE="${RESOURCE_TIMELINE}"
@@ -2969,6 +3659,7 @@ run_rank() {
 
 run_check() {
   local scope="$1"
+  verify_database_identity
   log "running ${scope} consistency checks"
   set_phase_status "${scope}" running
   if run_profile_tester "${RESULT_DIR}/check_${scope}.log" \
