@@ -182,9 +182,7 @@ impl Config {
         if (self.init || self.benchmark) && self.seed.is_none() {
             return Err(ConfigError::MissingSeed);
         }
-        if (self.init || self.benchmark || (self.check && self.check_scope != CheckScope::Setup))
-            && self.state_dir.is_none()
-        {
+        if (self.init || self.benchmark || self.check) && self.state_dir.is_none() {
             return Err(ConfigError::MissingStateDir);
         }
 

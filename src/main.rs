@@ -1,3 +1,4 @@
+mod check_executor;
 mod checker;
 mod config;
 mod connection;
@@ -148,14 +149,37 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 
         if config.check {
             info!("运行 {} 阶段一致性检查", config.check_scope.as_str());
-            let mut chk = checker::ConsistencyChecker::new(
-                &mut cursor,
-                config.scale_factor,
-                config.expected_new_orders,
-            );
-            let all_passed = chk.run_all_checks().await?;
-            if !all_passed {
-                return Err("一致性检查未全部通过".into());
+            if config.check_scope == config::CheckScope::Setup {
+                let store = run_state::StateStore::open(
+                    config
+                        .state_dir
+                        .as_deref()
+                        .ok_or("validated setup check lost its state directory")?,
+                )?;
+                let dataset = store.load_dataset()?;
+                if dataset.warehouses != config.scale_factor
+                    || effective.seed.is_some_and(|seed| dataset.seed != seed)
+                {
+                    return Err(format!(
+                        "setup state mismatch: state seed/SF={}/{}, CLI seed/SF={:?}/{}",
+                        dataset.seed,
+                        dataset.warehouses,
+                        effective.seed,
+                        config.scale_factor
+                    )
+                    .into());
+                }
+                check_executor::run_setup(cursor.client_mut(), &dataset).await?;
+            } else {
+                let mut chk = checker::ConsistencyChecker::new(
+                    &mut cursor,
+                    config.scale_factor,
+                    config.expected_new_orders,
+                );
+                let all_passed = chk.run_all_checks().await?;
+                if !all_passed {
+                    return Err("一致性检查未全部通过".into());
+                }
             }
         }
 
