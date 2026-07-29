@@ -288,7 +288,14 @@ if "--probe-ready" in sys.argv and not os.path.isdir(os.environ["FAKE_DB_PATH"])
                 for args in invocations
                 if "--check-scope" in args
             ]
-            self.assertEqual(scopes, ["online", "recovery"])
+            self.assertEqual(scopes, ["setup", "online", "recovery"])
+            state_dirs = [
+                args[args.index("--state-dir") + 1]
+                for args in invocations
+                if "--state-dir" in args
+            ]
+            self.assertGreaterEqual(len(state_dirs), 4)
+            self.assertEqual(len(set(state_dirs)), 1)
             probes = [
                 args for args in invocations if "--probe-ready" in args
             ]

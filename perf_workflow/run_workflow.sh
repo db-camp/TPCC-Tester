@@ -32,6 +32,7 @@ WARMUP_SECONDS=""
 WINDOW_SECONDS=""
 SERVER_BIN_OVERRIDE=""
 TPCC_BIN_OVERRIDE=""
+STATE_DIR_OVERRIDE=""
 
 SERVER_PID=""
 PROBE_PID=""
@@ -41,6 +42,7 @@ RESULT_DIR=""
 RUN_TEMP_DIR=""
 CSV_DIR=""
 LOAD_DIR=""
+STATE_DIR=""
 RUN_MARKER=""
 DB_MARKER=""
 OWNER_TOKEN=""
@@ -71,6 +73,7 @@ Paths/build:
   --target-dir <RMDB-root>
   --tpcc-dir <TPCC-Tester-root>
   --record-root <result-root>
+  --state-dir <run-state-dir>
   --build-dir <relative-single-component>
   --server-bin <path>
   --tpcc-bin <path>
@@ -168,6 +171,8 @@ while [[ $# -gt 0 ]]; do
       need_value "$1" "${2-}"; TPCC_DIR="$2"; shift 2 ;;
     --record-root)
       need_value "$1" "${2-}"; RECORD_ROOT="$2"; shift 2 ;;
+    --state-dir)
+      need_value "$1" "${2-}"; STATE_DIR_OVERRIDE="$2"; shift 2 ;;
     --build-dir)
       need_value "$1" "${2-}"; BUILD_DIR="$2"; shift 2 ;;
     --host)
@@ -257,6 +262,10 @@ if [[ -n "${TPCC_BIN_OVERRIDE}" ]]; then
   TPCC_BIN_OVERRIDE="$(canonical_existing_file "${TPCC_BIN_OVERRIDE}")" \
     || die "--tpcc-bin does not name an existing regular file"
 fi
+if [[ -n "${STATE_DIR_OVERRIDE}" ]]; then
+  STATE_DIR_OVERRIDE="$(canonical_existing_dir "${STATE_DIR_OVERRIDE}")" \
+    || die "--state-dir must name an existing real directory"
+fi
 
 if [[ -z "${RECORD_ROOT}" ]]; then
   RECORD_ROOT="${RMDB_DIR}/performance_test_record"
@@ -271,6 +280,16 @@ RUN_MARKER="${RUN_TEMP_DIR}/.owner"
 DB_PATH="${RMDB_DIR}/${DB_NAME}"
 DB_MARKER="${DB_PATH}/.tpcc-workflow-owner"
 OWNER_TOKEN="tpcc-final2026:${RUN_ID}:${DB_PATH}"
+if [[ -n "${STATE_DIR_OVERRIDE}" ]]; then
+  STATE_DIR="${STATE_DIR_OVERRIDE}"
+else
+  STATE_DIR="${RESULT_DIR}/state"
+fi
+if [[ "${MODE}" == "recovery" ]] \
+  || { [[ "${MODE}" == "rank" ]] && [[ "${INIT_BEFORE_RUN}" != "1" ]]; }; then
+  [[ -n "${STATE_DIR_OVERRIDE}" ]] \
+    || die "--mode ${MODE} on an existing database requires --state-dir from its setup run"
+fi
 
 if [[ "${CLEAN_DB_ON_EXIT}" == "auto" ]]; then
   if [[ "${MODE}" == "all" ]]; then
@@ -305,6 +324,7 @@ db_name=${DB_NAME}
 db_path=${DB_PATH}
 result_dir=${RESULT_DIR}
 csv_dir=${CSV_DIR}
+state_dir=${STATE_DIR}
 host=${HOST}
 port=${PORT}
 ready_probe=tpcc-tester --probe-ready --host ${HOST} --port ${PORT}
@@ -321,6 +341,9 @@ mkdir -p "${RECORD_ROOT}"
 [[ ! -e "${RESULT_DIR}" && ! -L "${RESULT_DIR}" ]] \
   || die "result directory already exists: ${RESULT_DIR}"
 mkdir "${RESULT_DIR}"
+if [[ -z "${STATE_DIR_OVERRIDE}" ]]; then
+  mkdir "${STATE_DIR}"
+fi
 
 RUN_STATE_ROOT="${RMDB_DIR}/.tpcc-workflow"
 if [[ -e "${RUN_STATE_ROOT}" || -L "${RUN_STATE_ROOT}" ]]; then
@@ -622,6 +645,7 @@ run_tester() {
     cd "${TPCC_DIR}"
     RMDB_TPCC_CSV_DIR="${CSV_DIR}" \
     RMDB_TPCC_LOAD_DIR="${LOAD_DIR}" \
+    RMDB_TPCC_RUN_ID="${RUN_ID}" \
       "${TPCC_BIN}" "$@"
   ) >"${log_path}" 2>&1
 }
@@ -646,7 +670,8 @@ run_profile_tester() {
 run_setup() {
   log "creating and loading final2026 dataset"
   run_profile_tester "${RESULT_DIR}/setup.log" \
-    --create-schema --init --profile "${PROFILE}" --seed "${SEED}" \
+    --create-schema --init --check --check-scope setup \
+    --profile "${PROFILE}" --seed "${SEED}" --state-dir "${STATE_DIR}" \
     --host "${HOST}" --port "${PORT}" \
     || die "TPC-C setup failed; see ${RESULT_DIR}/setup.log"
 }
@@ -655,6 +680,7 @@ run_rank() {
   log "running one Rust-owned final2026 benchmark"
   run_profile_tester "${RESULT_DIR}/rank.log" \
     --benchmark --profile "${PROFILE}" --seed "${SEED}" \
+    --state-dir "${STATE_DIR}" \
     --host "${HOST}" --port "${PORT}" \
     || die "TPC-C ranking failed; see ${RESULT_DIR}/rank.log"
 }
@@ -664,6 +690,7 @@ run_check() {
   log "running ${scope} consistency checks"
   run_profile_tester "${RESULT_DIR}/check_${scope}.log" \
     --check --check-scope "${scope}" --profile "${PROFILE}" --seed "${SEED}" \
+    --state-dir "${STATE_DIR}" \
     --host "${HOST}" --port "${PORT}" \
     || die "TPC-C ${scope} checks failed; see ${RESULT_DIR}/check_${scope}.log"
 }
@@ -696,7 +723,6 @@ case "${MODE}" in
   init)
     start_new_database
     run_setup
-    run_check online
     stop_server
     ;;
   rank)
