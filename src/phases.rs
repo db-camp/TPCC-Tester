@@ -20,6 +20,63 @@ use crate::transaction::TransactionType;
 
 const WARMUP_DURATION: Duration = Duration::from_secs(WARMUP_SECONDS);
 
+/// Timing and concurrency for one scheduler run.
+///
+/// [`Self::official`] is the public final profile used by
+/// [`Final2026Scheduler::new`].  Any other value is a local, non-ranked smoke
+/// schedule: it preserves the three-window state machine and measurement
+/// accounting, but must not be reported as an official ranked run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseScheduleConfig {
+    clients: u16,
+    warmup_duration: Duration,
+    measurement_window_duration: Duration,
+}
+
+impl PhaseScheduleConfig {
+    /// Builds a local, non-ranked smoke schedule.
+    ///
+    /// The final profile always has exactly three measurement windows, so the
+    /// number of windows is intentionally not configurable.
+    pub fn new(
+        clients: u16,
+        warmup_duration: Duration,
+        measurement_window_duration: Duration,
+    ) -> Result<Self, SchedulerError> {
+        if clients == 0 || clients > OFFICIAL_CLIENTS {
+            return Err(SchedulerError::InvalidScheduleClients(clients));
+        }
+        if measurement_window_duration.is_zero() {
+            return Err(SchedulerError::InvalidMeasurementWindowDuration);
+        }
+        Ok(Self {
+            clients,
+            warmup_duration,
+            measurement_window_duration,
+        })
+    }
+
+    pub const fn official() -> Self {
+        Self {
+            clients: OFFICIAL_CLIENTS,
+            warmup_duration: WARMUP_DURATION,
+            measurement_window_duration: FORMAL_WINDOW_DURATION,
+        }
+    }
+
+    pub const fn clients(self) -> u16 {
+        self.clients
+    }
+
+    pub const fn warmup_duration(self) -> Duration {
+        self.warmup_duration
+    }
+
+    pub const fn measurement_window_duration(self) -> Duration {
+        self.measurement_window_duration
+    }
+}
+
 /// A source of monotonic time expressed relative to any stable epoch.
 pub trait MonotonicClock {
     fn now(&self) -> Duration;
@@ -329,6 +386,15 @@ pub struct SchedulerFailure {
 pub enum SchedulerError {
     #[error("worker id {0} is outside the official 0..32 range")]
     InvalidWorker(u16),
+    #[error("local schedule client count {0} must be in 1..=32")]
+    InvalidScheduleClients(u16),
+    #[error("local measurement-window duration must be non-zero")]
+    InvalidMeasurementWindowDuration,
+    #[error("worker {worker:?} is outside this run's configured 0..{configured_clients} range")]
+    WorkerNotConfigured {
+        worker: WorkerId,
+        configured_clients: u16,
+    },
     #[error("worker {0:?} has already registered a prepared session")]
     DuplicateWorker(WorkerId),
     #[error("prepared session {0:?} is already assigned to another worker")]
@@ -409,6 +475,7 @@ pub struct Final2026Scheduler<C, R> {
     clock: C,
     recorder: R,
     limits: LocalRuntimeLimits,
+    schedule: PhaseScheduleConfig,
     workers: Vec<WorkerState>,
     sessions: HashSet<PreparedSessionId>,
     origin: Option<Duration>,
@@ -427,12 +494,42 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         limits: LocalRuntimeLimits,
         hot_warehouses: [u16; OFFICIAL_HOT_WAREHOUSE_COUNT],
     ) -> Self {
-        Self {
+        Self::new_with_schedule(
             clock,
             recorder,
             limits,
-            workers: vec![WorkerState::default(); usize::from(OFFICIAL_CLIENTS)],
-            sessions: HashSet::with_capacity(usize::from(OFFICIAL_CLIENTS)),
+            hot_warehouses,
+            PhaseScheduleConfig::official(),
+        )
+        .expect("the public final phase schedule is valid")
+    }
+
+    /// Builds a scheduler for an explicitly local, non-ranked schedule.
+    ///
+    /// Window accounting remains enabled so smoke runs exercise the same
+    /// paths, but callers are responsible for not presenting its gates or
+    /// throughput as official ranked results.
+    pub fn new_with_schedule(
+        clock: C,
+        recorder: R,
+        limits: LocalRuntimeLimits,
+        hot_warehouses: [u16; OFFICIAL_HOT_WAREHOUSE_COUNT],
+        schedule: PhaseScheduleConfig,
+    ) -> Result<Self, SchedulerError> {
+        // Revalidate here so this constructor remains sound if the config
+        // representation gains additional construction paths later.
+        let schedule = PhaseScheduleConfig::new(
+            schedule.clients,
+            schedule.warmup_duration,
+            schedule.measurement_window_duration,
+        )?;
+        Ok(Self {
+            clock,
+            recorder,
+            limits,
+            schedule,
+            workers: vec![WorkerState::default(); usize::from(schedule.clients)],
+            sessions: HashSet::with_capacity(usize::from(schedule.clients)),
             origin: None,
             announced_phase: None,
             timeline_complete: false,
@@ -440,7 +537,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             next_ticket_id: 0,
             windows: std::array::from_fn(|_| WindowStats::new(hot_warehouses)),
             failure: None,
-        }
+        })
     }
 
     pub fn recorder(&self) -> &R {
@@ -451,8 +548,14 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         &self.windows
     }
 
+    pub const fn schedule(&self) -> PhaseScheduleConfig {
+        self.schedule
+    }
+
     pub fn prepared_session(&self, worker: WorkerId) -> Option<PreparedSessionId> {
-        self.workers[usize::from(worker.value())].session
+        self.workers
+            .get(usize::from(worker.value()))
+            .and_then(|state| state.session)
     }
 
     pub fn ready_workers(&self) -> usize {
@@ -462,18 +565,19 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
     /// Registers a session only after connection, SI setup, and PREPARE_SET.
     ///
     /// Registration is forbidden after the barrier releases.  Consequently,
-    /// the same 32-session pool is retained across every phase.
+    /// the same configured session pool is retained across every phase.
     pub fn worker_prepared(
         &mut self,
         worker: WorkerId,
         session: PreparedSessionId,
     ) -> Result<(), SchedulerError> {
         self.ensure_not_failed()?;
+        let worker_index = self.worker_index(worker)?;
         if self.origin.is_some() {
             return Err(SchedulerError::AlreadyStarted);
         }
         let now = self.observe_now()?;
-        let worker_state = &mut self.workers[usize::from(worker.value())];
+        let worker_state = &mut self.workers[worker_index];
         if worker_state.session.is_some() {
             return Err(SchedulerError::DuplicateWorker(worker));
         }
@@ -495,19 +599,19 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         if self.origin.is_some() {
             return Err(SchedulerError::AlreadyStarted);
         }
-        if self.ready_workers() != usize::from(OFFICIAL_CLIENTS) {
+        if self.ready_workers() != usize::from(self.schedule.clients) {
             return Err(SchedulerError::BarrierIncomplete {
                 ready: self.ready_workers(),
-                required: usize::from(OFFICIAL_CLIENTS),
+                required: usize::from(self.schedule.clients),
             });
         }
 
         let now = self.observe_now()?;
-        let deadline = checked_add(now, WARMUP_DURATION)?;
+        let deadline = checked_add(now, self.schedule.warmup_duration)?;
         self.origin = Some(now);
         self.announced_phase = Some(PhaseId::Warmup);
         self.recorder.record(SchedulerEvent::BarrierReleased {
-            workers: OFFICIAL_CLIENTS,
+            workers: self.schedule.clients,
             at: now,
         });
         self.recorder.record(SchedulerEvent::PhaseStarted {
@@ -529,13 +633,14 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         &mut self,
         worker: WorkerId,
     ) -> Result<TransactionReservation, SchedulerError> {
+        let worker_index = self.worker_index(worker)?;
         let now = self.observe_now()?;
         self.sync_to(now)?;
         self.ensure_running()?;
         let phase = self.announced_phase.ok_or(SchedulerError::TimelineEnded)?;
         let (_, deadline) = self.phase_bounds(phase)?;
 
-        let worker_state = &mut self.workers[usize::from(worker.value())];
+        let worker_state = &mut self.workers[worker_index];
         if worker_state.selection.is_some() {
             return Err(SchedulerError::WorkerBusy(worker));
         }
@@ -575,6 +680,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         reservation: TransactionReservation,
         identity: TransactionIdentity,
     ) -> Result<TransactionTicket, SchedulerError> {
+        let worker_index = self.worker_index(reservation.worker)?;
         let now = self.observe_now()?;
         self.sync_to(now)?;
         self.ensure_running()?;
@@ -582,7 +688,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             return Err(SchedulerError::ReservationDeadlinePassed);
         }
 
-        let worker_state = &mut self.workers[usize::from(reservation.worker.value())];
+        let worker_state = &mut self.workers[worker_index];
         match worker_state.selection {
             Some(SelectionState::Reserved(current)) if current == reservation => {}
             _ => return Err(SchedulerError::TicketMismatch(reservation.worker)),
@@ -611,6 +717,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         &mut self,
         ticket: TransactionTicket,
     ) -> Result<TransactionTicket, SchedulerError> {
+        let worker_index = self.worker_index(ticket.worker())?;
         let now = self.observe_now()?;
         self.sync_to(now)?;
         self.ensure_running()?;
@@ -618,7 +725,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             return Err(SchedulerError::RetryDeadlinePassed);
         }
 
-        let worker_state = &mut self.workers[usize::from(ticket.worker().value())];
+        let worker_state = &mut self.workers[worker_index];
         match worker_state.selection {
             Some(SelectionState::RetryPending(current)) if current == ticket => {
                 worker_state.selection = Some(SelectionState::InFlight {
@@ -643,11 +750,11 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         ticket: TransactionTicket,
         outcome: AttemptOutcome,
     ) -> Result<AttemptDisposition, SchedulerError> {
+        let worker_index = self.worker_index(ticket.worker())?;
         let now = self.observe_now()?;
         self.sync_to(now)?;
         self.ensure_not_failed()?;
 
-        let worker_index = usize::from(ticket.worker().value());
         match self.workers[worker_index].selection {
             Some(SelectionState::InFlight {
                 ticket: current, ..
@@ -736,10 +843,11 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
 
     /// Abandons a selected transaction after a retry cap or local policy.
     pub fn abandon_retry(&mut self, ticket: TransactionTicket) -> Result<(), SchedulerError> {
+        let worker_index = self.worker_index(ticket.worker())?;
         let now = self.observe_now()?;
         self.sync_to(now)?;
         self.ensure_not_failed()?;
-        let worker_state = &mut self.workers[usize::from(ticket.worker().value())];
+        let worker_state = &mut self.workers[worker_index];
         match worker_state.selection {
             Some(SelectionState::RetryPending(current)) if current == ticket => {
                 worker_state.selection = None;
@@ -765,11 +873,12 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         reason: impl Into<String>,
     ) -> Result<(), SchedulerError> {
         self.ensure_not_failed()?;
+        let worker_index = self.worker_index(worker)?;
         let now = self.observe_now()?;
         if self.origin.is_some() {
             self.sync_to(now)?;
         }
-        let phase = self.workers[usize::from(worker.value())]
+        let phase = self.workers[worker_index]
             .selection
             .as_ref()
             .map(SelectionState::phase)
@@ -980,17 +1089,33 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         }
     }
 
+    fn worker_index(&self, worker: WorkerId) -> Result<usize, SchedulerError> {
+        let index = usize::from(worker.value());
+        if index >= self.workers.len() {
+            return Err(SchedulerError::WorkerNotConfigured {
+                worker,
+                configured_clients: self.schedule.clients,
+            });
+        }
+        Ok(index)
+    }
+
     fn phase_bounds(&self, phase: PhaseId) -> Result<(Duration, Duration), SchedulerError> {
         let origin = self.origin.ok_or(SchedulerError::NotStarted)?;
         match phase {
-            PhaseId::Warmup => Ok((origin, checked_add(origin, WARMUP_DURATION)?)),
+            PhaseId::Warmup => Ok((origin, checked_add(origin, self.schedule.warmup_duration)?)),
             PhaseId::FormalWindow(index) => {
-                let formal_origin = checked_add(origin, WARMUP_DURATION)?;
-                let start_offset = FORMAL_WINDOW_DURATION
+                let formal_origin = checked_add(origin, self.schedule.warmup_duration)?;
+                let start_offset = self
+                    .schedule
+                    .measurement_window_duration
                     .checked_mul(u32::from(index))
                     .ok_or(SchedulerError::ClockOverflow)?;
                 let start = checked_add(formal_origin, start_offset)?;
-                Ok((start, checked_add(start, FORMAL_WINDOW_DURATION)?))
+                Ok((
+                    start,
+                    checked_add(start, self.schedule.measurement_window_duration)?,
+                ))
             }
         }
     }
@@ -1193,6 +1318,116 @@ mod tests {
             ]
         );
         assert!(wall_start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn local_non_ranked_schedule_uses_two_workers_and_three_continuous_windows() {
+        let clock = FakeClock::default();
+        let schedule = PhaseScheduleConfig::new(2, Duration::ZERO, Duration::from_secs(1)).unwrap();
+        let mut scheduler = Final2026Scheduler::new_with_schedule(
+            clock.clone(),
+            Vec::new(),
+            LocalRuntimeLimits::new(Duration::from_secs(5), Duration::from_secs(1)).unwrap(),
+            [1, 2, 3, 4],
+            schedule,
+        )
+        .unwrap();
+
+        for id in 0..2 {
+            scheduler
+                .worker_prepared(WorkerId::new(id).unwrap(), PreparedSessionId(u64::from(id)))
+                .unwrap();
+        }
+        let unconfigured = WorkerId::new(2).unwrap();
+        assert_eq!(
+            scheduler.worker_prepared(unconfigured, PreparedSessionId(2)),
+            Err(SchedulerError::WorkerNotConfigured {
+                worker: unconfigured,
+                configured_clients: 2,
+            })
+        );
+        assert_eq!(scheduler.prepared_session(unconfigured), None);
+
+        scheduler.start().unwrap();
+        assert_eq!(scheduler.schedule(), schedule);
+        clock.set(Duration::from_secs(3));
+        scheduler.poll().unwrap();
+
+        let starts: Vec<_> = scheduler
+            .recorder()
+            .iter()
+            .filter_map(|event| match event {
+                SchedulerEvent::PhaseStarted {
+                    phase,
+                    at,
+                    deadline,
+                } => Some((*phase, *at, *deadline)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (PhaseId::Warmup, Duration::ZERO, Duration::ZERO),
+                (
+                    PhaseId::FormalWindow(0),
+                    Duration::ZERO,
+                    Duration::from_secs(1),
+                ),
+                (
+                    PhaseId::FormalWindow(1),
+                    Duration::from_secs(1),
+                    Duration::from_secs(2),
+                ),
+                (
+                    PhaseId::FormalWindow(2),
+                    Duration::from_secs(2),
+                    Duration::from_secs(3),
+                ),
+            ]
+        );
+        let gate_times: Vec<_> = scheduler
+            .recorder()
+            .iter()
+            .filter_map(|event| match event {
+                SchedulerEvent::WindowGateEvaluated { window, at, .. } => Some((*window, *at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gate_times,
+            vec![
+                (0, Duration::from_secs(1)),
+                (1, Duration::from_secs(2)),
+                (2, Duration::from_secs(3)),
+            ]
+        );
+        assert!(scheduler.recorder().iter().any(|event| {
+            matches!(
+                event,
+                SchedulerEvent::BarrierReleased {
+                    workers: 2,
+                    at: Duration::ZERO
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn local_schedule_validation_keeps_three_windows_fixed() {
+        assert_eq!(
+            PhaseScheduleConfig::new(0, Duration::ZERO, Duration::from_secs(1)),
+            Err(SchedulerError::InvalidScheduleClients(0))
+        );
+        assert_eq!(
+            PhaseScheduleConfig::new(OFFICIAL_CLIENTS + 1, Duration::ZERO, Duration::from_secs(1),),
+            Err(SchedulerError::InvalidScheduleClients(OFFICIAL_CLIENTS + 1))
+        );
+        assert_eq!(
+            PhaseScheduleConfig::new(1, Duration::ZERO, Duration::ZERO),
+            Err(SchedulerError::InvalidMeasurementWindowDuration)
+        );
+        assert_eq!(FORMAL_WINDOW_COUNT, 3);
     }
 
     #[test]
