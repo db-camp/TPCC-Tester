@@ -10,8 +10,11 @@ pub mod measurement;
 mod model;
 pub mod phases;
 mod profile;
+mod ranking;
 mod report;
+mod routing;
 mod transaction;
+mod workload;
 
 use std::process;
 
@@ -21,10 +24,6 @@ use tracing::{error, info, warn};
 use config::{Config, ResolvedProfile};
 use connection::client::RmdbClient;
 use connection::cursor::RmdbCursor;
-use connection::wire::StreamResponse;
-use error::TpccError;
-
-const SNAPSHOT_ISOLATION_SQL: &str = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;";
 
 fn setup_tracing(verbose: u8) {
     use tracing_subscriber::EnvFilter;
@@ -104,62 +103,52 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         return Ok(());
     }
 
-    // Connection pre-check
-    info!("连接 RMDB: {}:{} ...", config.host, config.port);
-    let client = RmdbClient::connect(&config.host, config.port).await?;
-    let mut cursor = RmdbCursor::new(client);
-    configure_session(&mut cursor).await?;
+    let needs_control_connection =
+        config.create_schema || config.init || config.check || config.stats;
+    if needs_control_connection {
+        info!("连接 RMDB: {}:{} ...", config.host, config.port);
+        let client = RmdbClient::connect(&config.host, config.port).await?;
+        let mut cursor = RmdbCursor::new(client);
+        cursor.client_mut().ping().await?;
+        info!("RMDB 连接正常");
 
-    // Ping test
-    match cursor.client_mut().ping().await {
-        Ok(_) => info!("RMDB 连接正常"),
-        Err(e) => {
-            warn!("连接预检异常 (不一定致命): {e}");
+        if config.create_schema {
+            info!("创建 TPC-C 表和索引");
+            let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
+            ldr.create_tables().await?;
+            ldr.create_indexes().await?;
+            info!("TPC-C 表和索引创建完成");
+        }
+
+        if config.init {
+            info!("加载 TPC-C 初始数据 (scale_factor={})", config.scale_factor);
+            let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
+            ldr.load_all_data().await?;
+            info!("TPC-C 初始数据加载完成");
+        }
+
+        if config.check {
+            info!("运行 {} 阶段一致性检查", config.check_scope.as_str());
+            let mut chk = checker::ConsistencyChecker::new(
+                &mut cursor,
+                config.scale_factor,
+                config.expected_new_orders,
+            );
+            let all_passed = chk.run_all_checks().await?;
+            if !all_passed {
+                return Err("一致性检查未全部通过".into());
+            }
+        }
+
+        if config.stats {
+            let mut chk = checker::ConsistencyChecker::new(&mut cursor, config.scale_factor, None);
+            chk.show_stats().await?;
         }
     }
 
-    // Schema
-    if config.create_schema {
-        info!("创建 TPC-C 表和索引");
-        let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
-        ldr.create_tables().await?;
-        ldr.create_indexes().await?;
-        info!("TPC-C 表和索引创建完成");
-    }
-
-    // Init data
-    if config.init {
-        info!("加载 TPC-C 初始数据 (scale_factor={})", config.scale_factor);
-        let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
-        ldr.load_all_data().await?;
-        info!("TPC-C 初始数据加载完成");
-    }
-
-    // Check
-    if config.check {
-        info!("运行 {} 阶段一致性检查", config.check_scope.as_str());
-        let mut chk = checker::ConsistencyChecker::new(
-            &mut cursor,
-            config.scale_factor,
-            config.expected_new_orders,
-        );
-        let all_passed = chk.run_all_checks().await?;
-        if !all_passed {
-            error!("一致性检查未全部通过");
-            process::exit(1);
-        }
-    }
-
-    // Stats
-    if config.stats {
-        let mut chk = checker::ConsistencyChecker::new(&mut cursor, config.scale_factor, None);
-        chk.show_stats().await?;
-    }
-
-    // Benchmark
     if config.benchmark {
-        info!("启动 TPC-C 基准测试...");
-        let exec = executor::BenchmarkExecutor::new(config);
+        info!("启动原生 final2026 连续三窗口基准测试...");
+        let exec = executor::BenchmarkExecutor::new(config, effective);
         let result = exec.run().await?;
         result.print_report();
     }
@@ -169,10 +158,9 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 
 fn print_effective_profile(config: &Config, effective: &ResolvedProfile) {
     let profile = &effective.final2026;
-    let mix = config
-        .txn_probs
+    let mix = profile::TRANSACTION_MIX
         .iter()
-        .map(|value| value.to_string())
+        .map(|(_, weight)| weight.to_string())
         .collect::<Vec<_>>()
         .join("/");
     let seed = effective
@@ -181,14 +169,13 @@ fn print_effective_profile(config: &Config, effective: &ResolvedProfile) {
         .unwrap_or_else(|| "not supplied (no hidden seed assumed)".to_owned());
 
     info!(
-        "Effective profile: name={}, warehouses={}, clients={}, warmup={}s, windows={}x{}s, rw_ratio={}, mix={}, seed={}",
+        "Effective profile: name={}, warehouses={}, clients={}, warmup={}s, windows={}x{}s, derived_write_ratio=0.92, mix={}, seed={}",
         config.profile.as_str(),
         profile.warehouses,
         profile.clients,
         profile.warmup.as_secs(),
         profile.measurement_windows,
         profile.measurement_window.as_secs(),
-        config.rw_ratio,
         mix,
         seed
     );
@@ -212,24 +199,6 @@ fn print_effective_profile(config: &Config, effective: &ResolvedProfile) {
     }
 }
 
-async fn configure_session(cursor: &mut RmdbCursor) -> Result<(), TpccError> {
-    info!("发送 SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION");
-    match cursor
-        .client_mut()
-        .exec_stream(SNAPSHOT_ISOLATION_SQL)
-        .await?
-    {
-        StreamResponse::CommandOk => Ok(()),
-        StreamResponse::TransactionAbort { diagnostic } => Err(TpccError::Abort(diagnostic)),
-        StreamResponse::Error { diagnostic } => Err(TpccError::QueryError(format!(
-            "设置 SNAPSHOT ISOLATION 失败: {diagnostic}"
-        ))),
-        StreamResponse::Query { .. } => Err(TpccError::Protocol(
-            "SET SNAPSHOT ISOLATION 意外返回查询结果".to_owned(),
-        )),
-    }
-}
-
 async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     info!("========================================");
     info!("   RMDB 兼容性诊断");
@@ -248,7 +217,6 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
         }
     };
     let mut cursor = RmdbCursor::new(client);
-    configure_session(&mut cursor).await?;
 
     // 2. Basic SQL
     info!("[2/6] 基础 SQL 能力检测");

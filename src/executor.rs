@@ -1,329 +1,461 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+//! Native final-2026 ranked timeline and worker pool.
 
-use tokio::sync::watch;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use chrono::Local;
 use tokio::task::JoinSet;
-use tracing::{debug, error, info, warn};
+use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, ResolvedProfile};
 use crate::connection::client::RmdbClient;
-use crate::connection::cursor::RmdbCursor;
-use crate::data_gen::TpccDataGen;
 use crate::error::TpccError;
-use crate::report::BenchmarkResult;
-use crate::transaction::{self, TransactionSchedule, TransactionType};
+use crate::measurement::{MeasurementSummary, WindowStats, FORMAL_WINDOW_COUNT};
+use crate::phases::{
+    AttemptDisposition, AttemptOutcome, EventRecorder, Final2026Scheduler, LocalRuntimeLimits,
+    PhaseId, PhaseScheduleConfig, PreparedSessionId, SchedulerError, SystemMonotonicClock,
+    TransactionIdentity, WorkerId,
+};
+use crate::ranking::dispatch::{self, FrozenTransaction};
+use crate::ranking::runner::RankedTransactionOutcome;
+use crate::ranking::session::open_ranked_session;
+use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
+use crate::workload::Final2026Workload;
 
-const SNAPSHOT_ISOLATION_SQL: &str = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;";
+#[derive(Default)]
+struct NoopRecorder;
 
-struct SharedCounters {
-    total_committed: AtomicU64,
-    total_aborted: AtomicU64,
-    new_order_count: AtomicU64,
-    cancelled: AtomicBool,
+impl EventRecorder for NoopRecorder {
+    fn record(&mut self, _event: crate::phases::SchedulerEvent) {}
 }
+
+type Scheduler = Final2026Scheduler<SystemMonotonicClock, NoopRecorder>;
 
 pub struct BenchmarkExecutor {
     config: Config,
+    effective: ResolvedProfile,
 }
 
 impl BenchmarkExecutor {
-    pub fn new(config: Config) -> Self {
-        Self { config }
+    pub fn new(config: Config, effective: ResolvedProfile) -> Self {
+        Self { config, effective }
     }
 
-    pub async fn run(&self) -> Result<BenchmarkResult, TpccError> {
-        let num_threads = self.config.threads;
-        let txn_per_thread = self.config.transactions;
-        let rw_ratio = self.config.rw_ratio;
-        let txn_probs = self.config.txn_probs.clone();
+    pub async fn run(&self) -> Result<Final2026RunResult, TpccError> {
+        let profile = &self.effective.final2026;
+        let seed = self.effective.seed.ok_or_else(|| {
+            TpccError::Protocol("ranked run requires an explicit seed".to_owned())
+        })?;
+        let response_timeout = Duration::from_secs(self.config.response_timeout_seconds);
+        let limits = LocalRuntimeLimits::new(
+            response_timeout,
+            Duration::from_secs(self.config.phase_tail_grace_seconds),
+        )
+        .map_err(scheduler_error)?;
+        let schedule =
+            PhaseScheduleConfig::new(profile.clients, profile.warmup, profile.measurement_window)
+                .map_err(scheduler_error)?;
+
+        let router = if self.effective.is_ranked_configuration() {
+            OfficialRouter::new(WorkloadSeed(seed))
+        } else {
+            OfficialRouter::new_for_warehouses(WorkloadSeed(seed), profile.warehouses)
+                .map_err(|error| TpccError::Protocol(error.to_string()))?
+        };
+        let routing = Arc::new(RunRouting::new(router));
+        let scheduler = Arc::new(Mutex::new(
+            Final2026Scheduler::new_with_schedule(
+                SystemMonotonicClock::new(),
+                NoopRecorder,
+                limits,
+                *routing.router.hot_warehouses(),
+                schedule,
+            )
+            .map_err(scheduler_error)?,
+        ));
 
         info!(
-            "启动并发基准测试: {} 线程, 每线程 {} 事务",
-            num_threads, txn_per_thread
+            "preparing {} persistent Wire v3 sessions before the timing barrier",
+            profile.clients
         );
-
-        let counters = Arc::new(SharedCounters {
-            total_committed: AtomicU64::new(0),
-            total_aborted: AtomicU64::new(0),
-            new_order_count: AtomicU64::new(0),
-            cancelled: AtomicBool::new(false),
-        });
-
-        let start_time = Instant::now();
-        let cancelled_at = Arc::new(Mutex::new(None::<Instant>));
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let txn_schedule = Arc::new(TransactionSchedule::new(rw_ratio, &txn_probs));
-        let next_txn_sequence = Arc::new(AtomicU64::new(0));
-        info!("事务调度周期: {}", txn_schedule.describe());
-
-        // Ctrl+C handler
-        let cancel_counters = counters.clone();
-        let cancel_time = cancelled_at.clone();
-        let cancel_signal = cancel_tx.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("收到 Ctrl+C 信号，正在优雅关闭...");
-            if let Ok(mut guard) = cancel_time.lock() {
-                if guard.is_none() {
-                    *guard = Some(Instant::now());
-                }
+        let sessions = self
+            .open_sessions(profile.clients, response_timeout)
+            .await?;
+        {
+            let mut state = lock_scheduler(&scheduler)?;
+            for worker in 0..profile.clients {
+                state
+                    .worker_prepared(
+                        WorkerId::new(worker).map_err(scheduler_error)?,
+                        PreparedSessionId(u64::from(worker) + 1),
+                    )
+                    .map_err(scheduler_error)?;
             }
-            cancel_counters.cancelled.store(true, Ordering::Relaxed);
-            let _ = cancel_signal.send(true);
-        });
+            state.start().map_err(scheduler_error)?;
+        }
 
-        // Progress reporter
-        let progress_counters = counters.clone();
-        let progress_handle = tokio::spawn(async move {
-            let start = Instant::now();
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                if progress_counters.cancelled.load(Ordering::Relaxed) {
-                    break;
-                }
-                let committed = progress_counters.total_committed.load(Ordering::Relaxed);
-                let aborted = progress_counters.total_aborted.load(Ordering::Relaxed);
-                let elapsed = start.elapsed().as_secs_f64();
-                let tps = committed as f64 / elapsed;
-                let total = committed + aborted;
-                let success_rate = if total > 0 {
-                    committed as f64 / total as f64 * 100.0
-                } else {
-                    0.0
-                };
-                info!(
-                    "[进度] 已完成: {committed}, TPS: {tps:.1}, 成功率: {success_rate:.1}%, 耗时: {elapsed:.1}s"
-                );
-            }
-        });
-
-        let mut join_set = JoinSet::new();
-
-        // Per-thread timing data
-        let thread_results: Arc<tokio::sync::Mutex<Vec<Vec<(TransactionType, f64, bool)>>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
-
-        for thread_id in 0..num_threads {
-            let host = self.config.host.clone();
-            let port = self.config.port;
-            let scale = self.config.scale_factor;
-            let counters = counters.clone();
-            let results = thread_results.clone();
-            let mut cancel_rx = cancel_rx.clone();
-            let txn_schedule = txn_schedule.clone();
-            let next_txn_sequence = next_txn_sequence.clone();
-
-            join_set.spawn(async move {
-                let mut thread_data: Vec<(TransactionType, f64, bool)> = Vec::new();
-
-                // Create connection for this worker
-                let client = match RmdbClient::connect(&host, port).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("[Worker {thread_id}] 连接失败: {e}");
-                        return;
-                    }
-                };
-                let mut cursor = RmdbCursor::new(client);
-                if let Err(e) = configure_worker_session(&mut cursor, thread_id).await {
-                    error!("[Worker {thread_id}] 会话配置失败: {e}");
-                    results.lock().await.push(thread_data);
-                    return;
-                }
-                let gen = TpccDataGen::new(scale);
-
-                let mut consecutive_failures = 0u32;
-
-                'worker: for txn_idx in 0..txn_per_thread {
-                    if counters.cancelled.load(Ordering::Relaxed) || *cancel_rx.borrow() {
-                        break;
-                    }
-
-                    let txn_type =
-                        txn_schedule.pick(next_txn_sequence.fetch_add(1, Ordering::Relaxed));
-                    let txn_start = Instant::now();
-
-                    // Retry loop (matches Python behavior: infinite retry until success)
-                    loop {
-                        if counters.cancelled.load(Ordering::Relaxed) || *cancel_rx.borrow() {
-                            break 'worker;
-                        }
-
-                        let txn_result = tokio::select! {
-                            biased;
-
-                            changed = cancel_rx.changed() => {
-                                if changed.is_err() || *cancel_rx.borrow() {
-                                    debug!("[Worker {thread_id}] 收到取消信号，结束当前 worker");
-                                    break 'worker;
-                                }
-                                continue;
-                            }
-                            result = transaction::execute_transaction(&mut cursor, &gen, txn_type) => result,
-                        };
-
-                        match txn_result {
-                            Ok(true) => {
-                                let elapsed = txn_start.elapsed().as_secs_f64();
-                                counters.total_committed.fetch_add(1, Ordering::Relaxed);
-                                if txn_type == TransactionType::NewOrder {
-                                    counters.new_order_count.fetch_add(1, Ordering::Relaxed);
-                                }
-                                thread_data.push((txn_type, elapsed, true));
-                                consecutive_failures = 0;
-
-                                if elapsed > 30.0 {
-                                    error!(
-                                        "[Worker {thread_id}] 事务 {txn_idx} ({}) 耗时 {elapsed:.1}s",
-                                        txn_type.name()
-                                    );
-                                } else if elapsed > 5.0 {
-                                    warn!(
-                                        "[Worker {thread_id}] 事务 {txn_idx} ({}) 耗时 {elapsed:.1}s",
-                                        txn_type.name()
-                                    );
-                                }
-                                break;
-                            }
-                            Ok(false) => {
-                                counters.total_aborted.fetch_add(1, Ordering::Relaxed);
-                                consecutive_failures += 1;
-                                if consecutive_failures > 10 {
-                                    warn!(
-                                        "[Worker {thread_id}] 连续 {consecutive_failures} 次事务失败，请检查数据库状态"
-                                    );
-                                }
-                                debug!(
-                                    "[Worker {thread_id}] 事务 {} 重试 (attempt {})",
-                                    txn_type.name(),
-                                    consecutive_failures
-                                );
-                                // Continue retry
-                            }
-                            Err(TpccError::Connection(_)) | Err(TpccError::Io(_)) => {
-                                warn!("[Worker {thread_id}] 连接断开，尝试重连...");
-                                // Attempt reconnect
-                                match RmdbClient::connect(&host, port).await {
-                                    Ok(new_client) => {
-                                        cursor = RmdbCursor::new(new_client);
-                                        if let Err(e) =
-                                            configure_worker_session(&mut cursor, thread_id).await
-                                        {
-                                            error!("[Worker {thread_id}] 重连后会话配置失败: {e}");
-                                            results.lock().await.push(thread_data);
-                                            return;
-                                        }
-                                        info!("[Worker {thread_id}] 重连成功");
-                                    }
-                                    Err(e) => {
-                                        error!("[Worker {thread_id}] 重连失败: {e}");
-                                        error!("[Worker {thread_id}] rmdb 进程可能已崩溃，请检查服务状态");
-                                        results.lock().await.push(thread_data);
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!("[Worker {thread_id}] 事务错误: {e}");
-                                counters.total_aborted.fetch_add(1, Ordering::Relaxed);
-                                consecutive_failures += 1;
-                                // Continue retry
-                            }
-                        }
-                    }
-                }
-
-                results.lock().await.push(thread_data);
+        info!(
+            "timing started: one {}s warmup followed continuously by 3x{}s windows",
+            profile.warmup.as_secs(),
+            profile.measurement_window.as_secs()
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut workers = JoinSet::new();
+        for (worker_index, session) in sessions.into_iter().enumerate() {
+            let scheduler = Arc::clone(&scheduler);
+            let routing = Arc::clone(&routing);
+            let cancelled = Arc::clone(&cancelled);
+            workers.spawn(async move {
+                run_worker(worker_index as u16, session, scheduler, routing, cancelled).await
             });
         }
 
-        // Wait for all workers
-        while let Some(result) = join_set.join_next().await {
-            if let Err(e) = result {
-                error!("Worker panic: {e}");
+        let mut first_error = None;
+        while let Some(joined) = workers.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    cancelled.store(true, Ordering::Release);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    cancelled.store(true, Ordering::Release);
+                    if first_error.is_none() {
+                        first_error = Some(TpccError::Protocol(format!(
+                            "ranked worker task failed: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        let (windows, summary) = {
+            let mut state = lock_scheduler(&scheduler)?;
+            let summary = state.measurement_summary().map_err(scheduler_error)?;
+            (state.windows().clone(), summary)
+        };
+        let window_rates = std::array::from_fn(|index| {
+            windows[index]
+                .new_order_per_minute_for(profile.measurement_window)
+                .unwrap_or(0.0)
+        });
+        let median_new_order_per_minute = median_of_three(window_rates);
+        let result = Final2026RunResult {
+            ranked: self.effective.is_ranked_configuration(),
+            windows,
+            summary,
+            window_rates,
+            median_new_order_per_minute,
+            response_timeout,
+            phase_tail_grace: limits.phase_tail_grace,
+        };
+
+        if result.ranked && !result.summary.passed() {
+            result.print_report();
+            return Err(TpccError::QueryError(
+                "formal final2026 measurement failed a mandatory semantic/coverage gate".to_owned(),
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn open_sessions(
+        &self,
+        clients: u16,
+        response_timeout: Duration,
+    ) -> Result<Vec<RmdbClient>, TpccError> {
+        let mut tasks = JoinSet::new();
+        for worker in 0..clients {
+            let host = self.config.host.clone();
+            let port = self.config.port;
+            tasks.spawn(async move {
+                (
+                    worker,
+                    open_ranked_session(&host, port, response_timeout).await,
+                )
+            });
+        }
+
+        let mut sessions: Vec<Option<RmdbClient>> = std::iter::repeat_with(|| None)
+            .take(clients as usize)
+            .collect();
+        while let Some(joined) = tasks.join_next().await {
+            let (worker, session) = joined.map_err(|error| {
+                TpccError::Protocol(format!("session preparation task failed: {error}"))
+            })?;
+            match session {
+                Ok(session) => sessions[usize::from(worker)] = Some(session),
+                Err(error) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(TpccError::Protocol(format!(
+                        "worker {worker} failed before the all-session barrier: {error}"
+                    )));
+                }
             }
         }
 
-        let total_duration = cancelled_at
-            .lock()
-            .ok()
-            .and_then(|guard| *guard)
-            .map(|instant| instant.duration_since(start_time).as_secs_f64())
-            .unwrap_or_else(|| start_time.elapsed().as_secs_f64());
-        counters.cancelled.store(true, Ordering::Relaxed);
-        let _ = progress_handle.await;
-
-        // Collect results
-        let all_results = thread_results.lock().await;
-        let flat: Vec<(TransactionType, f64, bool)> =
-            all_results.iter().flat_map(|v| v.iter().copied()).collect();
-
-        // Build result
-        let total_committed = counters.total_committed.load(Ordering::Relaxed) as usize;
-        let total_aborted = counters.total_aborted.load(Ordering::Relaxed) as usize;
-        let new_order_count = counters.new_order_count.load(Ordering::Relaxed) as usize;
-
-        let mut txn_breakdown = std::collections::HashMap::new();
-        let mut txn_latencies: std::collections::HashMap<TransactionType, Vec<f64>> =
-            std::collections::HashMap::new();
-
-        for &(txn_type, latency, _success) in flat.iter() {
-            *txn_breakdown.entry(txn_type).or_insert(0usize) += 1;
-            txn_latencies.entry(txn_type).or_default().push(latency);
-        }
-
-        // Sort latencies for percentile calculation
-        for latencies in txn_latencies.values_mut() {
-            latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        }
-
-        let total_transactions = total_committed;
-        let avg_response_time = if !flat.is_empty() {
-            flat.iter().map(|(_, lat, _)| *lat).sum::<f64>() / flat.len() as f64
-        } else {
-            0.0
-        };
-        let throughput_tps = if total_duration > 0.0 {
-            total_committed as f64 / total_duration
-        } else {
-            0.0
-        };
-        let tpmc = if total_duration > 0.0 {
-            new_order_count as f64 * 60.0 / total_duration
-        } else {
-            0.0
-        };
-
-        Ok(BenchmarkResult {
-            total_transactions,
-            successful_transactions: total_committed,
-            failed_transactions: total_aborted,
-            avg_response_time,
-            throughput_tps,
-            total_duration,
-            tpmc,
-            transaction_breakdown: txn_breakdown,
-            transaction_latencies: txn_latencies,
-            num_threads,
-            txn_per_thread,
-            scale_factor: self.config.scale_factor,
-            rw_ratio,
-        })
+        sessions
+            .into_iter()
+            .enumerate()
+            .map(|(worker, session)| {
+                session.ok_or_else(|| {
+                    TpccError::Protocol(format!(
+                        "worker {worker} did not reach the prepared-session barrier"
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
-async fn configure_worker_session(
-    cursor: &mut RmdbCursor,
-    thread_id: usize,
-) -> Result<(), TpccError> {
-    let response = cursor.client_mut().send_cmd(SNAPSHOT_ISOLATION_SQL).await?;
-    let trimmed = response.trim();
-    if trimmed.starts_with("abort") || trimmed.starts_with("Error") {
-        return Err(TpccError::QueryError(format!(
-            "设置 SNAPSHOT ISOLATION 失败: {trimmed}"
-        )));
+struct RunRouting {
+    router: OfficialRouter,
+    warmup: WarehouseWheel,
+    formal: [WarehouseWheel; FORMAL_WINDOW_COUNT],
+}
+
+impl RunRouting {
+    fn new(router: OfficialRouter) -> Self {
+        let warmup = router.wheel(StageId::WARMUP);
+        let formal = std::array::from_fn(|index| router.wheel(StageId::measurement(index as u8)));
+        Self {
+            router,
+            warmup,
+            formal,
+        }
     }
-    debug!("[Worker {thread_id}] 已设置 SNAPSHOT ISOLATION");
-    Ok(())
+
+    fn wheel(&self, phase: PhaseId) -> &WarehouseWheel {
+        match phase {
+            PhaseId::Warmup => &self.warmup,
+            PhaseId::FormalWindow(index) => &self.formal[usize::from(index)],
+        }
+    }
+}
+
+async fn run_worker(
+    worker_value: u16,
+    mut client: RmdbClient,
+    scheduler: Arc<Mutex<Scheduler>>,
+    routing: Arc<RunRouting>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), TpccError> {
+    let worker = WorkerId::new(worker_value).map_err(scheduler_error)?;
+    let mut sequence_phase = None;
+    let mut sequence = ClientSequence::new(worker_value)
+        .map_err(|error| TpccError::Protocol(error.to_string()))?;
+
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let reservation = {
+            let mut state = lock_scheduler(&scheduler)?;
+            match state.reserve_transaction(worker) {
+                Ok(reservation) => reservation,
+                Err(SchedulerError::TimelineEnded) => return Ok(()),
+                Err(error) => return Err(scheduler_error(error)),
+            }
+        };
+
+        if sequence_phase != Some(reservation.phase) {
+            sequence = ClientSequence::new(worker_value)
+                .map_err(|error| TpccError::Protocol(error.to_string()))?;
+            sequence_phase = Some(reservation.phase);
+        }
+        if sequence.next_txn_no() != reservation.txn_no {
+            return fail_worker(
+                &scheduler,
+                &cancelled,
+                worker,
+                format!(
+                    "routing sequence {} does not match scheduler reservation {}",
+                    sequence.next_txn_no(),
+                    reservation.txn_no
+                ),
+            );
+        }
+
+        let workload = Final2026Workload::new(&routing.router, routing.wheel(reservation.phase));
+        let selected = workload
+            .select(&mut sequence)
+            .map_err(|error| TpccError::Protocol(error.to_string()))?;
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let frozen = FrozenTransaction::new(selected, timestamp)
+            .map_err(|message| TpccError::Protocol(message.to_owned()))?;
+        let identity = TransactionIdentity::new(
+            frozen.transaction_type(),
+            frozen.ticket().route().home_warehouse,
+            frozen.fingerprint(),
+            frozen.expects_business_rollback(),
+        )
+        .map_err(scheduler_error)?;
+
+        let mut phase_ticket = {
+            let mut state = lock_scheduler(&scheduler)?;
+            match state.start_transaction(reservation, identity) {
+                Ok(ticket) => ticket,
+                Err(SchedulerError::ReservationDeadlinePassed) => continue,
+                Err(error) => return Err(scheduler_error(error)),
+            }
+        };
+
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match dispatch::execute(&mut client, &frozen).await {
+                Ok(outcome) => {
+                    let attempt = match &outcome {
+                        RankedTransactionOutcome::Committed(commit) => AttemptOutcome::Commit {
+                            delivery_processed: commit.delivery_processed(),
+                        },
+                        RankedTransactionOutcome::ExpectedRollback => {
+                            AttemptOutcome::ExpectedRollback
+                        }
+                    };
+                    let disposition = {
+                        let mut state = lock_scheduler(&scheduler)?;
+                        state
+                            .finish_attempt(phase_ticket, attempt)
+                            .map_err(scheduler_error)?
+                    };
+                    debug_assert!(matches!(
+                        disposition,
+                        AttemptDisposition::Finished | AttemptDisposition::GraceTail
+                    ));
+                    break;
+                }
+                Err(error) if error.is_retryable_abort() => {
+                    let disposition = {
+                        let mut state = lock_scheduler(&scheduler)?;
+                        state
+                            .finish_attempt(phase_ticket, AttemptOutcome::RetryableAbort)
+                            .map_err(scheduler_error)?
+                    };
+                    if disposition != AttemptDisposition::RetrySameParameters {
+                        break;
+                    }
+                    phase_ticket = {
+                        let mut state = lock_scheduler(&scheduler)?;
+                        match state.start_retry(phase_ticket) {
+                            Ok(ticket) => ticket,
+                            Err(SchedulerError::RetryDeadlinePassed) => break,
+                            Err(error) => return Err(scheduler_error(error)),
+                        }
+                    };
+                }
+                Err(error) => {
+                    return fail_worker(
+                        &scheduler,
+                        &cancelled,
+                        worker,
+                        format!("ranked transaction failed: {error}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn fail_worker<T>(
+    scheduler: &Arc<Mutex<Scheduler>>,
+    cancelled: &Arc<AtomicBool>,
+    worker: WorkerId,
+    reason: String,
+) -> Result<T, TpccError> {
+    cancelled.store(true, Ordering::Release);
+    if let Ok(mut state) = scheduler.lock() {
+        let _ = state.worker_failed(worker, reason.clone());
+    }
+    Err(TpccError::Protocol(reason))
+}
+
+fn lock_scheduler(
+    scheduler: &Arc<Mutex<Scheduler>>,
+) -> Result<MutexGuard<'_, Scheduler>, TpccError> {
+    scheduler
+        .lock()
+        .map_err(|_| TpccError::Protocol("ranked scheduler mutex was poisoned".to_owned()))
+}
+
+fn scheduler_error(error: SchedulerError) -> TpccError {
+    TpccError::Protocol(format!("ranked scheduler: {error}"))
+}
+
+fn median_of_three(mut values: [f64; FORMAL_WINDOW_COUNT]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[1]
+}
+
+pub struct Final2026RunResult {
+    ranked: bool,
+    windows: [WindowStats; FORMAL_WINDOW_COUNT],
+    summary: MeasurementSummary,
+    window_rates: [f64; FORMAL_WINDOW_COUNT],
+    median_new_order_per_minute: f64,
+    response_timeout: Duration,
+    phase_tail_grace: Duration,
+}
+
+impl Final2026RunResult {
+    pub fn print_report(&self) {
+        println!("=== TPCC final2026 public-spec measurement ===");
+        println!(
+            "conformance={}",
+            if self.ranked {
+                "public_spec_aligned"
+            } else {
+                "non_ranked_deviation"
+            }
+        );
+        println!(
+            "local_safety=response_timeout:{}s,phase_tail_grace:{}s (official values unpublished)",
+            self.response_timeout.as_secs(),
+            self.phase_tail_grace.as_secs()
+        );
+        for index in 0..FORMAL_WINDOW_COUNT {
+            let window = &self.windows[index];
+            let gate = &self.summary.window_gates[index];
+            println!(
+                "window{}: new_order_per_min={:.3}, committed={}, expected_rollback={}, retry_abort={}, abandoned={}, grace_tail={}, delivery_processed={}, warehouses={}/{}, gate={}",
+                index + 1,
+                self.window_rates[index],
+                window.committed,
+                window.expected_rollbacks,
+                window.retry_aborts,
+                window.abandoned,
+                window.grace_tail,
+                window.delivery_processed,
+                gate.coverage.covered_warehouses,
+                gate.coverage.required_warehouses,
+                if gate.passed() { "pass" } else { "fail" }
+            );
+        }
+        println!(
+            "ranked_new_order_per_min_median={:.3}",
+            self.median_new_order_per_minute
+        );
+        println!(
+            "combined_coverage={}/{}, combined_gate={}",
+            self.summary.combined_coverage.covered_warehouses,
+            self.summary.combined_coverage.required_warehouses,
+            if self.summary.combined_coverage.passed() {
+                "pass"
+            } else {
+                "fail"
+            }
+        );
+        if !self.ranked {
+            warn!("this smoke result is deliberately non-ranked");
+        }
+    }
 }

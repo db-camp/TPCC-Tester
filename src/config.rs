@@ -1,8 +1,7 @@
 use clap::{Parser, ValueEnum};
+use std::path::PathBuf;
 
-use crate::profile::{Final2026Profile, ProfileError, SmokeOverrides, TRANSACTION_MIX};
-
-const OFFICIAL_RW_RATIO: f64 = 0.92;
+use crate::profile::{Final2026Profile, ProfileError, SmokeOverrides};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ProfileName {
@@ -106,21 +105,17 @@ pub struct Config {
     #[arg(long = "window-seconds")]
     pub window_seconds: Option<u64>,
 
-    /// 每线程事务数（旧执行器兼容字段）
-    #[arg(long, default_value_t = 100)]
-    pub transactions: usize,
+    /// Local socket-response safety deadline; the official value is unpublished
+    #[arg(long = "response-timeout-seconds", default_value_t = 30)]
+    pub response_timeout_seconds: u64,
 
-    /// 读写比例 0.0-1.0（正式配置固定为 0.92）
-    #[arg(long = "rw-ratio", default_value_t = OFFICIAL_RW_RATIO)]
-    pub rw_ratio: f64,
+    /// Local grace for a response already in flight at a phase boundary
+    #[arg(long = "phase-tail-grace-seconds", default_value_t = 5)]
+    pub phase_tail_grace_seconds: u64,
 
-    /// 事务概率 [NewOrder Payment OrderStatus Delivery StockLevel]
-    #[arg(
-        long = "txn-probs",
-        num_args = 5,
-        default_values_t = vec![45.0, 43.0, 4.0, 4.0, 4.0]
-    )]
-    pub txn_probs: Vec<f64>,
+    /// Run-owned directory for dataset, commit-ledger, and crash baselines
+    #[arg(long = "state-dir")]
+    pub state_dir: Option<PathBuf>,
 
     /// 运行数据库兼容性诊断
     #[arg(long)]
@@ -172,6 +167,9 @@ pub enum ConfigError {
     #[error("--seed is required for --init and --benchmark (no grader seed is embedded)")]
     MissingSeed,
 
+    #[error("--state-dir is required for init, benchmark, online check, and recovery check")]
+    MissingStateDir,
+
     #[error("--probe-ready must be used by itself")]
     ProbeReadyMustBeExclusive,
 }
@@ -183,6 +181,11 @@ impl Config {
 
         if (self.init || self.benchmark) && self.seed.is_none() {
             return Err(ConfigError::MissingSeed);
+        }
+        if (self.init || self.benchmark || (self.check && self.check_scope != CheckScope::Setup))
+            && self.state_dir.is_none()
+        {
+            return Err(ConfigError::MissingStateDir);
         }
 
         if self.probe_ready
@@ -210,26 +213,7 @@ impl Config {
             ..SmokeOverrides::default()
         })?;
 
-        let mut extra_deviations = Vec::new();
-        if self.rw_ratio.to_bits() != OFFICIAL_RW_RATIO.to_bits() {
-            extra_deviations.push(EffectiveDeviation {
-                field: "rw_ratio",
-                official: OFFICIAL_RW_RATIO.to_string(),
-                effective: self.rw_ratio.to_string(),
-            });
-        }
-
-        let official_mix: Vec<f64> = TRANSACTION_MIX
-            .iter()
-            .map(|(_, weight)| f64::from(*weight))
-            .collect();
-        if self.txn_probs != official_mix {
-            extra_deviations.push(EffectiveDeviation {
-                field: "txn_probs",
-                official: format_mix(&official_mix),
-                effective: format_mix(&self.txn_probs),
-            });
-        }
+        let extra_deviations: Vec<EffectiveDeviation> = Vec::new();
 
         let mut differing_fields = final2026
             .deviations()
@@ -266,40 +250,20 @@ impl Config {
                 range: "1..=65535",
             });
         }
-        if self.transactions == 0 {
+        if self.response_timeout_seconds == 0 {
             return Err(ConfigError::OutOfRange {
-                field: "transactions",
+                field: "response-timeout-seconds",
                 range: "1..",
             });
         }
-        if !self.rw_ratio.is_finite() || !(0.0..=1.0).contains(&self.rw_ratio) {
+        if self.phase_tail_grace_seconds == 0 {
             return Err(ConfigError::OutOfRange {
-                field: "rw-ratio",
-                range: "0.0..=1.0",
-            });
-        }
-        if self.txn_probs.len() != 5
-            || self
-                .txn_probs
-                .iter()
-                .any(|value| !value.is_finite() || *value < 0.0)
-            || self.txn_probs.iter().sum::<f64>() <= 0.0
-        {
-            return Err(ConfigError::OutOfRange {
-                field: "txn-probs",
-                range: "five finite non-negative weights with a positive sum",
+                field: "phase-tail-grace-seconds",
+                range: "1..",
             });
         }
         Ok(())
     }
-}
-
-fn format_mix(values: &[f64]) -> String {
-    values
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 #[cfg(test)]
@@ -318,6 +282,8 @@ mod tests {
             "--benchmark",
             "--seed",
             "73",
+            "--state-dir",
+            "/tmp/tpcc-final2026-test-state",
         ])
         .unwrap();
         config.validate().unwrap();
@@ -350,6 +316,8 @@ mod tests {
             "0",
             "--window-seconds",
             "5",
+            "--state-dir",
+            "/tmp/tpcc-final2026-smoke-state",
         ])
         .unwrap();
         assert!(matches!(
@@ -380,6 +348,8 @@ mod tests {
             "--check",
             "--check-scope",
             "recovery",
+            "--state-dir",
+            "/tmp/tpcc-final2026-recovery-state",
         ])
         .unwrap();
 
@@ -392,6 +362,24 @@ mod tests {
     fn init_and_benchmark_never_guess_the_hidden_seed() {
         let config = Config::try_parse_from(["tpcc-tester", "--init"]).unwrap();
         assert!(matches!(config.validate(), Err(ConfigError::MissingSeed)));
+    }
+
+    #[test]
+    fn stateful_phases_require_an_explicit_run_owned_state_directory() {
+        let benchmark =
+            Config::try_parse_from(["tpcc-tester", "--benchmark", "--seed", "7"]).unwrap();
+        assert!(matches!(
+            benchmark.validate(),
+            Err(ConfigError::MissingStateDir)
+        ));
+
+        let recovery =
+            Config::try_parse_from(["tpcc-tester", "--check", "--check-scope", "recovery"])
+                .unwrap();
+        assert!(matches!(
+            recovery.validate(),
+            Err(ConfigError::MissingStateDir)
+        ));
     }
 
     #[test]
