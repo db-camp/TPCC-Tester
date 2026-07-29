@@ -53,6 +53,7 @@ STATE_DIR=""
 RUN_MARKER=""
 DB_MARKER=""
 OWNER_TOKEN=""
+PROCESS_OWNER_TOKEN=""
 DB_PATH=""
 DATASET_RUN_ID=""
 DB_OWNED=0
@@ -92,7 +93,7 @@ Lifecycle modes:
 Official final2026 options:
   --profile final2026
   --seed <u64>
-  --host <host>
+  --host <numeric-ip>
   --port <port>
   --db-name <safe-single-component>
 
@@ -203,6 +204,19 @@ git_sha_or_unavailable() {
   fi
 }
 
+normalize_numeric_host() {
+  python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+print(f"{address.version}\t{address.compressed}")
+PY
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)
@@ -285,6 +299,9 @@ validate_nonnegative_integer "--seed" "${SEED}"
 validate_positive_integer "--port" "${PORT}"
 (( 10#${PORT} <= 65535 )) || die "--port must be at most 65535"
 validate_positive_integer "--ready-timeout-seconds" "${READY_TIMEOUT_SECONDS}"
+HOST_INFO="$(normalize_numeric_host "${HOST}")" \
+  || die "--host must be a numeric IPv4 or IPv6 address"
+IFS=$'\t' read -r HOST_VERSION HOST <<<"${HOST_INFO}"
 
 if [[ -n "${SCALE}${CLIENTS}${WARMUP_SECONDS}${WINDOW_SECONDS}" \
   || "${READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]] \
@@ -351,6 +368,7 @@ RUN_MARKER="${RUN_TEMP_DIR}/.owner"
 DB_PATH="${RMDB_DIR}/${DB_NAME}"
 DB_MARKER="${DB_PATH}/.tpcc-workflow-owner"
 OWNER_TOKEN="tpcc-final2026:${RUN_ID}:${DB_PATH}"
+PROCESS_OWNER_TOKEN="tpcc-process:${RUN_ID}:$$"
 if [[ -n "${STATE_DIR_OVERRIDE}" ]]; then
   STATE_DIR="${STATE_DIR_OVERRIDE}"
 else
@@ -864,19 +882,97 @@ else:
 PY
 }
 
+process_owner_matches() {
+  local pid="$1"
+  local absolute_deadline_millis="$2"
+  python3 - "${pid}" "${PROCESS_OWNER_TOKEN}" \
+    "${absolute_deadline_millis}" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+pid = int(sys.argv[1])
+token = sys.argv[2]
+deadline_millis = int(sys.argv[3])
+expected = f"RMDB_WORKFLOW_PROCESS_OWNER={token}"
+
+
+def remaining_seconds():
+    remaining = (
+        deadline_millis - time.monotonic_ns() // 1_000_000
+    ) / 1000.0
+    if remaining <= 0:
+        raise SystemExit(124)
+    return remaining
+
+
+environment_path = Path("/proc") / str(pid) / "environ"
+if environment_path.is_file():
+    remaining_seconds()
+    try:
+        entries = environment_path.read_bytes().split(b"\0")
+    except OSError:
+        raise SystemExit(1)
+    remaining_seconds()
+    raise SystemExit(
+        0 if expected.encode("utf-8") in entries else 1
+    )
+if sys.platform != "darwin":
+    raise SystemExit(1)
+try:
+    result = subprocess.run(
+        ["ps", "eww", "-o", "command=", "-p", str(pid)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=remaining_seconds(),
+    )
+except subprocess.TimeoutExpired:
+    raise SystemExit(124)
+remaining_seconds()
+raise SystemExit(
+    0 if result.returncode == 0 and expected in result.stdout.split() else 1
+)
+PY
+}
+
+establish_cleanup_identity() {
+  local pid="$1"
+  local cleanup_deadline=""
+  local cleanup_identity=""
+  local cleanup_pgid=""
+  cleanup_deadline=$(( $(monotonic_millis) + 1000 ))
+  process_owner_matches "${pid}" "${cleanup_deadline}" || return 1
+  cleanup_identity="$(process_identity "${pid}" "${cleanup_deadline}")" \
+    || return 1
+  cleanup_pgid="$(python3 - "${pid}" <<'PY'
+import os
+import sys
+
+try:
+    print(os.getpgid(int(sys.argv[1])))
+except ProcessLookupError:
+    raise SystemExit(1)
+PY
+)" || return 1
+  [[ "${cleanup_pgid}" == "${pid}" ]] || return 1
+  SERVER_IDENTITY="${cleanup_identity}"
+  SERVER_PGID="${cleanup_pgid}"
+}
+
 server_process_helper() {
   local action="$1"
   local signal_name="${2-}"
   local absolute_deadline_millis="${3-0}"
   python3 - "${action}" "${SERVER_PID}" "${SERVER_IDENTITY}" \
-    "${SERVER_PGID}" "${PORT}" "${HOST}" "${signal_name}" \
+    "${SERVER_PGID}" "${PORT}" "${HOST}" "${HOST_VERSION}" "${signal_name}" \
     "${absolute_deadline_millis}" <<'PY'
 import os
 from pathlib import Path
 import ctypes
 import ipaddress
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -888,12 +984,14 @@ import time
     pgid_text,
     port_text,
     host,
+    host_version_text,
     signal_name,
     deadline_text,
 ) = sys.argv[1:]
 root_pid = int(root_text)
 registered_pgid = int(pgid_text)
 port = int(port_text)
+host_version = int(host_version_text)
 absolute_deadline_millis = int(deadline_text)
 
 
@@ -1076,16 +1174,12 @@ def root_status(table):
 
 def listener_owners_linux():
     try:
-        target_addresses = {
-            ipaddress.ip_address(address[0])
-            for _, _, _, _, address in socket.getaddrinfo(
-                host,
-                port,
-                type=socket.SOCK_STREAM,
-            )
-        }
-    except (OSError, ValueError) as error:
-        raise RuntimeError(f"cannot resolve readiness host {host}: {error}")
+        target_address = ipaddress.ip_address(host)
+    except ValueError as error:
+        raise RuntimeError(f"invalid cached readiness host {host}: {error}")
+    if target_address.version != host_version:
+        raise RuntimeError("cached readiness host family changed")
+    target_addresses = {target_address}
 
     def decode_address(name, encoded):
         raw = bytes.fromhex(encoded)
@@ -1170,33 +1264,77 @@ def listener_owners_linux():
 def listener_owners_lsof():
     check_deadline()
     try:
-        result = subprocess.run(
-            [
-                "lsof",
-                "-nP",
-                "-a",
-                f"-iTCP@{host}:{port}",
-                "-sTCP:LISTEN",
-                "-Fp",
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=remaining_seconds(),
-        )
-    except FileNotFoundError:
-        raise RuntimeError("lsof is required to validate listener ownership")
-    except subprocess.TimeoutExpired as error:
-        raise DeadlineExpired from error
-    check_deadline()
+        target_address = ipaddress.ip_address(host)
+    except ValueError as error:
+        raise RuntimeError(f"invalid cached readiness host {host}: {error}")
+    if target_address.version != host_version:
+        raise RuntimeError("cached readiness host family changed")
+    target_addresses = {target_address}
+
+    def parse_endpoint(endpoint):
+        if endpoint.startswith("*:"):
+            return None
+        if endpoint.startswith("["):
+            closing = endpoint.find("]")
+            if closing <= 1:
+                raise RuntimeError("lsof returned an invalid IPv6 endpoint")
+            address_text = endpoint[1:closing]
+        else:
+            try:
+                address_text, _ = endpoint.rsplit(":", 1)
+            except ValueError as error:
+                raise RuntimeError(
+                    "lsof returned an invalid listener endpoint"
+                ) from error
+        try:
+            return ipaddress.ip_address(address_text)
+        except ValueError as error:
+            raise RuntimeError(
+                "lsof returned a non-numeric listener address"
+            ) from error
+
     owners = set()
-    for line in result.stdout.splitlines():
-        if line.startswith("p") and line[1:].isdigit():
-            owners.add(int(line[1:]))
-    if result.returncode == 1 and not owners:
+    for version in sorted({address.version for address in target_addresses}):
+        try:
+            result = subprocess.run(
+                [
+                    "lsof",
+                    "-nP",
+                    "-a",
+                    f"-i{version}TCP:{port}",
+                    "-sTCP:LISTEN",
+                    "-Fpn",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=remaining_seconds(),
+            )
+        except FileNotFoundError:
+            raise RuntimeError("lsof is required to validate listener ownership")
+        except subprocess.TimeoutExpired as error:
+            raise DeadlineExpired from error
+        check_deadline()
+        if result.returncode == 1 and not result.stdout:
+            continue
+        if result.returncode != 0:
+            raise RuntimeError("lsof could not inspect listening sockets")
+
+        family_targets = {
+            address for address in target_addresses if address.version == version
+        }
+        current_pid = None
+        for line in result.stdout.splitlines():
+            if line.startswith("p") and line[1:].isdigit():
+                current_pid = int(line[1:])
+            elif line.startswith("n"):
+                if current_pid is None:
+                    raise RuntimeError("lsof returned an ownerless socket")
+                local_address = parse_endpoint(line[1:])
+                if local_address is None or local_address in family_targets:
+                    owners.add(current_pid)
+    if not owners:
         return set(), False
-    if result.returncode != 0 or not owners:
-        raise RuntimeError("lsof could not identify the listening socket owner")
     return owners, True
 
 
@@ -1339,13 +1477,16 @@ PY
 
 port_is_available() {
   local absolute_deadline_millis="${1-0}"
-  python3 - "${HOST}" "${PORT}" "${absolute_deadline_millis}" <<'PY'
+  python3 - "${HOST}" "${HOST_VERSION}" "${PORT}" \
+    "${absolute_deadline_millis}" <<'PY'
 import socket
 import sys
 import time
 
-host, port = sys.argv[1], int(sys.argv[2])
-deadline_millis = int(sys.argv[3])
+host = sys.argv[1]
+host_version = int(sys.argv[2])
+port = int(sys.argv[3])
+deadline_millis = int(sys.argv[4])
 
 
 def remaining_seconds():
@@ -1360,38 +1501,33 @@ def remaining_seconds():
 
 
 remaining_seconds()
-addresses = {
-    (family, socktype, proto, address)
-    for family, socktype, proto, _, address in socket.getaddrinfo(
-        host, port, type=socket.SOCK_STREAM)
-}
-remaining_seconds()
-if not addresses:
-    raise SystemExit(1)
-for family, socktype, proto, address in addresses:
-    remaining = remaining_seconds()
-    sock = socket.socket(family, socktype, proto)
-    try:
-        if remaining is not None:
-            sock.settimeout(remaining)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(address)
-    except OSError:
-        sock.close()
-        raise SystemExit(1)
+if host_version == 4:
+    family = socket.AF_INET
+    address = (host, port)
+elif host_version == 6:
+    family = socket.AF_INET6
+    address = (host, port, 0, 0)
+else:
+    raise SystemExit(2)
+remaining = remaining_seconds()
+sock = socket.socket(family, socket.SOCK_STREAM)
+try:
+    if remaining is not None:
+        sock.settimeout(remaining)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(address)
+except OSError:
     sock.close()
-    remaining_seconds()
+    raise SystemExit(1)
+sock.close()
+remaining_seconds()
 raise SystemExit(0)
 PY
 }
 
 wait_for_server_group_exit() {
-  local timeout_millis="$1"
-  local started=""
-  local deadline=""
+  local deadline="$1"
   local now=""
-  started="$(monotonic_millis)"
-  deadline=$(( started + timeout_millis ))
   while true; do
     if server_process_helper group-running "" "${deadline}"; then
       :
@@ -1407,12 +1543,8 @@ wait_for_server_group_exit() {
 }
 
 wait_for_listener_gone() {
-  local timeout_millis="$1"
-  local started=""
-  local deadline=""
+  local deadline="$1"
   local now=""
-  started="$(monotonic_millis)"
-  deadline=$(( started + timeout_millis ))
   while true; do
     port_is_available "${deadline}" && return 0
     now="$(monotonic_millis)"
@@ -1431,54 +1563,65 @@ clear_server_registration() {
 stop_server() {
   local pid="${SERVER_PID}"
   local wait_status=0
+  local phase_deadline=""
   [[ -n "${pid}" ]] || return 0
   if [[ "${STOPPING_SERVER}" == "1" ]]; then
     warn "server shutdown is already in progress"
     return 1
   fi
   STOPPING_SERVER=1
+  if [[ -z "${SERVER_IDENTITY}" ]] \
+    && ! establish_cleanup_identity "${pid}"; then
+    warn "could not prove ownership of unregistered RMDB pid ${pid}"
+    STOPPING_SERVER=0
+    return 1
+  fi
 
-  if ! server_process_helper signal INT; then
+  phase_deadline=$(( $(monotonic_millis) + 10000 ))
+  if ! server_process_helper signal INT "${phase_deadline}"; then
     warn "refusing unsafe RMDB shutdown for registered pid ${pid}"
     STOPPING_SERVER=0
     return 1
   fi
-  wait_for_server_group_exit 10000 || wait_status=$?
+  wait_for_server_group_exit "${phase_deadline}" || wait_status=$?
   if (( wait_status > 1 )); then
     warn "could not safely inspect registered RMDB process group ${SERVER_PGID}"
     STOPPING_SERVER=0
     return 1
   fi
   if [[ "${wait_status}" == "1" ]]; then
-    if ! server_process_helper signal TERM; then
+    phase_deadline=$(( $(monotonic_millis) + 5000 ))
+    if ! server_process_helper signal TERM "${phase_deadline}"; then
       warn "refusing unsafe RMDB TERM escalation for registered pid ${pid}"
       STOPPING_SERVER=0
       return 1
     fi
-  fi
-  wait_status=0
-  wait_for_server_group_exit 5000 || wait_status=$?
-  if (( wait_status > 1 )); then
-    warn "could not safely inspect registered RMDB process group ${SERVER_PGID}"
-    STOPPING_SERVER=0
-    return 1
-  fi
-  if [[ "${wait_status}" == "1" ]]; then
-    if ! server_process_helper signal KILL; then
-      warn "refusing unsafe RMDB KILL escalation for registered pid ${pid}"
+    wait_status=0
+    wait_for_server_group_exit "${phase_deadline}" || wait_status=$?
+    if (( wait_status > 1 )); then
+      warn "could not safely inspect registered RMDB process group ${SERVER_PGID}"
       STOPPING_SERVER=0
       return 1
     fi
   fi
-  wait_status=0
-  wait_for_server_group_exit 5000 || wait_status=$?
-  if [[ "${wait_status}" != "0" ]]; then
-    warn "registered RMDB process group ${SERVER_PGID} did not terminate"
-    STOPPING_SERVER=0
-    return 1
+  if [[ "${wait_status}" == "1" ]]; then
+    phase_deadline=$(( $(monotonic_millis) + 5000 ))
+    if ! server_process_helper signal KILL "${phase_deadline}"; then
+      warn "refusing unsafe RMDB KILL escalation for registered pid ${pid}"
+      STOPPING_SERVER=0
+      return 1
+    fi
+    wait_status=0
+    wait_for_server_group_exit "${phase_deadline}" || wait_status=$?
+    if [[ "${wait_status}" != "0" ]]; then
+      warn "registered RMDB process group ${SERVER_PGID} did not terminate"
+      STOPPING_SERVER=0
+      return 1
+    fi
   fi
   wait "${pid}" 2>/dev/null || true
-  if ! wait_for_listener_gone 5000; then
+  phase_deadline=$(( $(monotonic_millis) + 5000 ))
+  if ! wait_for_listener_gone "${phase_deadline}"; then
     warn "listener ${HOST}:${PORT} remained after registered RMDB shutdown"
     clear_server_registration
     return 1
@@ -1539,8 +1682,10 @@ stop_trace() {
 
 crash_server() {
   local pid="${SERVER_PID}"
+  local crash_deadline=""
   [[ -n "${pid}" ]] || die "cannot crash an unregistered server"
-  server_process_helper root-alive \
+  crash_deadline=$(( $(monotonic_millis) + 5000 ))
+  server_process_helper root-alive "" "${crash_deadline}" \
     || die "registered server ${pid} is not the live RMDB process"
   log "SIGKILL registered RMDB process group ${SERVER_PGID}"
   force_stop_server 5000 \
@@ -1550,13 +1695,21 @@ crash_server() {
 force_stop_server() {
   local listener_timeout_millis="$1"
   local pid="${SERVER_PID}"
+  local process_deadline=""
+  local listener_deadline=""
   [[ -n "${pid}" ]] || return 0
-  server_process_helper signal KILL \
+  if [[ -z "${SERVER_IDENTITY}" ]] \
+    && ! establish_cleanup_identity "${pid}"; then
+    return 1
+  fi
+  process_deadline=$(( $(monotonic_millis) + 5000 ))
+  server_process_helper signal KILL "${process_deadline}" \
     || return 1
-  wait_for_server_group_exit 5000 \
+  wait_for_server_group_exit "${process_deadline}" \
     || return 1
   wait "${pid}" 2>/dev/null || true
-  if ! wait_for_listener_gone "${listener_timeout_millis}"; then
+  listener_deadline=$(( $(monotonic_millis) + listener_timeout_millis ))
+  if ! wait_for_listener_gone "${listener_deadline}"; then
     clear_server_registration
     return 1
   fi
@@ -1662,27 +1815,42 @@ probe_ready() {
     "${HOST}" "${PORT}" <<'PY' >>"${RESULT_DIR}/ready_probe.log" 2>&1 &
 import os
 import signal
-import subprocess
 import sys
 import time
 
 deadline_millis = int(sys.argv[1])
 working_directory, executable, host, port = sys.argv[2:]
-remaining_seconds = (
-    deadline_millis - (time.monotonic_ns() // 1_000_000)
-) / 1000.0
-if remaining_seconds <= 0:
+attempt_started_millis = time.monotonic_ns() // 1_000_000
+attempt_deadline_millis = min(
+    deadline_millis,
+    attempt_started_millis + 2_000,
+)
+if attempt_started_millis >= attempt_deadline_millis:
     raise SystemExit(124)
-probe_timeout_seconds = min(2.0, remaining_seconds)
 
-process = None
+probe_pid = None
+
+
+def kill_probe():
+    if probe_pid is None:
+        return
+    try:
+        os.killpg(probe_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.kill(probe_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def terminate_probe(signum, _frame):
-    if process is not None:
+    kill_probe()
+    if probe_pid is not None:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            os.waitpid(probe_pid, 0)
+        except ChildProcessError:
             pass
-        process.wait()
     raise SystemExit(128 + signum)
 
 
@@ -1691,26 +1859,47 @@ signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
 signal.signal(signal.SIGINT, terminate_probe)
 signal.signal(signal.SIGTERM, terminate_probe)
 try:
-    process = subprocess.Popen(
-        [executable, "--probe-ready", "--host", host, "--port", port],
-        cwd=working_directory,
-        start_new_session=True,
-    )
+    probe_pid = os.fork()
+    if probe_pid == 0:
+        try:
+            os.setsid()
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked_signals)
+            os.chdir(working_directory)
+            os.execv(
+                executable,
+                [
+                    executable,
+                    "--probe-ready",
+                    "--host",
+                    host,
+                    "--port",
+                    port,
+                ],
+            )
+        except BaseException as error:
+            print(f"could not start readiness probe: {error}", file=sys.stderr)
+            os._exit(127)
 except OSError as error:
-    print(f"could not start readiness probe: {error}", file=sys.stderr)
+    print(f"could not fork readiness probe: {error}", file=sys.stderr)
 finally:
     signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked_signals)
-if process is None:
+if probe_pid is None:
     raise SystemExit(127)
-try:
-    raise SystemExit(process.wait(timeout=probe_timeout_seconds))
-except subprocess.TimeoutExpired:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
-    raise SystemExit(124)
+
+while True:
+    waited_pid, status = os.waitpid(probe_pid, os.WNOHANG)
+    if waited_pid == probe_pid:
+        exit_code = os.waitstatus_to_exitcode(status)
+        raise SystemExit(exit_code if exit_code >= 0 else 128 - exit_code)
+    now_millis = time.monotonic_ns() // 1_000_000
+    if now_millis >= attempt_deadline_millis:
+        kill_probe()
+        try:
+            os.waitpid(probe_pid, 0)
+        except ChildProcessError:
+            pass
+        raise SystemExit(124)
+    time.sleep(min(0.01, (attempt_deadline_millis - now_millis) / 1000.0))
 PY
   PROBE_PID=$!
   local probe_rc=0
@@ -1818,7 +2007,8 @@ start_server() {
     + readiness_started_millis ))
   (
     cd "${RMDB_DIR}"
-    exec env RMDB_PORT="${PORT}" python3 -c \
+    exec env RMDB_PORT="${PORT}" \
+      RMDB_WORKFLOW_PROCESS_OWNER="${PROCESS_OWNER_TOKEN}" python3 -c \
       'import os, sys
 if os.getpgrp() != os.getpid():
     os.setpgid(0, 0)
@@ -1829,6 +2019,9 @@ os.execv(sys.argv[1], sys.argv[1:])' \
   SERVER_PGID="${SERVER_PID}"
   if ! register_server_process \
       "${SERVER_PID}" "${readiness_deadline_millis}"; then
+    if [[ -z "${SERVER_IDENTITY}" ]]; then
+      establish_cleanup_identity "${SERVER_PID}" || true
+    fi
     force_stop_server 1000 || true
     die "RMDB process registration exceeded the shared readiness budget"
   fi

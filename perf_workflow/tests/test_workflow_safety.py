@@ -104,7 +104,7 @@ database_existed = os.path.isdir(sys.argv[1])
 os.makedirs(sys.argv[1], exist_ok=True)
 listener = socket.socket()
 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind(("127.0.0.1", int(os.environ["RMDB_PORT"])))
+listener.bind(("0.0.0.0", int(os.environ["RMDB_PORT"])))
 listener.listen(8)
 with open(os.environ["FAKE_SERVER_EVENTS"], "a", encoding="utf-8") as output:
     output.write(f"start {os.getpid()} {int(database_existed)}\\n")
@@ -1127,6 +1127,175 @@ listener.close()
                 self.assertEqual(foreign.getsockname()[1], port)
             finally:
                 foreign.close()
+
+    def test_ipv4_wildcard_listener_belongs_to_ipv4_loopback_host(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_owner_check_ignores_foreign_same_family_address(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            _, tester, _, _, env, _ = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            server = self.make_python_executable(
+                temp_path / "fake-rmdb-exact",
+                """
+import os
+import signal
+import socket
+import sys
+import time
+
+os.makedirs(sys.argv[1], exist_ok=True)
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", int(os.environ["RMDB_PORT"])))
+listener.listen(4)
+def stop(_signum, _frame):
+    listener.close()
+    os._exit(0)
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    time.sleep(0.02)
+""",
+            )
+            foreign = socket.socket()
+            try:
+                try:
+                    foreign.bind(("127.0.0.2", 0))
+                except OSError:
+                    self.skipTest("127.0.0.2 is not configured locally")
+                foreign.listen(2)
+                port = foreign.getsockname()[1]
+                availability = socket.socket()
+                try:
+                    availability.bind(("127.0.0.1", port))
+                except OSError:
+                    self.skipTest("distinct IPv4 loopback listeners cannot coexist")
+                finally:
+                    availability.close()
+                result = self.run_script(
+                    "--mode",
+                    "init",
+                    "--target-dir",
+                    root,
+                    "--record-root",
+                    temp_path / "records",
+                    "--skip-build",
+                    "--server-bin",
+                    server,
+                    "--tpcc-bin",
+                    tester,
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    port,
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(foreign.getsockname()[1], port)
+            finally:
+                foreign.close()
+
+    def test_ipv6_wildcard_listener_belongs_to_ipv6_loopback_host(self):
+        if not socket.has_ipv6:
+            self.skipTest("IPv6 is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            _, tester, _, server_events, env, _ = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            server = self.make_python_executable(
+                temp_path / "fake-rmdb-v6",
+                """
+import os
+import signal
+import socket
+import sys
+import time
+
+os.makedirs(sys.argv[1], exist_ok=True)
+listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("::", int(os.environ["RMDB_PORT"])))
+listener.listen(4)
+with open(os.environ["FAKE_SERVER_EVENTS"], "a", encoding="utf-8") as output:
+    output.write(f"start {os.getpid()} 0\\n")
+def stop(signum, _frame):
+    with open(
+        os.environ["FAKE_SERVER_EVENTS"], "a", encoding="utf-8"
+    ) as output:
+        output.write(f"graceful {os.getpid()} {signum}\\n")
+    listener.close()
+    os._exit(0)
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    time.sleep(0.02)
+""",
+            )
+            reservation = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            reservation.setsockopt(
+                socket.IPPROTO_IPV6,
+                socket.IPV6_V6ONLY,
+                1,
+            )
+            reservation.bind(("::1", 0))
+            port = reservation.getsockname()[1]
+            reservation.close()
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--host",
+                "::1",
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            events = server_events.read_text(encoding="utf-8").splitlines()
+            self.assertTrue(any(line.startswith("start ") for line in events))
+            self.assertTrue(any(line.startswith("graceful ") for line in events))
 
     def test_stale_cmake_cache_fails_without_deleting_it(self):
         with tempfile.TemporaryDirectory() as temp:
