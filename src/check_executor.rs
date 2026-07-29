@@ -468,6 +468,78 @@ pub async fn run_final_online(
     Ok(values)
 }
 
+/// Execute the public online gate from the bounded terminal oracle.
+///
+/// Every artifact, dataset, Payment-domain, integer, and FLOAT oracle check is
+/// completed before the first Wire request. The online network surface remains
+/// exactly the six public-semantic integer queries plus seven FLOAT aggregates;
+/// recovery endpoints, retained samples, and partition audits are not queried.
+pub async fn run_final_online_from_terminal_evidence(
+    client: &mut RmdbClient,
+    dataset: &DatasetState,
+    evidence: &dyn TerminalEvidenceView,
+    initial_order_line_amounts: &NonNegativeF32Accumulator,
+) -> Result<FloatBaseline, TpccError> {
+    warn!("{PUBLIC_SPEC_NOTICE}");
+    let prepared = prepare_bounded_online(dataset, evidence, initial_order_line_amounts)?;
+    run_plan(client, &prepared.integer_plan, &dataset.runtime_schema).await?;
+
+    let values = read_float_aggregates(client, CheckScope::Online, &dataset.runtime_schema).await?;
+    validate_public_float_ledger(
+        aggregate_bits(&values, FloatAggregateId::HistoryAmount)?,
+        aggregate_bits(&values, FloatAggregateId::StockYtd)?,
+        aggregate_bits(&values, FloatAggregateId::OrderLineAmount)?,
+        prepared.float_oracle,
+    )
+    .map_err(|error| {
+        TpccError::QueryError(format!("public bounded FLOAT ledger gate failed: {error}"))
+    })?;
+    info!(
+        "public bounded online consistency PASS; hidden official 6 SQL, keys, seed, and answers were not inferred"
+    );
+    Ok(values)
+}
+
+struct PreparedBoundedOnline {
+    integer_plan: ConsistencyPlan,
+    float_oracle: PublicFloatLedgerEvidence,
+}
+
+fn prepare_bounded_online(
+    dataset: &DatasetState,
+    evidence: &dyn TerminalEvidenceView,
+    initial_order_line_amounts: &NonNegativeF32Accumulator,
+) -> Result<PreparedBoundedOnline, TpccError> {
+    validate_terminal_evidence(evidence).map_err(|_| {
+        TpccError::Protocol("online terminal evidence failed validation".to_owned())
+    })?;
+    validate_terminal_dataset_binding(
+        dataset,
+        evidence.intervals().warehouses(),
+        evidence.intervals().sample_seed(),
+    )?;
+    bounded_payment_endpoint_expectations(dataset.warehouses, evidence.payment())?;
+    let expectations =
+        bounded_recovery_expectations(dataset, evidence.stats(), initial_order_line_amounts)?;
+    let float_oracle =
+        bounded_online_float_oracle(dataset, evidence.stats(), initial_order_line_amounts)?;
+    let sample = dataset
+        .online_key_sample()
+        .map_err(|error| protocol_error("invalid online setup-evidence binding", error))?;
+    let integer_plan = public_online_integer_plan(expectations, sample)
+        .map_err(|error| protocol_error("invalid public online plan", error))?;
+    if integer_plan.queries.len() != 6 {
+        return Err(TpccError::Protocol(format!(
+            "bounded online plan generated {} integer queries, expected 6",
+            integer_plan.queries.len()
+        )));
+    }
+    Ok(PreparedBoundedOnline {
+        integer_plan,
+        float_oracle,
+    })
+}
+
 /// Execute the public final-2026 post-crash gate.
 ///
 /// This reruns full public integer checks, compares all seven raw FLOAT32
@@ -904,6 +976,66 @@ fn validate_online_float_ledger(
         },
     )
     .map_err(|error| TpccError::QueryError(format!("public FLOAT ledger gate failed: {error}")))
+}
+
+fn bounded_online_float_oracle(
+    dataset: &DatasetState,
+    stats: &BoundedPhysicalStats,
+    initial_order_line_amounts: &NonNegativeF32Accumulator,
+) -> Result<PublicFloatLedgerEvidence, TpccError> {
+    validate_consistency_warehouse_count(dataset.warehouses)?;
+    let initial_order_line_terms = u64::try_from(dataset.order_line_rows).map_err(|_| {
+        TpccError::Protocol("dataset order-line count is negative or too large".to_owned())
+    })?;
+    if initial_order_line_amounts.term_count() != initial_order_line_terms {
+        return Err(TpccError::Protocol(format!(
+            "initial order-line FLOAT accumulator has {} terms, dataset records {initial_order_line_terms}",
+            initial_order_line_amounts.term_count()
+        )));
+    }
+    let committed = stats
+        .to_committed_ledger()
+        .map_err(|error| protocol_error("invalid bounded online statistics", error))?;
+
+    let initial_history_rows = u64::try_from(dataset.warehouses)
+        .ok()
+        .and_then(|warehouses| warehouses.checked_mul(DISTRICTS_PER_WAREHOUSE as u64))
+        .and_then(|partitions| partitions.checked_mul(3_000))
+        .ok_or_else(|| TpccError::Protocol("initial history row count overflowed".to_owned()))?;
+    let mut history = NonNegativeF32Accumulator::default();
+    history
+        .add_repeated_bits(10.0_f32.to_bits(), initial_history_rows)
+        .map_err(|error| protocol_error("initial history accumulator failed", error))?;
+    let payment_history = stats
+        .payment_history_amounts()
+        .map_err(|error| protocol_error("bounded Payment history accumulator failed", error))?;
+    history
+        .merge(&payment_history)
+        .map_err(|error| protocol_error("Payment history accumulator failed", error))?;
+
+    let mut order_line = initial_order_line_amounts.clone();
+    let committed_order_lines = stats
+        .new_order_line_amounts()
+        .map_err(|error| protocol_error("bounded NewOrder line accumulator failed", error))?;
+    order_line
+        .merge(&committed_order_lines)
+        .map_err(|error| protocol_error("order-line accumulator failed", error))?;
+
+    let stock_ytd = committed.stock_ytd_delta as f32;
+    if !stock_ytd.is_finite() {
+        return Err(TpccError::Protocol(
+            "bounded stock YTD total cannot be represented as finite FLOAT32".to_owned(),
+        ));
+    }
+    Ok(PublicFloatLedgerEvidence {
+        history_amount: history
+            .boundary()
+            .map_err(|error| protocol_error("history boundary failed", error))?,
+        stock_ytd_bits: stock_ytd.to_bits(),
+        order_line_amount: order_line
+            .boundary()
+            .map_err(|error| protocol_error("order-line boundary failed", error))?,
+    })
 }
 
 fn validate_float_baseline(before: &FloatBaseline, after: &FloatBaseline) -> Result<(), TpccError> {
@@ -1720,16 +1852,35 @@ fn terminated_sql(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::connection::wire::HANDSHAKE;
     use crate::consistency::PUBLIC_RECOVERY_INTEGER_CHECK_COUNT;
+    use crate::data_gen::TpccDataGen;
     use crate::loader::{LoadSummary, PartitionLoadSummary};
+    use crate::ranking::bounded_stats::{
+        ClassTotals, PartitionTotals, LEDGER_CLASS_COUNT, PHYSICAL_PARTITION_COUNT,
+    };
+    use crate::ranking::evidence_collector::{
+        CustomerKey as EvidenceCustomerKey, SealedIntervalEvidence, StockKey,
+    };
+    use crate::ranking::preflight::StalePaymentPreflightProof;
+    use crate::ranking::rich_recovery_samples::{
+        InitialCustomerData, InitialHistoryRow, SealedRichRecoverySamples,
+    };
+    use crate::ranking::runner::StockVersion;
+    use crate::ranking::terminal_evidence::{SealedTerminalEvidence, TerminalEvidenceCollector};
     use crate::runtime_schema::{LogicalTable, SchemaMode};
     use crate::sample_evidence::setup_evidence_fixture;
 
     struct EmptyPaymentEndpoints {
         warehouses: u16,
         omit_last_warehouse: bool,
+        nonfinite_last_warehouse: bool,
     }
 
     impl PaymentEndpointView for EmptyPaymentEndpoints {
@@ -1752,6 +1903,8 @@ mod tests {
         fn warehouse_endpoint_bits(&self, warehouse_id: u16) -> Option<u32> {
             if self.omit_last_warehouse && warehouse_id == self.warehouses {
                 None
+            } else if self.nonfinite_last_warehouse && warehouse_id == self.warehouses {
+                Some(f32::INFINITY.to_bits())
             } else {
                 Some(300_000.0_f32.to_bits())
             }
@@ -1773,6 +1926,95 @@ mod tests {
             self.district_endpoint_bits(warehouse_id, district_id)
                 .map(|_| 0)
         }
+    }
+
+    struct PaymentOverrideEvidence<'a> {
+        inner: &'a SealedTerminalEvidence,
+        payment: &'a dyn PaymentEndpointView,
+    }
+
+    impl TerminalEvidenceView for PaymentOverrideEvidence<'_> {
+        fn policy_version(&self) -> u32 {
+            self.inner.policy_version()
+        }
+
+        fn stats(&self) -> &BoundedPhysicalStats {
+            self.inner.stats()
+        }
+
+        fn intervals(&self) -> &SealedIntervalEvidence {
+            self.inner.intervals()
+        }
+
+        fn payment(&self) -> &dyn PaymentEndpointView {
+            self.payment
+        }
+
+        fn rich(&self) -> &SealedRichRecoverySamples {
+            self.inner.rich()
+        }
+    }
+
+    async fn empty_terminal_evidence(dataset: &DatasetState) -> SealedTerminalEvidence {
+        let warehouses = u16::try_from(dataset.warehouses).unwrap();
+        let setup = dataset.setup_evidence();
+        let timestamp = String::from_utf8(setup.load_timestamp.clone()).unwrap();
+        let history_generator = TpccDataGen::with_seed_and_timestamp(
+            dataset.warehouses,
+            setup.load_seed,
+            timestamp.clone(),
+        );
+        let customer_generator =
+            TpccDataGen::with_seed_and_timestamp(dataset.warehouses, setup.load_seed, timestamp);
+        let initial_history = move |customer: EvidenceCustomerKey| {
+            history_generator
+                .initial_history(
+                    customer.warehouse_id,
+                    customer.district_id,
+                    customer.customer_id,
+                )
+                .map(|history| {
+                    InitialHistoryRow::new(
+                        history.h_date.into_bytes(),
+                        (history.h_amount as f32).to_bits(),
+                        history.h_data.into_bytes(),
+                    )
+                    .unwrap()
+                })
+        };
+        let initial_customer = move |customer: EvidenceCustomerKey| {
+            customer_generator
+                .initial_customer_profile(
+                    customer.warehouse_id,
+                    customer.district_id,
+                    customer.customer_id,
+                )
+                .map(|profile| {
+                    InitialCustomerData::new(*profile.credit(), profile.data().to_vec()).unwrap()
+                })
+        };
+        let stock_roots = |_stock: StockKey| {
+            Some(StockVersion {
+                quantity: 50,
+                ytd_bits: 0.0_f32.to_bits(),
+                order_count: 0,
+                remote_count: 0,
+            })
+        };
+        let collector = TerminalEvidenceCollector::new(
+            warehouses,
+            1,
+            dataset.seed,
+            stock_roots,
+            initial_history,
+            initial_customer,
+            StalePaymentPreflightProof::verified_for_test(dataset.seed, warehouses),
+        )
+        .unwrap();
+        collector.worker_finished(0).await.unwrap();
+        let sealed = collector.seal().await.unwrap();
+        validate_terminal_evidence(&sealed).unwrap();
+        sealed
     }
 
     fn smoke_dataset(warehouses: i32) -> DatasetState {
@@ -1858,6 +2100,7 @@ mod tests {
         let complete = EmptyPaymentEndpoints {
             warehouses: 1,
             omit_last_warehouse: false,
+            nonfinite_last_warehouse: false,
         };
         let (warehouses, districts) = bounded_payment_endpoint_expectations(1, &complete).unwrap();
         assert_eq!(warehouses.len(), 1);
@@ -1866,14 +2109,155 @@ mod tests {
         let wrong_scale = EmptyPaymentEndpoints {
             warehouses: 2,
             omit_last_warehouse: false,
+            nonfinite_last_warehouse: false,
         };
         assert!(bounded_payment_endpoint_expectations(1, &wrong_scale).is_err());
 
         let missing = EmptyPaymentEndpoints {
             warehouses: 1,
             omit_last_warehouse: true,
+            nonfinite_last_warehouse: false,
         };
         assert!(bounded_payment_endpoint_expectations(1, &missing).is_err());
+
+        let nonfinite = EmptyPaymentEndpoints {
+            warehouses: 1,
+            omit_last_warehouse: false,
+            nonfinite_last_warehouse: true,
+        };
+        assert!(bounded_payment_endpoint_expectations(1, &nonfinite).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_online_prepares_exact_public_query_surface() {
+        let dataset = smoke_dataset(1);
+        let evidence = empty_terminal_evidence(&dataset).await;
+        let prepared =
+            prepare_bounded_online(&dataset, &evidence, dataset.initial_order_line_amounts())
+                .unwrap();
+
+        assert_eq!(prepared.integer_plan.queries.len(), 6);
+        assert!(prepared
+            .integer_plan
+            .queries
+            .iter()
+            .all(|query| query.id.starts_with("online.public.")));
+        assert_eq!(
+            float_aggregate_plan(CheckScope::Online).queries.len(),
+            FLOAT_AGGREGATES.len()
+        );
+        assert_eq!(FLOAT_AGGREGATES.len(), 7);
+
+        assert!(
+            prepare_bounded_online(&dataset, &evidence, &NonNegativeF32Accumulator::default())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_bounded_online_evidence_fails_before_first_wire_request() {
+        let dataset = smoke_dataset(1);
+        let evidence = empty_terminal_evidence(&dataset).await;
+        let incomplete_payment = EmptyPaymentEndpoints {
+            warehouses: 1,
+            omit_last_warehouse: true,
+            nonfinite_last_warehouse: false,
+        };
+        let incomplete_evidence = PaymentOverrideEvidence {
+            inner: &evidence,
+            payment: &incomplete_payment,
+        };
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; HANDSHAKE.len()];
+            socket.read_exact(&mut handshake).await.unwrap();
+            assert_eq!(handshake, HANDSHAKE);
+            socket.write_all(&HANDSHAKE).await.unwrap();
+            matches!(
+                tokio::time::timeout(Duration::from_millis(200), socket.read_u8()).await,
+                Ok(Ok(_))
+            )
+        });
+        let mut client =
+            RmdbClient::connect_with_timeout("127.0.0.1", port, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert!(run_final_online_from_terminal_evidence(
+            &mut client,
+            &dataset,
+            &incomplete_evidence,
+            dataset.initial_order_line_amounts(),
+        )
+        .await
+        .is_err());
+        assert!(
+            !server.await.unwrap(),
+            "bounded evidence validation emitted a Wire request"
+        );
+    }
+
+    #[test]
+    fn bounded_online_float_oracle_merges_all_nine_physical_classes() {
+        let dataset = smoke_dataset(1);
+        let mut classes = [ClassTotals::default(); LEDGER_CLASS_COUNT];
+        let mut partitions = [PartitionTotals::default(); PHYSICAL_PARTITION_COUNT];
+        let mut payment_amounts = std::array::from_fn(|_| NonNegativeF32Accumulator::default());
+        let mut order_line_amounts = std::array::from_fn(|_| NonNegativeF32Accumulator::default());
+        let delivery_amounts = std::array::from_fn(|_| NonNegativeF32Accumulator::default());
+        let mut class_bits = Vec::with_capacity(LEDGER_CLASS_COUNT);
+        for index in 0..LEDGER_CLASS_COUNT {
+            let bits = ((index + 1) as f32).to_bits();
+            class_bits.push(bits);
+            classes[index] = ClassTotals {
+                new_order_commits: 1,
+                payment_commits: 1,
+                new_orders: 1,
+                new_order_lines: 5,
+                stock_quantity_delta: 5,
+                ..ClassTotals::default()
+            };
+            payment_amounts[index].add_bits(bits).unwrap();
+            order_line_amounts[index]
+                .add_repeated_bits(bits, 5)
+                .unwrap();
+        }
+        partitions[0] = PartitionTotals {
+            new_orders: LEDGER_CLASS_COUNT as u64,
+            new_order_lines: (LEDGER_CLASS_COUNT * 5) as u64,
+            ..PartitionTotals::default()
+        };
+        let stats = BoundedPhysicalStats::from_canonical_parts(
+            classes,
+            partitions,
+            payment_amounts,
+            order_line_amounts,
+            delivery_amounts,
+        )
+        .unwrap();
+
+        let oracle =
+            bounded_online_float_oracle(&dataset, &stats, dataset.initial_order_line_amounts())
+                .unwrap();
+        let mut expected_history = NonNegativeF32Accumulator::default();
+        expected_history
+            .add_repeated_bits(10.0_f32.to_bits(), (DISTRICTS_PER_WAREHOUSE * 3_000) as u64)
+            .unwrap();
+        let mut expected_order_lines = dataset.initial_order_line_amounts().clone();
+        for bits in class_bits {
+            expected_history.add_bits(bits).unwrap();
+            expected_order_lines.add_repeated_bits(bits, 5).unwrap();
+        }
+
+        assert_eq!(oracle.history_amount, expected_history.boundary().unwrap());
+        assert_eq!(
+            oracle.order_line_amount,
+            expected_order_lines.boundary().unwrap()
+        );
+        assert_eq!(oracle.stock_ytd_bits, 45.0_f32.to_bits());
     }
 
     #[test]
