@@ -826,7 +826,12 @@ impl<'a> TerminalDelta<'a> {
                         ));
                     }
                     for amount_bits in &order.line_amount_bits {
-                        validate_positive_amount("Delivery line amount", *amount_bits, 10_000.0)?;
+                        validate_amount_range(
+                            "Delivery line amount",
+                            *amount_bits,
+                            0.01,
+                            9_999.99,
+                        )?;
                     }
                     let expected_amount = sum_f32_as_f64_once(
                         order.line_amount_bits.iter().copied(),
@@ -956,6 +961,20 @@ fn validate_positive_amount(
 ) -> Result<f32, BoundedStatsError> {
     let value = f32::from_bits(bits);
     if !value.is_finite() || value <= 0.0 || value > maximum {
+        Err(BoundedStatsError::InvalidFloatBits { field, bits })
+    } else {
+        Ok(value)
+    }
+}
+
+fn validate_amount_range(
+    field: &'static str,
+    bits: u32,
+    minimum: f32,
+    maximum: f32,
+) -> Result<f32, BoundedStatsError> {
+    let value = f32::from_bits(bits);
+    if !value.is_finite() || value < minimum || value > maximum {
         Err(BoundedStatsError::InvalidFloatBits { field, bits })
     } else {
         Ok(value)
@@ -1638,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_validates_exact_line_sum_without_a_false_amount_ceiling() {
+    fn delivery_validates_exact_line_sum_and_public_line_ceiling() {
         let delivery_ticket = ticket(TransactionKind::Delivery, None, StageId::WARMUP, 1, 37);
         let mut high_amount = delivery(&delivery_ticket);
         let RankedTransactionOutcome::Committed(RankedCommit::Delivery(orders)) = &mut high_amount
@@ -1671,6 +1690,58 @@ mod tests {
             Err(BoundedStatsError::InvalidEvidence(
                 "Delivery amount-bit count differs from line_count"
             ))
+        ));
+        assert_eq!(stats, before);
+
+        let mut below_public_line_limit = high_amount.clone();
+        let RankedTransactionOutcome::Committed(RankedCommit::Delivery(orders)) =
+            &mut below_public_line_limit
+        else {
+            unreachable!();
+        };
+        orders[0].line_amount_bits[0] = 0.009_f32.to_bits();
+        orders[0].amount_bits =
+            sum_f32_as_f64_once(orders[0].line_amount_bits.iter().copied()).unwrap();
+        orders[0].customer_balance_after_bits =
+            (f32::from_bits(orders[0].customer_balance_before_bits)
+                + f32::from_bits(orders[0].amount_bits))
+            .to_bits();
+        assert!(matches!(
+            stats.offer_terminal(
+                LedgerClass::Warmup,
+                &delivery_ticket,
+                &below_public_line_limit
+            ),
+            Err(BoundedStatsError::InvalidFloatBits {
+                field: "Delivery line amount",
+                bits
+            }) if bits == 0.009_f32.to_bits()
+        ));
+        assert_eq!(stats, before);
+
+        let mut over_public_line_limit = high_amount.clone();
+        let RankedTransactionOutcome::Committed(RankedCommit::Delivery(orders)) =
+            &mut over_public_line_limit
+        else {
+            unreachable!();
+        };
+        orders[0].line_amount_bits[0] = 10_000.0_f32.to_bits();
+        orders[0].amount_bits =
+            sum_f32_as_f64_once(orders[0].line_amount_bits.iter().copied()).unwrap();
+        orders[0].customer_balance_after_bits =
+            (f32::from_bits(orders[0].customer_balance_before_bits)
+                + f32::from_bits(orders[0].amount_bits))
+            .to_bits();
+        assert!(matches!(
+            stats.offer_terminal(
+                LedgerClass::Warmup,
+                &delivery_ticket,
+                &over_public_line_limit
+            ),
+            Err(BoundedStatsError::InvalidFloatBits {
+                field: "Delivery line amount",
+                bits
+            }) if bits == 10_000.0_f32.to_bits()
         ));
         assert_eq!(stats, before);
 
