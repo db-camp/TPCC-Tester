@@ -648,6 +648,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "libc",
  "rand",
  "sha2",
  "thiserror",

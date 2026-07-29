@@ -72,6 +72,26 @@ async fn main() {
             process::exit(1);
         }
     };
+    if config.attest_formal_state {
+        let seed = effective
+            .seed
+            .expect("validated formal-state attestation has a caller seed");
+        let root = config
+            .state_dir
+            .as_deref()
+            .expect("validated formal-state attestation has a state directory");
+        let contract = run_contract(&config, &effective);
+        match run_state::attest_formal_state(root, seed, &contract) {
+            Ok(receipt) => {
+                println!("{receipt}");
+                return;
+            }
+            Err(error) => {
+                error!("正式状态证明失败: {error}");
+                process::exit(1);
+            }
+        }
+    }
     print_effective_profile(&config, &effective);
 
     if let Err(e) = run(config, effective).await {

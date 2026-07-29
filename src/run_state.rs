@@ -1,10 +1,18 @@
 //! Versioned cross-process state for the public final-2026 workflow.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use sha2::{Digest, Sha256};
 
 use crate::consistency::{
     FloatAggregateId, NonNegativeF32Accumulator, OnlineKeySample, FLOAT_AGGREGATES,
@@ -69,6 +77,7 @@ const DIAGNOSTIC_OBSERVATION_CLAIM_ARTIFACT: &str = "diagnostic_observation_clai
 const DIAGNOSTIC_OBSERVATION_CLAIM_FILE: &str = "diagnostic_observation.started";
 const DIAGNOSTIC_OBSERVATION_RECEIPT_ARTIFACT: &str = "diagnostic_observation_receipt";
 const DIAGNOSTIC_OBSERVATION_RECEIPT_FILE: &str = "diagnostic_observation.passed";
+const DATABASE_IDENTITY_FILE: &str = "database.identity";
 const STATE_ARTIFACT_FILES: [&str; 20] = [
     DATASET_FILE,
     SETUP_INTENT_FILE,
@@ -86,6 +95,68 @@ const STATE_ARTIFACT_FILES: [&str; 20] = [
     RESTART_READY_FILE,
     RECOVERY_CLAIM_FILE,
     RECOVERY_RECEIPT_FILE,
+    DIAGNOSTIC_WARMUP_CLAIM_FILE,
+    DIAGNOSTIC_WARMUP_RECEIPT_FILE,
+    DIAGNOSTIC_OBSERVATION_CLAIM_FILE,
+    DIAGNOSTIC_OBSERVATION_RECEIPT_FILE,
+];
+const FORMAL_STATE_DOMAIN_V2: &[u8] = b"RMDB_TPCC_FORMAL_CHAIN_V2\0";
+const FORMAL_STATE_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const FORMAL_STATE_FILES_V2: [(&str, u64); 16] = [
+    (DATASET_FILE, MAX_DATASET_STATE_BYTES as u64),
+    (SETUP_INTENT_FILE, MAX_SETUP_INTENT_BYTES as u64),
+    (SETUP_EXECUTION_FILE, MAX_SETUP_INTENT_BYTES as u64),
+    (
+        RUN_CONTRACT_FILE,
+        MAX_CONTRACT_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        SETUP_CHECK_CLAIM_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        SETUP_RECEIPT_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        RANK_CLAIM_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (TERMINAL_EVIDENCE_FILE, MAX_TERMINAL_EVIDENCE_FILE_BYTES),
+    (
+        ONLINE_CLAIM_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        FLOAT_BASELINE_FILE,
+        MAX_FLOAT_BASELINE_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        CRASH_INTENT_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        CRASH_KILLED_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        RESTART_STARTED_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        RESTART_READY_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        RECOVERY_CLAIM_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+    (
+        RECOVERY_RECEIPT_FILE,
+        MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+    ),
+];
+const DIAGNOSTIC_STATE_FILES: [&str; 4] = [
     DIAGNOSTIC_WARMUP_CLAIM_FILE,
     DIAGNOSTIC_WARMUP_RECEIPT_FILE,
     DIAGNOSTIC_OBSERVATION_CLAIM_FILE,
@@ -250,6 +321,40 @@ impl RunContract {
         }
         Ok(contract)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FormalStateReceipt {
+    terminal_evidence_size: u64,
+    terminal_evidence_sha256: [u8; 32],
+    formal_chain_sha256: [u8; 32],
+    state_device: u64,
+    state_inode: u64,
+}
+
+impl std::fmt::Display for FormalStateReceipt {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            output,
+            "FORMAL_STATE_V2 terminal_evidence_size={} terminal_evidence_sha256={} \
+             formal_chain_sha256={} state_device={} state_inode={}",
+            self.terminal_evidence_size,
+            lowercase_sha256(self.terminal_evidence_sha256),
+            lowercase_sha256(self.formal_chain_sha256),
+            self.state_device,
+            self.state_inode,
+        )
+    }
+}
+
+fn lowercase_sha256(digest: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 #[derive(Debug)]
@@ -1734,6 +1839,326 @@ impl StateStore {
     }
 }
 
+pub fn attest_formal_state(
+    root: &Path,
+    expected_seed: u64,
+    expected_contract: &RunContract,
+) -> Result<FormalStateReceipt, StateError> {
+    if !root.is_absolute() {
+        return Err(StateError::Invalid(
+            "formal state directory must be an absolute path".to_owned(),
+        ));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, expected_seed, expected_contract);
+        return Err(StateError::Invalid(
+            "formal-state attestation requires Unix descriptor semantics".to_owned(),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        expected_contract.validate_shape()?;
+        if expected_contract.conformance != RunConformance::PublicSpecAligned {
+            return Err(StateError::Invalid(
+                "formal-state attestation requires the public-spec-aligned contract".to_owned(),
+            ));
+        }
+
+        let directory_lock = lock_readonly_formal_state_directory(root)?;
+        let directory_metadata = directory_lock.0.metadata()?;
+        let state_device = directory_metadata.dev();
+        let state_inode = directory_metadata.ino();
+        let initial_entries = formal_directory_snapshot(&directory_lock.0)?;
+        validate_formal_directory_entries(&initial_entries)?;
+
+        let mut total_bytes = 0_u64;
+        let mut files = Vec::with_capacity(FORMAL_STATE_FILES_V2.len());
+        for &(name, limit) in &FORMAL_STATE_FILES_V2 {
+            ensure_formal_directory_snapshot_unchanged(&directory_lock.0, &initial_entries)?;
+            let bytes = read_formal_file_at(&directory_lock.0, name, limit)?;
+            total_bytes = total_bytes
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| StateError::Invalid("formal state size overflow".to_owned()))?;
+            if total_bytes > FORMAL_STATE_MAX_TOTAL_BYTES {
+                return Err(StateError::Invalid(format!(
+                    "formal state exceeds {FORMAL_STATE_MAX_TOTAL_BYTES} bytes"
+                )));
+            }
+            files.push(FormalFileBytes { name, bytes });
+            ensure_formal_directory_snapshot_unchanged(&directory_lock.0, &initial_entries)?;
+        }
+
+        for name in DIAGNOSTIC_STATE_FILES {
+            if initial_entries
+                .binary_search_by(|candidate| candidate.as_str().cmp(name))
+                .is_ok()
+            {
+                ensure_formal_directory_snapshot_unchanged(&directory_lock.0, &initial_entries)?;
+                validate_auxiliary_formal_entry_at(&directory_lock.0, name)?;
+                ensure_formal_directory_snapshot_unchanged(&directory_lock.0, &initial_entries)?;
+            }
+        }
+        ensure_formal_directory_snapshot_unchanged(&directory_lock.0, &initial_entries)?;
+        validate_auxiliary_formal_entry_at(&directory_lock.0, DATABASE_IDENTITY_FILE)?;
+        ensure_formal_directory_snapshot_unchanged(&directory_lock.0, &initial_entries)?;
+
+        validate_formal_state_semantics(&files, expected_seed, expected_contract)?;
+        ensure_formal_directory_snapshot_unchanged(&directory_lock.0, &initial_entries)?;
+        validate_locked_directory_identity(root, &directory_lock.0)?;
+
+        let terminal_evidence = formal_file(&files, TERMINAL_EVIDENCE_FILE)?;
+        let terminal_evidence_sha256: [u8; 32] = Sha256::digest(terminal_evidence)
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                StateError::Invalid(
+                    "SHA-256 implementation returned a wrong digest size".to_owned(),
+                )
+            })?;
+        let formal_chain_sha256 =
+            formal_chain_sha256_v2(state_device, state_inode, files.as_slice())?;
+
+        Ok(FormalStateReceipt {
+            terminal_evidence_size: terminal_evidence.len() as u64,
+            terminal_evidence_sha256,
+            formal_chain_sha256,
+            state_device,
+            state_inode,
+        })
+    }
+}
+
+struct FormalFileBytes {
+    name: &'static str,
+    bytes: Vec<u8>,
+}
+
+fn formal_file<'a>(
+    files: &'a [FormalFileBytes],
+    expected_name: &str,
+) -> Result<&'a [u8], StateError> {
+    files
+        .iter()
+        .find(|file| file.name == expected_name)
+        .map(|file| file.bytes.as_slice())
+        .ok_or_else(|| {
+            StateError::Invalid(format!(
+                "formal state is missing required artifact {expected_name}"
+            ))
+        })
+}
+
+fn formal_utf8<'a>(
+    files: &'a [FormalFileBytes],
+    expected_name: &str,
+) -> Result<&'a str, StateError> {
+    std::str::from_utf8(formal_file(files, expected_name)?).map_err(|_| {
+        StateError::Invalid(format!(
+            "formal state artifact {expected_name} is not valid UTF-8"
+        ))
+    })
+}
+
+fn formal_chain_sha256_v2(
+    state_device: u64,
+    state_inode: u64,
+    files: &[FormalFileBytes],
+) -> Result<[u8; 32], StateError> {
+    let count = u32::try_from(FORMAL_STATE_FILES_V2.len())
+        .map_err(|_| StateError::Invalid("formal state file count overflow".to_owned()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(FORMAL_STATE_DOMAIN_V2);
+    hasher.update(state_device.to_be_bytes());
+    hasher.update(state_inode.to_be_bytes());
+    hasher.update(count.to_be_bytes());
+    for &(name, _) in &FORMAL_STATE_FILES_V2 {
+        if !name.is_ascii() {
+            return Err(StateError::Invalid(
+                "formal state contains a non-ASCII canonical name".to_owned(),
+            ));
+        }
+        let name_len = u32::try_from(name.len())
+            .map_err(|_| StateError::Invalid("formal state name length overflow".to_owned()))?;
+        let content = formal_file(files, name)?;
+        let content_len = u64::try_from(content.len())
+            .map_err(|_| StateError::Invalid("formal state content length overflow".to_owned()))?;
+        hasher.update(name_len.to_be_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(content_len.to_be_bytes());
+        hasher.update(content);
+        hasher.update(content_len.to_be_bytes());
+    }
+    hasher
+        .finalize()
+        .as_slice()
+        .try_into()
+        .map_err(|_| StateError::Invalid("SHA-256 implementation returned a wrong size".to_owned()))
+}
+
+fn validate_formal_state_semantics(
+    files: &[FormalFileBytes],
+    expected_seed: u64,
+    expected_contract: &RunContract,
+) -> Result<(), StateError> {
+    let dataset = DatasetState::decode(formal_utf8(files, DATASET_FILE)?)?;
+    if dataset.seed != expected_seed {
+        return Err(StateError::Invalid(format!(
+            "dataset seed mismatch: expected {expected_seed}, got {}",
+            dataset.seed
+        )));
+    }
+    expected_contract.validate(&dataset)?;
+
+    let (intent, intent_checksum) = decode_setup_intent(formal_utf8(files, SETUP_INTENT_FILE)?)?;
+    if intent.run_id != dataset.run_id
+        || intent.seed != expected_seed
+        || intent.contract != *expected_contract
+    {
+        return Err(StateError::Invalid(
+            "setup intent does not bind the attested dataset, seed, and contract".to_owned(),
+        ));
+    }
+
+    let (execution, execution_checksum) =
+        decode_setup_execution(formal_utf8(files, SETUP_EXECUTION_FILE)?)?;
+    if execution.run_id != dataset.run_id
+        || execution.seed != expected_seed
+        || execution.intent_checksum != intent_checksum
+        || execution.contract != *expected_contract
+    {
+        return Err(StateError::Invalid(
+            "setup execution does not bind the attested setup intent".to_owned(),
+        ));
+    }
+
+    let (contract_payload, contract_checksum) = decode_artifact_and_checksum(
+        formal_utf8(files, RUN_CONTRACT_FILE)?,
+        RUN_CONTRACT_ARTIFACT,
+        &dataset,
+        MAX_CONTRACT_PAYLOAD_BYTES,
+    )?;
+    let stored_contract =
+        decode_setup_bound_contract(contract_payload, intent_checksum, execution_checksum)?;
+    stored_contract.validate(&dataset)?;
+    if stored_contract != *expected_contract {
+        return Err(StateError::Invalid(
+            "stored run contract differs from the requested formal contract".to_owned(),
+        ));
+    }
+
+    let setup_claim = decode_formal_marker(
+        formal_utf8(files, SETUP_CHECK_CLAIM_FILE)?,
+        SETUP_CHECK_CLAIM_ARTIFACT,
+        &dataset,
+        contract_checksum,
+        contract_checksum,
+    )?;
+    let setup_receipt = decode_formal_marker(
+        formal_utf8(files, SETUP_RECEIPT_FILE)?,
+        SETUP_RECEIPT_ARTIFACT,
+        &dataset,
+        contract_checksum,
+        setup_claim,
+    )?;
+    let rank_claim = decode_formal_marker(
+        formal_utf8(files, RANK_CLAIM_FILE)?,
+        RANK_CLAIM_ARTIFACT,
+        &dataset,
+        contract_checksum,
+        setup_receipt,
+    )?;
+
+    let (terminal_payload, terminal_evidence_checksum) = decode_artifact_and_checksum(
+        formal_utf8(files, TERMINAL_EVIDENCE_FILE)?,
+        terminal_evidence_artifact(expected_contract.conformance),
+        &dataset,
+        MAX_TERMINAL_EVIDENCE_PAYLOAD_BYTES,
+    )?;
+    let terminal_inner = decode_bound_payload(
+        terminal_payload,
+        contract_checksum,
+        rank_claim,
+        "terminal evidence",
+    )?;
+    let _terminal_evidence = decode_persisted_terminal_evidence(&dataset, terminal_inner)?;
+
+    let online_claim = decode_formal_marker(
+        formal_utf8(files, ONLINE_CLAIM_FILE)?,
+        ONLINE_CLAIM_ARTIFACT,
+        &dataset,
+        contract_checksum,
+        terminal_evidence_checksum,
+    )?;
+    let (baseline_payload, baseline_checksum) = decode_artifact_and_checksum(
+        formal_utf8(files, FLOAT_BASELINE_FILE)?,
+        FLOAT_BASELINE_ARTIFACT,
+        &dataset,
+        MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
+    )?;
+    let baseline_inner = decode_bound_payload(
+        baseline_payload,
+        contract_checksum,
+        online_claim,
+        "FLOAT baseline",
+    )?;
+    let _baseline = decode_terminal_float_baseline(baseline_inner, terminal_evidence_checksum)?;
+
+    let mut predecessor_checksum = baseline_checksum;
+    for (file, artifact) in crash_lifecycle_specs() {
+        let (payload, checksum) = decode_artifact_and_checksum(
+            formal_utf8(files, file)?,
+            artifact,
+            &dataset,
+            MAX_MARKER_PAYLOAD_BYTES,
+        )?;
+        let inner =
+            decode_bound_payload(payload, contract_checksum, predecessor_checksum, artifact)?;
+        decode_terminal_crash_lifecycle_binding(
+            inner,
+            terminal_evidence_checksum,
+            baseline_checksum,
+            artifact,
+        )?;
+        predecessor_checksum = checksum;
+    }
+
+    let recovery_claim = decode_formal_marker(
+        formal_utf8(files, RECOVERY_CLAIM_FILE)?,
+        RECOVERY_CLAIM_ARTIFACT,
+        &dataset,
+        contract_checksum,
+        predecessor_checksum,
+    )?;
+    decode_formal_marker(
+        formal_utf8(files, RECOVERY_RECEIPT_FILE)?,
+        RECOVERY_RECEIPT_ARTIFACT,
+        &dataset,
+        contract_checksum,
+        recovery_claim,
+    )?;
+    Ok(())
+}
+
+fn decode_formal_marker(
+    input: &str,
+    artifact: &str,
+    dataset: &DatasetState,
+    contract_checksum: u64,
+    predecessor_checksum: u64,
+) -> Result<u64, StateError> {
+    let (payload, checksum) =
+        decode_artifact_and_checksum(input, artifact, dataset, MAX_MARKER_PAYLOAD_BYTES)?;
+    let inner = decode_bound_payload(payload, contract_checksum, predecessor_checksum, artifact)?;
+    if !inner.is_empty() {
+        return Err(StateError::Invalid(format!(
+            "{artifact} marker payload must be empty"
+        )));
+    }
+    Ok(checksum)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     #[error("state I/O failed: {0}")]
@@ -2695,6 +3120,355 @@ fn read_limited(path: &Path, limit: u64) -> Result<String, StateError> {
     Ok(input)
 }
 
+#[cfg(unix)]
+fn lock_readonly_formal_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
+    let path_metadata = fs::symlink_metadata(root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            StateError::Invalid(format!(
+                "formal state directory does not exist: {}",
+                root.display()
+            ))
+        } else {
+            StateError::Io(error)
+        }
+    })?;
+    validate_real_directory(root, &path_metadata)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?;
+    directory.lock()?;
+    validate_locked_directory_identity(root, &directory)?;
+    Ok(StateDirectoryLock(directory))
+}
+
+#[cfg(unix)]
+struct FormalDirectoryStream(*mut libc::DIR);
+
+#[cfg(unix)]
+impl Drop for FormalDirectoryStream {
+    fn drop(&mut self) {
+        unsafe {
+            libc::closedir(self.0);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn formal_directory_snapshot(directory: &File) -> Result<Vec<String>, StateError> {
+    let current_directory = CString::new(".").expect("static directory name contains no NUL");
+    let duplicate = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            current_directory.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if duplicate < 0 {
+        return Err(StateError::Io(std::io::Error::last_os_error()));
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(StateError::Io(error));
+    }
+    let stream = FormalDirectoryStream(stream);
+    let mut entries = Vec::new();
+    loop {
+        unsafe {
+            *formal_errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let errno = unsafe { *formal_errno_location() };
+            if errno != 0 {
+                return Err(StateError::Io(std::io::Error::from_raw_os_error(errno)));
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if !name.is_ascii() {
+            return Err(StateError::Invalid(
+                "formal state directory contains a non-ASCII entry".to_owned(),
+            ));
+        }
+        let name = std::str::from_utf8(name)
+            .expect("ASCII directory entry is valid UTF-8")
+            .to_owned();
+        entries.push(name);
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn formal_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+unsafe fn formal_errno_location() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))
+))]
+compile_error!("formal-state attestation needs a supported Unix errno accessor");
+
+#[cfg(unix)]
+fn validate_formal_directory_entries(entries: &[String]) -> Result<(), StateError> {
+    for name in entries {
+        if name == LEDGER_FILE || is_legacy_temporary_name(name) {
+            return Err(StateError::Invalid(format!(
+                "legacy run-ledger state is forbidden during formal attestation: {name}"
+            )));
+        }
+        let is_formal = FORMAL_STATE_FILES_V2
+            .iter()
+            .any(|(candidate, _)| *candidate == name);
+        let is_diagnostic = DIAGNOSTIC_STATE_FILES.contains(&name.as_str());
+        if !is_formal && !is_diagnostic && name != DATABASE_IDENTITY_FILE {
+            return Err(StateError::Invalid(format!(
+                "unknown state entry is forbidden during formal attestation: {name}"
+            )));
+        }
+    }
+    for &(name, _) in &FORMAL_STATE_FILES_V2 {
+        if entries
+            .binary_search_by(|candidate| candidate.as_str().cmp(name))
+            .is_err()
+        {
+            return Err(StateError::Invalid(format!(
+                "formal state is missing required artifact {name}"
+            )));
+        }
+    }
+    if entries
+        .binary_search_by(|candidate| candidate.as_str().cmp(DATABASE_IDENTITY_FILE))
+        .is_err()
+    {
+        return Err(StateError::Invalid(format!(
+            "formal state is missing required artifact {DATABASE_IDENTITY_FILE}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_formal_directory_snapshot_unchanged(
+    directory: &File,
+    expected: &[String],
+) -> Result<(), StateError> {
+    let actual = formal_directory_snapshot(directory)?;
+    validate_formal_directory_entries(&actual)?;
+    if actual != expected {
+        return Err(StateError::Invalid(
+            "formal state directory entries changed during attestation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FormalFileIdentity {
+    device: u64,
+    inode: u64,
+    links: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl FormalFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            links: metadata.nlink(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+
+    fn from_stat(stat: &libc::stat) -> Self {
+        let (modified_seconds, modified_nanoseconds, changed_seconds, changed_nanoseconds) =
+            formal_stat_times(stat);
+        Self {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+            links: stat.st_nlink as u64,
+            mode: stat.st_mode as u32,
+            uid: stat.st_uid,
+            gid: stat.st_gid,
+            size: stat.st_size as u64,
+            modified_seconds,
+            modified_nanoseconds,
+            changed_seconds,
+            changed_nanoseconds,
+        }
+    }
+
+    fn validate_regular(self, name: &str, limit: Option<u64>) -> Result<(), StateError> {
+        if self.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+            return Err(StateError::Invalid(format!(
+                "formal state entry is not a regular file: {name}"
+            )));
+        }
+        if self.size == 0 {
+            return Err(StateError::Invalid(format!(
+                "formal state entry is empty: {name}"
+            )));
+        }
+        if let Some(limit) = limit {
+            if self.size > limit {
+                return Err(StateError::Invalid(format!(
+                    "formal state artifact {name} exceeds {limit} bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn formal_stat_times(stat: &libc::stat) -> (i64, i64, i64, i64) {
+    (
+        stat.st_mtime as i64,
+        stat.st_mtime_nsec as i64,
+        stat.st_ctime as i64,
+        stat.st_ctime_nsec as i64,
+    )
+}
+
+#[cfg(unix)]
+fn formal_entry_identity_at(
+    directory: &File,
+    name: &str,
+) -> Result<FormalFileIdentity, StateError> {
+    let name = CString::new(name)
+        .map_err(|_| StateError::Invalid("formal state name contains NUL".to_owned()))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return Err(StateError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(FormalFileIdentity::from_stat(unsafe {
+        &stat.assume_init()
+    }))
+}
+
+#[cfg(unix)]
+fn open_formal_entry_at(directory: &File, name: &str) -> Result<File, StateError> {
+    let name = CString::new(name)
+        .map_err(|_| StateError::Invalid("formal state name contains NUL".to_owned()))?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(StateError::Io(std::io::Error::last_os_error()));
+    }
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn read_formal_file_at(directory: &File, name: &str, limit: u64) -> Result<Vec<u8>, StateError> {
+    let before = formal_entry_identity_at(directory, name)?;
+    before.validate_regular(name, Some(limit))?;
+    let mut file = open_formal_entry_at(directory, name)?;
+    let opened = FormalFileIdentity::from_metadata(&file.metadata()?);
+    opened.validate_regular(name, Some(limit))?;
+    if opened != before {
+        return Err(StateError::Invalid(format!(
+            "formal state artifact changed while opening: {name}"
+        )));
+    }
+
+    let capacity = usize::try_from(before.size)
+        .map_err(|_| StateError::Invalid(format!("formal state artifact is too large: {name}")))?;
+    let read_limit = limit
+        .checked_add(1)
+        .ok_or_else(|| StateError::Invalid("formal state read limit overflow".to_owned()))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file).take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != before.size || bytes.len() as u64 > limit {
+        return Err(StateError::Invalid(format!(
+            "formal state artifact changed while reading: {name}"
+        )));
+    }
+
+    let after_open = FormalFileIdentity::from_metadata(&file.metadata()?);
+    let after_path = formal_entry_identity_at(directory, name)?;
+    if after_open != before || after_path != before {
+        return Err(StateError::Invalid(format!(
+            "formal state artifact identity changed while reading: {name}"
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn validate_auxiliary_formal_entry_at(directory: &File, name: &str) -> Result<(), StateError> {
+    let before = formal_entry_identity_at(directory, name)?;
+    before.validate_regular(name, Some(FORMAL_STATE_MAX_TOTAL_BYTES))?;
+    let file = open_formal_entry_at(directory, name)?;
+    let opened = FormalFileIdentity::from_metadata(&file.metadata()?);
+    let after_path = formal_entry_identity_at(directory, name)?;
+    if opened != before || after_path != before {
+        return Err(StateError::Invalid(format!(
+            "optional diagnostic entry changed while opening: {name}"
+        )));
+    }
+    Ok(())
+}
+
 struct StateDirectoryLock(File);
 
 impl Drop for StateDirectoryLock {
@@ -3358,6 +4132,46 @@ mod tests {
             .unwrap();
     }
 
+    fn initialize_formal_run(directory: &TestDirectory) -> (DatasetState, RunContract) {
+        let store = StateStore::open_terminal(&directory.0).unwrap();
+        let dataset = sample_dataset_with_warehouses(
+            "run-formal-attestation",
+            0x7a11_ce55,
+            i32::from(OFFICIAL_WAREHOUSES),
+        );
+        let contract = sample_contract(OFFICIAL_WAREHOUSES);
+        initialize_online_run(&store, &dataset, &contract);
+        for event in [
+            CrashLifecycleEvent::Intent,
+            CrashLifecycleEvent::Killed,
+            CrashLifecycleEvent::RestartStarted,
+            CrashLifecycleEvent::RestartReady,
+        ] {
+            store
+                .record_crash_lifecycle_from_terminal_evidence(&dataset, &contract, event)
+                .unwrap();
+        }
+        let (recovery, _, _) = store
+            .begin_recovery_check_from_terminal_evidence(&dataset, &contract)
+            .unwrap();
+        store
+            .complete_recovery_check_from_terminal_evidence(&dataset, &contract, recovery)
+            .unwrap();
+        fs::write(
+            directory.0.join(DATABASE_IDENTITY_FILE),
+            b"database-identity-v2\n",
+        )
+        .unwrap();
+        (dataset, contract)
+    }
+
+    fn copy_state_directory(source: &Path, target: &Path) {
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+        }
+    }
+
     fn sample_float_baseline() -> BTreeMap<FloatAggregateId, u32> {
         FLOAT_AGGREGATES
             .iter()
@@ -3423,6 +4237,183 @@ mod tests {
                 collector.worker_finished(0).await.unwrap();
                 collector.seal().await.unwrap()
             })
+    }
+
+    #[test]
+    fn formal_state_v2_matches_the_cross_language_golden_receipt() {
+        let files = FORMAL_STATE_FILES_V2
+            .iter()
+            .map(|(name, _)| FormalFileBytes {
+                name,
+                bytes: format!("{name}\n").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        let encoded_len = FORMAL_STATE_DOMAIN_V2.len()
+            + 8
+            + 8
+            + 4
+            + files
+                .iter()
+                .map(|file| 4 + file.name.len() + 8 + file.bytes.len() + 8)
+                .sum::<usize>();
+        assert_eq!(encoded_len, 930);
+
+        let formal_digest = formal_chain_sha256_v2(1, 2, &files).unwrap();
+        assert_eq!(
+            lowercase_sha256(formal_digest),
+            "95293d5ca572b8805ff6cd84c361f8d4b90b163848e03b76c894ad64756b4aae"
+        );
+        let terminal = formal_file(&files, TERMINAL_EVIDENCE_FILE).unwrap();
+        assert_eq!(terminal.len(), 24);
+        let terminal_digest: [u8; 32] = Sha256::digest(terminal).into();
+        assert_eq!(
+            lowercase_sha256(terminal_digest),
+            "4e001b1a88a1fe5db74c8f13c88dcb3d4d83ea85259927b3033121ab03674b5f"
+        );
+
+        let receipt = FormalStateReceipt {
+            terminal_evidence_size: terminal.len() as u64,
+            terminal_evidence_sha256: terminal_digest,
+            formal_chain_sha256: formal_digest,
+            state_device: 1,
+            state_inode: 2,
+        }
+        .to_string();
+        assert!(receipt.is_ascii());
+        assert_eq!(
+            receipt,
+            "FORMAL_STATE_V2 terminal_evidence_size=24 \
+             terminal_evidence_sha256=4e001b1a88a1fe5db74c8f13c88dcb3d4d83ea85259927b3033121ab03674b5f \
+             formal_chain_sha256=95293d5ca572b8805ff6cd84c361f8d4b90b163848e03b76c894ad64756b4aae \
+             state_device=1 state_inode=2"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn formal_attestation_is_read_only_and_diagnostics_do_not_rank() {
+        let directory = TestDirectory::new();
+        let (dataset, contract) = initialize_formal_run(&directory);
+        let before = FORMAL_STATE_FILES_V2
+            .iter()
+            .map(|(name, _)| (*name, fs::read(directory.0.join(name)).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+
+        let baseline = attest_formal_state(&directory.0, dataset.seed, &contract).unwrap();
+        assert!(baseline.to_string().is_ascii());
+        assert_eq!(
+            baseline.terminal_evidence_size,
+            fs::metadata(directory.0.join(TERMINAL_EVIDENCE_FILE))
+                .unwrap()
+                .len()
+        );
+        assert_eq!(
+            before,
+            FORMAL_STATE_FILES_V2
+                .iter()
+                .map(|(name, _)| (*name, fs::read(directory.0.join(name)).unwrap()))
+                .collect()
+        );
+
+        fs::write(
+            directory.0.join(DIAGNOSTIC_WARMUP_CLAIM_FILE),
+            b"diagnostic process failed after its claim\n",
+        )
+        .unwrap();
+        assert_eq!(
+            attest_formal_state(&directory.0, dataset.seed, &contract).unwrap(),
+            baseline
+        );
+        for name in [
+            DIAGNOSTIC_WARMUP_RECEIPT_FILE,
+            DIAGNOSTIC_OBSERVATION_CLAIM_FILE,
+            DIAGNOSTIC_OBSERVATION_RECEIPT_FILE,
+        ] {
+            fs::write(directory.0.join(name), format!("{name}\n")).unwrap();
+        }
+        assert_eq!(
+            attest_formal_state(&directory.0, dataset.seed, &contract).unwrap(),
+            baseline
+        );
+
+        fs::write(
+            directory.0.join(DATABASE_IDENTITY_FILE),
+            b"changed-but-valid-database-identity\n",
+        )
+        .unwrap();
+        assert_eq!(
+            attest_formal_state(&directory.0, dataset.seed, &contract).unwrap(),
+            baseline
+        );
+
+        fs::write(directory.0.join(DIAGNOSTIC_OBSERVATION_RECEIPT_FILE), []).unwrap();
+        assert!(attest_formal_state(&directory.0, dataset.seed, &contract).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn formal_attestation_fails_closed_without_mutating_unsafe_state() {
+        let source = TestDirectory::new();
+        let (dataset, contract) = initialize_formal_run(&source);
+
+        let empty = TestDirectory::new();
+        assert!(attest_formal_state(&empty.0, dataset.seed, &contract).is_err());
+        assert!(attest_formal_state(Path::new("relative"), dataset.seed, &contract).is_err());
+
+        let legacy_target = TestDirectory::new();
+        copy_state_directory(&source.0, &legacy_target.0);
+        fs::write(legacy_target.0.join(LEDGER_FILE), b"legacy target\n").unwrap();
+        assert!(attest_formal_state(&legacy_target.0, dataset.seed, &contract).is_err());
+        assert_eq!(
+            fs::read(legacy_target.0.join(LEDGER_FILE)).unwrap(),
+            b"legacy target\n"
+        );
+
+        let legacy_temporary = TestDirectory::new();
+        copy_state_directory(&source.0, &legacy_temporary.0);
+        let temporary = legacy_temporary.0.join(".run_ledger.state.17.3.tmp");
+        fs::write(&temporary, b"legacy temporary\n").unwrap();
+        assert!(attest_formal_state(&legacy_temporary.0, dataset.seed, &contract).is_err());
+        assert_eq!(fs::read(&temporary).unwrap(), b"legacy temporary\n");
+
+        let unknown = TestDirectory::new();
+        copy_state_directory(&source.0, &unknown.0);
+        fs::write(unknown.0.join("unknown.state"), b"unknown\n").unwrap();
+        assert!(attest_formal_state(&unknown.0, dataset.seed, &contract).is_err());
+        assert!(unknown.0.join("unknown.state").is_file());
+
+        let symlink = TestDirectory::new();
+        copy_state_directory(&source.0, &symlink.0);
+        fs::remove_file(symlink.0.join(DATABASE_IDENTITY_FILE)).unwrap();
+        std::os::unix::fs::symlink(
+            symlink.0.join(TERMINAL_EVIDENCE_FILE),
+            symlink.0.join(DATABASE_IDENTITY_FILE),
+        )
+        .unwrap();
+        assert!(attest_formal_state(&symlink.0, dataset.seed, &contract).is_err());
+        assert!(fs::symlink_metadata(symlink.0.join(DATABASE_IDENTITY_FILE))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let missing = TestDirectory::new();
+        copy_state_directory(&source.0, &missing.0);
+        fs::remove_file(missing.0.join(RECOVERY_RECEIPT_FILE)).unwrap();
+        assert!(attest_formal_state(&missing.0, dataset.seed, &contract).is_err());
+
+        let tampered = TestDirectory::new();
+        copy_state_directory(&source.0, &tampered.0);
+        let terminal_path = tampered.0.join(TERMINAL_EVIDENCE_FILE);
+        let mut terminal_bytes = fs::read(&terminal_path).unwrap();
+        *terminal_bytes.last_mut().unwrap() ^= 1;
+        fs::write(&terminal_path, &terminal_bytes).unwrap();
+        assert!(attest_formal_state(&tampered.0, dataset.seed, &contract).is_err());
+        assert_eq!(fs::read(terminal_path).unwrap(), terminal_bytes);
+
+        let missing_identity = TestDirectory::new();
+        copy_state_directory(&source.0, &missing_identity.0);
+        fs::remove_file(missing_identity.0.join(DATABASE_IDENTITY_FILE)).unwrap();
+        assert!(attest_formal_state(&missing_identity.0, dataset.seed, &contract).is_err());
     }
 
     #[test]
