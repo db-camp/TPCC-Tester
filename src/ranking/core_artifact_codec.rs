@@ -5,6 +5,8 @@
 //! evidence bundle: the final artifact also binds the rich recovery sections
 //! and outer run metadata.
 
+use std::cmp::Ordering;
+
 use thiserror::Error;
 
 use crate::consistency::{
@@ -96,6 +98,8 @@ pub(crate) enum CoreCodecError {
         #[source]
         source: FloatError,
     },
+    #[error("canonical {field} accumulator sum is outside its live per-term range")]
+    ImpossibleAccumulatorSum { field: &'static str },
     #[error("invalid canonical interval evidence: {0}")]
     InvalidIntervals(#[source] CollectorError),
     #[error("customer and Stock interval sections disagree on {0}")]
@@ -343,6 +347,7 @@ pub(crate) fn encode_physical_stats_section(
     let mut writer = section_writer(SectionKind::PhysicalStats, MAX_PHYSICAL_STATS_SECTION_BYTES)?;
     let (classes, partitions, payment_history, new_order_lines, delivery_customers) =
         stats.canonical_parts();
+    validate_accumulator_ranges(payment_history, new_order_lines, delivery_customers)?;
     for totals in classes {
         encode_class_totals(&mut writer, *totals)?;
     }
@@ -390,6 +395,7 @@ pub(crate) fn decode_physical_stats_section(
         *accumulator = decode_accumulator(&mut reader, "Delivery customer amount")?;
     }
     reader.finish()?;
+    validate_accumulator_ranges(&payment_history, &new_order_lines, &delivery_customers)?;
     BoundedPhysicalStats::from_canonical_parts(
         classes,
         partitions,
@@ -499,6 +505,78 @@ fn decode_accumulator(
     }
     NonNegativeF32Accumulator::from_words(term_count, &words)
         .map_err(|source| CoreCodecError::InvalidAccumulator { field, source })
+}
+
+fn validate_accumulator_ranges(
+    payment_history: &[NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+    new_order_lines: &[NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+    delivery_customers: &[NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+) -> Result<(), CoreCodecError> {
+    validate_accumulator_group_range(
+        payment_history,
+        "Payment/history amount",
+        1.0_f32.to_bits(),
+        5_000.0_f32.to_bits(),
+    )?;
+    validate_accumulator_group_range(
+        new_order_lines,
+        "NewOrder line amount",
+        1.0_f32.to_bits(),
+        1_000.0_f32.to_bits(),
+    )?;
+    // Initial undelivered lines may be binary32(0.01). Delivery sums at
+    // least five values exactly as binary64, then rounds once to binary32.
+    // 0x3d4ccccc is that smallest possible order total.
+    validate_accumulator_group_range(
+        delivery_customers,
+        "Delivery customer amount",
+        0x3d4c_cccc,
+        150_000.0_f32.to_bits(),
+    )
+}
+
+fn validate_accumulator_group_range(
+    accumulators: &[NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+    field: &'static str,
+    minimum_bits: u32,
+    maximum_bits: u32,
+) -> Result<(), CoreCodecError> {
+    for accumulator in accumulators {
+        validate_accumulator_range(accumulator, field, minimum_bits, maximum_bits)?;
+    }
+    Ok(())
+}
+
+fn validate_accumulator_range(
+    accumulator: &NonNegativeF32Accumulator,
+    field: &'static str,
+    minimum_bits: u32,
+    maximum_bits: u32,
+) -> Result<(), CoreCodecError> {
+    let term_count = accumulator.term_count();
+    let actual_words = accumulator.to_words().1;
+    let mut minimum = NonNegativeF32Accumulator::default();
+    minimum
+        .add_repeated_bits(minimum_bits, term_count)
+        .map_err(|source| CoreCodecError::InvalidAccumulator { field, source })?;
+    let mut maximum = NonNegativeF32Accumulator::default();
+    maximum
+        .add_repeated_bits(maximum_bits, term_count)
+        .map_err(|source| CoreCodecError::InvalidAccumulator { field, source })?;
+    let minimum_words = minimum.to_words().1;
+    let maximum_words = maximum.to_words().1;
+    if compare_accumulator_words(&actual_words, &minimum_words) == Ordering::Less
+        || compare_accumulator_words(&actual_words, &maximum_words) == Ordering::Greater
+    {
+        return Err(CoreCodecError::ImpossibleAccumulatorSum { field });
+    }
+    Ok(())
+}
+
+fn compare_accumulator_words(left: &[u64], right: &[u64]) -> Ordering {
+    left.len()
+        .cmp(&right.len())
+        .then_with(|| left.iter().rev().cmp(right.iter().rev()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1108,6 +1186,43 @@ mod tests {
         assert!(matches!(
             decode_physical_stats_section(&vec![0; MAX_PHYSICAL_STATS_SECTION_BYTES + 1]),
             Err(CoreCodecError::OversizedSection { .. })
+        ));
+    }
+
+    #[test]
+    fn physical_stats_decoder_rejects_impossible_nonempty_accumulator_sum() {
+        let default = BoundedPhysicalStats::default();
+        let (classes, partitions, payment, new_order, delivery) = default.canonical_parts();
+        let mut classes = *classes;
+        let mut payment = payment.clone();
+        classes[0].payment_commits = 1;
+        payment[0].add_bits(1.0_f32.to_bits()).unwrap();
+        let stats = BoundedPhysicalStats::from_canonical_parts(
+            classes,
+            *partitions,
+            payment,
+            new_order.clone(),
+            delivery.clone(),
+        )
+        .unwrap();
+        let mut encoded = encode_physical_stats_section(&stats).unwrap();
+
+        const FIRST_ACCUMULATOR: usize =
+            7 + LEDGER_CLASS_COUNT * 12 * 8 + PHYSICAL_PARTITION_COUNT * 4 * 8;
+        let word_count = u32::from_le_bytes(
+            encoded[FIRST_ACCUMULATOR + 8..FIRST_ACCUMULATOR + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert!(word_count > 0);
+        encoded[FIRST_ACCUMULATOR + 8..FIRST_ACCUMULATOR + 12]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        encoded.drain(FIRST_ACCUMULATOR + 12..FIRST_ACCUMULATOR + 12 + word_count * 8);
+        assert!(matches!(
+            decode_physical_stats_section(&encoded),
+            Err(CoreCodecError::ImpossibleAccumulatorSum {
+                field: "Payment/history amount"
+            })
         ));
     }
 
