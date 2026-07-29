@@ -163,7 +163,6 @@ struct Accounting<'a> {
 struct RegisteredCall {
     interval_receipt: IntervalAckReceipt,
     payment_receipt: Option<PaymentAckReceipt>,
-    guard: TerminalCallGuard,
 }
 
 /// Bounded evidence accumulated by exactly one shared terminal ACK path.
@@ -312,6 +311,13 @@ impl TerminalEvidenceCollector {
         accounting: Option<Accounting<'_>>,
         prepared: PreparedTerminal,
     ) -> Result<(), TerminalEvidenceError> {
+        // Arm cancellation before the first registration await. Dropping the
+        // future anywhere in offer/registration/wait must abandon every
+        // evidence domain, including mutations made before Payment is offered.
+        let mut guard = TerminalCallGuard {
+            tracker: Arc::clone(&self.tracker),
+            completed: false,
+        };
         let registered = match self
             .register_terminal(worker_id, accounting, prepared)
             .await
@@ -325,7 +331,6 @@ impl TerminalEvidenceCollector {
         let RegisteredCall {
             interval_receipt,
             payment_receipt,
-            mut guard,
         } = registered;
 
         if let Err(error) = tokio::try_join!(
@@ -534,10 +539,6 @@ impl TerminalEvidenceCollector {
                 abandoned_rx: self.tracker.abandoned_tx.subscribe(),
             },
             payment_receipt,
-            guard: TerminalCallGuard {
-                tracker: Arc::clone(&self.tracker),
-                completed: false,
-            },
         })
     }
 
