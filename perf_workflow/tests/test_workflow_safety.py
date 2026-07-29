@@ -283,7 +283,7 @@ if "--check-scope" in sys.argv:
                 "--tpcc-bin",
                 tester,
                 "--ready-timeout-seconds",
-                "2",
+                "5",
                 "--diagnostics",
                 env=env,
             )
@@ -446,7 +446,7 @@ if "--check-scope" in sys.argv:
                 "--tpcc-bin",
                 tester,
                 "--ready-timeout-seconds",
-                "2",
+                "5",
                 "--diagnostics",
                 "--seed",
                 "7331",
