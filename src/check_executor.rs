@@ -18,6 +18,7 @@ use crate::consistency::{
     ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
 };
 use crate::error::TpccError;
+use crate::ranking::bounded_stats::BoundedPhysicalStats;
 use crate::ranking::ledger::{LedgerEvent, RunLedger};
 use crate::run_state::DatasetState;
 use crate::runtime_schema::RuntimeSchema;
@@ -578,6 +579,33 @@ fn final_expectations(
             undelivered_order_line_rows: dataset.undelivered_order_line_rows,
         },
         committed: ledger.to_committed_ledger(),
+    })
+}
+
+fn bounded_recovery_expectations(
+    dataset: &DatasetState,
+    stats: &BoundedPhysicalStats,
+    initial_order_line_amounts: &NonNegativeF32Accumulator,
+) -> Result<RecoveryExpectations, TpccError> {
+    validate_consistency_warehouse_count(dataset.warehouses)?;
+    let initial_terms = u64::try_from(dataset.order_line_rows).map_err(|_| {
+        TpccError::Protocol("dataset order-line count is negative or too large".to_owned())
+    })?;
+    if initial_order_line_amounts.term_count() != initial_terms {
+        return Err(TpccError::Protocol(format!(
+            "initial order-line FLOAT accumulator has {} terms, dataset records {initial_terms}",
+            initial_order_line_amounts.term_count()
+        )));
+    }
+    Ok(RecoveryExpectations {
+        setup: SetupExpectations {
+            warehouses: dataset.warehouses,
+            order_line_rows: dataset.order_line_rows,
+            undelivered_order_line_rows: dataset.undelivered_order_line_rows,
+        },
+        committed: stats
+            .to_committed_ledger()
+            .map_err(|error| protocol_error("invalid bounded recovery statistics", error))?,
     })
 }
 
@@ -1165,6 +1193,84 @@ fn partition_expectations(
         .collect()
 }
 
+fn bounded_partition_expectations(
+    dataset: &DatasetState,
+    stats: &BoundedPhysicalStats,
+) -> Result<Vec<PartitionExpectation>, TpccError> {
+    let expected_partitions = validate_consistency_warehouse_count(dataset.warehouses)?;
+    if dataset.partitions.len() != expected_partitions {
+        return Err(TpccError::Protocol(format!(
+            "recovery requires {expected_partitions} load partitions for {} warehouses, state has {}",
+            dataset.warehouses,
+            dataset.partitions.len(),
+        )));
+    }
+    dataset
+        .partitions
+        .iter()
+        .map(|initial| {
+            let key = PartitionKey {
+                warehouse_id: initial.warehouse_id,
+                district_id: initial.district_id,
+            };
+            let delta = stats
+                .partition_totals(key.warehouse_id, key.district_id)
+                .map_err(|error| protocol_error("invalid bounded recovery partition", error))?;
+            let new_orders = checked_partition_u64(delta.new_orders, "partition new orders")?;
+            let new_order_lines =
+                checked_partition_u64(delta.new_order_lines, "partition new-order lines")?;
+            let delivered_orders =
+                checked_partition_u64(delta.delivered_orders, "partition delivered orders")?;
+            let delivered_order_lines = checked_partition_u64(
+                delta.delivered_order_lines,
+                "partition delivered order lines",
+            )?;
+            let order_count = checked_partition_add(
+                i64::from(ORDERS_PER_DISTRICT),
+                new_orders,
+                "partition order count",
+            )?;
+            let order_line_count = checked_partition_add(
+                initial.order_line_rows,
+                new_order_lines,
+                "partition order-line count",
+            )?;
+            let new_order_count = checked_partition_add(
+                checked_partition_add(
+                    i64::from(NEW_ORDERS_PER_DISTRICT),
+                    new_orders,
+                    "partition new-order count",
+                )?,
+                -delivered_orders,
+                "partition new-order count",
+            )?;
+            let empty_delivery_time_count = checked_partition_add(
+                checked_partition_add(
+                    initial.undelivered_order_line_rows,
+                    new_order_lines,
+                    "partition empty delivery count",
+                )?,
+                -delivered_order_lines,
+                "partition empty delivery count",
+            )?;
+            let next_order_id = checked_partition_add(order_count, 1, "partition next order id")?;
+            Ok(PartitionExpectation {
+                key,
+                order_count,
+                order_line_count,
+                new_order_count,
+                empty_delivery_time_count,
+                carrier_zero_count: new_order_count,
+                next_order_id,
+            })
+        })
+        .collect()
+}
+
+fn checked_partition_u64(value: u64, name: &str) -> Result<i64, TpccError> {
+    i64::try_from(value).map_err(|_| TpccError::Protocol(format!("{name} exceeds INT64")))
+}
+
 fn checked_partition_add(left: i64, right: i64, name: &str) -> Result<i64, TpccError> {
     left.checked_add(right)
         .filter(|value| *value >= 0)
@@ -1461,6 +1567,25 @@ mod tests {
             DISTRICTS_PER_WAREHOUSE as usize
         );
         assert!(validate_consistency_warehouse_count(FINAL_WAREHOUSES + 1).is_err());
+    }
+
+    #[test]
+    fn bounded_sf1_recovery_uses_its_complete_dataset_keyspace() {
+        let dataset = smoke_dataset(1);
+        let stats = BoundedPhysicalStats::default();
+        let expectations =
+            bounded_recovery_expectations(&dataset, &stats, dataset.initial_order_line_amounts())
+                .unwrap();
+        assert_eq!(expectations.setup.warehouses, 1);
+
+        let partitions = bounded_partition_expectations(&dataset, &stats).unwrap();
+        assert_eq!(partitions.len(), DISTRICTS_PER_WAREHOUSE as usize);
+        assert_eq!(
+            recovery_partition_audits_for_warehouses(dataset.warehouses, partitions)
+                .unwrap()
+                .len(),
+            DISTRICTS_PER_WAREHOUSE as usize
+        );
     }
 
     #[test]
