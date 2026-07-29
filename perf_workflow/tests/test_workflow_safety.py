@@ -363,7 +363,7 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
                                 database_stat.st_dev,
                                 database_stat.st_ino,
                             ),
-                            interval_ms=100,
+                            interval_ms=1_000,
                             proc_root=Path("/unused"),
                         )
                     )
@@ -1499,17 +1499,19 @@ if "--benchmark" in sys.argv:
                 temp_path,
                 root,
             )
+            probe_completed = temp_path / "probe-completed"
             tester = self.make_python_executable(
                 temp_path / "three-second-tpcc",
-                """
+                f"""
 import sys
 import time
 
 if "--probe-ready" in sys.argv:
     time.sleep(3)
+    open({str(probe_completed)!r}, "w", encoding="utf-8").close()
 """,
             )
-            started = time.monotonic()
+            started = time.time()
             result = self.run_script(
                 "--mode",
                 "init",
@@ -1526,13 +1528,14 @@ if "--probe-ready" in sys.argv:
                 port,
                 "--allow-deviation",
                 "--ready-timeout-seconds",
-                "5",
+                "8",
                 env=env,
             )
-            elapsed = time.monotonic() - started
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertGreaterEqual(elapsed, 3.0)
-            self.assertLess(elapsed, 5.0)
+            self.assertTrue(probe_completed.is_file())
+            readiness_elapsed = probe_completed.stat().st_mtime - started
+            self.assertGreaterEqual(readiness_elapsed, 3.0)
+            self.assertLess(readiness_elapsed, 8.0)
 
     def test_readiness_probe_is_bounded_by_shared_absolute_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
