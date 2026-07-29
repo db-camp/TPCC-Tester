@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 from pathlib import Path
 import shutil
@@ -73,6 +74,22 @@ class WorkflowSafetyTests(unittest.TestCase):
                         unsafe_name,
                     )
                     self.assertNotEqual(result.returncode, 0)
+
+    def test_diagnostics_requires_full_lifecycle(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            for mode in ("init", "rank", "recovery", "tools"):
+                with self.subTest(mode=mode):
+                    result = self.run_script(
+                        "--plan-only",
+                        "--mode",
+                        mode,
+                        "--diagnostics",
+                        "--target-dir",
+                        root,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("requires --mode all", result.stderr)
 
     def test_tools_mode_preserves_existing_database_and_source_csv(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -243,6 +260,10 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
     output.write("\\t".join(sys.argv[1:]) + "\\n")
 if "--probe-ready" in sys.argv and not os.path.isdir(os.environ["FAKE_DB_PATH"]):
     raise SystemExit(1)
+if "--check-scope" in sys.argv:
+    scope = sys.argv[sys.argv.index("--check-scope") + 1]
+    if scope == os.environ.get("FAKE_TPCC_FAIL_SCOPE"):
+        raise SystemExit(12)
 """,
             )
             env = os.environ.copy()
@@ -263,6 +284,7 @@ if "--probe-ready" in sys.argv and not os.path.isdir(os.environ["FAKE_DB_PATH"])
                 tester,
                 "--ready-timeout-seconds",
                 "2",
+                "--diagnostics",
                 env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -273,6 +295,10 @@ if "--probe-ready" in sys.argv and not os.path.isdir(os.environ["FAKE_DB_PATH"])
             ranks = [args for args in invocations if "--benchmark" in args]
             self.assertEqual(
                 len(ranks), 1, (invocations, result.stdout, result.stderr)
+            )
+            self.assertFalse(
+                any("--diagnose" in args for args in invocations),
+                "unsupported 10s+60s diagnostics must not reuse another mode",
             )
             self.assertIn("--profile", ranks[0])
             self.assertIn("final2026", ranks[0])
@@ -315,6 +341,88 @@ if "--probe-ready" in sys.argv and not os.path.isdir(os.environ["FAKE_DB_PATH"])
             )
             result_dirs = list((Path(temp) / "records").iterdir())
             self.assertEqual(len(result_dirs), 1)
+            manifest = json.loads(
+                (result_dirs[0] / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["conformance"], "public_spec_aligned")
+            self.assertFalse(manifest["embeds_unpublished_official_values"])
+            self.assertEqual(manifest["status"], "success")
+            self.assertTrue(manifest["ranked_configuration"])
+            self.assertEqual(
+                manifest["seed"],
+                {
+                    "value": 2026,
+                    "caller_supplied": False,
+                    "source": "local_workflow_default_not_official",
+                },
+            )
+            self.assertEqual(
+                {
+                    key: manifest["effective"][key]
+                    for key in (
+                        "warehouses",
+                        "clients",
+                        "warmup_seconds",
+                        "measurement_windows",
+                        "window_seconds",
+                    )
+                },
+                {
+                    "warehouses": 50,
+                    "clients": 32,
+                    "warmup_seconds": 30,
+                    "measurement_windows": 3,
+                    "window_seconds": 150,
+                },
+            )
+            self.assertEqual(
+                manifest["phases"],
+                {
+                    "setup": "passed",
+                    "rank": "passed",
+                    "online": "passed",
+                    "crash_restart": "passed",
+                    "recovery": "passed",
+                    "diagnostics": manifest["diagnostics"]["status"],
+                },
+            )
+            self.assertIn(
+                manifest["diagnostics"]["status"],
+                {"unavailable", "unsupported"},
+            )
+            self.assertEqual(
+                {
+                    key: manifest["diagnostics"][key]
+                    for key in (
+                        "requested",
+                        "ranked",
+                        "public_warmup_seconds",
+                        "public_observation_seconds",
+                        "native_single_observation_supported",
+                    )
+                },
+                {
+                    "requested": True,
+                    "ranked": False,
+                    "public_warmup_seconds": 10,
+                    "public_observation_seconds": 60,
+                    "native_single_observation_supported": False,
+                },
+            )
+            self.assertEqual(manifest["paths"]["result"], str(result_dirs[0]))
+            self.assertEqual(
+                manifest["paths"]["state"],
+                str(result_dirs[0] / "state"),
+            )
+            self.assertEqual(
+                manifest["source"]["rmdb_sha"],
+                "unavailable",
+            )
+            self.assertRegex(
+                manifest["source"]["tpcc_tester_sha"],
+                r"^[0-9a-f]{40}$",
+            )
+            self.assertIn("WARN:", result.stderr)
             server_log = (result_dirs[0] / "server.log").read_text(
                 encoding="utf-8"
             )
@@ -322,6 +430,56 @@ if "--probe-ready" in sys.argv and not os.path.isdir(os.environ["FAKE_DB_PATH"])
             self.assertIn("[server start: existing database]", server_log)
             self.assertFalse((root / "tpcc_final2026").exists())
             self.assertEqual(source_csv.read_text(encoding="utf-8"), "tracked csv")
+
+            env["FAKE_TPCC_FAIL_SCOPE"] = "recovery"
+            failed_records = Path(temp) / "failed-records"
+            failed = self.run_script(
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--record-root",
+                failed_records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--ready-timeout-seconds",
+                "2",
+                "--diagnostics",
+                "--seed",
+                "7331",
+                env=env,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            failed_result_dirs = list(failed_records.iterdir())
+            self.assertEqual(len(failed_result_dirs), 1)
+            failed_manifest = json.loads(
+                (failed_result_dirs[0] / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(failed_manifest["status"], "failed")
+            self.assertEqual(
+                failed_manifest["seed"],
+                {
+                    "value": 7331,
+                    "caller_supplied": True,
+                    "source": "caller",
+                },
+            )
+            self.assertEqual(
+                failed_manifest["phases"],
+                {
+                    "setup": "passed",
+                    "rank": "passed",
+                    "online": "passed",
+                    "crash_restart": "passed",
+                    "recovery": "failed",
+                    "diagnostics": "skipped_due_to_failure",
+                },
+            )
 
 
 if __name__ == "__main__":
