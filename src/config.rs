@@ -57,6 +57,10 @@ impl LifecycleEvent {
 
 pub const DIAGNOSTIC_WARMUP_SECONDS: u64 = 10;
 pub const DIAGNOSTIC_OBSERVATION_SECONDS: u64 = 60;
+/// Local replay ceiling selected from the public elapsed time in the supplied
+/// grader report. The final statement deliberately does not publish the
+/// official socket-response deadline, so this must not be treated as one.
+pub const LOCAL_RESPONSE_TIMEOUT_SECONDS: u64 = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DiagnosticSegment {
@@ -175,8 +179,11 @@ pub struct Config {
     #[arg(long = "window-seconds")]
     pub window_seconds: Option<u64>,
 
-    /// Local socket-response safety deadline; the official value is unpublished
-    #[arg(long = "response-timeout-seconds", default_value_t = 30)]
+    /// Local socket-response replay deadline; the official value is unpublished
+    #[arg(
+        long = "response-timeout-seconds",
+        default_value_t = LOCAL_RESPONSE_TIMEOUT_SECONDS
+    )]
     pub response_timeout_seconds: u64,
 
     /// Local grace for a response already in flight at a phase boundary
@@ -575,6 +582,10 @@ mod tests {
         assert_eq!(
             resolved.final2026.recovery_ready_budget.as_secs(),
             RECOVERY_READY_BUDGET_SECONDS
+        );
+        assert_eq!(
+            config.response_timeout_seconds,
+            LOCAL_RESPONSE_TIMEOUT_SECONDS
         );
         assert_eq!(resolved.final2026.conformance(), Conformance::Official);
         assert_eq!(resolved.seed, Some(73));

@@ -101,6 +101,23 @@ impl RmdbClient {
             .map_err(|error| map_exec_wire_error(error, cmd))
     }
 
+    /// Execute a consistency request without putting its SQL text into timeout
+    /// diagnostics. A response-read timeout is known to occur only after the
+    /// complete request frame was sent, which lets local reports distinguish
+    /// the grader-observed terminal failure from send and semantic failures.
+    pub async fn exec_consistency_stream(
+        &mut self,
+        cmd: &str,
+        item: &str,
+    ) -> Result<StreamResponse, TpccError> {
+        trace!("发送一致性 SQL: {item}");
+
+        self.connection
+            .exec_stream_with_timeout(cmd, self.response_timeout)
+            .await
+            .map_err(|error| map_consistency_wire_error(error, item))
+    }
+
     /// Execute one typed streaming query while retaining only caller-defined
     /// fold state. SQL text is deliberately omitted from logs and error
     /// mapping so recovery sample keys cannot leak through diagnostics.
@@ -203,6 +220,42 @@ fn map_exec_wire_error(error: WireError, sql: &str) -> TpccError {
             context: format!("{request} Wire {phase} timeout ({timeout:?}), last sent SQL: {sql}"),
         },
         other => map_wire_error(other),
+    }
+}
+
+fn map_consistency_wire_error(error: WireError, item: &str) -> TpccError {
+    match error {
+        WireError::Timeout {
+            request,
+            phase: crate::connection::wire::WireTimeoutPhase::ResponseRead,
+            timeout,
+        } => TpccError::Timeout {
+            context: format!(
+                "{} consistency item {item}: {request} request was sent, but no complete response \
+                 frame and terminal arrived before the {timeout:?} response-read deadline",
+                consistency_phase(item)
+            ),
+        },
+        WireError::Timeout {
+            request,
+            phase,
+            timeout,
+        } => TpccError::Timeout {
+            context: format!(
+                "consistency item {item}: {request} Wire {phase} timeout ({timeout:?})"
+            ),
+        },
+        other => map_wire_error(other),
+    }
+}
+
+fn consistency_phase(item: &str) -> &'static str {
+    if item.starts_with("recovery.") {
+        "post-crash"
+    } else if item.starts_with("online.") {
+        "pre-crash online"
+    } else {
+        "setup"
     }
 }
 
@@ -333,6 +386,44 @@ mod tests {
             .to_string();
         assert!(error.contains("response read timeout"), "{error}");
         assert!(!error.contains("sample_secret_417"), "{error}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consistency_response_timeout_matches_observed_failure_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; HANDSHAKE.len()];
+            socket.read_exact(&mut handshake).await.unwrap();
+            socket.write_all(&handshake).await.unwrap();
+
+            let mut header = [0_u8; 8];
+            socket.read_exact(&mut header).await.unwrap();
+            let payload_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let mut payload = vec![0_u8; payload_bytes];
+            socket.read_exact(&mut payload).await.unwrap();
+            assert!(String::from_utf8(payload)
+                .unwrap()
+                .contains("recovery_secret_613"));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut client =
+            RmdbClient::connect_with_timeout("127.0.0.1", port, Duration::from_millis(100))
+                .await
+                .unwrap();
+        let error = client
+            .exec_consistency_stream("SELECT recovery_secret_613;", "recovery.count.customer")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("post-crash consistency"), "{error}");
+        assert!(error.contains("request was sent"), "{error}");
+        assert!(error.contains("response frame and terminal"), "{error}");
+        assert!(error.contains("100ms"), "{error}");
+        assert!(!error.contains("recovery_secret_613"), "{error}");
         server.await.unwrap();
     }
 

@@ -141,4 +141,8 @@ RMDB_TPCC_RUN_ID=local-final2026-smoke \
 
 smoke 仍走同一三窗口状态机、Wire 路径与语义检查，但会明确输出 `NON-RANKED`，其结果不能与正式 final2026 排名比较。`--threads` 是 `--clients` 的兼容别名。
 
-`--response-timeout-seconds`（本地默认 30 秒）与 `--phase-tail-grace-seconds`（本地默认 5 秒）是为了避免本地测试永久阻塞的安全值。官方对应 deadline 未公开，这两个默认值不得被描述为官方参数。
+`--response-timeout-seconds`（本地默认 150 秒）用于按已提供官方失败报告中的公开 elapsed
+边界复现响应读取超时，`--phase-tail-grace-seconds`（本地默认 5 秒）用于避免阶段尾部请求
+永久阻塞。决赛说明没有公布官方对应 deadline；150 秒只是本地报告复现值，不得描述为
+官方参数。恢复一致性请求若在完整发送后超时，会明确报告“请求已发送，但未收到完整
+response frame 与 terminal”，且不会把本地生成的 SQL 写入超时诊断。

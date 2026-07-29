@@ -1219,7 +1219,10 @@ async fn execute_typed_sql(
     sql: &str,
 ) -> Result<TypedResult, TpccError> {
     let rendered = schema.render_sql(sql);
-    match client.exec_stream(&terminated_sql(&rendered)).await? {
+    match client
+        .exec_consistency_stream(&terminated_sql(&rendered), id)
+        .await?
+    {
         StreamResponse::Query { rows, .. } => Ok(TypedResult {
             rows: rows
                 .into_iter()
