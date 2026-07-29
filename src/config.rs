@@ -34,6 +34,31 @@ impl CheckScope {
     }
 }
 
+pub const DIAGNOSTIC_WARMUP_SECONDS: u64 = 10;
+pub const DIAGNOSTIC_OBSERVATION_SECONDS: u64 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DiagnosticSegment {
+    Warmup,
+    Observation,
+}
+
+impl DiagnosticSegment {
+    pub const fn duration_seconds(self) -> u64 {
+        match self {
+            Self::Warmup => DIAGNOSTIC_WARMUP_SECONDS,
+            Self::Observation => DIAGNOSTIC_OBSERVATION_SECONDS,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warmup => "warmup",
+            Self::Observation => "observation",
+        }
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "tpcc-tester", about = "TPC-C Benchmark Tool for RMDB")]
 pub struct Config {
@@ -92,6 +117,10 @@ pub struct Config {
     /// Run one explicitly non-ranked final2026 diagnostic workload phase
     #[arg(long = "diagnostic-workload-seconds")]
     pub diagnostic_workload_seconds: Option<u64>,
+
+    /// Select the public 10-second warmup or 60-second observation segment
+    #[arg(long = "diagnostic-segment", value_enum)]
+    pub diagnostic_segment: Option<DiagnosticSegment>,
 
     /// Complete a Wire v3 handshake and exact `show tables;` request, then exit
     #[arg(long = "probe-ready")]
@@ -189,6 +218,18 @@ pub enum ConfigError {
     #[error("--diagnostic-workload-seconds must be used by itself")]
     DiagnosticWorkloadMustBeExclusive,
 
+    #[error("--diagnostic-workload-seconds and --diagnostic-segment must be supplied together")]
+    DiagnosticSegmentMustMatchWorkload,
+
+    #[error(
+        "diagnostic {segment} must run for exactly {expected_seconds}s, got {actual_seconds}s"
+    )]
+    DiagnosticDurationMismatch {
+        segment: &'static str,
+        expected_seconds: u64,
+        actual_seconds: u64,
+    },
+
     #[error(
         "final2026 diagnostic workload requires exactly 50 warehouses and 32 clients; \
          it is non-ranked but retains the published workload shape"
@@ -200,6 +241,21 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_raw()?;
         let diagnostic_workload = self.diagnostic_workload_seconds.is_some();
+        if diagnostic_workload != self.diagnostic_segment.is_some() {
+            return Err(ConfigError::DiagnosticSegmentMustMatchWorkload);
+        }
+        if let (Some(actual_seconds), Some(segment)) =
+            (self.diagnostic_workload_seconds, self.diagnostic_segment)
+        {
+            let expected_seconds = segment.duration_seconds();
+            if actual_seconds != expected_seconds {
+                return Err(ConfigError::DiagnosticDurationMismatch {
+                    segment: segment.as_str(),
+                    expected_seconds,
+                    actual_seconds,
+                });
+            }
+        }
         if self.diagnose
             && (self.create_schema
                 || self.init
@@ -213,6 +269,7 @@ impl Config {
                 || self.expected_new_orders.is_some()
                 || self.warmup_seconds.is_some()
                 || self.window_seconds.is_some()
+                || self.diagnostic_segment.is_some()
                 || self.state_dir.is_some()
                 || self.check_scope != CheckScope::Setup)
         {
@@ -478,6 +535,8 @@ mod tests {
             "tpcc-tester",
             "--diagnostic-workload-seconds",
             "10",
+            "--diagnostic-segment",
+            "warmup",
             "--seed",
             "7",
         ])
@@ -491,6 +550,8 @@ mod tests {
             "tpcc-tester",
             "--diagnostic-workload-seconds",
             "60",
+            "--diagnostic-segment",
+            "observation",
             "--seed",
             "7",
             "--state-dir",
@@ -499,6 +560,10 @@ mod tests {
         .unwrap();
         config.validate().unwrap();
         assert_eq!(config.diagnostic_workload_seconds, Some(60));
+        assert_eq!(
+            config.diagnostic_segment,
+            Some(DiagnosticSegment::Observation)
+        );
     }
 
     #[test]
@@ -507,6 +572,8 @@ mod tests {
             "tpcc-tester",
             "--diagnostic-workload-seconds",
             "10",
+            "--diagnostic-segment",
+            "warmup",
             "--benchmark",
             "--seed",
             "7",
@@ -523,6 +590,8 @@ mod tests {
             "tpcc-tester",
             "--diagnostic-workload-seconds",
             "10",
+            "--diagnostic-segment",
+            "warmup",
             "--clients",
             "1",
             "--allow-deviation",
@@ -541,6 +610,8 @@ mod tests {
             "tpcc-tester",
             "--diagnostic-workload-seconds",
             "10",
+            "--diagnostic-segment",
+            "warmup",
             "--warmup-seconds",
             "30",
             "--seed",
@@ -553,5 +624,55 @@ mod tests {
             ignored_ranked_timing.validate(),
             Err(ConfigError::DiagnosticWorkloadMustBeExclusive)
         ));
+    }
+
+    #[test]
+    fn diagnostic_segments_are_explicit_and_have_fixed_public_durations() {
+        let state = "/tmp/tpcc-final2026-diagnostic-state";
+        for args in [
+            vec![
+                "tpcc-tester",
+                "--diagnostic-workload-seconds",
+                "10",
+                "--seed",
+                "7",
+                "--state-dir",
+                state,
+            ],
+            vec![
+                "tpcc-tester",
+                "--diagnostic-segment",
+                "warmup",
+                "--seed",
+                "7",
+                "--state-dir",
+                state,
+            ],
+        ] {
+            let config = Config::try_parse_from(args).unwrap();
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::DiagnosticSegmentMustMatchWorkload)
+            ));
+        }
+
+        for (segment, seconds) in [("warmup", "60"), ("observation", "10")] {
+            let config = Config::try_parse_from([
+                "tpcc-tester",
+                "--diagnostic-workload-seconds",
+                seconds,
+                "--diagnostic-segment",
+                segment,
+                "--seed",
+                "7",
+                "--state-dir",
+                state,
+            ])
+            .unwrap();
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::DiagnosticDurationMismatch { .. })
+            ));
+        }
     }
 }
