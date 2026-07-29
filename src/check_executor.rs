@@ -9,12 +9,13 @@ use crate::connection::wire::{StreamResponse, WireValue};
 use crate::consistency::{
     float32_matches, float_aggregate_plan, public_online_integer_plan,
     recovery_partition_audits_for_warehouses, recovery_plan, setup_plan,
-    validate_crash_float_baseline, validate_increment_chain, validate_public_float_ledger,
+    validate_crash_float_baseline, validate_customer_update_chain, validate_public_float_ledger,
     validate_relative_update_chain_from_initial, CheckQuery, CheckScope, ConsistencyPlan,
-    FloatAggregateId, NonNegativeF32Accumulator, PartitionExpectation, PartitionKey,
-    PublicFloatLedgerEvidence, RecoveryExpectations, RelativeUpdateEvidence, SetupExpectations,
-    TypedResult, TypedValue, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES, FLOAT_AGGREGATES,
-    NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
+    CustomerLogicalVersion, CustomerUpdateEvidence, CustomerUpdateKind, FloatAggregateId,
+    NonNegativeF32Accumulator, PartitionExpectation, PartitionKey, PublicFloatLedgerEvidence,
+    RecoveryExpectations, RelativeUpdateEvidence, SetupExpectations, TypedResult, TypedValue,
+    DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES, FLOAT_AGGREGATES, NEW_ORDERS_PER_DISTRICT,
+    ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
 };
 use crate::error::TpccError;
 use crate::ranking::ledger::{LedgerEvent, RunLedger};
@@ -206,12 +207,7 @@ impl Default for CustomerEndpoint {
 fn validate_transaction_evidence(ledger: &RunLedger) -> Result<RelativeEndpoints, TpccError> {
     let mut warehouse_updates: BTreeMap<i32, Vec<RelativeUpdateEvidence>> = BTreeMap::new();
     let mut district_updates: BTreeMap<(i32, i32), Vec<RelativeUpdateEvidence>> = BTreeMap::new();
-    let mut customer_balance_updates: BTreeMap<CustomerKey, Vec<RelativeUpdateEvidence>> =
-        BTreeMap::new();
-    let mut customer_ytd_updates: BTreeMap<CustomerKey, Vec<RelativeUpdateEvidence>> =
-        BTreeMap::new();
-    let mut customer_payment_counts: BTreeMap<CustomerKey, Vec<(i32, i32)>> = BTreeMap::new();
-    let mut customer_delivery_counts: BTreeMap<CustomerKey, Vec<(i32, i32)>> = BTreeMap::new();
+    let mut customer_updates: BTreeMap<CustomerKey, Vec<CustomerUpdateEvidence>> = BTreeMap::new();
 
     for event in ledger.events() {
         match event {
@@ -238,25 +234,25 @@ fn validate_transaction_evidence(ledger: &RunLedger) -> Result<RelativeEndpoints
                     i32::from(delta.customer_district_id),
                     delta.customer_id,
                 );
-                customer_balance_updates.entry(customer).or_default().push(
-                    RelativeUpdateEvidence {
-                        before_bits: delta.customer_balance_before_bits,
-                        bound_amount_bits: amount ^ 0x8000_0000,
-                        after_bits: delta.customer_balance_after_bits,
-                    },
-                );
-                customer_ytd_updates
+                customer_updates
                     .entry(customer)
                     .or_default()
-                    .push(RelativeUpdateEvidence {
-                        before_bits: delta.customer_ytd_before_bits,
-                        bound_amount_bits: amount,
-                        after_bits: delta.customer_ytd_after_bits,
+                    .push(CustomerUpdateEvidence {
+                        kind: CustomerUpdateKind::Payment,
+                        before_version: CustomerLogicalVersion {
+                            payment_count: delta.customer_payment_count_before,
+                            delivery_count: delta.customer_delivery_count_before,
+                        },
+                        after_version: CustomerLogicalVersion {
+                            payment_count: delta.customer_payment_count_after,
+                            delivery_count: delta.customer_delivery_count_after,
+                        },
+                        amount_bits: amount,
+                        balance_before_bits: delta.customer_balance_before_bits,
+                        balance_after_bits: delta.customer_balance_after_bits,
+                        ytd_payment_before_bits: Some(delta.customer_ytd_before_bits),
+                        ytd_payment_after_bits: Some(delta.customer_ytd_after_bits),
                     });
-                customer_payment_counts.entry(customer).or_default().push((
-                    delta.customer_payment_count_before,
-                    delta.customer_payment_count_after,
-                ));
             }
             LedgerEvent::Delivery(delta) => {
                 for order in &delta.orders {
@@ -265,17 +261,25 @@ fn validate_transaction_evidence(ledger: &RunLedger) -> Result<RelativeEndpoints
                         i32::from(order.district_id),
                         order.customer_id,
                     );
-                    customer_balance_updates.entry(customer).or_default().push(
-                        RelativeUpdateEvidence {
-                            before_bits: order.customer_balance_before_bits,
-                            bound_amount_bits: order.customer_amount_bits,
-                            after_bits: order.customer_balance_after_bits,
-                        },
-                    );
-                    customer_delivery_counts.entry(customer).or_default().push((
-                        order.customer_delivery_count_before,
-                        order.customer_delivery_count_after,
-                    ));
+                    customer_updates
+                        .entry(customer)
+                        .or_default()
+                        .push(CustomerUpdateEvidence {
+                            kind: CustomerUpdateKind::Delivery,
+                            before_version: CustomerLogicalVersion {
+                                payment_count: order.customer_payment_count_before,
+                                delivery_count: order.customer_delivery_count_before,
+                            },
+                            after_version: CustomerLogicalVersion {
+                                payment_count: order.customer_payment_count_after,
+                                delivery_count: order.customer_delivery_count_after,
+                            },
+                            amount_bits: order.customer_amount_bits,
+                            balance_before_bits: order.customer_balance_before_bits,
+                            balance_after_bits: order.customer_balance_after_bits,
+                            ytd_payment_before_bits: None,
+                            ytd_payment_after_bits: None,
+                        });
                 }
             }
             LedgerEvent::NewOrder(_)
@@ -306,59 +310,31 @@ fn validate_transaction_evidence(ledger: &RunLedger) -> Result<RelativeEndpoints
                 })?;
         endpoints.districts.insert((warehouse, district), endpoint);
     }
-    for ((warehouse, district, customer), updates) in customer_balance_updates {
-        let endpoint =
-            validate_relative_update_chain_from_initial((-10.0_f32).to_bits(), &updates).map_err(
-                |error| {
-                TpccError::QueryError(format!(
-                    "Payment/Delivery c_balance chain for ({warehouse},{district},{customer}) failed: {error}"
-                ))
-                },
-            )?;
-        endpoints
-            .customers
-            .entry((warehouse, district, customer))
-            .or_default()
-            .balance_bits = endpoint;
-    }
-    for ((warehouse, district, customer), updates) in customer_ytd_updates {
-        let endpoint =
-            validate_relative_update_chain_from_initial(10.0_f32.to_bits(), &updates).map_err(
-                |error| {
-                TpccError::QueryError(format!(
-                    "Payment c_ytd_payment chain for ({warehouse},{district},{customer}) failed: {error}"
-                ))
-                },
-            )?;
-        endpoints
-            .customers
-            .entry((warehouse, district, customer))
-            .or_default()
-            .ytd_payment_bits = endpoint;
-    }
-    for ((warehouse, district, customer), updates) in customer_payment_counts {
-        let endpoint = validate_increment_chain(1, &updates).map_err(|error| {
+    for ((warehouse, district, customer), updates) in customer_updates {
+        let endpoint = validate_customer_update_chain(
+            (-10.0_f32).to_bits(),
+            10.0_f32.to_bits(),
+            CustomerLogicalVersion {
+                payment_count: 1,
+                delivery_count: 0,
+            },
+            &updates,
+        )
+        .map_err(|error| {
             TpccError::QueryError(format!(
-                "Payment c_payment_cnt chain for ({warehouse},{district},{customer}) failed: {error}"
+                "Payment/Delivery customer version chain for \
+                 ({warehouse},{district},{customer}) failed: {error}"
             ))
         })?;
-        endpoints
-            .customers
-            .entry((warehouse, district, customer))
-            .or_default()
-            .payment_count = endpoint;
-    }
-    for ((warehouse, district, customer), updates) in customer_delivery_counts {
-        let endpoint = validate_increment_chain(0, &updates).map_err(|error| {
-            TpccError::QueryError(format!(
-                "Delivery c_delivery_cnt chain for ({warehouse},{district},{customer}) failed: {error}"
-            ))
-        })?;
-        endpoints
-            .customers
-            .entry((warehouse, district, customer))
-            .or_default()
-            .delivery_count = endpoint;
+        endpoints.customers.insert(
+            (warehouse, district, customer),
+            CustomerEndpoint {
+                balance_bits: endpoint.balance_bits,
+                ytd_payment_bits: endpoint.ytd_payment_bits,
+                payment_count: endpoint.version.payment_count,
+                delivery_count: endpoint.version.delivery_count,
+            },
+        );
     }
     Ok(endpoints)
 }

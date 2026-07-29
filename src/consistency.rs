@@ -1563,6 +1563,274 @@ pub fn validate_increment_chain(
     Ok(current)
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CustomerLogicalVersion {
+    pub payment_count: i32,
+    pub delivery_count: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CustomerUpdateKind {
+    Payment,
+    Delivery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustomerUpdateEvidence {
+    pub kind: CustomerUpdateKind,
+    pub before_version: CustomerLogicalVersion,
+    pub after_version: CustomerLogicalVersion,
+    pub amount_bits: u32,
+    pub balance_before_bits: u32,
+    pub balance_after_bits: u32,
+    pub ytd_payment_before_bits: Option<u32>,
+    pub ytd_payment_after_bits: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustomerUpdateEndpoint {
+    pub version: CustomerLogicalVersion,
+    pub balance_bits: u32,
+    pub ytd_payment_bits: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CustomerChainError {
+    NegativeVersion(CustomerLogicalVersion),
+    VersionOverflow(CustomerLogicalVersion),
+    InvalidVersionEdge {
+        kind: CustomerUpdateKind,
+        before: CustomerLogicalVersion,
+        after: CustomerLogicalVersion,
+    },
+    DuplicatePredecessor(CustomerLogicalVersion),
+    MissingPredecessor(CustomerLogicalVersion),
+    BalancePredecessorMismatch {
+        version: CustomerLogicalVersion,
+        expected_bits: u32,
+        actual_bits: u32,
+    },
+    YtdPredecessorMismatch {
+        version: CustomerLogicalVersion,
+        expected_bits: u32,
+        actual_bits: u32,
+    },
+    MissingPaymentYtd(CustomerLogicalVersion),
+    UnexpectedDeliveryYtd(CustomerLogicalVersion),
+    Float(FloatError),
+}
+
+impl fmt::Display for CustomerChainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NegativeVersion(version) => {
+                write!(f, "customer logical version is negative: {version:?}")
+            }
+            Self::VersionOverflow(version) => {
+                write!(f, "customer logical version overflowed after {version:?}")
+            }
+            Self::InvalidVersionEdge {
+                kind,
+                before,
+                after,
+            } => write!(
+                f,
+                "{kind:?} customer version edge {before:?}->{after:?} does not advance exactly \
+                 one family counter"
+            ),
+            Self::DuplicatePredecessor(version) => {
+                write!(
+                    f,
+                    "customer update chain forks from predecessor {version:?}"
+                )
+            }
+            Self::MissingPredecessor(version) => {
+                write!(
+                    f,
+                    "customer update chain is disconnected at predecessor {version:?}"
+                )
+            }
+            Self::BalancePredecessorMismatch {
+                version,
+                expected_bits,
+                actual_bits,
+            } => write!(
+                f,
+                "customer balance predecessor at {version:?} expected 0x{expected_bits:08x}, \
+                 got 0x{actual_bits:08x}"
+            ),
+            Self::YtdPredecessorMismatch {
+                version,
+                expected_bits,
+                actual_bits,
+            } => write!(
+                f,
+                "customer ytd predecessor at {version:?} expected 0x{expected_bits:08x}, \
+                 got 0x{actual_bits:08x}"
+            ),
+            Self::MissingPaymentYtd(version) => {
+                write!(f, "Payment at {version:?} omitted c_ytd_payment evidence")
+            }
+            Self::UnexpectedDeliveryYtd(version) => {
+                write!(
+                    f,
+                    "Delivery at {version:?} supplied Payment-only ytd evidence"
+                )
+            }
+            Self::Float(error) => write!(f, "customer FLOAT32 chain failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CustomerChainError {}
+
+impl From<FloatError> for CustomerChainError {
+    fn from(error: FloatError) -> Self {
+        Self::Float(error)
+    }
+}
+
+/// Replay all Payment and Delivery writes to one customer through their shared
+/// `(c_payment_cnt, c_delivery_cnt)` predecessor.
+///
+/// The pair is a monotonic logical row version: a Payment advances only the
+/// first component and a Delivery advances only the second. Consequently each
+/// committed update must own one unique predecessor. This rejects stale
+/// cross-family forks even when the balance edge is a binary32 self-loop, and
+/// rejects disconnected or compensating evidence before it can be used to
+/// derive recovery endpoints.
+pub fn validate_customer_update_chain(
+    initial_balance_bits: u32,
+    initial_ytd_payment_bits: u32,
+    initial_version: CustomerLogicalVersion,
+    updates: &[CustomerUpdateEvidence],
+) -> Result<CustomerUpdateEndpoint, CustomerChainError> {
+    require_finite(initial_balance_bits)?;
+    require_finite(initial_ytd_payment_bits)?;
+    validate_customer_version(initial_version)?;
+
+    let mut by_predecessor = BTreeMap::new();
+    for update in updates {
+        validate_customer_version(update.before_version)?;
+        validate_customer_version(update.after_version)?;
+        let expected_after = next_customer_version(update.kind, update.before_version)?;
+        if update.after_version != expected_after {
+            return Err(CustomerChainError::InvalidVersionEdge {
+                kind: update.kind,
+                before: update.before_version,
+                after: update.after_version,
+            });
+        }
+        if by_predecessor
+            .insert(update.before_version, *update)
+            .is_some()
+        {
+            return Err(CustomerChainError::DuplicatePredecessor(
+                update.before_version,
+            ));
+        }
+    }
+
+    let mut version = initial_version;
+    let mut balance_bits = canonical_zero(initial_balance_bits);
+    let mut ytd_payment_bits = canonical_zero(initial_ytd_payment_bits);
+    while !by_predecessor.is_empty() {
+        let update = by_predecessor
+            .remove(&version)
+            .ok_or(CustomerChainError::MissingPredecessor(version))?;
+        if !float32_matches(balance_bits, update.balance_before_bits, 0) {
+            return Err(CustomerChainError::BalancePredecessorMismatch {
+                version,
+                expected_bits: balance_bits,
+                actual_bits: update.balance_before_bits,
+            });
+        }
+
+        let balance_delta_bits = match update.kind {
+            CustomerUpdateKind::Payment => update.amount_bits ^ 0x8000_0000,
+            CustomerUpdateKind::Delivery => update.amount_bits,
+        };
+        let expected_balance_bits = add_f32_once(balance_bits, balance_delta_bits)?;
+        if !float32_matches(expected_balance_bits, update.balance_after_bits, 0) {
+            return Err(CustomerChainError::Float(FloatError::UlpMismatch {
+                expected_bits: expected_balance_bits,
+                actual_bits: update.balance_after_bits,
+                max_ulps: 0,
+            }));
+        }
+        balance_bits = canonical_zero(update.balance_after_bits);
+
+        match (
+            update.kind,
+            update.ytd_payment_before_bits,
+            update.ytd_payment_after_bits,
+        ) {
+            (CustomerUpdateKind::Payment, Some(before_bits), Some(after_bits)) => {
+                if !float32_matches(ytd_payment_bits, before_bits, 0) {
+                    return Err(CustomerChainError::YtdPredecessorMismatch {
+                        version,
+                        expected_bits: ytd_payment_bits,
+                        actual_bits: before_bits,
+                    });
+                }
+                let expected_ytd_bits = add_f32_once(ytd_payment_bits, update.amount_bits)?;
+                if !float32_matches(expected_ytd_bits, after_bits, 0) {
+                    return Err(CustomerChainError::Float(FloatError::UlpMismatch {
+                        expected_bits: expected_ytd_bits,
+                        actual_bits: after_bits,
+                        max_ulps: 0,
+                    }));
+                }
+                ytd_payment_bits = canonical_zero(after_bits);
+            }
+            (CustomerUpdateKind::Payment, _, _) => {
+                return Err(CustomerChainError::MissingPaymentYtd(version));
+            }
+            (CustomerUpdateKind::Delivery, None, None) => {}
+            (CustomerUpdateKind::Delivery, _, _) => {
+                return Err(CustomerChainError::UnexpectedDeliveryYtd(version));
+            }
+        }
+        version = update.after_version;
+    }
+
+    Ok(CustomerUpdateEndpoint {
+        version,
+        balance_bits,
+        ytd_payment_bits,
+    })
+}
+
+fn validate_customer_version(version: CustomerLogicalVersion) -> Result<(), CustomerChainError> {
+    if version.payment_count < 0 || version.delivery_count < 0 {
+        Err(CustomerChainError::NegativeVersion(version))
+    } else {
+        Ok(())
+    }
+}
+
+fn next_customer_version(
+    kind: CustomerUpdateKind,
+    before: CustomerLogicalVersion,
+) -> Result<CustomerLogicalVersion, CustomerChainError> {
+    let mut after = before;
+    match kind {
+        CustomerUpdateKind::Payment => {
+            after.payment_count = after
+                .payment_count
+                .checked_add(1)
+                .ok_or(CustomerChainError::VersionOverflow(before))?;
+        }
+        CustomerUpdateKind::Delivery => {
+            after.delivery_count = after
+                .delivery_count
+                .checked_add(1)
+                .ok_or(CustomerChainError::VersionOverflow(before))?;
+        }
+    }
+    Ok(after)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum FloatError {
     NonFinite(u32),
@@ -2363,6 +2631,146 @@ mod tests {
         assert!(
             validate_relative_update_chain_from_initial(100.0_f32.to_bits(), &stale_fork).is_err()
         );
+    }
+
+    fn customer_version(payment_count: i32, delivery_count: i32) -> CustomerLogicalVersion {
+        CustomerLogicalVersion {
+            payment_count,
+            delivery_count,
+        }
+    }
+
+    fn payment_customer_update(
+        before_version: CustomerLogicalVersion,
+        before_balance: f32,
+        before_ytd: f32,
+        amount: f32,
+    ) -> CustomerUpdateEvidence {
+        CustomerUpdateEvidence {
+            kind: CustomerUpdateKind::Payment,
+            before_version,
+            after_version: customer_version(
+                before_version.payment_count + 1,
+                before_version.delivery_count,
+            ),
+            amount_bits: amount.to_bits(),
+            balance_before_bits: before_balance.to_bits(),
+            balance_after_bits: (before_balance - amount).to_bits(),
+            ytd_payment_before_bits: Some(before_ytd.to_bits()),
+            ytd_payment_after_bits: Some((before_ytd + amount).to_bits()),
+        }
+    }
+
+    fn delivery_customer_update(
+        before_version: CustomerLogicalVersion,
+        before_balance: f32,
+        amount: f32,
+    ) -> CustomerUpdateEvidence {
+        CustomerUpdateEvidence {
+            kind: CustomerUpdateKind::Delivery,
+            before_version,
+            after_version: customer_version(
+                before_version.payment_count,
+                before_version.delivery_count + 1,
+            ),
+            amount_bits: amount.to_bits(),
+            balance_before_bits: before_balance.to_bits(),
+            balance_after_bits: (before_balance + amount).to_bits(),
+            ytd_payment_before_bits: None,
+            ytd_payment_after_bits: None,
+        }
+    }
+
+    #[test]
+    fn customer_version_pair_replays_mixed_families_in_predecessor_order() {
+        let payment_one = payment_customer_update(customer_version(1, 0), -10.0, 10.0, 2.0);
+        let delivery = delivery_customer_update(customer_version(2, 0), -12.0, 5.0);
+        let payment_two = payment_customer_update(customer_version(2, 1), -7.0, 12.0, 1.0);
+        let unordered = [payment_two, payment_one, delivery];
+
+        let endpoint = validate_customer_update_chain(
+            (-10.0_f32).to_bits(),
+            10.0_f32.to_bits(),
+            customer_version(1, 0),
+            &unordered,
+        )
+        .unwrap();
+        assert_eq!(endpoint.version, customer_version(3, 1));
+        assert_eq!(endpoint.balance_bits, (-8.0_f32).to_bits());
+        assert_eq!(endpoint.ytd_payment_bits, 13.0_f32.to_bits());
+    }
+
+    #[test]
+    fn customer_version_pair_rejects_cross_family_stale_fork_and_broken_chain() {
+        let payment = payment_customer_update(customer_version(1, 0), -10.0, 10.0, 2.0);
+        let delivery = delivery_customer_update(customer_version(1, 0), -10.0, 5.0);
+        assert!(matches!(
+            validate_customer_update_chain(
+                (-10.0_f32).to_bits(),
+                10.0_f32.to_bits(),
+                customer_version(1, 0),
+                &[payment, delivery],
+            ),
+            Err(CustomerChainError::DuplicatePredecessor(version))
+                if version == customer_version(1, 0)
+        ));
+
+        let disconnected = payment_customer_update(customer_version(2, 0), -10.0, 10.0, 2.0);
+        assert!(matches!(
+            validate_customer_update_chain(
+                (-10.0_f32).to_bits(),
+                10.0_f32.to_bits(),
+                customer_version(1, 0),
+                &[disconnected],
+            ),
+            Err(CustomerChainError::MissingPredecessor(version))
+                if version == customer_version(1, 0)
+        ));
+    }
+
+    #[test]
+    fn customer_version_pair_rejects_compensation_and_self_loop_stale_evidence() {
+        let mut compensation = payment_customer_update(customer_version(1, 0), -10.0, 10.0, 2.0);
+        compensation.after_version = customer_version(1, 0);
+        assert!(matches!(
+            validate_customer_update_chain(
+                (-10.0_f32).to_bits(),
+                10.0_f32.to_bits(),
+                customer_version(1, 0),
+                &[compensation],
+            ),
+            Err(CustomerChainError::InvalidVersionEdge { .. })
+        ));
+
+        let large = 16_777_216.0_f32;
+        let self_loop = delivery_customer_update(customer_version(1, 0), large, 1.0);
+        assert_eq!(self_loop.balance_before_bits, self_loop.balance_after_bits);
+        assert!(matches!(
+            validate_customer_update_chain(
+                large.to_bits(),
+                10.0_f32.to_bits(),
+                customer_version(1, 0),
+                &[self_loop, self_loop],
+            ),
+            Err(CustomerChainError::DuplicatePredecessor(version))
+                if version == customer_version(1, 0)
+        ));
+    }
+
+    #[test]
+    fn customer_version_pair_rejects_stale_ytd_on_later_payment() {
+        let payment = payment_customer_update(customer_version(1, 0), -10.0, 10.0, 2.0);
+        let delivery = delivery_customer_update(customer_version(2, 0), -12.0, 5.0);
+        let stale_ytd = payment_customer_update(customer_version(2, 1), -7.0, 10.0, 1.0);
+        assert!(matches!(
+            validate_customer_update_chain(
+                (-10.0_f32).to_bits(),
+                10.0_f32.to_bits(),
+                customer_version(1, 0),
+                &[stale_ytd, delivery, payment],
+            ),
+            Err(CustomerChainError::YtdPredecessorMismatch { .. })
+        ));
     }
 
     #[test]
