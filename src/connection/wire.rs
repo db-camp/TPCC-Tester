@@ -210,6 +210,7 @@ pub struct WireConnection<S> {
     io: S,
     handshaken: bool,
     timeout_poison: Option<TimeoutPoison>,
+    incomplete_exchange: Option<&'static str>,
     pub(crate) prepared: BTreeMap<u16, PreparedDefinition>,
 }
 
@@ -234,6 +235,7 @@ where
             io,
             handshaken: false,
             timeout_poison: None,
+            incomplete_exchange: None,
             prepared: BTreeMap::new(),
         }
     }
@@ -377,106 +379,117 @@ where
             )));
         }
 
-        let deadline = self
-            .write_request_frame(
-                FrameTag::ExecStream,
-                0,
-                sql.as_bytes(),
-                "EXEC_STREAM",
-                timeout,
-            )
-            .await?;
-
-        let mut columns: Option<Vec<Column>> = None;
-        let mut row_count = 0_u64;
-        let mut callback_error = None;
-
-        loop {
-            let frame = self
-                .read_response_frame_before(deadline, "EXEC_STREAM")
+        let mut exchange_complete = false;
+        let result = async {
+            let deadline = self
+                .write_request_frame(
+                    FrameTag::ExecStream,
+                    0,
+                    sql.as_bytes(),
+                    "EXEC_STREAM",
+                    timeout,
+                )
                 .await?;
-            match frame.tag {
-                FrameTag::Meta => {
-                    if columns.is_some() {
-                        return Err(WireError::Protocol(
-                            "EXEC_STREAM response contains duplicate META".to_owned(),
-                        ));
+
+            let mut columns: Option<Vec<Column>> = None;
+            let mut row_count = 0_u64;
+            let mut callback_error = None;
+
+            loop {
+                let frame = self
+                    .read_response_frame_before(deadline, "EXEC_STREAM")
+                    .await?;
+                match frame.tag {
+                    FrameTag::Meta => {
+                        if columns.is_some() {
+                            return Err(WireError::Protocol(
+                                "EXEC_STREAM response contains duplicate META".to_owned(),
+                            ));
+                        }
+                        if row_count != 0 {
+                            return Err(WireError::Protocol(
+                                "EXEC_STREAM META arrived after ROW".to_owned(),
+                            ));
+                        }
+                        let parsed = parse_meta(&frame.payload)?;
+                        if callback_error.is_none() {
+                            if let Err(error) = on_meta(&parsed, &mut state) {
+                                callback_error = Some(error);
+                            }
+                        }
+                        columns = Some(parsed);
                     }
-                    if row_count != 0 {
-                        return Err(WireError::Protocol(
-                            "EXEC_STREAM META arrived after ROW".to_owned(),
-                        ));
-                    }
-                    let parsed = parse_meta(&frame.payload)?;
-                    if callback_error.is_none() {
-                        if let Err(error) = on_meta(&parsed, &mut state) {
-                            callback_error = Some(error);
+                    FrameTag::Row => {
+                        let schema = columns.as_ref().ok_or_else(|| {
+                            WireError::Protocol("EXEC_STREAM ROW arrived before META".to_owned())
+                        })?;
+                        let row = parse_row(&frame.payload, schema)?;
+                        row_count = row_count.checked_add(1).ok_or_else(|| {
+                            WireError::Protocol("EXEC_STREAM ROW count overflow".to_owned())
+                        })?;
+                        if callback_error.is_none() {
+                            if let Err(error) = on_row(schema, row, &mut state) {
+                                callback_error = Some(error);
+                            }
                         }
                     }
-                    columns = Some(parsed);
-                }
-                FrameTag::Row => {
-                    let schema = columns.as_ref().ok_or_else(|| {
-                        WireError::Protocol("EXEC_STREAM ROW arrived before META".to_owned())
-                    })?;
-                    let row = parse_row(&frame.payload, schema)?;
-                    row_count = row_count.checked_add(1).ok_or_else(|| {
-                        WireError::Protocol("EXEC_STREAM ROW count overflow".to_owned())
-                    })?;
-                    if callback_error.is_none() {
-                        if let Err(error) = on_row(schema, row, &mut state) {
-                            callback_error = Some(error);
+                    FrameTag::CommandOk => {
+                        ensure_empty(&frame.payload, "COMMAND_OK")?;
+                        if columns.is_some() {
+                            return Err(WireError::Protocol(
+                                "query response terminated with COMMAND_OK".to_owned(),
+                            ));
                         }
+                        exchange_complete = true;
+                        return Ok(FoldStreamResponse::CommandOk);
                     }
-                }
-                FrameTag::CommandOk => {
-                    ensure_empty(&frame.payload, "COMMAND_OK")?;
-                    if columns.is_some() {
-                        return Err(WireError::Protocol(
-                            "query response terminated with COMMAND_OK".to_owned(),
-                        ));
+                    FrameTag::ResultEnd => {
+                        if columns.is_none() {
+                            return Err(WireError::Protocol(
+                                "RESULT_END arrived before META".to_owned(),
+                            ));
+                        }
+                        let declared_row_count = parse_result_end(&frame.payload)?;
+                        if declared_row_count != row_count {
+                            return Err(WireError::Protocol(format!(
+                                "RESULT_END row_count {declared_row_count} does not match {row_count} ROW frames"
+                            )));
+                        }
+                        exchange_complete = true;
+                        if let Some(error) = callback_error {
+                            return Err(error);
+                        }
+                        return Ok(FoldStreamResponse::Query {
+                            columns: columns.expect("META presence checked"),
+                            row_count,
+                            state,
+                        });
                     }
-                    return Ok(FoldStreamResponse::CommandOk);
-                }
-                FrameTag::ResultEnd => {
-                    if columns.is_none() {
-                        return Err(WireError::Protocol(
-                            "RESULT_END arrived before META".to_owned(),
-                        ));
+                    FrameTag::TransactionAbort => {
+                        let diagnostic =
+                            parse_diagnostic(&frame.payload, "TRANSACTION_ABORT")?;
+                        exchange_complete = true;
+                        return Ok(FoldStreamResponse::TransactionAbort { diagnostic });
                     }
-                    let declared_row_count = parse_result_end(&frame.payload)?;
-                    if declared_row_count != row_count {
+                    FrameTag::Error => {
+                        let diagnostic = parse_diagnostic(&frame.payload, "ERROR")?;
+                        exchange_complete = true;
+                        return Ok(FoldStreamResponse::Error { diagnostic });
+                    }
+                    other => {
                         return Err(WireError::Protocol(format!(
-                            "RESULT_END row_count {declared_row_count} does not match {row_count} ROW frames"
+                            "unexpected {:?} frame in EXEC_STREAM response",
+                            other
                         )));
                     }
-                    if let Some(error) = callback_error {
-                        return Err(error);
-                    }
-                    return Ok(FoldStreamResponse::Query {
-                        columns: columns.expect("META presence checked"),
-                        row_count,
-                        state,
-                    });
-                }
-                FrameTag::TransactionAbort => {
-                    return Ok(FoldStreamResponse::TransactionAbort {
-                        diagnostic: parse_diagnostic(&frame.payload, "TRANSACTION_ABORT")?,
-                    });
-                }
-                FrameTag::Error => {
-                    return Ok(FoldStreamResponse::Error {
-                        diagnostic: parse_diagnostic(&frame.payload, "ERROR")?,
-                    });
-                }
-                other => {
-                    return Err(WireError::Protocol(format!(
-                        "unexpected {:?} frame in EXEC_STREAM response",
-                        other
-                    )));
                 }
             }
         }
+        .await;
+        if result.is_err() && !exchange_complete {
+            self.incomplete_exchange = Some("EXEC_STREAM");
+        }
+        result
     }
 
     pub(crate) fn ensure_handshaken(&self, request_name: &str) -> WireResult<()> {
@@ -484,6 +497,11 @@ where
             return Err(WireError::Protocol(format!(
                 "connection cannot be reused after {} wire {} timeout",
                 poison.request, poison.phase
+            )));
+        }
+        if let Some(request) = self.incomplete_exchange {
+            return Err(WireError::Protocol(format!(
+                "connection cannot be reused after incomplete or invalid {request} exchange"
             )));
         }
         if !self.handshaken {
@@ -1174,6 +1192,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn folded_server_terminal_overrides_callback_error_and_allows_reuse() {
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let mut row = Vec::new();
+        encode_value(SqlType::Int32, &WireValue::Int32(42), &mut row).unwrap();
+
+        let (client_io, mut server_io) = duplex(128);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io
+                .write_all(&frame(FrameTag::Meta, 0, 0, &columns))
+                .await
+                .unwrap();
+            server_io
+                .write_all(&frame(FrameTag::Row, 0, 0, &row))
+                .await
+                .unwrap();
+            server_io
+                .write_all(&frame(FrameTag::TransactionAbort, 0, 0, b"stale write"))
+                .await
+                .unwrap();
+
+            read_exec_request(&mut server_io).await;
+            server_io
+                .write_all(&frame(FrameTag::CommandOk, 0, 0, &[]))
+                .await
+                .unwrap();
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let result = connection
+            .exec_stream_fold(
+                "select i from t;",
+                (),
+                |_, _| Ok(()),
+                |_, _, _| {
+                    Err(WireError::Protocol(
+                        "folded row violates expected type".to_owned(),
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            FoldStreamResponse::TransactionAbort {
+                diagnostic: "stale write".to_owned(),
+            }
+        );
+        assert_eq!(
+            connection.exec_stream("show tables;").await.unwrap(),
+            StreamResponse::CommandOk
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn folded_row_count_mismatch_discards_state() {
         #[derive(Debug)]
         struct DropState(Arc<AtomicUsize>);
@@ -1203,6 +1279,49 @@ mod tests {
         .to_string();
         assert!(error.contains("row_count 2 does not match 1 ROW"));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn folded_protocol_failure_poisons_connection_reuse() {
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let mut row = Vec::new();
+        encode_value(SqlType::Int32, &WireValue::Int32(42), &mut row).unwrap();
+        let (client_io, mut server_io) = duplex(128);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io
+                .write_all(&frame(FrameTag::Meta, 0, 0, &columns))
+                .await
+                .unwrap();
+            server_io
+                .write_all(&frame(FrameTag::Row, 0, 0, &row))
+                .await
+                .unwrap();
+            server_io
+                .write_all(&frame(FrameTag::ResultEnd, 0, 0, &2_u64.to_be_bytes()))
+                .await
+                .unwrap();
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let first_error = connection
+            .exec_stream_fold("select i from t;", (), |_, _| Ok(()), |_, _, _| Ok(()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(first_error.contains("row_count 2 does not match 1 ROW"));
+        let reuse_error = connection
+            .exec_stream("show tables;")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reuse_error.contains("cannot be reused after incomplete or invalid EXEC_STREAM"),
+            "{reuse_error}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
