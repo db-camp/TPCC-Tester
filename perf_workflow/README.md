@@ -200,11 +200,18 @@ device/inode/size/SHA-256，并在每次执行前复核。
 opaque + sealed、五个正式阶段均通过，并且 Rust 对完整正式状态链的只读验证
 成功，且工作流最终状态为 `success` 时，才同时给出
 `conformance=public_spec_aligned` 和 `ranking_eligible=true`。缺失、损坏或
-符号链接状态工件会使正式 attestation 失败；显式偏差、`init`/`rank`/`recovery`
-拆分模式和 `tools` 始终非排名。`summary.md` 只从 `manifest.json` 生成，不读取
-旧式文本 manifest；只有 size/SHA-256 与 manifest 绑定一致的 `rank.log` 可以
-提供吞吐，profiling 日志始终只是 observation。manifest 缺失、损坏、自相矛盾
-或状态非成功时不会抽取吞吐。
+符号链接状态工件会使正式 attestation 失败；唯一排名证据文件固定为
+`${STATE_DIR}/terminal_evidence.state`。工作流和 summary 都通过状态目录 fd 与
+`O_NOFOLLOW` 打开它，要求 regular file，按 16 MiB canonical hex + 128-byte
+binding headroom + 4 KiB StateStore envelope 得到 16,781,440-byte 上限，并把
+精确路径、size 和 SHA-256 绑定进 manifest。任何形态的
+`${STATE_DIR}/run_ledger.state`（包括普通文件、目录、符号链接和 dangling
+symlink）只通过 `lstat` 检测，绝不读取、删除或修改，并立即使正式结果
+fail-closed。显式偏差、`init`/`rank`/`recovery` 拆分模式和 `tools` 始终非排名。
+`summary.md` 只从 `manifest.json` 生成，不读取旧式文本 manifest；只有
+size/SHA-256 与 manifest 绑定一致的 `rank.log` 可以提供吞吐，profiling 日志
+始终只是 observation。manifest 缺失、损坏、自相矛盾或状态非成功时不会抽取
+吞吐。
 
 资源工件始终标记 `ranked=false`、`score_effect=none`。RSS 是登记 RMDB
 进程树在固定周期采样时的总和峰值；磁盘占用使用 `lstat`/allocated blocks，
