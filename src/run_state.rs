@@ -18,7 +18,7 @@ use crate::ranking::ledger::RunLedger;
 use crate::runtime_schema::{RuntimeSchema, ENCODED_BEGIN_MARKER, ENCODED_END_MARKER};
 use crate::sample_evidence::SetupEvidence;
 
-const STATE_VERSION: u32 = 4;
+const STATE_VERSION: u32 = 5;
 const DATASET_FILE: &str = "dataset.state";
 const MAX_DATASET_STATE_BYTES: usize = 256 * 1024;
 const ARTIFACT_VERSION: u32 = 1;
@@ -276,6 +276,7 @@ pub struct DatasetState {
     pub warehouses: i32,
     pub order_line_rows: i64,
     pub undelivered_order_line_rows: i64,
+    generated_csv_sha256: [u8; 32],
     pub runtime_schema: RuntimeSchema,
     initial_order_line_amounts: NonNegativeF32Accumulator,
     pub partitions: Vec<PartitionLoadSummary>,
@@ -315,12 +316,14 @@ impl DatasetState {
                 warehouses * 10
             )));
         }
+        let generated_csv_sha256 = load.setup_evidence.dataset_checksum;
         let state = Self {
             run_id,
             seed,
             warehouses,
             order_line_rows: load.order_line_rows,
             undelivered_order_line_rows: load.undelivered_order_line_rows,
+            generated_csv_sha256,
             runtime_schema,
             initial_order_line_amounts: load.order_line_amounts,
             partitions: load.partitions,
@@ -398,13 +401,13 @@ impl DatasetState {
             ));
         }
         self.setup_evidence
-            .validate(self.warehouses)
+            .validate_binding(
+                self.warehouses,
+                self.seed,
+                self.runtime_schema.fingerprint(),
+                &self.generated_csv_sha256,
+            )
             .map_err(|error| StateError::Invalid(format!("invalid setup evidence: {error}")))?;
-        if self.setup_evidence.load_seed != self.seed {
-            return Err(StateError::Invalid(
-                "setup evidence load seed does not match dataset seed".to_owned(),
-            ));
-        }
         Ok(())
     }
 
@@ -416,12 +419,13 @@ impl DatasetState {
             .collect::<Vec<_>>()
             .join(",");
         let mut output = format!(
-            "version={STATE_VERSION}\nrun_id={}\nseed={}\nwarehouses={}\norder_line_rows={}\nundelivered_order_line_rows={}\norder_line_amount_terms={amount_terms}\norder_line_amount_words={amount_words}\n",
+            "version={STATE_VERSION}\nrun_id={}\nseed={}\nwarehouses={}\norder_line_rows={}\nundelivered_order_line_rows={}\norder_line_amount_terms={amount_terms}\norder_line_amount_words={amount_words}\ngenerated_csv_sha256={}\n",
             self.run_id,
             self.seed,
             self.warehouses,
             self.order_line_rows,
             self.undelivered_order_line_rows,
+            hex_encode(&self.generated_csv_sha256),
         );
         output.push_str(&self.runtime_schema.encode());
         output.push_str(&format!(
@@ -464,6 +468,10 @@ impl DatasetState {
                     ))
                 },
             )?;
+        let generated_csv_sha256 = parse_sha256(
+            value(&mut lines, "generated_csv_sha256")?,
+            "generated CSV checksum",
+        )?;
         let first_schema_line = lines
             .next()
             .ok_or_else(|| StateError::Invalid("missing runtime schema".to_owned()))?;
@@ -513,6 +521,7 @@ impl DatasetState {
             warehouses,
             order_line_rows,
             undelivered_order_line_rows,
+            generated_csv_sha256,
             runtime_schema,
             initial_order_line_amounts,
             partitions,
@@ -529,6 +538,10 @@ impl DatasetState {
 
     pub fn initial_order_line_amounts(&self) -> &NonNegativeF32Accumulator {
         &self.initial_order_line_amounts
+    }
+
+    pub const fn generated_csv_sha256(&self) -> &[u8; 32] {
+        &self.generated_csv_sha256
     }
 
     pub fn setup_evidence(&self) -> &SetupEvidence {
@@ -2218,6 +2231,36 @@ fn parse_checksum(value: &str) -> Result<u64, StateError> {
         .map_err(|_| StateError::Invalid("checksum is not valid hexadecimal".to_owned()))
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn parse_sha256(value: &str, name: &str) -> Result<[u8; 32], StateError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StateError::Invalid(format!(
+            "{name} must be 64 lower-case hexadecimal digits"
+        )));
+    }
+    let mut checksum = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let encoded = std::str::from_utf8(pair)
+            .map_err(|_| StateError::Invalid(format!("{name} is not ASCII")))?;
+        checksum[index] = u8::from_str_radix(encoded, 16)
+            .map_err(|_| StateError::Invalid(format!("{name} is not valid hexadecimal")))?;
+    }
+    Ok(checksum)
+}
+
 fn parse_accumulator_words(value: &str) -> Result<Vec<u64>, StateError> {
     if value.is_empty() {
         return Ok(Vec::new());
@@ -2683,7 +2726,11 @@ mod tests {
         assert!(encoded.len() < MAX_DATASET_STATE_BYTES);
         assert_eq!(DatasetState::decode(&encoded).unwrap(), state);
         assert!(DatasetState::decode(encoded.trim_end()).is_err());
-        assert!(DatasetState::decode(&encoded.replacen("version=4", "version=3", 1)).is_err());
+        assert!(DatasetState::decode(&encoded.replacen("version=5", "version=4", 1)).is_err());
+        assert_eq!(
+            state.generated_csv_sha256(),
+            &state.setup_evidence.dataset_checksum
+        );
         assert_eq!(
             DatasetState::decode(&encoded)
                 .unwrap()
@@ -2704,6 +2751,20 @@ mod tests {
         assert!(DatasetState::decode(&encoded.replacen(
             &encoded_fingerprint,
             &damaged_fingerprint,
+            1
+        ))
+        .is_err());
+        let encoded_csv_checksum = hex_encode(state.generated_csv_sha256());
+        let mut damaged_csv_checksum = encoded_csv_checksum.clone().into_bytes();
+        damaged_csv_checksum[0] = if damaged_csv_checksum[0] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
+        let damaged_csv_checksum = String::from_utf8(damaged_csv_checksum).unwrap();
+        assert!(DatasetState::decode(&encoded.replacen(
+            &encoded_csv_checksum,
+            &damaged_csv_checksum,
             1
         ))
         .is_err());
