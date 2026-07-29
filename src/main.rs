@@ -13,6 +13,7 @@ mod profile;
 mod ranking;
 mod report;
 mod routing;
+mod run_state;
 mod transaction;
 mod workload;
 
@@ -123,7 +124,25 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         if config.init {
             info!("加载 TPC-C 初始数据 (scale_factor={})", config.scale_factor);
             let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
-            ldr.load_all_data().await?;
+            let load = ldr.load_all_data().await?;
+            let seed = effective
+                .seed
+                .ok_or("validated init configuration lost its seed")?;
+            let run_id =
+                std::env::var("RMDB_TPCC_RUN_ID").unwrap_or_else(|_| format!("local-{seed}"));
+            let state =
+                run_state::DatasetState::from_load(run_id, seed, config.scale_factor, load)?;
+            let store = run_state::StateStore::open(
+                config
+                    .state_dir
+                    .as_deref()
+                    .ok_or("validated init configuration lost its state directory")?,
+            )?;
+            store.save_dataset(&state)?;
+            info!(
+                "已保存版本化装载状态: {}",
+                store.root().join("dataset.state").display()
+            );
             info!("TPC-C 初始数据加载完成");
         }
 

@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::fs::{create_dir_all, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -12,6 +12,21 @@ use crate::error::TpccError;
 pub struct Loader<'a> {
     cursor: &'a mut RmdbCursor,
     scale_factor: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartitionLoadSummary {
+    pub warehouse_id: i32,
+    pub district_id: i32,
+    pub order_line_rows: i64,
+    pub undelivered_order_line_rows: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoadSummary {
+    pub order_line_rows: i64,
+    pub undelivered_order_line_rows: i64,
+    pub partitions: Vec<PartitionLoadSummary>,
 }
 
 impl<'a> Loader<'a> {
@@ -72,7 +87,7 @@ impl<'a> Loader<'a> {
         Ok(())
     }
 
-    pub async fn load_all_data(&mut self) -> Result<(), TpccError> {
+    pub async fn load_all_data(&mut self) -> Result<LoadSummary, TpccError> {
         info!(
             "[数据加载] 开始生成 CSV 并通过 load 导入 TPC-C 数据 (scale_factor={})",
             self.scale_factor
@@ -211,7 +226,18 @@ impl<'a> Loader<'a> {
         .await?;
         // Sum O_OL_CNT while the order CSV is already being streamed. This
         // avoids a second 1.5-million-order shape traversal at final SF=50.
-        let expected_order_line_count = Cell::new(0_u64);
+        let partition_shapes = RefCell::new(
+            (1..=self.scale_factor)
+                .flat_map(|warehouse_id| {
+                    (1..=10).map(move |district_id| PartitionLoadSummary {
+                        warehouse_id,
+                        district_id,
+                        order_line_rows: 0,
+                        undelivered_order_line_rows: 0,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
         self.write_and_load_table(
             csv_dir,
             load_dir,
@@ -227,7 +253,13 @@ impl<'a> Loader<'a> {
                 "o_all_local",
             ],
             gen.generate_orders().into_iter().map(|o| {
-                expected_order_line_count.set(expected_order_line_count.get() + o.o_ol_cnt as u64);
+                let index = ((o.o_w_id - 1) * 10 + (o.o_d_id - 1)) as usize;
+                let mut shapes = partition_shapes.borrow_mut();
+                let shape = &mut shapes[index];
+                shape.order_line_rows += i64::from(o.o_ol_cnt);
+                if o.o_carrier_id == 0 {
+                    shape.undelivered_order_line_rows += i64::from(o.o_ol_cnt);
+                }
                 o.to_sql_params()
             }),
         )
@@ -277,16 +309,28 @@ impl<'a> Loader<'a> {
                     .map(|ol| ol.to_sql_params()),
             )
             .await?;
-        let expected_order_line_count = expected_order_line_count.get();
-        if generated_order_line_count != expected_order_line_count {
+        let partitions = partition_shapes.into_inner();
+        let expected_order_line_count = partitions
+            .iter()
+            .map(|partition| partition.order_line_rows)
+            .sum::<i64>();
+        if i64::try_from(generated_order_line_count).ok() != Some(expected_order_line_count) {
             return Err(TpccError::QueryError(format!(
                 "order_line 生成计数不一致: generated={generated_order_line_count}, expected={expected_order_line_count}"
             )));
         }
+        let undelivered_order_line_rows = partitions
+            .iter()
+            .map(|partition| partition.undelivered_order_line_rows)
+            .sum();
 
         info!("[数据加载] 全部数据加载完成");
-        self.verify_counts(expected_order_line_count as i64).await?;
-        Ok(())
+        self.verify_counts(expected_order_line_count).await?;
+        Ok(LoadSummary {
+            order_line_rows: expected_order_line_count,
+            undelivered_order_line_rows,
+            partitions,
+        })
     }
 
     async fn write_and_load_table<I>(
