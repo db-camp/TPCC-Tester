@@ -2,5 +2,11 @@
 
 pub mod catalog;
 pub mod common;
+pub mod delivery;
+pub mod dispatch;
+pub mod new_order;
+pub mod order_status;
+pub mod payment;
 pub mod runner;
 pub mod session;
+pub mod stock_level;

@@ -1,9 +1,21 @@
 #[path = "../src/connection/mod.rs"]
 mod connection;
+#[path = "../src/data_gen.rs"]
+mod data_gen;
 #[path = "../src/error.rs"]
 mod error;
+#[path = "../src/model.rs"]
+mod model;
+#[path = "../src/profile.rs"]
+mod profile;
 #[path = "../src/ranking/mod.rs"]
 mod ranking;
+#[path = "../src/routing.rs"]
+mod routing;
+#[path = "../src/transaction/mod.rs"]
+mod transaction;
+#[path = "../src/workload.rs"]
+mod workload;
 
 use std::collections::BTreeSet;
 
