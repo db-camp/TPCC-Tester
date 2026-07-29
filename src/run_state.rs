@@ -2787,8 +2787,9 @@ fn validate_unlinked_temporary(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AtomicPublishStep {
+    FirstDirectorySync,
     TemporaryUnlink,
-    DirectorySync,
+    SecondDirectorySync,
 }
 
 fn atomic_publish_new(root: &Path, name: &str, bytes: &[u8]) -> Result<(), StateError> {
@@ -2844,9 +2845,7 @@ fn atomic_publish_new_with_fault(
             }
             Err(error) => return Err(error),
         }
-        inject_fault(AtomicPublishStep::TemporaryUnlink)?;
-        fs::remove_file(&temporary)?;
-        inject_fault(AtomicPublishStep::DirectorySync)?;
+        inject_fault(AtomicPublishStep::FirstDirectorySync)?;
         File::open(root)?.sync_all()
     })() {
         drop(file);
@@ -2858,7 +2857,36 @@ fn atomic_publish_new_with_fault(
         }
         return Err(StateError::Io(error));
     }
+    drop(file);
+
+    if let Err(error) = (|| -> std::io::Result<()> {
+        inject_fault(AtomicPublishStep::TemporaryUnlink)?;
+        fs::remove_file(&temporary)?;
+        inject_fault(AtomicPublishStep::SecondDirectorySync)?;
+        File::open(root)?.sync_all()
+    })() {
+        return match finish_committed_publish(root, &temporary) {
+            Ok(()) => Err(StateError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "state artifact was published durably, but cleanup failed ({error}); cleanup was recovered durably"
+                ),
+            ))),
+            Err(cleanup_error) => Err(StateError::Invalid(format!(
+                "state artifact was published durably, but cleanup failed ({error}); cleanup recovery also failed ({cleanup_error})"
+            ))),
+        };
+    }
     Ok(())
+}
+
+fn finish_committed_publish(root: &Path, temporary: &Path) -> std::io::Result<()> {
+    match fs::remove_file(temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    File::open(root)?.sync_all()
 }
 
 fn rollback_atomic_publish(
@@ -3527,7 +3555,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_publish_unlink_failure_rolls_back_and_can_retry() {
+    fn atomic_publish_unlink_failure_after_commit_is_reported_and_cleaned() {
         let directory = TestDirectory::new();
         let name = "unlink-failure.state";
 
@@ -3543,10 +3571,12 @@ mod tests {
         })
         .unwrap_err();
 
+        assert!(matches!(&error, StateError::Io(_)));
         assert!(error
             .to_string()
             .contains("injected temporary unlink failure"));
-        assert!(!directory.0.join(name).exists());
+        assert!(error.to_string().contains("published durably"));
+        assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"durable");
         let temporary_prefix = format!(".{name}.");
         let temporary_files = fs::read_dir(&directory.0)
             .unwrap()
@@ -3558,22 +3588,23 @@ mod tests {
             })
             .count();
         assert_eq!(temporary_files, 0);
-        atomic_publish_new(&directory.0, name, b"durable").unwrap();
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        assert!(atomic_publish_new(&directory.0, name, b"replacement").is_err());
         assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"durable");
     }
 
     #[test]
-    fn atomic_publish_directory_sync_failure_rolls_back_and_can_retry() {
+    fn atomic_publish_first_directory_sync_failure_rolls_back_and_can_retry() {
         let directory = TestDirectory::new();
-        let name = "directory-sync-failure.state";
+        let name = "first-directory-sync-failure.state";
         let mut injected = false;
 
         let error = atomic_publish_new_with_fault(&directory.0, name, b"durable", |step| {
-            if step == AtomicPublishStep::DirectorySync {
+            if step == AtomicPublishStep::FirstDirectorySync {
                 injected = true;
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    "injected directory sync failure",
+                    "injected first directory sync failure",
                 ))
             } else {
                 Ok(())
@@ -3584,10 +3615,41 @@ mod tests {
         assert!(injected);
         assert!(error
             .to_string()
-            .contains("injected directory sync failure"));
+            .contains("injected first directory sync failure"));
         assert!(!directory.0.join(name).exists());
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
         atomic_publish_new(&directory.0, name, b"durable").unwrap();
+        assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"durable");
+    }
+
+    #[test]
+    fn atomic_publish_second_directory_sync_failure_is_reported_and_cleaned() {
+        let directory = TestDirectory::new();
+        let name = "second-directory-sync-failure.state";
+        let mut injected = false;
+
+        let error = atomic_publish_new_with_fault(&directory.0, name, b"durable", |step| {
+            if step == AtomicPublishStep::SecondDirectorySync {
+                injected = true;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected second directory sync failure",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(injected);
+        assert!(matches!(&error, StateError::Io(_)));
+        assert!(error
+            .to_string()
+            .contains("injected second directory sync failure"));
+        assert!(error.to_string().contains("published durably"));
+        assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"durable");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        assert!(atomic_publish_new(&directory.0, name, b"replacement").is_err());
         assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"durable");
     }
 
@@ -3612,11 +3674,11 @@ mod tests {
                 SETUP_INTENT_FILE,
                 encoded.as_bytes(),
                 |step| {
-                    if step == AtomicPublishStep::DirectorySync {
+                    if step == AtomicPublishStep::FirstDirectorySync {
                         publisher_linked.wait();
                         publisher_release.wait();
                         Err(std::io::Error::other(
-                            "injected directory sync failure",
+                            "injected first directory sync failure",
                         ))
                     } else {
                         Ok(())
@@ -3654,32 +3716,6 @@ mod tests {
         assert_ne!(claim.intent_checksum, 0);
         assert!(directory.0.join(SETUP_INTENT_FILE).is_file());
         assert!(directory.0.join(SETUP_EXECUTION_FILE).is_file());
-    }
-
-    #[test]
-    fn atomic_publish_failure_before_link_is_an_error() {
-        let directory = TestDirectory::new();
-
-        let error = atomic_publish_new_with_fault(
-            &directory.0,
-            "pre-link-failure.state",
-            b"value",
-            |step| {
-                if step == AtomicPublishStep::TemporaryUnlink {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "injected pre-publish failure",
-                    ))
-                } else {
-                    Ok(())
-                }
-            },
-        )
-        .unwrap_err();
-
-        assert!(matches!(&error, StateError::Io(_)));
-        assert!(error.to_string().contains("injected pre-publish failure"));
-        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
     }
 
     #[test]
