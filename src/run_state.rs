@@ -604,8 +604,7 @@ impl StateStore {
         let store = Self {
             root: root.to_path_buf(),
         };
-        let _directory_lock = lock_state_directory(&store.root)?;
-        cleanup_orphan_temporary_files(&store.root)?;
+        let _directory_lock = lock_clean_state_directory(&store.root)?;
         drop(_directory_lock);
         Ok(store)
     }
@@ -625,8 +624,7 @@ impl StateStore {
         let store = Self {
             root: root.to_path_buf(),
         };
-        let _directory_lock = lock_state_directory(&store.root)?;
-        cleanup_orphan_temporary_files(&store.root)?;
+        let _directory_lock = lock_clean_state_directory(&store.root)?;
         drop(_directory_lock);
         Ok(store)
     }
@@ -637,7 +635,7 @@ impl StateStore {
         seed: u64,
         contract: &RunContract,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.create_setup_intent(run_id, seed, contract)?;
         Ok(())
     }
@@ -666,7 +664,7 @@ impl StateStore {
         seed: u64,
         contract: &RunContract,
     ) -> Result<(SetupClaim, SetupClaimOrigin), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         let (intent_checksum, origin) =
             match fs::symlink_metadata(self.root.join(SETUP_INTENT_FILE)) {
                 Ok(_) => (
@@ -724,7 +722,7 @@ impl StateStore {
         contract: &RunContract,
         claim: SetupClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         dataset.validate()?;
         contract.validate(dataset)?;
         self.ensure_setup_execution_pending()?;
@@ -766,7 +764,7 @@ impl StateStore {
     }
 
     pub fn load_bound_dataset(&self, expected: &RunContract) -> Result<DatasetState, StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         let dataset = self.load_dataset_unlocked()?;
         self.contract_checksum(&dataset, expected)?;
         Ok(dataset)
@@ -777,7 +775,7 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<SetupCheckClaim, StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let claim_checksum = self.publish_marker(
@@ -800,7 +798,7 @@ impl StateStore {
         contract: &RunContract,
         claim: SetupCheckClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.validate_claim(
             dataset,
             contract,
@@ -823,7 +821,7 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<RankClaim, StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let setup_claim = self.load_marker(
@@ -861,7 +859,7 @@ impl StateStore {
         claim: RankClaim,
         ledger: &RunLedger,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.validate_claim(
             dataset,
             contract,
@@ -884,7 +882,7 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<(OnlineCheckClaim, RunLedger), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, ledger, ledger_checksum) =
             self.load_bound_ledger(dataset, contract)?;
@@ -915,7 +913,7 @@ impl StateStore {
         claim: OnlineCheckClaim,
         values: &BTreeMap<FloatAggregateId, u32>,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.validate_claim(
             dataset,
             contract,
@@ -950,7 +948,7 @@ impl StateStore {
         contract: &RunContract,
         event: CrashLifecycleEvent,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, ledger_checksum, baseline_checksum) =
             self.load_crash_context(dataset, contract)?;
@@ -994,7 +992,7 @@ impl StateStore {
         ),
         StateError,
     > {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, ledger, ledger_checksum) =
             self.load_bound_ledger(dataset, contract)?;
@@ -1033,7 +1031,7 @@ impl StateStore {
         contract: &RunContract,
         claim: RecoveryCheckClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.validate_claim(
             dataset,
             contract,
@@ -1077,7 +1075,7 @@ impl StateStore {
         contract: &RunContract,
         stage: DiagnosticStage,
     ) -> Result<DiagnosticClaim, StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let predecessor_checksum = match stage {
             DiagnosticStage::Warmup => {
@@ -1140,7 +1138,7 @@ impl StateStore {
         contract: &RunContract,
         claim: DiagnosticClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         let (claim_file, claim_artifact) = diagnostic_claim_spec(claim.stage);
         self.validate_claim(dataset, contract, claim.token, claim_file, claim_artifact)?;
         let (receipt_file, receipt_artifact) = diagnostic_receipt_spec(claim.stage);
@@ -1253,7 +1251,7 @@ impl StateStore {
     }
 
     pub fn load_dataset(&self) -> Result<DatasetState, StateError> {
-        let _directory_lock = lock_state_directory(&self.root)?;
+        let _directory_lock = lock_clean_state_directory(&self.root)?;
         self.load_dataset_unlocked()
     }
 
@@ -2627,6 +2625,12 @@ fn lock_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
     Ok(StateDirectoryLock(directory))
 }
 
+fn lock_clean_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
+    let directory_lock = lock_state_directory(root)?;
+    cleanup_orphan_temporary_files(root)?;
+    Ok(directory_lock)
+}
+
 fn cleanup_orphan_temporary_files(root: &Path) -> Result<(), StateError> {
     let mut removed = false;
     for entry in fs::read_dir(root)? {
@@ -2866,12 +2870,7 @@ fn atomic_publish_new_with_fault(
         File::open(root)?.sync_all()
     })() {
         return match finish_committed_publish(root, &temporary) {
-            Ok(()) => Err(StateError::Io(std::io::Error::new(
-                error.kind(),
-                format!(
-                    "state artifact was published durably, but cleanup failed ({error}); cleanup was recovered durably"
-                ),
-            ))),
+            Ok(()) => Ok(()),
             Err(cleanup_error) => Err(StateError::Invalid(format!(
                 "state artifact was published durably, but cleanup failed ({error}); cleanup recovery also failed ({cleanup_error})"
             ))),
@@ -3555,12 +3554,14 @@ mod tests {
     }
 
     #[test]
-    fn atomic_publish_unlink_failure_after_commit_is_reported_and_cleaned() {
+    fn atomic_publish_unlink_failure_after_commit_is_recovered_before_success() {
         let directory = TestDirectory::new();
         let name = "unlink-failure.state";
+        let mut injected = false;
 
-        let error = atomic_publish_new_with_fault(&directory.0, name, b"durable", |step| {
+        atomic_publish_new_with_fault(&directory.0, name, b"durable", |step| {
             if step == AtomicPublishStep::TemporaryUnlink {
+                injected = true;
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "injected temporary unlink failure",
@@ -3569,13 +3570,9 @@ mod tests {
                 Ok(())
             }
         })
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(&error, StateError::Io(_)));
-        assert!(error
-            .to_string()
-            .contains("injected temporary unlink failure"));
-        assert!(error.to_string().contains("published durably"));
+        assert!(injected);
         assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"durable");
         let temporary_prefix = format!(".{name}.");
         let temporary_files = fs::read_dir(&directory.0)
@@ -3623,12 +3620,12 @@ mod tests {
     }
 
     #[test]
-    fn atomic_publish_second_directory_sync_failure_is_reported_and_cleaned() {
+    fn atomic_publish_second_directory_sync_failure_is_recovered_before_success() {
         let directory = TestDirectory::new();
         let name = "second-directory-sync-failure.state";
         let mut injected = false;
 
-        let error = atomic_publish_new_with_fault(&directory.0, name, b"durable", |step| {
+        atomic_publish_new_with_fault(&directory.0, name, b"durable", |step| {
             if step == AtomicPublishStep::SecondDirectorySync {
                 injected = true;
                 Err(std::io::Error::new(
@@ -3639,14 +3636,9 @@ mod tests {
                 Ok(())
             }
         })
-        .unwrap_err();
+        .unwrap();
 
         assert!(injected);
-        assert!(matches!(&error, StateError::Io(_)));
-        assert!(error
-            .to_string()
-            .contains("injected second directory sync failure"));
-        assert!(error.to_string().contains("published durably"));
         assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"durable");
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
         assert!(atomic_publish_new(&directory.0, name, b"replacement").is_err());
@@ -3742,6 +3734,59 @@ mod tests {
             .publish_setup_intent("run-clean-orphan", 51, &contract)
             .unwrap();
         assert!(directory.0.join(SETUP_INTENT_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preopened_store_recovers_linked_orphan_after_publisher_exit() {
+        let directory = TestDirectory::new();
+        let claimant_store = StateStore::open_existing(&directory.0).unwrap();
+        let dataset = sample_dataset("run-preopened-orphan", 53);
+        let encoded = dataset.encode();
+        let publisher_root = directory.0.clone();
+        let (linked_send, linked_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+
+        let publisher = thread::spawn(move || {
+            let _directory_lock = lock_state_directory(&publisher_root).unwrap();
+            let temporary =
+                publisher_root.join(format!(".{DATASET_FILE}.{}.2.tmp", std::process::id()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .unwrap();
+            file.write_all(encoded.as_bytes()).unwrap();
+            file.sync_all().unwrap();
+            fs::hard_link(&temporary, publisher_root.join(DATASET_FILE)).unwrap();
+            linked_send.send(temporary).unwrap();
+            release_receive.recv().unwrap();
+        });
+
+        let temporary = linked_receive.recv().unwrap();
+        assert!(temporary.is_file());
+        assert!(directory.0.join(DATASET_FILE).is_file());
+
+        let (result_send, result_receive) = mpsc::channel();
+        let claimant = thread::spawn(move || {
+            result_send.send(claimant_store.load_dataset()).unwrap();
+        });
+        assert!(matches!(
+            result_receive.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_send.send(()).unwrap();
+        publisher.join().unwrap();
+        let loaded = result_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        claimant.join().unwrap();
+
+        assert_eq!(loaded, dataset);
+        assert!(!temporary.exists());
+        assert!(directory.0.join(DATASET_FILE).is_file());
     }
 
     #[cfg(unix)]
