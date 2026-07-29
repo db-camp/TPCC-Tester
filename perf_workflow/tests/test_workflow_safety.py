@@ -2599,7 +2599,9 @@ if "--benchmark" in sys.argv:
         "measurement_window_ns=1000000000\\n",
         encoding="ascii",
     )
-    time.sleep(3.4)
+    # Keep the server alive for more than one complete 1s sampler interval
+    # beyond the formal end so the final CPU interval is deterministic.
+    time.sleep(4.6)
 """,
             )
             records = temp_path / "records"
@@ -2633,7 +2635,11 @@ if "--benchmark" in sys.argv:
                 )
             )
             self.assertIn(metrics["status"], {"available", "partial"})
-            self.assertEqual(metrics["rank_cpu"]["status"], "available")
+            self.assertEqual(
+                metrics["rank_cpu"]["status"],
+                "available",
+                metrics,
+            )
             self.assertEqual(len(metrics["rank_cpu"]["windows"]), 3)
             self.assertTrue(
                 all(
