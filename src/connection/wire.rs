@@ -6,11 +6,14 @@
 //! before typed cells are exposed to callers.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::time::Instant;
 
 pub const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
@@ -22,9 +25,30 @@ pub enum WireError {
     Io(#[from] io::Error),
     #[error("wire protocol violation: {0}")]
     Protocol(String),
+    #[error("{request} wire {phase} timed out after {timeout:?}")]
+    Timeout {
+        request: &'static str,
+        phase: WireTimeoutPhase,
+        timeout: Duration,
+    },
 }
 
 pub type WireResult<T> = Result<T, WireError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WireTimeoutPhase {
+    RequestSend,
+    ResponseRead,
+}
+
+impl fmt::Display for WireTimeoutPhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequestSend => formatter.write_str("request send"),
+            Self::ResponseRead => formatter.write_str("response read"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -146,6 +170,18 @@ pub(crate) struct PreparedDefinition {
     pub(crate) columns: Option<Vec<Column>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResponseReadDeadline {
+    at: Instant,
+    timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimeoutPoison {
+    request: &'static str,
+    phase: WireTimeoutPhase,
+}
+
 /// A sequential RMDB Wire Protocol connection.
 ///
 /// The API intentionally exposes one complete request at a time, matching the
@@ -153,6 +189,7 @@ pub(crate) struct PreparedDefinition {
 pub struct WireConnection<S> {
     io: S,
     handshaken: bool,
+    timeout_poison: Option<TimeoutPoison>,
     pub(crate) prepared: BTreeMap<u16, PreparedDefinition>,
 }
 
@@ -176,6 +213,7 @@ where
         Self {
             io,
             handshaken: false,
+            timeout_poison: None,
             prepared: BTreeMap::new(),
         }
     }
@@ -211,11 +249,23 @@ where
     /// frames, provisional rows are discarded and only that terminal is
     /// returned.
     pub async fn exec_stream(&mut self, sql: &str) -> WireResult<StreamResponse> {
-        if !self.handshaken {
-            return Err(WireError::Protocol(
-                "EXEC_STREAM requires a completed handshake".to_owned(),
-            ));
-        }
+        self.exec_stream_inner(sql, None).await
+    }
+
+    pub(crate) async fn exec_stream_with_timeout(
+        &mut self,
+        sql: &str,
+        timeout: Duration,
+    ) -> WireResult<StreamResponse> {
+        self.exec_stream_inner(sql, Some(timeout)).await
+    }
+
+    async fn exec_stream_inner(
+        &mut self,
+        sql: &str,
+        timeout: Option<Duration>,
+    ) -> WireResult<StreamResponse> {
+        self.ensure_handshaken("EXEC_STREAM")?;
         if sql.is_empty() {
             return Err(WireError::Protocol(
                 "EXEC_STREAM SQL payload must not be empty".to_owned(),
@@ -232,14 +282,23 @@ where
             )));
         }
 
-        self.write_frame(FrameTag::ExecStream, 0, sql.as_bytes())
+        let deadline = self
+            .write_request_frame(
+                FrameTag::ExecStream,
+                0,
+                sql.as_bytes(),
+                "EXEC_STREAM",
+                timeout,
+            )
             .await?;
 
         let mut columns: Option<Vec<Column>> = None;
         let mut rows = Vec::new();
 
         loop {
-            let frame = self.read_response_frame().await?;
+            let frame = self
+                .read_response_frame_before(deadline, "EXEC_STREAM")
+                .await?;
             match frame.tag {
                 FrameTag::Meta => {
                     if columns.is_some() {
@@ -310,21 +369,57 @@ where
     }
 
     pub(crate) fn ensure_handshaken(&self, request_name: &str) -> WireResult<()> {
-        if self.handshaken {
-            Ok(())
-        } else {
+        if let Some(poison) = self.timeout_poison {
+            return Err(WireError::Protocol(format!(
+                "connection cannot be reused after {} wire {} timeout",
+                poison.request, poison.phase
+            )));
+        }
+        if !self.handshaken {
             Err(WireError::Protocol(format!(
                 "{request_name} requires a completed handshake"
             )))
+        } else {
+            Ok(())
         }
     }
 
-    pub(crate) async fn write_frame(
+    pub(crate) async fn write_request_frame(
         &mut self,
         tag: FrameTag,
         flags: u8,
         payload: &[u8],
-    ) -> WireResult<()> {
+        request_name: &'static str,
+        timeout: Option<Duration>,
+    ) -> WireResult<Option<ResponseReadDeadline>> {
+        let write = self.write_frame(tag, flags, payload);
+        match timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, write).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.timeout_poison = Some(TimeoutPoison {
+                        request: request_name,
+                        phase: WireTimeoutPhase::RequestSend,
+                    });
+                    return Err(WireError::Timeout {
+                        request: request_name,
+                        phase: WireTimeoutPhase::RequestSend,
+                        timeout,
+                    });
+                }
+            },
+            None => write.await?,
+        }
+
+        Ok(timeout.map(|timeout| ResponseReadDeadline {
+            // The response budget begins only after the complete request frame
+            // has been written and flushed.
+            at: Instant::now() + timeout,
+            timeout,
+        }))
+    }
+
+    async fn write_frame(&mut self, tag: FrameTag, flags: u8, payload: &[u8]) -> WireResult<()> {
         if payload.len() > MAX_FRAME_PAYLOAD {
             return Err(WireError::Protocol(format!(
                 "frame payload exceeds {MAX_FRAME_PAYLOAD} bytes"
@@ -344,7 +439,32 @@ where
         Ok(())
     }
 
-    pub(crate) async fn read_response_frame(&mut self) -> WireResult<Frame> {
+    pub(crate) async fn read_response_frame_before(
+        &mut self,
+        deadline: Option<ResponseReadDeadline>,
+        request_name: &'static str,
+    ) -> WireResult<Frame> {
+        let read = self.read_response_frame();
+        match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline.at, read).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.timeout_poison = Some(TimeoutPoison {
+                        request: request_name,
+                        phase: WireTimeoutPhase::ResponseRead,
+                    });
+                    Err(WireError::Timeout {
+                        request: request_name,
+                        phase: WireTimeoutPhase::ResponseRead,
+                        timeout: deadline.timeout,
+                    })
+                }
+            },
+            None => read.await,
+        }
+    }
+
+    async fn read_response_frame(&mut self) -> WireResult<Frame> {
         let mut header = [0_u8; 8];
         self.io.read_exact(&mut header).await?;
 
@@ -577,6 +697,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::time::sleep;
 
     use super::*;
 
@@ -691,6 +812,22 @@ mod tests {
         let result = connection.exec_stream("show tables;").await;
         server.await.unwrap();
         result
+    }
+
+    async fn server_handshake(stream: &mut tokio::io::DuplexStream) {
+        let mut handshake = [0_u8; 8];
+        stream.read_exact(&mut handshake).await.unwrap();
+        assert_eq!(handshake, HANDSHAKE);
+        stream.write_all(&handshake).await.unwrap();
+    }
+
+    async fn read_exec_request(stream: &mut tokio::io::DuplexStream) {
+        let mut header = [0_u8; 8];
+        stream.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[4], FrameTag::ExecStream as u8);
+        let payload_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let mut payload = vec![0_u8; payload_bytes];
+        stream.read_exact(&mut payload).await.unwrap();
     }
 
     #[tokio::test]
@@ -838,6 +975,158 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("must not contain NUL"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_deadline_starts_after_complete_request_send() {
+        let timeout = Duration::from_millis(400);
+        let (client_io, mut server_io) = duplex(8);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+
+            // The small duplex buffer makes the request payload block until
+            // the server starts reading it.
+            sleep(Duration::from_millis(250)).await;
+            read_exec_request(&mut server_io).await;
+            sleep(Duration::from_millis(250)).await;
+            server_io
+                .write_all(&frame(FrameTag::CommandOk, 0, 0, &[]))
+                .await
+                .unwrap();
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let sql = "x".repeat(256);
+        assert_eq!(
+            connection
+                .exec_stream_with_timeout(&sql, timeout)
+                .await
+                .unwrap(),
+            StreamResponse::CommandOk
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intermediate_frames_do_not_reset_response_deadline() {
+        let timeout = Duration::from_millis(400);
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let mut row = Vec::new();
+        encode_value(SqlType::Int32, &WireValue::Int32(42), &mut row).unwrap();
+        let (client_io, mut server_io) = duplex(128);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io
+                .write_all(&frame(FrameTag::Meta, 0, 0, &columns))
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(250)).await;
+            server_io
+                .write_all(&frame(FrameTag::Row, 0, 0, &row))
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(250)).await;
+            server_io
+                .write_all(&frame(FrameTag::ResultEnd, 0, 0, &1_u64.to_be_bytes()))
+                .await
+                .unwrap();
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let error = connection
+            .exec_stream_with_timeout("select i from t;", timeout)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WireError::Timeout {
+                phase: WireTimeoutPhase::ResponseRead,
+                ..
+            }
+        ));
+        let reuse_error = connection
+            .exec_stream("show tables;")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(reuse_error.contains("cannot be reused"));
+        server.await.unwrap();
+    }
+
+    async fn assert_partial_response_times_out(prefix: Vec<u8>) {
+        let timeout = Duration::from_millis(200);
+        let (client_io, mut server_io) = duplex(64);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io.write_all(&prefix).await.unwrap();
+            sleep(Duration::from_millis(300)).await;
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let error = connection
+            .exec_stream_with_timeout("show tables;", timeout)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WireError::Timeout {
+                phase: WireTimeoutPhase::ResponseRead,
+                ..
+            }
+        ));
+        assert!(connection
+            .exec_stream("show tables;")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be reused"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_response_header_and_payload_share_the_response_deadline() {
+        let full_header = frame(FrameTag::CommandOk, 0, 0, &[]);
+        assert_partial_response_times_out(full_header[..4].to_vec()).await;
+
+        let full_payload = frame(FrameTag::Error, 0, 0, b"slow response");
+        assert_partial_response_times_out(full_payload[..10].to_vec()).await;
+    }
+
+    #[tokio::test]
+    async fn request_send_timeout_is_distinct_and_poisons_connection() {
+        let timeout = Duration::from_millis(200);
+        let (client_io, mut server_io) = duplex(8);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            sleep(Duration::from_millis(300)).await;
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let sql = "x".repeat(256);
+        let error = connection
+            .exec_stream_with_timeout(&sql, timeout)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WireError::Timeout {
+                phase: WireTimeoutPhase::RequestSend,
+                ..
+            }
+        ));
+        assert!(connection
+            .exec_stream("show tables;")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("request send timeout"));
         server.await.unwrap();
     }
 }

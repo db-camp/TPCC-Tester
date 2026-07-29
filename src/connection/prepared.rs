@@ -1,6 +1,7 @@
 //! Prepared statement and bounded batch support for RMDB Wire Protocol 3.0.
 
 use std::collections::{BTreeMap, HashSet};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -72,11 +73,31 @@ where
 {
     /// Atomically install a connection-local prepared statement dictionary.
     pub async fn prepare_set(&mut self, statements: &[Statement]) -> WireResult<PrepareResponse> {
+        self.prepare_set_inner(statements, None).await
+    }
+
+    pub(crate) async fn prepare_set_with_timeout(
+        &mut self,
+        statements: &[Statement],
+        timeout: Duration,
+    ) -> WireResult<PrepareResponse> {
+        self.prepare_set_inner(statements, Some(timeout)).await
+    }
+
+    async fn prepare_set_inner(
+        &mut self,
+        statements: &[Statement],
+        timeout: Option<Duration>,
+    ) -> WireResult<PrepareResponse> {
         self.ensure_handshaken("PREPARE_SET")?;
         let (payload, replacement) = build_prepare_payload(statements)?;
-        self.write_frame(FrameTag::PrepareSet, 0, &payload).await?;
+        let deadline = self
+            .write_request_frame(FrameTag::PrepareSet, 0, &payload, "PREPARE_SET", timeout)
+            .await?;
 
-        let frame = self.read_response_frame().await?;
+        let frame = self
+            .read_response_frame_before(deadline, "PREPARE_SET")
+            .await?;
         match frame.tag {
             FrameTag::PrepareOk => {
                 parse_prepare_ok(&frame.payload, statements)?;
@@ -94,12 +115,37 @@ where
 
     /// Execute a bounded, ordered operation batch with mandatory AUTO_ABORT.
     pub async fn exec_batch(&mut self, operations: &[Operation]) -> WireResult<BatchResponse> {
+        self.exec_batch_inner(operations, None).await
+    }
+
+    pub(crate) async fn exec_batch_with_timeout(
+        &mut self,
+        operations: &[Operation],
+        timeout: Duration,
+    ) -> WireResult<BatchResponse> {
+        self.exec_batch_inner(operations, Some(timeout)).await
+    }
+
+    async fn exec_batch_inner(
+        &mut self,
+        operations: &[Operation],
+        timeout: Option<Duration>,
+    ) -> WireResult<BatchResponse> {
         self.ensure_handshaken("EXEC_BATCH")?;
         let payload = build_batch_payload(operations, &self.prepared)?;
-        self.write_frame(FrameTag::ExecBatch, AUTO_ABORT_FLAG, &payload)
+        let deadline = self
+            .write_request_frame(
+                FrameTag::ExecBatch,
+                AUTO_ABORT_FLAG,
+                &payload,
+                "EXEC_BATCH",
+                timeout,
+            )
             .await?;
 
-        let frame = self.read_response_frame().await?;
+        let frame = self
+            .read_response_frame_before(deadline, "EXEC_BATCH")
+            .await?;
         match frame.tag {
             FrameTag::BatchResult => parse_batch_result(&frame.payload, operations, &self.prepared),
             FrameTag::Error => Ok(BatchResponse::TopLevelError {
@@ -659,6 +705,7 @@ mod tests {
     use tokio::io::{
         duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
     };
+    use tokio::time::sleep;
 
     use super::*;
     use crate::connection::wire::HANDSHAKE;
@@ -812,6 +859,16 @@ mod tests {
         payload
     }
 
+    fn successful_command_batch(executed: u16) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&executed.to_be_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&u16::MAX.to_be_bytes());
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&0_u16.to_be_bytes());
+        payload
+    }
+
     #[tokio::test]
     async fn fragmented_prepare_and_batch_preserve_float_bits() {
         let float_bits = 0x3f80_0001_u32;
@@ -900,6 +957,44 @@ mod tests {
                 }],
             }
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_exec_batch_gets_a_fresh_response_deadline() {
+        let timeout = Duration::from_millis(400);
+        let operation = Operation {
+            statement_id: 1,
+            parameters: vec![WireValue::Int32(7)],
+        };
+        let response = response_frame(FrameTag::BatchResult, &successful_command_batch(1));
+        let (client_io, mut server_io) = duplex(64);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+
+            for _ in 0..2 {
+                let (tag, flags, _) = read_request(&mut server_io).await;
+                assert_eq!((tag, flags), (FrameTag::ExecBatch, AUTO_ABORT_FLAG));
+                sleep(Duration::from_millis(250)).await;
+                server_io.write_all(&response).await.unwrap();
+            }
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        connection.prepared = test_dictionary();
+        for _ in 0..2 {
+            assert_eq!(
+                connection
+                    .exec_batch_with_timeout(std::slice::from_ref(&operation), timeout)
+                    .await
+                    .unwrap(),
+                BatchResponse::Ok {
+                    executed_operations: 1,
+                    results: Vec::new(),
+                }
+            );
+        }
         server.await.unwrap();
     }
 

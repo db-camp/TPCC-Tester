@@ -46,51 +46,30 @@ impl RmdbClient {
     pub async fn exec_stream(&mut self, cmd: &str) -> Result<StreamResponse, TpccError> {
         trace!("发送 SQL: {cmd}");
 
-        tokio::time::timeout(self.response_timeout, self.connection.exec_stream(cmd))
+        self.connection
+            .exec_stream_with_timeout(cmd, self.response_timeout)
             .await
-            .map_err(|_| TpccError::Timeout {
-                context: format!(
-                    "等待完整 Wire 响应帧超时 ({:?}), 最后发送的 SQL: {cmd}",
-                    self.response_timeout
-                ),
-            })?
-            .map_err(map_wire_error)
+            .map_err(|error| map_exec_wire_error(error, cmd))
     }
 
     pub async fn prepare_set(
         &mut self,
         statements: &[Statement],
     ) -> Result<PrepareResponse, TpccError> {
-        tokio::time::timeout(
-            self.response_timeout,
-            self.connection.prepare_set(statements),
-        )
-        .await
-        .map_err(|_| TpccError::Timeout {
-            context: format!(
-                "等待 PREPARE_SET 完整响应帧超时 ({:?})",
-                self.response_timeout
-            ),
-        })?
-        .map_err(map_wire_error)
+        self.connection
+            .prepare_set_with_timeout(statements, self.response_timeout)
+            .await
+            .map_err(map_wire_error)
     }
 
     pub async fn exec_batch(
         &mut self,
         operations: &[Operation],
     ) -> Result<BatchResponse, TpccError> {
-        tokio::time::timeout(
-            self.response_timeout,
-            self.connection.exec_batch(operations),
-        )
-        .await
-        .map_err(|_| TpccError::Timeout {
-            context: format!(
-                "等待 EXEC_BATCH 完整响应帧超时 ({:?})",
-                self.response_timeout
-            ),
-        })?
-        .map_err(map_wire_error)
+        self.connection
+            .exec_batch_with_timeout(operations, self.response_timeout)
+            .await
+            .map_err(map_wire_error)
     }
 
     /// Transitional text adapter for legacy callers.
@@ -126,6 +105,26 @@ fn map_wire_error(error: WireError) -> TpccError {
     match error {
         WireError::Io(error) => TpccError::Connection(error.to_string()),
         WireError::Protocol(message) => TpccError::Protocol(message),
+        WireError::Timeout {
+            request,
+            phase,
+            timeout,
+        } => TpccError::Timeout {
+            context: format!("{request} Wire {phase} timeout ({timeout:?})"),
+        },
+    }
+}
+
+fn map_exec_wire_error(error: WireError, sql: &str) -> TpccError {
+    match error {
+        WireError::Timeout {
+            request,
+            phase,
+            timeout,
+        } => TpccError::Timeout {
+            context: format!("{request} Wire {phase} timeout ({timeout:?}), last sent SQL: {sql}"),
+        },
+        other => map_wire_error(other),
     }
 }
 
@@ -167,6 +166,7 @@ fn wire_value_text(value: WireValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::wire::WireTimeoutPhase;
 
     #[test]
     fn readiness_accepts_both_published_success_terminals() {
@@ -190,5 +190,28 @@ mod tests {
             diagnostic: "failed".to_owned(),
         })
         .is_err());
+    }
+
+    #[test]
+    fn timeout_mapping_distinguishes_send_and_response_read() {
+        let send = map_wire_error(WireError::Timeout {
+            request: "EXEC_BATCH",
+            phase: WireTimeoutPhase::RequestSend,
+            timeout: Duration::from_secs(1),
+        })
+        .to_string();
+        assert!(send.contains("request send timeout"));
+
+        let read = map_exec_wire_error(
+            WireError::Timeout {
+                request: "EXEC_STREAM",
+                phase: WireTimeoutPhase::ResponseRead,
+                timeout: Duration::from_secs(2),
+            },
+            "show tables;",
+        )
+        .to_string();
+        assert!(read.contains("response read timeout"));
+        assert!(read.contains("show tables;"));
     }
 }
