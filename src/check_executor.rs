@@ -8,7 +8,7 @@ use crate::connection::client::RmdbClient;
 use crate::connection::wire::{StreamResponse, WireValue};
 use crate::consistency::{
     float32_matches, float_aggregate_plan, public_online_integer_plan,
-    recovery_partition_audits_for_warehouses, recovery_plan, setup_plan,
+    recovery_partition_audits_for_warehouses, recovery_plan, setup_plan, sum_f32_as_f64_once,
     validate_crash_float_baseline, validate_customer_update_chain, validate_public_float_ledger,
     validate_relative_update_chain_from_initial, CheckQuery, CheckScope, ConsistencyPlan,
     CustomerLogicalVersion, CustomerUpdateEvidence, CustomerUpdateKind, FloatAggregateId,
@@ -21,6 +21,9 @@ use crate::error::TpccError;
 use crate::ranking::ledger::{LedgerEvent, RunLedger};
 use crate::run_state::DatasetState;
 use crate::runtime_schema::RuntimeSchema;
+use crate::sample_evidence::{
+    DistrictSample, HistorySample, ItemSample, OrderLineSample, SetupEvidence, StockSample,
+};
 
 pub type FloatBaseline = BTreeMap<FloatAggregateId, u32>;
 
@@ -28,7 +31,8 @@ const PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT: usize = 64;
 
 pub async fn run_setup(client: &mut RmdbClient, dataset: &DatasetState) -> Result<(), TpccError> {
     let plan = scheduled_setup_plan(dataset)?;
-    run_plan(client, &plan, &dataset.runtime_schema).await
+    run_plan(client, &plan, &dataset.runtime_schema).await?;
+    run_setup_sample_checks(client, dataset.setup_evidence(), &dataset.runtime_schema).await
 }
 
 fn scheduled_setup_plan(dataset: &DatasetState) -> Result<ConsistencyPlan, TpccError> {
@@ -67,6 +71,491 @@ fn scheduled_setup_plan(dataset: &DatasetState) -> Result<ConsistencyPlan, TpccE
         )));
     }
     Ok(plan)
+}
+
+#[derive(Debug)]
+struct ExactSetupQuery {
+    id: &'static str,
+    sql: String,
+    expected_rows: Vec<Vec<TypedValue>>,
+}
+
+async fn run_setup_sample_checks(
+    client: &mut RmdbClient,
+    evidence: &SetupEvidence,
+    schema: &RuntimeSchema,
+) -> Result<(), TpccError> {
+    for query in setup_sample_queries(evidence)? {
+        let result = execute_typed_sql(client, schema, query.id, &query.sql).await?;
+        validate_exact_setup_rows(query.id, result, query.expected_rows)?;
+        info!(
+            "consistency PASS: {} — bounded relationship/content evidence",
+            query.id
+        );
+    }
+    Ok(())
+}
+
+fn setup_sample_queries(evidence: &SetupEvidence) -> Result<Vec<ExactSetupQuery>, TpccError> {
+    let mut warehouse_rows = BTreeMap::new();
+    for anchor in &evidence.anchors {
+        warehouse_rows
+            .entry(anchor.warehouse.id)
+            .or_insert(&anchor.warehouse);
+    }
+    let warehouse_terms = warehouse_rows
+        .keys()
+        .map(|warehouse| format!("warehouse.w_id = {warehouse}"))
+        .collect();
+    let warehouse_expected = warehouse_rows
+        .into_values()
+        .map(|row| {
+            vec![
+                TypedValue::Int32(row.id),
+                TypedValue::Char(row.name.clone()),
+                TypedValue::Char(row.state.clone()),
+                TypedValue::Char(row.zip.clone()),
+                TypedValue::Float32(row.tax_bits),
+                TypedValue::Float32(row.ytd_bits),
+            ]
+        })
+        .collect();
+
+    let district_terms = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let row = &anchor.district;
+            format!(
+                "(district.d_w_id = {} AND district.d_id = {})",
+                row.warehouse_id, row.id
+            )
+        })
+        .collect();
+    let district_expected = evidence
+        .anchors
+        .iter()
+        .map(|anchor| district_typed_row(&anchor.district))
+        .collect();
+
+    let customer_terms = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let row = &anchor.customer;
+            format!(
+                "(customer.c_w_id = {} AND customer.c_d_id = {} AND customer.c_id = {})",
+                row.warehouse_id, row.district_id, row.id
+            )
+        })
+        .collect();
+    let customer_expected = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let row = &anchor.customer;
+            vec![
+                TypedValue::Int32(row.warehouse_id),
+                TypedValue::Int32(row.district_id),
+                TypedValue::Int32(row.id),
+                TypedValue::Char(row.first.clone()),
+                TypedValue::Char(row.middle.clone()),
+                TypedValue::Char(row.last.clone()),
+                TypedValue::Char(row.since.clone()),
+                TypedValue::Char(row.credit.clone()),
+                TypedValue::Float32(row.discount_bits),
+                TypedValue::Float32(row.balance_bits),
+                TypedValue::Float32(row.ytd_payment_bits),
+                TypedValue::Int32(row.payment_count),
+                TypedValue::Int32(row.delivery_count),
+                TypedValue::Char(row.data.clone()),
+            ]
+        })
+        .collect();
+
+    let order_terms = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let row = &anchor.order;
+            format!(
+                "(orders.o_w_id = {} AND orders.o_d_id = {} AND orders.o_id = {})",
+                row.warehouse_id, row.district_id, row.id
+            )
+        })
+        .collect::<Vec<_>>();
+    let order_expected = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let row = &anchor.order;
+            vec![
+                TypedValue::Int32(row.warehouse_id),
+                TypedValue::Int32(row.district_id),
+                TypedValue::Int32(row.id),
+                TypedValue::Int32(row.customer_id),
+                TypedValue::Char(row.entry_date.clone()),
+                TypedValue::Int32(row.carrier_id),
+                TypedValue::Int32(row.line_count),
+                TypedValue::Int32(row.all_local),
+            ]
+        })
+        .collect();
+
+    let new_order_terms = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let row = &anchor.new_order;
+            format!(
+                "(new_orders.no_w_id = {} AND new_orders.no_d_id = {} AND new_orders.no_o_id = {})",
+                row.warehouse_id, row.district_id, row.order_id
+            )
+        })
+        .collect();
+    let new_order_expected = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let row = &anchor.new_order;
+            vec![
+                TypedValue::Int32(row.warehouse_id),
+                TypedValue::Int32(row.district_id),
+                TypedValue::Int32(row.order_id),
+            ]
+        })
+        .collect();
+
+    let history_terms = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let row = &anchor.history;
+            format!(
+                "(history.h_c_w_id = {} AND history.h_c_d_id = {} AND history.h_c_id = {} AND history.h_w_id = {} AND history.h_d_id = {})",
+                row.customer_warehouse_id,
+                row.customer_district_id,
+                row.customer_id,
+                row.warehouse_id,
+                row.district_id,
+            )
+        })
+        .collect();
+    let history_expected = evidence
+        .anchors
+        .iter()
+        .map(|anchor| history_typed_row(&anchor.history))
+        .collect();
+
+    let line_terms = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let row = &anchor.order;
+            format!(
+                "(order_line.ol_w_id = {} AND order_line.ol_d_id = {} AND order_line.ol_o_id = {})",
+                row.warehouse_id, row.district_id, row.id
+            )
+        })
+        .collect();
+    let line_expected = evidence
+        .anchors
+        .iter()
+        .flat_map(|anchor| anchor.lines.iter().map(order_line_typed_row))
+        .collect();
+
+    let item_terms = evidence
+        .items
+        .iter()
+        .map(|row| format!("item.i_id = {}", row.id))
+        .collect();
+    let item_expected = evidence.items.iter().map(item_typed_row).collect();
+
+    let stock_terms = evidence
+        .stocks
+        .iter()
+        .map(|row| {
+            format!(
+                "(stock.s_w_id = {} AND stock.s_i_id = {})",
+                row.warehouse_id, row.item_id
+            )
+        })
+        .collect();
+    let stock_expected = evidence.stocks.iter().map(stock_typed_row).collect();
+
+    let sum_expected = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            let bits = sum_f32_as_f64_once(anchor.lines.iter().map(|line| line.amount_bits))
+                .map_err(|error| {
+                    TpccError::Protocol(format!(
+                        "invalid persisted setup order-line amount evidence: {error}"
+                    ))
+                })?;
+            Ok(vec![
+                TypedValue::Int32(anchor.order.warehouse_id),
+                TypedValue::Int32(anchor.order.district_id),
+                TypedValue::Int32(anchor.order.id),
+                TypedValue::Float32(bits),
+            ])
+        })
+        .collect::<Result<Vec<_>, TpccError>>()?;
+    let sum_terms = evidence
+        .anchors
+        .iter()
+        .map(|anchor| {
+            format!(
+                "(order_line.ol_w_id = {} AND order_line.ol_d_id = {} AND order_line.ol_o_id = {})",
+                anchor.order.warehouse_id, anchor.order.district_id, anchor.order.id
+            )
+        })
+        .collect();
+
+    let order_filter = or_terms(order_terms)?;
+    let sum_filter = or_terms(sum_terms)?;
+    Ok(vec![
+        ExactSetupQuery {
+            id: "setup.sample.warehouse_content",
+            sql: format!(
+                "SELECT warehouse.w_id, warehouse.w_name, warehouse.w_state, warehouse.w_zip, warehouse.w_tax, warehouse.w_ytd FROM warehouse WHERE {}",
+                or_terms(warehouse_terms)?
+            ),
+            expected_rows: warehouse_expected,
+        },
+        ExactSetupQuery {
+            id: "setup.sample.district_to_warehouse",
+            sql: format!(
+                "SELECT district.d_w_id, district.d_id, district.d_name, district.d_state, district.d_zip, district.d_tax, district.d_ytd, district.d_next_o_id FROM district, warehouse WHERE ({}) AND warehouse.w_id = district.d_w_id",
+                or_terms(district_terms)?
+            ),
+            expected_rows: district_expected,
+        },
+        ExactSetupQuery {
+            id: "setup.sample.customer_to_district",
+            sql: format!(
+                "SELECT customer.c_w_id, customer.c_d_id, customer.c_id, customer.c_first, customer.c_middle, customer.c_last, customer.c_since, customer.c_credit, customer.c_discount, customer.c_balance, customer.c_ytd_payment, customer.c_payment_cnt, customer.c_delivery_cnt, customer.c_data FROM customer, district WHERE ({}) AND district.d_w_id = customer.c_w_id AND district.d_id = customer.c_d_id",
+                or_terms(customer_terms)?
+            ),
+            expected_rows: customer_expected,
+        },
+        ExactSetupQuery {
+            id: "setup.sample.orders_to_customer",
+            sql: format!(
+                "SELECT orders.o_w_id, orders.o_d_id, orders.o_id, orders.o_c_id, orders.o_entry_d, orders.o_carrier_id, orders.o_ol_cnt, orders.o_all_local FROM orders, customer WHERE ({order_filter}) AND customer.c_w_id = orders.o_w_id AND customer.c_d_id = orders.o_d_id AND customer.c_id = orders.o_c_id"
+            ),
+            expected_rows: order_expected,
+        },
+        ExactSetupQuery {
+            id: "setup.sample.new_orders_to_orders",
+            sql: format!(
+                "SELECT new_orders.no_w_id, new_orders.no_d_id, new_orders.no_o_id FROM new_orders, orders WHERE ({}) AND orders.o_w_id = new_orders.no_w_id AND orders.o_d_id = new_orders.no_d_id AND orders.o_id = new_orders.no_o_id",
+                or_terms(new_order_terms)?
+            ),
+            expected_rows: new_order_expected,
+        },
+        ExactSetupQuery {
+            id: "setup.sample.history_to_customer",
+            sql: format!(
+                "SELECT history.h_c_w_id, history.h_c_d_id, history.h_c_id, history.h_w_id, history.h_d_id, history.h_date, history.h_amount, history.h_data FROM history, customer WHERE ({}) AND customer.c_w_id = history.h_c_w_id AND customer.c_d_id = history.h_c_d_id AND customer.c_id = history.h_c_id",
+                or_terms(history_terms)?
+            ),
+            expected_rows: history_expected,
+        },
+        ExactSetupQuery {
+            id: "setup.sample.order_line_relationships",
+            sql: format!(
+                "SELECT order_line.ol_w_id, order_line.ol_d_id, order_line.ol_o_id, order_line.ol_number, order_line.ol_i_id, order_line.ol_supply_w_id, order_line.ol_delivery_d, order_line.ol_quantity, order_line.ol_amount, order_line.ol_dist_info FROM order_line, orders, item, stock WHERE ({}) AND orders.o_w_id = order_line.ol_w_id AND orders.o_d_id = order_line.ol_d_id AND orders.o_id = order_line.ol_o_id AND item.i_id = order_line.ol_i_id AND stock.s_w_id = order_line.ol_supply_w_id AND stock.s_i_id = order_line.ol_i_id",
+                or_terms(line_terms)?
+            ),
+            expected_rows: line_expected,
+        },
+        ExactSetupQuery {
+            id: "setup.sample.item_content",
+            sql: format!(
+                "SELECT item.i_id, item.i_name, item.i_price, item.i_data FROM item WHERE {}",
+                or_terms(item_terms)?
+            ),
+            expected_rows: item_expected,
+        },
+        ExactSetupQuery {
+            id: "setup.sample.stock_content",
+            sql: format!(
+                "SELECT stock.s_w_id, stock.s_i_id, stock.s_quantity, stock.s_ytd, stock.s_order_cnt, stock.s_remote_cnt, stock.s_data FROM stock WHERE {}",
+                or_terms(stock_terms)?
+            ),
+            expected_rows: stock_expected,
+        },
+        ExactSetupQuery {
+            id: "setup.sample.undelivered_order_sum",
+            sql: format!(
+                "SELECT order_line.ol_w_id, order_line.ol_d_id, order_line.ol_o_id, SUM(order_line.ol_amount) FROM order_line WHERE {} GROUP BY order_line.ol_w_id, order_line.ol_d_id, order_line.ol_o_id",
+                sum_filter
+            ),
+            expected_rows: sum_expected,
+        },
+    ])
+}
+
+fn or_terms(terms: Vec<String>) -> Result<String, TpccError> {
+    if terms.is_empty() {
+        return Err(TpccError::Protocol(
+            "setup evidence produced an empty bounded predicate".to_owned(),
+        ));
+    }
+    Ok(terms.join(" OR "))
+}
+
+fn district_typed_row(row: &DistrictSample) -> Vec<TypedValue> {
+    vec![
+        TypedValue::Int32(row.warehouse_id),
+        TypedValue::Int32(row.id),
+        TypedValue::Char(row.name.clone()),
+        TypedValue::Char(row.state.clone()),
+        TypedValue::Char(row.zip.clone()),
+        TypedValue::Float32(row.tax_bits),
+        TypedValue::Float32(row.ytd_bits),
+        TypedValue::Int32(row.next_order_id),
+    ]
+}
+
+fn history_typed_row(row: &HistorySample) -> Vec<TypedValue> {
+    vec![
+        TypedValue::Int32(row.customer_warehouse_id),
+        TypedValue::Int32(row.customer_district_id),
+        TypedValue::Int32(row.customer_id),
+        TypedValue::Int32(row.warehouse_id),
+        TypedValue::Int32(row.district_id),
+        TypedValue::Char(row.date.clone()),
+        TypedValue::Float32(row.amount_bits),
+        TypedValue::Char(row.data.clone()),
+    ]
+}
+
+fn order_line_typed_row(row: &OrderLineSample) -> Vec<TypedValue> {
+    vec![
+        TypedValue::Int32(row.warehouse_id),
+        TypedValue::Int32(row.district_id),
+        TypedValue::Int32(row.order_id),
+        TypedValue::Int32(row.number),
+        TypedValue::Int32(row.item_id),
+        TypedValue::Int32(row.supply_warehouse_id),
+        TypedValue::Char(row.delivery_date.clone()),
+        TypedValue::Int32(row.quantity),
+        TypedValue::Float32(row.amount_bits),
+        TypedValue::Char(row.dist_info.clone()),
+    ]
+}
+
+fn item_typed_row(row: &ItemSample) -> Vec<TypedValue> {
+    vec![
+        TypedValue::Int32(row.id),
+        TypedValue::Char(row.name.clone()),
+        TypedValue::Float32(row.price_bits),
+        TypedValue::Char(row.data.clone()),
+    ]
+}
+
+fn stock_typed_row(row: &StockSample) -> Vec<TypedValue> {
+    vec![
+        TypedValue::Int32(row.warehouse_id),
+        TypedValue::Int32(row.item_id),
+        TypedValue::Int32(row.quantity),
+        TypedValue::Float32(row.ytd_bits),
+        TypedValue::Int32(row.order_count),
+        TypedValue::Int32(row.remote_count),
+        TypedValue::Char(row.data.clone()),
+    ]
+}
+
+fn validate_exact_setup_rows(
+    id: &str,
+    result: TypedResult,
+    expected_rows: Vec<Vec<TypedValue>>,
+) -> Result<(), TpccError> {
+    if result.rows.len() != expected_rows.len() {
+        return Err(TpccError::QueryError(format!(
+            "LOAD content mismatch: {id} expected {} rows, got {}",
+            expected_rows.len(),
+            result.rows.len()
+        )));
+    }
+    let expected_shape = expected_rows
+        .first()
+        .ok_or_else(|| TpccError::Protocol(format!("{id} has no persisted expected setup rows")))?;
+    for row in &result.rows {
+        if row.len() != expected_shape.len() {
+            return Err(TpccError::Protocol(format!(
+                "{id} returned {} columns, expected {}",
+                row.len(),
+                expected_shape.len()
+            )));
+        }
+        for (column, (expected, actual)) in expected_shape.iter().zip(row).enumerate() {
+            if !same_typed_kind(expected, actual) {
+                return Err(TpccError::Protocol(format!(
+                    "{id} column {column} returned {}, expected {}",
+                    typed_kind(actual),
+                    typed_kind(expected)
+                )));
+            }
+        }
+    }
+    let mut matched = vec![false; expected_rows.len()];
+    for (row_index, actual) in result.rows.iter().enumerate() {
+        let Some(expected_index) =
+            expected_rows
+                .iter()
+                .enumerate()
+                .position(|(index, expected)| {
+                    !matched[index] && exact_setup_row_matches(expected, actual)
+                })
+        else {
+            return Err(TpccError::QueryError(format!(
+                "LOAD content mismatch: {id} returned unexpected row {row_index}"
+            )));
+        };
+        matched[expected_index] = true;
+    }
+    if matched.iter().all(|value| *value) {
+        Ok(())
+    } else {
+        Err(TpccError::QueryError(format!(
+            "LOAD content mismatch: {id} omitted a persisted setup row"
+        )))
+    }
+}
+
+fn exact_setup_row_matches(expected: &[TypedValue], actual: &[TypedValue]) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .all(|(expected, actual)| match (expected, actual) {
+                (TypedValue::Float32(expected), TypedValue::Float32(actual)) => {
+                    float32_matches(*expected, *actual, 0)
+                }
+                _ => expected == actual,
+            })
+}
+
+fn same_typed_kind(left: &TypedValue, right: &TypedValue) -> bool {
+    matches!(
+        (left, right),
+        (TypedValue::Null, TypedValue::Null)
+            | (TypedValue::Int32(_), TypedValue::Int32(_))
+            | (TypedValue::Float32(_), TypedValue::Float32(_))
+            | (TypedValue::Char(_), TypedValue::Char(_))
+    )
+}
+
+fn typed_kind(value: &TypedValue) -> &'static str {
+    match value {
+        TypedValue::Null => "NULL",
+        TypedValue::Int32(_) => "INT32",
+        TypedValue::Float32(_) => "FLOAT32",
+        TypedValue::Char(_) => "CHAR",
+    }
 }
 
 /// Execute the public final-2026 online gate with typed Wire values.
@@ -1279,5 +1768,106 @@ mod tests {
         assert_eq!(sample.len(), PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT);
         assert_eq!(sample.first().map(|item| item.0), Some((1, 1, 1)));
         assert_eq!(sample.last().map(|item| item.0), Some((1, 1, 100)));
+    }
+
+    #[test]
+    fn setup_sample_queries_are_bounded_and_cover_every_published_relationship() {
+        let evidence = setup_evidence_fixture(50, 2026);
+        let queries = setup_sample_queries(&evidence).unwrap();
+        assert_eq!(queries.len(), 10);
+        assert!(queries.iter().all(|query| query.sql.len() < 64 * 1024));
+
+        let district = queries
+            .iter()
+            .find(|query| query.id == "setup.sample.district_to_warehouse")
+            .unwrap();
+        assert!(district.sql.contains("warehouse.w_id = district.d_w_id"));
+        let customer = queries
+            .iter()
+            .find(|query| query.id == "setup.sample.customer_to_district")
+            .unwrap();
+        assert!(customer.sql.contains("district.d_w_id = customer.c_w_id"));
+        let orders = queries
+            .iter()
+            .find(|query| query.id == "setup.sample.orders_to_customer")
+            .unwrap();
+        assert!(orders.sql.contains("customer.c_id = orders.o_c_id"));
+        let new_orders = queries
+            .iter()
+            .find(|query| query.id == "setup.sample.new_orders_to_orders")
+            .unwrap();
+        assert!(new_orders.sql.contains("orders.o_id = new_orders.no_o_id"));
+        let lines = queries
+            .iter()
+            .find(|query| query.id == "setup.sample.order_line_relationships")
+            .unwrap();
+        for relation in [
+            "orders.o_id = order_line.ol_o_id",
+            "item.i_id = order_line.ol_i_id",
+            "stock.s_w_id = order_line.ol_supply_w_id",
+            "stock.s_i_id = order_line.ol_i_id",
+        ] {
+            assert!(lines.sql.contains(relation));
+        }
+        let history = queries
+            .iter()
+            .find(|query| query.id == "setup.sample.history_to_customer")
+            .unwrap();
+        assert!(history.sql.contains("customer.c_id = history.h_c_id"));
+        assert_eq!(
+            history.expected_rows.len(),
+            evidence.anchors.len(),
+            "history is checked in one bounded scan, not one full scan per anchor"
+        );
+    }
+
+    #[test]
+    fn exact_setup_rows_use_zero_ulp_and_exact_char_bytes() {
+        let expected = vec![
+            vec![
+                TypedValue::Int32(1),
+                TypedValue::Float32(0.0_f32.to_bits()),
+                TypedValue::Char(b"one".to_vec()),
+            ],
+            vec![
+                TypedValue::Int32(2),
+                TypedValue::Float32(1.0_f32.to_bits()),
+                TypedValue::Char(b"two".to_vec()),
+            ],
+        ];
+        let reordered_with_negative_zero = TypedResult {
+            rows: vec![
+                expected[1].clone(),
+                vec![
+                    TypedValue::Int32(1),
+                    TypedValue::Float32((-0.0_f32).to_bits()),
+                    TypedValue::Char(b"one".to_vec()),
+                ],
+            ],
+        };
+        assert!(validate_exact_setup_rows(
+            "setup.test",
+            reordered_with_negative_zero,
+            expected.clone()
+        )
+        .is_ok());
+
+        let mut one_ulp = expected.clone();
+        one_ulp[1][1] = TypedValue::Float32(1.0_f32.to_bits() + 1);
+        assert!(validate_exact_setup_rows(
+            "setup.test",
+            TypedResult { rows: one_ulp },
+            expected.clone()
+        )
+        .is_err());
+
+        let mut wrong_char = expected.clone();
+        wrong_char[0][2] = TypedValue::Char(b"One".to_vec());
+        assert!(validate_exact_setup_rows(
+            "setup.test",
+            TypedResult { rows: wrong_char },
+            expected
+        )
+        .is_err());
     }
 }
