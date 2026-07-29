@@ -125,6 +125,11 @@ pub async fn execute(
                 payment_count: customer_after.payment_count,
                 delivery_count: customer_after.delivery_count,
             },
+            history_timestamp: timestamp.as_bytes().to_vec(),
+            history_data: stage_two.history_data,
+            customer_is_bad_credit: stage_two.customer_is_bad_credit,
+            customer_data_before: snapshot.customer.data,
+            customer_data_after: stage_two.expected_customer_data,
         },
     )))
 }
@@ -454,6 +459,8 @@ fn parse_customer(row: &[WireValue]) -> SemanticResult<CustomerSnapshot> {
 struct StageTwo {
     operations: Vec<Operation>,
     expected_customer_data: Vec<u8>,
+    history_data: Vec<u8>,
+    customer_is_bad_credit: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -519,7 +526,7 @@ fn build_stage_two(
                 WireValue::Int32(i32::from(home_warehouse)),
                 WireValue::Char(timestamp.as_bytes().to_vec()),
                 amount,
-                WireValue::Char(h_data),
+                WireValue::Char(h_data.clone()),
             ],
         ),
         operation(
@@ -532,6 +539,8 @@ fn build_stage_two(
     Ok(StageTwo {
         operations,
         expected_customer_data,
+        history_data: h_data,
+        customer_is_bad_credit: snapshot.customer.credit == CustomerCredit::Bad,
     })
 }
 
@@ -934,6 +943,8 @@ mod tests {
             ]
         );
         assert_eq!(stage.expected_customer_data.len(), 50);
+        assert!(stage.customer_is_bad_credit);
+        assert_eq!(stage.history_data, b"WAREHOUSE    DISTRICT");
         assert!(stage
             .expected_customer_data
             .starts_with(b"321 7 50 4 3 5000.00 "));
@@ -986,6 +997,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stage.expected_customer_data, snapshot.customer.data);
+        assert!(!stage.customer_is_bad_credit);
         let results = result(
             &stage.operations,
             [(

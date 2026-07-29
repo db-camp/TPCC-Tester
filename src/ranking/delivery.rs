@@ -40,7 +40,7 @@ struct StageTwoIndices {
     line_sum: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LockedOrder {
     claim: DistrictClaim,
     customer_id: i32,
@@ -49,6 +49,7 @@ struct LockedOrder {
     customer_delivery_count: i32,
     line_count: u8,
     amount_bits: u32,
+    line_amount_bits: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +131,8 @@ pub async fn execute(
                 payment_count: after.payment_count,
                 delivery_count: after.delivery_count,
             },
+            delivery_timestamp: timestamp.as_bytes().to_vec(),
+            line_amount_bits: order.line_amount_bits,
         })
         .collect();
 
@@ -341,6 +344,7 @@ fn parse_stage_two(
             customer_delivery_count,
             line_count: line_rows.len() as u8,
             amount_bits,
+            line_amount_bits: amount_values,
         });
     }
 
@@ -619,6 +623,58 @@ mod tests {
                 WireValue::Int32(3017),
             ]
         );
+    }
+
+    #[test]
+    fn stage_two_retains_each_raw_line_for_recovery_evidence() {
+        let claims = [DistrictClaim {
+            district_id: 2,
+            order_id: 3001,
+        }];
+        let (operations, indices) = stage_two_operations(17, &claims);
+        let amounts = [
+            1.25_f32.to_bits(),
+            2.5_f32.to_bits(),
+            3.75_f32.to_bits(),
+            4.0_f32.to_bits(),
+            5.5_f32.to_bits(),
+        ];
+        let sum_bits = exact_f64_sum_to_f32_bits(&amounts).unwrap();
+        let response = BatchResponse::Ok {
+            executed_operations: operations.len() as u16,
+            results: vec![
+                query(1, vec![vec![WireValue::Int32(3001)]]),
+                query(2, vec![vec![WireValue::Int32(42)]]),
+                query(
+                    3,
+                    vec![vec![
+                        WireValue::Int32(42),
+                        WireValue::Float32(10.0_f32.to_bits()),
+                        WireValue::Int32(3),
+                        WireValue::Int32(4),
+                    ]],
+                ),
+                query(
+                    4,
+                    amounts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, bits)| {
+                            vec![
+                                WireValue::Int32((index + 1) as i32),
+                                WireValue::Float32(*bits),
+                            ]
+                        })
+                        .collect(),
+                ),
+                query(5, vec![vec![WireValue::Float32(sum_bits)]]),
+            ],
+        };
+        let results = accept_batch(response, &operations).unwrap();
+        let locked = parse_stage_two(&results, &claims, &indices).unwrap();
+        assert_eq!(locked.len(), 1);
+        assert_eq!(locked[0].line_amount_bits, amounts);
+        assert_eq!(locked[0].amount_bits, sum_bits);
     }
 
     #[test]

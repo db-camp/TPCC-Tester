@@ -373,6 +373,11 @@ impl LedgerEvent {
                         payment_count: delta.customer_payment_count_after,
                         delivery_count: delta.customer_delivery_count_after,
                     },
+                    history_timestamp: Vec::new(),
+                    history_data: Vec::new(),
+                    customer_is_bad_credit: false,
+                    customer_data_before: Vec::new(),
+                    customer_data_after: Vec::new(),
                 },
             )),
             Self::Delivery(delta) => RankedTransactionOutcome::Committed(RankedCommit::Delivery(
@@ -396,6 +401,8 @@ impl LedgerEvent {
                             payment_count: order.customer_payment_count_after,
                             delivery_count: order.customer_delivery_count_after,
                         },
+                        delivery_timestamp: Vec::new(),
+                        line_amount_bits: vec![0.0_f32.to_bits(); order.line_count as usize],
                     })
                     .collect(),
             )),
@@ -2468,6 +2475,11 @@ mod tests {
                 payment_count: 2,
                 delivery_count: 0,
             },
+            history_timestamp: b"2026-07-29 10:20:30".to_vec(),
+            history_data: b"W D".to_vec(),
+            customer_is_bad_credit: false,
+            customer_data_before: Vec::new(),
+            customer_data_after: Vec::new(),
         }))
     }
 
@@ -2491,6 +2503,15 @@ mod tests {
                 payment_count: 1,
                 delivery_count: 1,
             },
+            delivery_timestamp: b"2026-07-29 10:20:30".to_vec(),
+            line_amount_bits: vec![
+                10.0_f32.to_bits(),
+                20.0_f32.to_bits(),
+                30.0_f32.to_bits(),
+                19.0_f32.to_bits(),
+                10.0_f32.to_bits(),
+                10.25_f32.to_bits(),
+            ],
         }]))
     }
 

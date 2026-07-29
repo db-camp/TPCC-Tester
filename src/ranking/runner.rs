@@ -74,6 +74,11 @@ pub struct PaymentEvidence {
     pub customer_ytd_after_bits: u32,
     pub customer_version_before: CustomerVersion,
     pub customer_version_after: CustomerVersion,
+    pub history_timestamp: Vec<u8>,
+    pub history_data: Vec<u8>,
+    pub customer_is_bad_credit: bool,
+    pub customer_data_before: Vec<u8>,
+    pub customer_data_after: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +93,8 @@ pub struct DeliveredOrderEvidence {
     pub customer_balance_after_bits: u32,
     pub customer_version_before: CustomerVersion,
     pub customer_version_after: CustomerVersion,
+    pub delivery_timestamp: Vec<u8>,
+    pub line_amount_bits: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,6 +225,8 @@ mod tests {
                     payment_count: 1,
                     delivery_count: 1,
                 },
+                delivery_timestamp: b"2026-07-29 10:20:30".to_vec(),
+                line_amount_bits: vec![1.0_f32.to_bits(); 5],
             }])
             .delivery_processed(),
             1
