@@ -22,6 +22,7 @@ mod workload;
 
 use std::future::Future;
 use std::process;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -238,6 +239,36 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             );
         }
 
+        let setup_schema = if config.create_schema || config.init {
+            let seed = effective
+                .seed
+                .ok_or("validated setup configuration lost its seed")?;
+            let schema = if config.canonical_schema {
+                runtime_schema::RuntimeSchema::canonical(seed)?
+            } else {
+                runtime_schema::RuntimeSchema::opaque(seed)?
+            };
+            Some(Arc::new(schema))
+        } else {
+            None
+        };
+        let materialized = if config.init {
+            let schema = Arc::clone(
+                setup_schema
+                    .as_ref()
+                    .ok_or("validated init configuration lost its runtime schema")?,
+            );
+            let scale_factor = config.scale_factor;
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    loader::CsvMaterializer::new(scale_factor, &schema)?.materialize()
+                })
+                .await??,
+            )
+        } else {
+            None
+        };
+
         info!("连接 RMDB: {}:{} ...", config.host, config.port);
         let client = RmdbClient::connect_with_timeout(
             &config.host,
@@ -262,7 +293,13 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 
         if config.create_schema {
             info!("创建 TPC-C 表和索引");
-            let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
+            let mut ldr = loader::Loader::new(
+                &mut cursor,
+                config.scale_factor,
+                setup_schema
+                    .as_deref()
+                    .ok_or("validated schema setup lost its runtime schema")?,
+            );
             setup_step(setup_deadline, "create 9 tables", ldr.create_tables()).await?;
             setup_step(setup_deadline, "create 10 indexes", ldr.create_indexes()).await?;
             info!("TPC-C 表和索引创建完成");
@@ -270,11 +307,19 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 
         if config.init {
             info!("加载 TPC-C 初始数据 (scale_factor={})", config.scale_factor);
-            let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
+            let mut ldr = loader::Loader::new(
+                &mut cursor,
+                config.scale_factor,
+                setup_schema
+                    .as_deref()
+                    .ok_or("validated init configuration lost its runtime schema")?,
+            );
             let load = setup_step(
                 setup_deadline,
-                "generate/load 9 relations and verify 9 counts",
-                ldr.load_all_data(),
+                "load 9 pre-materialized relations and verify exactly 9 counts",
+                ldr.load_materialized(
+                    materialized.ok_or("validated init configuration lost its CSV assets")?,
+                ),
             )
             .await?;
             let (store, contract, claim, run_id, seed) = setup_run
