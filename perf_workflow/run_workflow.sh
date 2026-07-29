@@ -1,921 +1,732 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_RMDB_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-RMDB_DIR="${RMDB_DIR_OVERRIDE:-${DEFAULT_RMDB_DIR}}"
-WORK_ROOT="$(cd "${RMDB_DIR}/.." && pwd)"
-RECORD_ROOT_DEFAULT="${DEFAULT_RMDB_DIR}/performance_test_record"
-RECORD_ROOT="${RECORD_ROOT_OVERRIDE:-${RECORD_ROOT_DEFAULT}}"
-LOCAL_BIN="${HOME}/.local/bin"
+# This script owns process and filesystem lifecycle only. The Rust tester owns
+# the final2026 workload schedule, warmup, measurement windows, deadlines, and
+# semantic checks.
 
-export PATH="${LOCAL_BIN}:${PATH}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+DEFAULT_RMDB_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd -P)"
+DEFAULT_TPCC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 
 MODE="all"
-LABEL="manual"
+LABEL="final2026"
+DB_NAME="tpcc_final2026"
+RMDB_DIR="${RMDB_DIR_OVERRIDE:-${DEFAULT_RMDB_DIR}}"
+TPCC_DIR="${TPCC_TESTER_DIR:-${DEFAULT_TPCC_DIR}}"
+RECORD_ROOT=""
 BUILD_DIR="build-perf"
-BUILD_TYPE="RelWithDebInfo"
-DB_NAME="tpcc_sf50"
 HOST="127.0.0.1"
 PORT="8765"
-SCALE="50"
-THREADS="16"
-TRANSACTIONS="1000000"
-RW_RATIO="0.9130434782608695"
-TXN_PROBS="10 10 1 1 1"
-TPCC_DIR="${TPCC_TESTER_DIR:-}"
-TPCC_BIN=""
-TARGET_NAME="$(basename "${RMDB_DIR}")"
-INIT_DB=0
-RUN_CHECK=0
-RUN_DIAGNOSE=0
+PROFILE="final2026"
+SEED="2026"
+READY_TIMEOUT_SECONDS="90"
 SKIP_BUILD=0
-SKIP_PERF_RECORD=0
-PERF_RECORD_SECONDS=""
-PERF_STAT_EVENTS="task-clock,cpu-clock,context-switches,cpu-migrations,page-faults,minor-faults,major-faults,cycles,instructions,branches,branch-misses,cache-references,cache-misses,LLC-loads,LLC-load-misses,LLC-stores,LLC-store-misses,dTLB-loads,dTLB-load-misses,iTLB-loads,iTLB-load-misses"
-CALLGRIND_TRANSACTIONS="500"
-HEAPTRACK_TRANSACTIONS="500"
-WARMUP_TRANSACTIONS="40"
-WARMUP_SECONDS="30"
-MEASURE_SECONDS="60"
-TIMED_TRANSACTIONS_CAP="1000000"
-TIMED_SHUTDOWN_GRACE="10m"
-TPCC_TIMEOUT="5m"
-SERVER_START_TIMEOUT_SECONDS="120"
-DETACH=0
-KEEP_DB_ARTIFACTS=0
-RESULT_DIR=""
+PLAN_ONLY=0
+INIT_BEFORE_RUN=0
+CLEAN_DB_ON_EXIT="auto"
+ALLOW_DEVIATION=0
+SCALE=""
+CLIENTS=""
+WARMUP_SECONDS=""
+WINDOW_SECONDS=""
+SERVER_BIN_OVERRIDE=""
+TPCC_BIN_OVERRIDE=""
+
 SERVER_PID=""
+PROBE_PID=""
+STOPPING_SERVER=0
 SERVER_LOG=""
+RESULT_DIR=""
+RUN_TEMP_DIR=""
+CSV_DIR=""
+LOAD_DIR=""
+RUN_MARKER=""
+DB_MARKER=""
+OWNER_TOKEN=""
+DB_PATH=""
+DB_OWNED=0
+WORKFLOW_SUCCEEDED=0
 
 usage() {
   cat <<'EOF'
 Usage:
   run_workflow.sh [options]
 
-Options:
-  --mode <all|benchmark|perf|callgrind|heaptrack|tools>
-  --label <name>
-  --db-name <name>
-  --build-dir <dir>
-  --target-dir <dir>
-  --record-root <dir>
+Lifecycle modes:
+  --mode all         Create/load, rank, online-check, SIGKILL, restart, recovery-check
+  --mode init        Create/load a new database and retain it
+  --mode rank        Rank an existing database and run the online checks
+  --mode recovery    Start an existing database and run the recovery checks
+  --mode tools       Record available build/runtime tools only
+
+Official final2026 options:
+  --profile final2026
+  --seed <u64>
   --host <host>
   --port <port>
-  --scale <n>
-  --threads <n>
-  --transactions <n>
-  --rw-ratio <f>
-  --txn-probs "<new_order payment order_status delivery stock_level>"
-  --tpcc-dir <path>
-  --init-db
-  --check
-  --diagnose
+  --db-name <safe-single-component>
+
+Paths/build:
+  --target-dir <RMDB-root>
+  --tpcc-dir <TPCC-Tester-root>
+  --record-root <result-root>
+  --build-dir <relative-single-component>
+  --server-bin <path>
+  --tpcc-bin <path>
   --skip-build
-  --skip-perf-record
-  --perf-record-seconds <n>
-  --perf-stat-events <events>
-  --callgrind-transactions <n>
-  --heaptrack-transactions <n>
-  --warmup-transactions <n>
-  --warmup-seconds <n>
-  --measure-seconds <n>
-  --server-start-timeout-seconds <n>
-  --timed-shutdown-grace <duration>
-  --tpcc-timeout <duration>
-  --detach
+
+Lifecycle:
+  --init-db                    Initialize before --mode rank
+  --ready-timeout-seconds <n>  Default: 90
   --keep-db-artifacts
-  --help
+  --clean-db-on-exit
+  --label <safe-single-component>
+  --plan-only | --dry-run
+
+Short local deviations (never enabled implicitly):
+  --allow-deviation
+  --scale <n>
+  --clients <n>               --threads is accepted as an alias
+  --warmup-seconds <n>
+  --window-seconds <n>        --measure-seconds is accepted as an alias
+
+The shell deliberately has no transaction-mix, transaction-count, output-file,
+or per-window timeout controls. Those are part of the Rust final2026 contract.
 EOF
 }
 
 log() {
-  printf '[run_workflow] %s\n' "$*"
+  printf '[tpcc-workflow] %s\n' "$*"
 }
 
 die() {
-  printf '[run_workflow] ERROR: %s\n' "$*" >&2
+  printf '[tpcc-workflow] ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+need_value() {
+  local option="$1"
+  local value="${2-}"
+  [[ -n "${value}" ]] || die "${option} requires a value"
+}
+
+is_uint() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+validate_positive_integer() {
+  local option="$1"
+  local value="$2"
+  is_uint "${value}" || die "${option} must be a positive integer"
+  (( 10#${value} > 0 )) || die "${option} must be a positive integer"
+}
+
+validate_nonnegative_integer() {
+  local option="$1"
+  local value="$2"
+  is_uint "${value}" || die "${option} must be a non-negative integer"
+}
+
+validate_component() {
+  local option="$1"
+  local value="$2"
+  [[ -n "${value}" ]] || die "${option} must not be empty"
+  [[ "${value}" != "." && "${value}" != ".." ]] \
+    || die "${option} must be a safe single path component"
+  [[ "${value}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$ ]] \
+    || die "${option} must be a safe single path component"
+}
+
+canonical_existing_dir() {
+  local path="$1"
+  (cd "${path}" 2>/dev/null && pwd -P)
+}
+
+canonical_existing_file() {
+  local path="$1"
+  local directory=""
+  local filename=""
+  directory="$(dirname "${path}")"
+  filename="$(basename "${path}")"
+  directory="$(canonical_existing_dir "${directory}")" || return 1
+  [[ -f "${directory}/${filename}" ]] || return 1
+  printf '%s/%s\n' "${directory}" "${filename}"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mode) MODE="$2"; shift 2 ;;
-    --label) LABEL="$2"; shift 2 ;;
-    --db-name) DB_NAME="$2"; shift 2 ;;
-    --build-dir) BUILD_DIR="$2"; shift 2 ;;
-    --target-dir) RMDB_DIR="$2"; WORK_ROOT="$(cd "${RMDB_DIR}/.." && pwd)"; TARGET_NAME="$(basename "${RMDB_DIR}")"; shift 2 ;;
-    --record-root) RECORD_ROOT="$2"; shift 2 ;;
-    --host) HOST="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
-    --scale) SCALE="$2"; shift 2 ;;
-    --threads) THREADS="$2"; shift 2 ;;
-    --transactions) TRANSACTIONS="$2"; shift 2 ;;
-    --rw-ratio) RW_RATIO="$2"; shift 2 ;;
-    --txn-probs) TXN_PROBS="$2"; shift 2 ;;
-    --tpcc-dir) TPCC_DIR="$2"; shift 2 ;;
-    --init-db) INIT_DB=1; shift ;;
-    --check) RUN_CHECK=1; shift ;;
-    --diagnose) RUN_DIAGNOSE=1; shift ;;
-    --skip-build) SKIP_BUILD=1; shift ;;
-    --skip-perf-record) SKIP_PERF_RECORD=1; shift ;;
-    --perf-record-seconds) PERF_RECORD_SECONDS="$2"; shift 2 ;;
-    --perf-stat-events) PERF_STAT_EVENTS="$2"; shift 2 ;;
-    --callgrind-transactions) CALLGRIND_TRANSACTIONS="$2"; shift 2 ;;
-    --heaptrack-transactions) HEAPTRACK_TRANSACTIONS="$2"; shift 2 ;;
-    --warmup-transactions) WARMUP_TRANSACTIONS="$2"; shift 2 ;;
-    --warmup-seconds) WARMUP_SECONDS="$2"; shift 2 ;;
-    --measure-seconds) MEASURE_SECONDS="$2"; shift 2 ;;
-    --server-start-timeout-seconds) SERVER_START_TIMEOUT_SECONDS="$2"; shift 2 ;;
-    --timed-shutdown-grace) TIMED_SHUTDOWN_GRACE="$2"; shift 2 ;;
-    --tpcc-timeout) TPCC_TIMEOUT="$2"; shift 2 ;;
-    --detach) DETACH=1; shift ;;
-    --keep-db-artifacts) KEEP_DB_ARTIFACTS=1; shift ;;
-    --help) usage; exit 0 ;;
-    *) die "unknown argument: $1" ;;
+    --mode)
+      need_value "$1" "${2-}"; MODE="$2"; shift 2 ;;
+    --label)
+      need_value "$1" "${2-}"; LABEL="$2"; shift 2 ;;
+    --db-name)
+      need_value "$1" "${2-}"; DB_NAME="$2"; shift 2 ;;
+    --target-dir)
+      need_value "$1" "${2-}"; RMDB_DIR="$2"; shift 2 ;;
+    --tpcc-dir)
+      need_value "$1" "${2-}"; TPCC_DIR="$2"; shift 2 ;;
+    --record-root)
+      need_value "$1" "${2-}"; RECORD_ROOT="$2"; shift 2 ;;
+    --build-dir)
+      need_value "$1" "${2-}"; BUILD_DIR="$2"; shift 2 ;;
+    --host)
+      need_value "$1" "${2-}"; HOST="$2"; shift 2 ;;
+    --port)
+      need_value "$1" "${2-}"; PORT="$2"; shift 2 ;;
+    --profile)
+      need_value "$1" "${2-}"; PROFILE="$2"; shift 2 ;;
+    --seed)
+      need_value "$1" "${2-}"; SEED="$2"; shift 2 ;;
+    --ready-timeout-seconds|--server-start-timeout-seconds)
+      need_value "$1" "${2-}"; READY_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --server-bin)
+      need_value "$1" "${2-}"; SERVER_BIN_OVERRIDE="$2"; shift 2 ;;
+    --tpcc-bin)
+      need_value "$1" "${2-}"; TPCC_BIN_OVERRIDE="$2"; shift 2 ;;
+    --skip-build)
+      SKIP_BUILD=1; shift ;;
+    --init-db)
+      INIT_BEFORE_RUN=1; shift ;;
+    --keep-db-artifacts)
+      CLEAN_DB_ON_EXIT=0; shift ;;
+    --clean-db-on-exit)
+      CLEAN_DB_ON_EXIT=1; shift ;;
+    --plan-only|--dry-run)
+      PLAN_ONLY=1; shift ;;
+    --allow-deviation)
+      ALLOW_DEVIATION=1; shift ;;
+    --scale)
+      need_value "$1" "${2-}"; SCALE="$2"; shift 2 ;;
+    --clients|--threads)
+      need_value "$1" "${2-}"; CLIENTS="$2"; shift 2 ;;
+    --warmup-seconds)
+      need_value "$1" "${2-}"; WARMUP_SECONDS="$2"; shift 2 ;;
+    --window-seconds|--measure-seconds)
+      need_value "$1" "${2-}"; WINDOW_SECONDS="$2"; shift 2 ;;
+    --check)
+      # final2026 rank/all always run the prescribed checks.
+      shift ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      die "unknown or obsolete option: $1" ;;
   esac
 done
 
-validate_seconds_option() {
-  local name="$1"
-  local value="$2"
-  local allow_zero="$3"
-  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
-    die "${name} must be an integer number of seconds"
+if [[ "${MODE}" == "benchmark" ]]; then
+  MODE="rank"
+fi
+case "${MODE}" in
+  all|init|rank|recovery|tools) ;;
+  *) die "unsupported mode: ${MODE}" ;;
+esac
+
+validate_component "--db-name" "${DB_NAME}"
+validate_component "--label" "${LABEL}"
+validate_component "--build-dir" "${BUILD_DIR}"
+[[ "${PROFILE}" == "final2026" ]] || die "only --profile final2026 is supported"
+validate_nonnegative_integer "--seed" "${SEED}"
+validate_positive_integer "--port" "${PORT}"
+(( 10#${PORT} <= 65535 )) || die "--port must be at most 65535"
+validate_positive_integer "--ready-timeout-seconds" "${READY_TIMEOUT_SECONDS}"
+
+if [[ -n "${SCALE}${CLIENTS}${WARMUP_SECONDS}${WINDOW_SECONDS}" ]] \
+  && [[ "${ALLOW_DEVIATION}" != "1" ]]; then
+  die "local sizing/timing overrides require --allow-deviation"
+fi
+if [[ "${ALLOW_DEVIATION}" == "1" ]]; then
+  [[ -z "${SCALE}" ]] || validate_positive_integer "--scale" "${SCALE}"
+  [[ -z "${CLIENTS}" ]] || validate_positive_integer "--clients" "${CLIENTS}"
+  [[ -z "${WARMUP_SECONDS}" ]] \
+    || validate_nonnegative_integer "--warmup-seconds" "${WARMUP_SECONDS}"
+  [[ -z "${WINDOW_SECONDS}" ]] \
+    || validate_positive_integer "--window-seconds" "${WINDOW_SECONDS}"
+fi
+
+RMDB_DIR="$(canonical_existing_dir "${RMDB_DIR}")" \
+  || die "RMDB root does not exist: ${RMDB_DIR}"
+TPCC_DIR="$(canonical_existing_dir "${TPCC_DIR}")" \
+  || die "TPCC-Tester root does not exist: ${TPCC_DIR}"
+[[ "${RMDB_DIR}" != "/" ]] || die "refusing to use filesystem root as RMDB root"
+if [[ -n "${SERVER_BIN_OVERRIDE}" ]]; then
+  SERVER_BIN_OVERRIDE="$(canonical_existing_file "${SERVER_BIN_OVERRIDE}")" \
+    || die "--server-bin does not name an existing regular file"
+fi
+if [[ -n "${TPCC_BIN_OVERRIDE}" ]]; then
+  TPCC_BIN_OVERRIDE="$(canonical_existing_file "${TPCC_BIN_OVERRIDE}")" \
+    || die "--tpcc-bin does not name an existing regular file"
+fi
+
+if [[ -z "${RECORD_ROOT}" ]]; then
+  RECORD_ROOT="${RMDB_DIR}/performance_test_record"
+fi
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)_$$"
+RESULT_DIR="${RECORD_ROOT}/${RUN_ID}_${LABEL}"
+RUN_TEMP_DIR="${RMDB_DIR}/.tpcc-workflow/${RUN_ID}"
+CSV_DIR="${RUN_TEMP_DIR}/csv"
+LOAD_DIR="../.tpcc-workflow/${RUN_ID}/csv"
+RUN_MARKER="${RUN_TEMP_DIR}/.owner"
+DB_PATH="${RMDB_DIR}/${DB_NAME}"
+DB_MARKER="${DB_PATH}/.tpcc-workflow-owner"
+OWNER_TOKEN="tpcc-final2026:${RUN_ID}:${DB_PATH}"
+
+if [[ "${CLEAN_DB_ON_EXIT}" == "auto" ]]; then
+  if [[ "${MODE}" == "all" ]]; then
+    CLEAN_DB_ON_EXIT=1
+  else
+    CLEAN_DB_ON_EXIT=0
   fi
-  local numeric=$((10#${value}))
-  if [[ "${allow_zero}" == "1" ]]; then
-    if (( numeric < 0 )); then
-      die "${name} must be non-negative"
-    fi
-  elif (( numeric <= 0 )); then
-    die "${name} must be positive"
-  fi
+fi
+
+if [[ -n "${SERVER_BIN_OVERRIDE}" ]]; then
+  SERVER_BIN="${SERVER_BIN_OVERRIDE}"
+else
+  SERVER_BIN="${RMDB_DIR}/${BUILD_DIR}/bin/rmdb"
+fi
+if [[ -n "${TPCC_BIN_OVERRIDE}" ]]; then
+  TPCC_BIN="${TPCC_BIN_OVERRIDE}"
+else
+  TPCC_BIN="${TPCC_DIR}/target/release/tpcc-tester"
+fi
+
+print_plan() {
+  cat <<EOF
+mode=${MODE}
+profile=${PROFILE}
+seed=${SEED}
+rmdb_dir=${RMDB_DIR}
+tpcc_dir=${TPCC_DIR}
+build_dir=${RMDB_DIR}/${BUILD_DIR}
+server_bin=${SERVER_BIN}
+tpcc_bin=${TPCC_BIN}
+db_name=${DB_NAME}
+db_path=${DB_PATH}
+result_dir=${RESULT_DIR}
+csv_dir=${CSV_DIR}
+host=${HOST}
+port=${PORT}
+ready_probe=tpcc-tester --probe-ready --host ${HOST} --port ${PORT}
+schedule_owner=rust
+EOF
 }
 
-if [[ -n "${WARMUP_SECONDS}" ]]; then
-  validate_seconds_option "--warmup-seconds" "${WARMUP_SECONDS}" 1
-fi
-if [[ -n "${MEASURE_SECONDS}" ]]; then
-  validate_seconds_option "--measure-seconds" "${MEASURE_SECONDS}" 0
-fi
-if [[ -z "${PERF_RECORD_SECONDS}" ]]; then
-  PERF_RECORD_SECONDS="${MEASURE_SECONDS:-60}"
-fi
-validate_seconds_option "--perf-record-seconds" "${PERF_RECORD_SECONDS}" 0
-validate_seconds_option "--server-start-timeout-seconds" "${SERVER_START_TIMEOUT_SECONDS}" 0
-if [[ -z "${TPCC_DIR}" ]]; then
-  TPCC_DIR="${RMDB_DIR}/deps/TPCC-Tester"
+if [[ "${PLAN_ONLY}" == "1" ]]; then
+  print_plan
+  exit 0
 fi
 
-RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-RESULT_DIR="${RECORD_ROOT}/${RUN_TIMESTAMP}_${LABEL}"
-mkdir -p "${RESULT_DIR}"
+mkdir -p "${RECORD_ROOT}"
+[[ ! -e "${RESULT_DIR}" && ! -L "${RESULT_DIR}" ]] \
+  || die "result directory already exists: ${RESULT_DIR}"
+mkdir "${RESULT_DIR}"
+
+RUN_STATE_ROOT="${RMDB_DIR}/.tpcc-workflow"
+if [[ -e "${RUN_STATE_ROOT}" || -L "${RUN_STATE_ROOT}" ]]; then
+  [[ -d "${RUN_STATE_ROOT}" && ! -L "${RUN_STATE_ROOT}" ]] \
+    || die "workflow state root is not a safe directory: ${RUN_STATE_ROOT}"
+else
+  mkdir "${RUN_STATE_ROOT}"
+fi
+[[ ! -e "${RUN_TEMP_DIR}" && ! -L "${RUN_TEMP_DIR}" ]] \
+  || die "refusing to adopt an existing run directory: ${RUN_TEMP_DIR}"
+mkdir "${RUN_TEMP_DIR}"
+mkdir "${CSV_DIR}"
+printf '%s\n' "${OWNER_TOKEN}" >"${RUN_MARKER}"
 SERVER_LOG="${RESULT_DIR}/server.log"
 
-cleanup_server() {
-  if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    kill -INT "${SERVER_PID}" 2>/dev/null || true
-    for _ in $(seq 1 40); do
-      kill -0 "${SERVER_PID}" 2>/dev/null || break
-      sleep 0.25
-    done
-    if kill -0 "${SERVER_PID}" 2>/dev/null; then
-      kill -TERM "${SERVER_PID}" 2>/dev/null || true
-      sleep 1
-      kill -KILL "${SERVER_PID}" 2>/dev/null || true
-    fi
-    wait "${SERVER_PID}" 2>/dev/null || true
-  fi
-  while read -r pid; do
-    [[ -z "${pid}" ]] && continue
-    kill -TERM "${pid}" 2>/dev/null || true
-  done < <(port_listener_pids)
-  sleep 0.25
-  SERVER_PID=""
-}
-
-cleanup() {
-  cleanup_server
-  if declare -F generate_summary >/dev/null 2>&1; then
-    generate_summary || true
-  fi
-  if [[ "${DETACH}" == "0" && "${KEEP_DB_ARTIFACTS}" == "0" ]]; then
-    cleanup_database_artifacts
-  fi
-}
-trap cleanup EXIT
-
-write_file() {
-  local path="$1"
-  shift
-  printf '%s\n' "$@" >"${path}"
-}
-
-append_file() {
-  local path="$1"
-  shift
-  printf '%s\n' "$@" >>"${path}"
-}
-
-tool_path() {
-  which "$1" 2>/dev/null | head -n 1 || true
-}
-
-record_tool_status() {
-  local status_file="${RESULT_DIR}/tool_status.txt"
+write_manifest() {
   {
-    echo "perf=$(tool_path perf)"
-    echo "valgrind=$(tool_path valgrind)"
-    echo "callgrind_control=$(tool_path callgrind_control)"
-    echo "callgrind_annotate=$(tool_path callgrind_annotate)"
-    echo "flamegraph.pl=$(tool_path flamegraph.pl)"
-    echo "stackcollapse-perf.pl=$(tool_path stackcollapse-perf.pl)"
-    echo "heaptrack=$(tool_path heaptrack)"
-    echo "heaptrack_print=$(tool_path heaptrack_print)"
-    echo "heaptrack_gui=$(tool_path heaptrack_gui)"
-    echo "hotspot=$(tool_path hotspot)"
-    echo "trace_processor=$(tool_path trace_processor)"
-    echo "traceconv=$(tool_path traceconv)"
-    echo "home_flamegraph=${HOME}/FlameGraph"
-    if [[ -r /proc/sys/kernel/yama/ptrace_scope ]]; then
-      echo "kernel.yama.ptrace_scope=$(< /proc/sys/kernel/yama/ptrace_scope)"
-    else
-      echo "kernel.yama.ptrace_scope=unavailable"
-    fi
-  } >"${status_file}"
-  if [[ -x "$(tool_path hotspot)" ]]; then
-    {
-      echo
-      echo "[ldd hotspot]"
-      ldd "$(tool_path hotspot)" || true
-    } >>"${status_file}"
-  fi
-  if [[ -x "$(tool_path heaptrack_gui)" ]]; then
-    {
-      echo
-      echo "[ldd heaptrack_gui]"
-      ldd "$(tool_path heaptrack_gui)" || true
-    } >>"${status_file}"
-  fi
-}
-
-ensure_heaptrack_attach_allowed() {
-  local out_dir="$1"
-  local ptrace_scope_file="/proc/sys/kernel/yama/ptrace_scope"
-  local ptrace_log="${out_dir}/heaptrack_ptrace_scope.txt"
-
-  if [[ ! -e "${ptrace_scope_file}" ]]; then
-    echo "kernel.yama.ptrace_scope=unavailable" >"${ptrace_log}"
-    return 0
-  fi
-  if [[ ! -r "${ptrace_scope_file}" ]]; then
-    echo "kernel.yama.ptrace_scope=unreadable" >"${ptrace_log}"
-    return 0
-  fi
-
-  local current_scope
-  current_scope="$(< "${ptrace_scope_file}")"
-  echo "kernel.yama.ptrace_scope.before=${current_scope}" >"${ptrace_log}"
-  if [[ "${current_scope}" == "0" ]]; then
-    echo "kernel.yama.ptrace_scope.after=${current_scope}" >>"${ptrace_log}"
-    return 0
-  fi
-
-  if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
-    die "heaptrack attach requires kernel.yama.ptrace_scope=0 or passwordless sudo"
-  fi
-
-  sudo -n sysctl -w kernel.yama.ptrace_scope=0 >>"${ptrace_log}" 2>&1 \
-    || die "failed to set kernel.yama.ptrace_scope=0; see ${ptrace_log}"
-  echo "kernel.yama.ptrace_scope.after=$(< "${ptrace_scope_file}")" >>"${ptrace_log}"
-}
-
-record_system_info() {
-  {
-    echo "date=$(date -Is 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')"
-    echo "cwd=${WORK_ROOT}"
-    echo "rmdb_dir=${RMDB_DIR}"
-    echo "result_dir=${RESULT_DIR}"
-    echo "kernel=$(uname -a)"
-    echo "os_release="
-    if [[ -r /etc/os-release ]]; then
-      cat /etc/os-release
-    else
-      sw_vers 2>/dev/null || true
-    fi
-  } >"${RESULT_DIR}/system_info.txt"
-}
-
-record_manifest() {
-  {
-    echo "mode=${MODE}"
-    echo "label=${LABEL}"
-    echo "db_name=${DB_NAME}"
-    echo "target_name=${TARGET_NAME}"
-    echo "target_dir=${RMDB_DIR}"
-    echo "build_dir=${BUILD_DIR}"
-    echo "record_root=${RECORD_ROOT}"
-    echo "host=${HOST}"
-    echo "port=${PORT}"
+    print_plan
+    echo "allow_deviation=${ALLOW_DEVIATION}"
     echo "scale=${SCALE}"
-    echo "threads=${THREADS}"
-    echo "transactions=${TRANSACTIONS}"
-    echo "rw_ratio=${RW_RATIO}"
-    echo "txn_probs=${TXN_PROBS}"
-    echo "tpcc_dir=${TPCC_DIR}"
-    echo "init_db=${INIT_DB}"
-    echo "run_check=${RUN_CHECK}"
-    echo "run_diagnose=${RUN_DIAGNOSE}"
-    echo "skip_build=${SKIP_BUILD}"
-    echo "skip_perf_record=${SKIP_PERF_RECORD}"
-    echo "perf_record_seconds=${PERF_RECORD_SECONDS}"
-    echo "perf_stat_events=${PERF_STAT_EVENTS}"
-    echo "callgrind_transactions=${CALLGRIND_TRANSACTIONS}"
-    echo "heaptrack_transactions=${HEAPTRACK_TRANSACTIONS}"
-    echo "warmup_transactions=${WARMUP_TRANSACTIONS}"
+    echo "clients=${CLIENTS}"
     echo "warmup_seconds=${WARMUP_SECONDS}"
-    echo "measure_seconds=${MEASURE_SECONDS}"
-    echo "timed_transactions_cap=${TIMED_TRANSACTIONS_CAP}"
-    echo "timed_shutdown_grace=${TIMED_SHUTDOWN_GRACE}"
-    echo "tpcc_timeout=${TPCC_TIMEOUT}"
-    echo "server_start_timeout_seconds=${SERVER_START_TIMEOUT_SECONDS}"
-    echo "keep_db_artifacts=${KEEP_DB_ARTIFACTS}"
+    echo "window_seconds=${WINDOW_SECONDS}"
   } >"${RESULT_DIR}/manifest.txt"
 }
 
-ensure_tpcc_tester() {
-  if [[ ! -f "${TPCC_DIR}/Cargo.toml" ]]; then
-    if [[ -d "${RMDB_DIR}/.git" || -f "${RMDB_DIR}/.git" ]]; then
-      log "initializing TPCC-Tester submodule"
-      git -C "${RMDB_DIR}" submodule update --init --recursive deps/TPCC-Tester \
-        >"${RESULT_DIR}/tpcc_submodule_update.log" 2>&1 || true
+record_tools() {
+  local tool
+  : >"${RESULT_DIR}/tool_status.txt"
+  for tool in bash cmake cargo python3; do
+    if command -v "${tool}" >/dev/null 2>&1; then
+      printf '%s=%s\n' "${tool}" "$(command -v "${tool}")" \
+        >>"${RESULT_DIR}/tool_status.txt"
+    else
+      printf '%s=\n' "${tool}" >>"${RESULT_DIR}/tool_status.txt"
     fi
+  done
+  uname -a >"${RESULT_DIR}/system_info.txt" 2>&1 || true
+}
+
+owned_marker_matches() {
+  local marker="$1"
+  [[ -f "${marker}" ]] || return 1
+  [[ "$(sed -n '1p' "${marker}")" == "${OWNER_TOKEN}" ]]
+}
+
+stop_server() {
+  local pid="${SERVER_PID}"
+  local attempts=0
+  [[ -n "${pid}" ]] || return 0
+  if [[ "${STOPPING_SERVER}" == "1" ]]; then
+    kill -KILL "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    SERVER_PID=""
+    return 0
   fi
-  [[ -f "${TPCC_DIR}/Cargo.toml" ]] \
-    || die "TPCC-Tester submodule not found at ${TPCC_DIR}; run: git submodule update --init --recursive deps/TPCC-Tester"
-  log "building TPCC-Tester"
-  cargo build --release --manifest-path "${TPCC_DIR}/Cargo.toml" \
-    >"${RESULT_DIR}/tpcc_build.log" 2>&1
-  TPCC_BIN="${TPCC_DIR}/target/release/tpcc-tester"
-  [[ -x "${TPCC_BIN}" ]] || die "tpcc-tester binary not found at ${TPCC_BIN}"
-}
-
-build_rmdb() {
-  [[ "${SKIP_BUILD}" == "1" ]] && return 0
-  log "configuring RMDB into ${BUILD_DIR}"
-  cmake -S "${RMDB_DIR}" -B "${RMDB_DIR}/${BUILD_DIR}" \
-    -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-    -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O2 -g -fno-omit-frame-pointer" \
-    >"${RESULT_DIR}/cmake_configure.log" 2>&1
-  log "building RMDB"
-  cmake --build "${RMDB_DIR}/${BUILD_DIR}" --target rmdb -j"$(nproc)" \
-    >"${RESULT_DIR}/cmake_build.log" 2>&1
-}
-
-server_bin() {
-  printf '%s\n' "${RMDB_DIR}/${BUILD_DIR}/bin/rmdb"
-}
-
-database_path() {
-  printf '%s\n' "${RMDB_DIR}/${DB_NAME}"
-}
-
-reset_database_dir() {
-  local db_path
-  db_path="$(database_path)"
-  if [[ -e "${db_path}" ]]; then
-    log "removing existing database directory ${db_path}"
-    rm -rf "${db_path}"
+  STOPPING_SERVER=1
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    wait "${pid}" 2>/dev/null || true
+    SERVER_PID=""
+    STOPPING_SERVER=0
+    return 0
   fi
+  kill -INT "${pid}" 2>/dev/null || true
+  while kill -0 "${pid}" 2>/dev/null && (( attempts < 40 )); do
+    sleep 0.25
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM "${pid}" 2>/dev/null || true
+    attempts=0
+    while kill -0 "${pid}" 2>/dev/null && (( attempts < 20 )); do
+      sleep 0.25
+      attempts=$((attempts + 1))
+    done
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL "${pid}" 2>/dev/null || true
+  fi
+  wait "${pid}" 2>/dev/null || true
+  SERVER_PID=""
+  STOPPING_SERVER=0
 }
 
-cleanup_database_artifacts() {
-  local db_path
-  db_path="$(database_path)"
-  if [[ -e "${db_path}" ]]; then
-    log "cleaning database directory ${db_path}"
-    rm -rf "${db_path}"
+stop_probe() {
+  local pid="${PROBE_PID}"
+  [[ -n "${pid}" ]] || return 0
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM "${pid}" 2>/dev/null || true
+    sleep 0.05
   fi
-  local table_data_dir="${RMDB_DIR}/src/test/performance_test/table_data"
-  if [[ -e "${table_data_dir}" ]]; then
-    log "cleaning generated CSV files in ${table_data_dir}"
-    rm -f "${table_data_dir}"/*.csv
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL "${pid}" 2>/dev/null || true
   fi
+  wait "${pid}" 2>/dev/null || true
+  PROBE_PID=""
 }
 
-port_listener_pids() {
-  ss -ltnpH "( sport = :${PORT} )" 2>/dev/null \
-    | grep -o 'pid=[0-9]\+' \
-    | cut -d= -f2 \
-    | sort -u
+crash_server() {
+  local pid="${SERVER_PID}"
+  [[ -n "${pid}" ]] || die "cannot crash an unregistered server"
+  kill -0 "${pid}" 2>/dev/null || die "registered server ${pid} is not running"
+  log "SIGKILL registered RMDB pid ${pid}"
+  kill -KILL "${pid}"
+  wait "${pid}" 2>/dev/null || true
+  SERVER_PID=""
 }
 
-describe_port_listeners() {
-  local found=0
-  while read -r pid; do
-    [[ -z "${pid}" ]] && continue
-    found=1
-    ps -p "${pid}" -o pid=,ppid=,cmd= || true
-  done < <(port_listener_pids)
-  if [[ "${found}" == "0" ]]; then
-    echo "(none)"
+remove_current_owned_database() {
+  [[ "${DB_OWNED}" == "1" ]] || return 0
+  [[ "${DB_PATH}" == "${RMDB_DIR}/${DB_NAME}" ]] \
+    || die "internal database path invariant failed"
+  [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] || return 0
+  owned_marker_matches "${DB_MARKER}" \
+    || die "refusing to remove database without the current run ownership marker"
+  log "removing current run-owned database ${DB_PATH}"
+  rm -rf -- "${DB_PATH}"
+  DB_OWNED=0
+}
+
+remove_current_run_temp() {
+  [[ "${RUN_TEMP_DIR}" == "${RMDB_DIR}/.tpcc-workflow/${RUN_ID}" ]] || return 0
+  [[ -d "${RUN_TEMP_DIR}" && ! -L "${RUN_TEMP_DIR}" ]] || return 0
+  owned_marker_matches "${RUN_MARKER}" || return 0
+  rm -rf -- "${RUN_TEMP_DIR}"
+}
+
+cleanup() {
+  CLEANUP_RC=$?
+  local rc="${CLEANUP_RC}"
+  trap - EXIT
+  stop_probe || true
+  stop_server || true
+  if [[ "${WORKFLOW_SUCCEEDED}" == "1" && "${CLEAN_DB_ON_EXIT}" == "1" ]]; then
+    remove_current_owned_database || rc=$?
   fi
+  remove_current_run_temp || true
+  exit "${rc}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+check_cmake_cache_source() {
+  local cache="${RMDB_DIR}/${BUILD_DIR}/CMakeCache.txt"
+  local cached_source=""
+  [[ -f "${cache}" ]] || return 0
+  cached_source="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${cache}" | head -n 1)"
+  [[ -z "${cached_source}" || "${cached_source}" == "${RMDB_DIR}" ]] || {
+    die "stale CMake cache: ${cache} belongs to ${cached_source}; choose a fresh --build-dir (the workflow will not delete it)"
+  }
+}
+
+portable_jobs() {
+  local jobs=""
+  jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  if ! is_uint "${jobs}" || (( 10#${jobs} <= 0 )); then
+    jobs="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  fi
+  if ! is_uint "${jobs}" || (( 10#${jobs} <= 0 )); then
+    jobs=2
+  fi
+  printf '%s\n' "${jobs}"
+}
+
+ensure_binaries() {
+  if [[ "${SKIP_BUILD}" != "1" ]]; then
+    if [[ -z "${TPCC_BIN_OVERRIDE}" ]]; then
+      [[ -f "${TPCC_DIR}/Cargo.toml" ]] \
+        || die "Cargo.toml not found in TPCC-Tester root: ${TPCC_DIR}"
+      log "building TPCC-Tester"
+      cargo build --release --manifest-path "${TPCC_DIR}/Cargo.toml" \
+        >"${RESULT_DIR}/tpcc_build.log" 2>&1
+    fi
+
+    check_cmake_cache_source
+    log "configuring RMDB"
+    cmake -S "${RMDB_DIR}" -B "${RMDB_DIR}/${BUILD_DIR}" \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O2 -g -fno-omit-frame-pointer" \
+      >"${RESULT_DIR}/cmake_configure.log" 2>&1
+    log "building RMDB"
+    cmake --build "${RMDB_DIR}/${BUILD_DIR}" --target rmdb \
+      -j"$(portable_jobs)" >"${RESULT_DIR}/cmake_build.log" 2>&1
+  fi
+  [[ -x "${TPCC_BIN}" ]] || die "tpcc-tester is not executable: ${TPCC_BIN}"
+  [[ -x "${SERVER_BIN}" ]] || die "RMDB server is not executable: ${SERVER_BIN}"
 }
 
 ensure_port_available() {
-  local listeners
-  listeners="$(port_listener_pids || true)"
-  [[ -z "${listeners}" ]] && return 0
-  {
-    echo "port ${HOST}:${PORT} is already in use before startup"
-    echo
-    echo "[ss]"
-    ss -ltnp "( sport = :${PORT} )" || true
-    echo
-    echo "[ps]"
-    describe_port_listeners
-  } >"${RESULT_DIR}/port_conflict.txt"
-  die "port ${HOST}:${PORT} is already in use; stop the existing listener first. See ${RESULT_DIR}/port_conflict.txt"
+  if ! python3 - "${HOST}" "${PORT}" <<'PY'
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+addresses = {
+    (family, socktype, proto, address)
+    for family, socktype, proto, _, address in socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM)
+}
+if not addresses:
+    raise SystemExit(1)
+for family, socktype, proto, address in addresses:
+    sock = socket.socket(family, socktype, proto)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(address)
+    except OSError:
+        sock.close()
+        raise SystemExit(1)
+    sock.close()
+raise SystemExit(0)
+PY
+  then
+    die "port ${HOST}:${PORT} is already in use; the workflow will not kill its owner"
+  fi
 }
 
-wait_for_server() {
-  local timeout_seconds="${1:-20}"
-  local retries=$((timeout_seconds * 4))
-  while (( retries > 0 )); do
+probe_ready() {
+  (
+    cd "${TPCC_DIR}"
+    exec "${TPCC_BIN}" --probe-ready --host "${HOST}" --port "${PORT}"
+  ) >>"${RESULT_DIR}/ready_probe.log" 2>&1 &
+  PROBE_PID=$!
+
+  local attempts=0
+  local probe_rc=0
+  while kill -0 "${PROBE_PID}" 2>/dev/null && (( attempts < 40 )); do
+    sleep 0.05
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "${PROBE_PID}" 2>/dev/null; then
+    stop_probe
+    return 1
+  fi
+  wait "${PROBE_PID}" || probe_rc=$?
+  PROBE_PID=""
+  return "${probe_rc}"
+}
+
+wait_for_ready() {
+  local deadline=$(( $(date +%s) + 10#${READY_TIMEOUT_SECONDS} ))
+  while (( $(date +%s) <= deadline )); do
     if [[ -z "${SERVER_PID}" ]] || ! kill -0 "${SERVER_PID}" 2>/dev/null; then
       return 1
     fi
-    if [[ -z "$(port_listener_pids)" ]]; then
-      sleep 0.25
-      retries=$((retries - 1))
-      continue
-    fi
-    if python3 - <<PY
-import socket
-s = socket.socket()
-s.settimeout(0.2)
-try:
-    s.connect(("${HOST}", int("${PORT}")))
-except OSError:
-    raise SystemExit(1)
-else:
-    s.close()
-    raise SystemExit(0)
-PY
-    then
+    if probe_ready; then
       return 0
     fi
     sleep 0.25
-    retries=$((retries - 1))
   done
   return 1
 }
 
 start_server() {
-  local mode_name="$1"
-  shift || true
-  cleanup_server
+  local purpose="$1"
   ensure_port_available
-  : >"${SERVER_LOG}"
-  log "starting RMDB server (${mode_name})"
+  printf '\n[server start: %s]\n' "${purpose}" >>"${SERVER_LOG}"
+  log "starting RMDB for ${purpose}"
   (
     cd "${RMDB_DIR}"
-    RMDB_PORT="${PORT}" "$@" "$(server_bin)" "${DB_NAME}"
-  ) >"${SERVER_LOG}" 2>&1 &
+    exec env RMDB_PORT="${PORT}" "${SERVER_BIN}" "${DB_NAME}"
+  ) >>"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
-  local start_timeout="${SERVER_START_TIMEOUT_SECONDS}"
-  wait_for_server "${start_timeout}" || {
-    {
-      echo
-      echo "[ss after failed startup]"
-      ss -ltnp "( sport = :${PORT} )" || true
-      echo
-      echo "[ps after failed startup]"
-      describe_port_listeners
-    } >>"${SERVER_LOG}"
-    die "RMDB server failed to listen on ${HOST}:${PORT}; see ${SERVER_LOG}"
-  }
-  echo "${SERVER_PID}" >"${RESULT_DIR}/server.pid"
+  printf '%s\n' "${SERVER_PID}" >"${RESULT_DIR}/server.pid"
+  if ! wait_for_ready; then
+    stop_server
+    die "RMDB did not pass the exact show-tables readiness probe within ${READY_TIMEOUT_SECONDS}s; see ${SERVER_LOG}"
+  fi
 }
 
-run_tpcc() {
+claim_new_database() {
+  [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] \
+    || die "RMDB did not create the expected database directory: ${DB_PATH}"
+  [[ ! -e "${DB_MARKER}" ]] \
+    || die "new database unexpectedly already contains an ownership marker"
+  printf '%s\n' "${OWNER_TOKEN}" >"${DB_MARKER}"
+  DB_OWNED=1
+}
+
+start_new_database() {
+  if [[ -e "${DB_PATH}" || -L "${DB_PATH}" ]]; then
+    die "database path already exists: ${DB_PATH}; choose another --db-name or remove it explicitly"
+  fi
+  start_server "new database setup"
+  claim_new_database
+}
+
+start_existing_database() {
+  [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] \
+    || die "existing database directory is missing or unsafe: ${DB_PATH}"
+  start_server "existing database"
+}
+
+run_tester() {
   local log_path="$1"
   shift
   (
     cd "${TPCC_DIR}"
-    timeout "${TPCC_TIMEOUT}" "${TPCC_BIN}" --host "${HOST}" --port "${PORT}" -s "${SCALE}" "$@"
+    RMDB_TPCC_CSV_DIR="${CSV_DIR}" \
+    RMDB_TPCC_LOAD_DIR="${LOAD_DIR}" \
+      "${TPCC_BIN}" "$@"
   ) >"${log_path}" 2>&1
 }
 
-run_tpcc_for_seconds() {
+run_profile_tester() {
   local log_path="$1"
-  local seconds="$2"
-  shift 2
-  local rc=0
-  (
-    cd "${TPCC_DIR}"
-    timeout -s INT -k "${TIMED_SHUTDOWN_GRACE}" "${seconds}s" "${TPCC_BIN}" --host "${HOST}" --port "${PORT}" -s "${SCALE}" "$@"
-  ) >"${log_path}" 2>&1 || rc=$?
-
-  # GNU timeout exits 124 after sending SIGINT even when tpcc-tester catches it
-  # and prints the final benchmark report. Treat that as a successful timed run.
-  if [[ "${rc}" == "124" ]] && grep -q "TPC-C CONCURRENT BENCHMARK RESULTS" "${log_path}"; then
-    return 0
+  shift
+  local -a command
+  command=("$@")
+  if [[ "${ALLOW_DEVIATION}" == "1" ]]; then
+    command+=(--allow-deviation)
+    [[ -z "${SCALE}" ]] || command+=(--scale "${SCALE}")
+    [[ -z "${CLIENTS}" ]] || command+=(--clients "${CLIENTS}")
+    [[ -z "${WARMUP_SECONDS}" ]] \
+      || command+=(--warmup-seconds "${WARMUP_SECONDS}")
+    [[ -z "${WINDOW_SECONDS}" ]] \
+      || command+=(--window-seconds "${WINDOW_SECONDS}")
   fi
-  return "${rc}"
+  run_tester "${log_path}" "${command[@]}"
 }
 
-maybe_append_txn_probs() {
-  local -n cmd_ref=$1
-  if [[ -n "${TXN_PROBS}" ]]; then
-    cmd_ref+=(--txn-probs)
-    IFS=' ' read -r -a probs <<<"${TXN_PROBS}"
-    cmd_ref+=("${probs[@]}")
-  fi
+run_setup() {
+  log "creating and loading final2026 dataset"
+  run_profile_tester "${RESULT_DIR}/setup.log" \
+    --create-schema --init --profile "${PROFILE}" --seed "${SEED}" \
+    --host "${HOST}" --port "${PORT}" \
+    || die "TPC-C setup failed; see ${RESULT_DIR}/setup.log"
 }
 
-prepare_database() {
-  if [[ "${INIT_DB}" == "1" ]]; then
-    reset_database_dir
-  fi
-  start_server "prepare"
-  if [[ "${RUN_DIAGNOSE}" == "1" ]]; then
-    log "running TPCC diagnose -> ${RESULT_DIR}/diagnose.log"
-    run_tpcc "${RESULT_DIR}/diagnose.log" --diagnose \
-      || die "TPCC diagnose failed; see ${RESULT_DIR}/diagnose.log"
-  fi
-  if [[ "${INIT_DB}" == "1" ]]; then
-    log "running TPCC schema setup -> ${RESULT_DIR}/schema.log"
-    run_tpcc "${RESULT_DIR}/schema.log" --create-schema \
-      || die "TPCC schema setup failed; see ${RESULT_DIR}/schema.log"
-    log "running TPCC init -> ${RESULT_DIR}/init.log"
-    run_tpcc "${RESULT_DIR}/init.log" --init \
-      || die "TPCC init failed; see ${RESULT_DIR}/init.log"
-  fi
-  if [[ "${RUN_CHECK}" == "1" ]]; then
-    log "running TPCC check -> ${RESULT_DIR}/check.log"
-    run_tpcc "${RESULT_DIR}/check.log" --check --expected-new-orders 0 \
-      || die "TPCC check failed; see ${RESULT_DIR}/check.log"
-  fi
-  cleanup_server
+run_rank() {
+  log "running one Rust-owned final2026 benchmark"
+  run_profile_tester "${RESULT_DIR}/rank.log" \
+    --benchmark --profile "${PROFILE}" --seed "${SEED}" \
+    --host "${HOST}" --port "${PORT}" \
+    || die "TPC-C ranking failed; see ${RESULT_DIR}/rank.log"
 }
 
-run_benchmark_phase() {
-  local phase_name="$1"
-  local transactions="$2"
-  local log_path="${RESULT_DIR}/${phase_name}.log"
-  local benchmark_transactions="${transactions}"
-  if [[ -n "${MEASURE_SECONDS}" ]]; then
-    benchmark_transactions="${TIMED_TRANSACTIONS_CAP}"
-  fi
-  local cmd=(--benchmark --threads "${THREADS}" --transactions "${benchmark_transactions}" --rw-ratio "${RW_RATIO}")
-  maybe_append_txn_probs cmd
-  start_server "${phase_name}"
-  if [[ -n "${WARMUP_SECONDS}" ]]; then
-    if [[ "${WARMUP_SECONDS}" != "0" ]]; then
-      local warmup_log="${RESULT_DIR}/${phase_name}_warmup.log"
-      local warmup_cmd=(--benchmark --threads "${THREADS}" --transactions "${TIMED_TRANSACTIONS_CAP}" --rw-ratio "${RW_RATIO}")
-      maybe_append_txn_probs warmup_cmd
-      log "running TPCC warmup (${phase_name}, ${WARMUP_SECONDS}s) -> ${warmup_log}"
-      run_tpcc_for_seconds "${warmup_log}" "${WARMUP_SECONDS}" "${warmup_cmd[@]}" \
-        || die "TPCC warmup failed; see ${warmup_log}"
-    fi
-  elif [[ "${WARMUP_TRANSACTIONS}" != "0" ]]; then
-    local warmup_log="${RESULT_DIR}/${phase_name}_warmup.log"
-    local warmup_cmd=(--benchmark --threads "${THREADS}" --transactions "${WARMUP_TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
-    maybe_append_txn_probs warmup_cmd
-    log "running TPCC warmup (${phase_name}) -> ${warmup_log}"
-    run_tpcc "${warmup_log}" "${warmup_cmd[@]}" \
-      || die "TPCC warmup failed; see ${warmup_log}"
-  fi
-  if [[ -n "${MEASURE_SECONDS}" ]]; then
-    log "running TPCC benchmark (${phase_name}, ${MEASURE_SECONDS}s) -> ${log_path}"
-    run_tpcc_for_seconds "${log_path}" "${MEASURE_SECONDS}" "${cmd[@]}" \
-      || die "TPCC benchmark failed; see ${log_path}"
-  else
-    log "running TPCC benchmark (${phase_name}) -> ${log_path}"
-    run_tpcc "${log_path}" "${cmd[@]}" \
-      || die "TPCC benchmark failed; see ${log_path}"
-  fi
-  cleanup_server
+run_check() {
+  local scope="$1"
+  log "running ${scope} consistency checks"
+  run_profile_tester "${RESULT_DIR}/check_${scope}.log" \
+    --check --check-scope "${scope}" --profile "${PROFILE}" --seed "${SEED}" \
+    --host "${HOST}" --port "${PORT}" \
+    || die "TPC-C ${scope} checks failed; see ${RESULT_DIR}/check_${scope}.log"
 }
 
-run_timed_warmup_phase() {
-  local phase_name="$1"
-  local out_dir="$2"
-  if [[ -n "${WARMUP_SECONDS}" ]]; then
-    if [[ "${WARMUP_SECONDS}" == "0" ]]; then
-      return 0
-    fi
-    local warmup_log="${out_dir}/${phase_name}_warmup.log"
-    local warmup_cmd=(--benchmark --threads "${THREADS}" --transactions "${TIMED_TRANSACTIONS_CAP}" --rw-ratio "${RW_RATIO}")
-    maybe_append_txn_probs warmup_cmd
-    log "running TPCC warmup (${phase_name}, ${WARMUP_SECONDS}s) -> ${warmup_log}"
-    run_tpcc_for_seconds "${warmup_log}" "${WARMUP_SECONDS}" "${warmup_cmd[@]}"
-    return $?
-  fi
-  if [[ "${WARMUP_TRANSACTIONS}" != "0" ]]; then
-    local warmup_log="${out_dir}/${phase_name}_warmup.log"
-    local warmup_cmd=(--benchmark --threads "${THREADS}" --transactions "${WARMUP_TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
-    maybe_append_txn_probs warmup_cmd
-    log "running TPCC warmup (${phase_name}) -> ${warmup_log}"
-    run_tpcc "${warmup_log}" "${warmup_cmd[@]}"
-  fi
-}
-
-supported_perf_events() {
-  local events_csv="$1"
-  local supported=()
-  IFS=',' read -r -a candidates <<<"${events_csv}"
-  for event in "${candidates[@]}"; do
-    [[ -n "${event}" ]] || continue
-    if perf stat -x, -e "${event}" -- sleep 0.01 >/dev/null 2>&1; then
-      supported+=("${event}")
-    else
-      echo "${event}" >>"${RESULT_DIR}/perf_unsupported_events.txt"
-    fi
-  done
-  local joined
-  joined="$(IFS=,; echo "${supported[*]}")"
-  if [[ -z "${joined}" ]]; then
-    joined="task-clock,context-switches,cpu-migrations,page-faults"
-  fi
-  printf '%s\n' "${joined}"
-}
-
-run_perf_phase() {
-  local perf_dir="${RESULT_DIR}/perf"
-  mkdir -p "${perf_dir}"
-  local bench_log="${perf_dir}/benchmark.log"
-  local perf_stat="${perf_dir}/perf_stat.csv"
-  local perf_data="${perf_dir}/perf.data"
-  local perf_script_out="${perf_dir}/perf.script"
-  local perf_folded="${perf_dir}/perf.folded"
-  local perf_svg="${perf_dir}/perf.svg"
-  local bench_cmd=(--benchmark --threads "${THREADS}" --transactions "${TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
-  maybe_append_txn_probs bench_cmd
-
-  start_server "perf"
-  run_timed_warmup_phase "perf" "${perf_dir}" || true
-  local perf_event_list
-  perf_event_list="$(supported_perf_events "${PERF_STAT_EVENTS}")"
-  echo "${perf_event_list}" >"${perf_dir}/perf_stat_events.txt"
-
-  log "running perf stat"
-  "${TPCC_BIN}" --host "${HOST}" --port "${PORT}" -s "${SCALE}" "${bench_cmd[@]}" \
-    >"${bench_log}" 2>&1 &
-  local bench_pid=$!
-  sleep 1
-  perf stat -x, -o "${perf_stat}" \
-    -e "${perf_event_list}" \
-    -p "${SERVER_PID}" -- sleep "${PERF_RECORD_SECONDS}" \
-    >"${perf_dir}/perf_stat.stdout" 2>"${perf_dir}/perf_stat.stderr" || true
-  kill -INT "${bench_pid}" 2>/dev/null || true
-  wait "${bench_pid}" 2>/dev/null || true
-
-  if [[ "${SKIP_PERF_RECORD}" == "0" ]]; then
-    run_timed_warmup_phase "perf_record" "${perf_dir}" || true
-    log "running perf record"
-    "${TPCC_BIN}" --host "${HOST}" --port "${PORT}" -s "${SCALE}" "${bench_cmd[@]}" \
-      >"${perf_dir}/benchmark_record.log" 2>&1 &
-    bench_pid=$!
-    sleep 1
-    perf record -F 99 -g -e cpu-clock -o "${perf_data}" -p "${SERVER_PID}" -- sleep "${PERF_RECORD_SECONDS}" \
-      >"${perf_dir}/perf_record.stdout" 2>"${perf_dir}/perf_record.stderr" || true
-    kill -INT "${bench_pid}" 2>/dev/null || true
-    wait "${bench_pid}" 2>/dev/null || true
-
-    if [[ -s "${perf_data}" ]] && command -v stackcollapse-perf.pl >/dev/null 2>&1 && command -v flamegraph.pl >/dev/null 2>&1; then
-      perf script -i "${perf_data}" >"${perf_script_out}" 2>"${perf_dir}/perf_script.stderr" || true
-      stackcollapse-perf.pl "${perf_script_out}" >"${perf_folded}" 2>"${perf_dir}/stackcollapse.stderr" || true
-      flamegraph.pl "${perf_folded}" >"${perf_svg}" 2>"${perf_dir}/flamegraph.stderr" || true
-    fi
-  fi
-  cleanup_server
-}
-
-run_callgrind_phase() {
-  local out_dir="${RESULT_DIR}/callgrind"
-  mkdir -p "${out_dir}"
-  if ! command -v valgrind >/dev/null 2>&1; then
-    log "skipping callgrind: valgrind not found"
-    echo "skipped: valgrind not found" >"${out_dir}/skipped.txt"
-    return 0
-  fi
-  if ! command -v callgrind_control >/dev/null 2>&1; then
-    log "skipping callgrind: callgrind_control not found"
-    echo "skipped: callgrind_control not found" >"${out_dir}/skipped.txt"
-    return 0
-  fi
-  local callgrind_out="${out_dir}/callgrind.out"
-  local callgrind_online_out="${out_dir}/callgrind.online.out"
-  local callgrind_shutdown_out="${out_dir}/callgrind.shutdown.out"
-  local control_log="${out_dir}/callgrind_control.log"
-  start_server "callgrind" valgrind --tool=callgrind --instr-atstart=no --callgrind-out-file="${callgrind_out}"
-  run_timed_warmup_phase "callgrind" "${out_dir}" || true
-  log "starting callgrind counters after RMDB recovery"
+write_summary() {
   {
-    echo "[callgrind_control -i on ${SERVER_PID}]"
-    callgrind_control -i on "${SERVER_PID}"
+    echo "# TPCC final2026 workflow"
     echo
-    echo "[callgrind_control -z ${SERVER_PID}]"
-    callgrind_control -z "${SERVER_PID}"
-  } >"${control_log}" 2>&1 || die "callgrind_control failed; see ${control_log}"
-  local tpcc_rc=0
-  local bench_cmd=(--benchmark --threads "${THREADS}" --transactions "${CALLGRIND_TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
-  maybe_append_txn_probs bench_cmd
-  if [[ -n "${MEASURE_SECONDS}" && "${MEASURE_SECONDS}" != "0" ]]; then
-    log "running callgrind benchmark (${MEASURE_SECONDS}s) -> ${out_dir}/benchmark.log"
-    run_tpcc_for_seconds "${out_dir}/benchmark.log" "${MEASURE_SECONDS}" "${bench_cmd[@]}" || tpcc_rc=$?
-  else
-    log "running callgrind benchmark -> ${out_dir}/benchmark.log"
-    run_tpcc "${out_dir}/benchmark.log" "${bench_cmd[@]}" || tpcc_rc=$?
-  fi
-  log "dumping callgrind counters before RMDB shutdown"
-  {
-    echo
-    echo "[callgrind_control -d ${SERVER_PID}]"
-    callgrind_control -d "${SERVER_PID}"
-    echo
-    callgrind_dump=""
-    for candidate in "${out_dir}"/callgrind.out*; do
-      [[ -s "${candidate}" ]] || continue
-      callgrind_dump="${candidate}"
-    done
-    if [[ -n "${callgrind_dump}" ]]; then
-      echo "[copy online callgrind dump]"
-      echo "source=${callgrind_dump}"
-      cp "${callgrind_dump}" "${callgrind_online_out}"
-      ls -l "${callgrind_online_out}"
-    else
-      echo "[copy online callgrind dump]"
-      echo "missing callgrind dump matching ${out_dir}/callgrind.out*"
-    fi
-    echo
-    echo "[callgrind_control -i off ${SERVER_PID}]"
-    callgrind_control -i off "${SERVER_PID}"
-    echo
-    echo "[callgrind_control -z ${SERVER_PID}]"
-    callgrind_control -z "${SERVER_PID}"
-  } >>"${control_log}" 2>&1 || {
-    cleanup_server
-    die "callgrind final dump failed; see ${control_log}"
-  }
-  cleanup_server
-  if [[ -s "${callgrind_out}" ]]; then
-    cp "${callgrind_out}" "${callgrind_shutdown_out}" 2>/dev/null || true
-  fi
-  if [[ -s "${callgrind_online_out}" ]]; then
-    cp "${callgrind_online_out}" "${callgrind_out}"
-  fi
-  if [[ "${tpcc_rc}" != "0" ]]; then
-    return "${tpcc_rc}"
-  fi
-  if [[ -s "${callgrind_out}" ]]; then
-    callgrind_annotate --inclusive=yes "${callgrind_out}" >"${out_dir}/callgrind_annotate.txt" 2>"${out_dir}/callgrind_annotate.stderr" || true
-  fi
+    echo "- mode: ${MODE}"
+    echo "- profile: ${PROFILE}"
+    echo "- seed: ${SEED}"
+    echo "- status: success"
+    echo "- Rust owns warmup, all three formal windows, and semantic gates."
+  } >"${RESULT_DIR}/summary.md"
 }
 
-run_heaptrack_phase() {
-  local out_dir="${RESULT_DIR}/heaptrack"
-  mkdir -p "${out_dir}"
-  if ! command -v heaptrack >/dev/null 2>&1; then
-    log "skipping heaptrack: heaptrack not found"
-    echo "skipped: heaptrack not found" >"${out_dir}/skipped.txt"
-    return 0
-  fi
-  local heaptrack_cmd_log="${out_dir}/heaptrack_command.txt"
-  start_server "heaptrack"
-  run_timed_warmup_phase "heaptrack" "${out_dir}" || true
-  log "attaching heaptrack after RMDB recovery"
-  ensure_heaptrack_attach_allowed "${out_dir}"
-  local -a heaptrack_cmd=(heaptrack --pid "${SERVER_PID}")
-  printf '%q ' "${heaptrack_cmd[@]}" >"${heaptrack_cmd_log}"
-  printf '\n' >>"${heaptrack_cmd_log}"
-  (
-    cd "${out_dir}"
-    "${heaptrack_cmd[@]}"
-  ) \
-    >"${out_dir}/heaptrack.stdout" 2>"${out_dir}/heaptrack.stderr" &
-  local heaptrack_pid=$!
-  sleep 2
-  if ! kill -0 "${heaptrack_pid}" 2>/dev/null; then
-    wait "${heaptrack_pid}" 2>/dev/null || true
-    cleanup_server
-    die "heaptrack attach failed; see ${out_dir}/heaptrack.stderr"
-  fi
-  local tpcc_rc=0
-  local bench_cmd=(--benchmark --threads "${THREADS}" --transactions "${HEAPTRACK_TRANSACTIONS}" --rw-ratio "${RW_RATIO}")
-  maybe_append_txn_probs bench_cmd
-  if [[ -n "${MEASURE_SECONDS}" && "${MEASURE_SECONDS}" != "0" ]]; then
-    log "running heaptrack benchmark (${MEASURE_SECONDS}s) -> ${out_dir}/benchmark.log"
-    run_tpcc_for_seconds "${out_dir}/benchmark.log" "${MEASURE_SECONDS}" "${bench_cmd[@]}" || tpcc_rc=$?
-  else
-    log "running heaptrack benchmark -> ${out_dir}/benchmark.log"
-    run_tpcc "${out_dir}/benchmark.log" "${bench_cmd[@]}" || tpcc_rc=$?
-  fi
-  kill -INT "${heaptrack_pid}" 2>/dev/null || true
-  for _ in $(seq 1 40); do
-    kill -0 "${heaptrack_pid}" 2>/dev/null || break
-    sleep 0.25
-  done
-  if kill -0 "${heaptrack_pid}" 2>/dev/null; then
-    kill -TERM "${heaptrack_pid}" 2>/dev/null || true
-  fi
-  wait "${heaptrack_pid}" 2>/dev/null || true
-  cleanup_server
-  if [[ "${tpcc_rc}" != "0" ]]; then
-    return "${tpcc_rc}"
-  fi
-  local heaptrack_result=""
-  while IFS= read -r -d '' candidate; do
-    heaptrack_result="${candidate}"
-    break
-  done < <(find "${out_dir}" -maxdepth 1 -type f \
-    \( -name 'heaptrack*.gz' -o -name 'heaptrack*.zst' \) -print0 | sort -z)
-  if [[ -s "${heaptrack_result}" ]] && command -v heaptrack_print >/dev/null 2>&1; then
-    heaptrack_print "${heaptrack_result}" >"${out_dir}/heaptrack_print.txt" 2>"${out_dir}/heaptrack_print.stderr" || true
-  fi
-}
-
-generate_summary() {
-  python3 "${SCRIPT_DIR}/summarize_perf_run.py" "${RESULT_DIR}" >"${RESULT_DIR}/summary.md"
-}
-
-run_detached() {
-  local status_file="${RESULT_DIR}/detach_status.txt"
-  local script_copy="${RESULT_DIR}/run_detached_inner.sh"
-  cat >"${script_copy}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-trap '' HUP
-$(printf 'cd %q\n' "${WORK_ROOT}")
-$(printf 'export PATH=%q:"$PATH"\n' "${LOCAL_BIN}")
-  $(printf 'bash %q --mode %q --label %q --db-name %q --build-dir %q --target-dir %q --record-root %q --host %q --port %q --scale %q --threads %q --transactions %q --rw-ratio %q --perf-record-seconds %q --perf-stat-events %q --callgrind-transactions %q --heaptrack-transactions %q --warmup-transactions %q --server-start-timeout-seconds %q --timed-shutdown-grace %q %s %s %s %s %s %s %s %s\n' \
-  "${SCRIPT_DIR}/run_workflow.sh" "${MODE}" "${LABEL}" "${DB_NAME}" "${BUILD_DIR}" "${RMDB_DIR}" "${RECORD_ROOT}" "${HOST}" "${PORT}" "${SCALE}" "${THREADS}" "${TRANSACTIONS}" "${RW_RATIO}" "${PERF_RECORD_SECONDS}" "${PERF_STAT_EVENTS}" "${CALLGRIND_TRANSACTIONS}" "${HEAPTRACK_TRANSACTIONS}" "${WARMUP_TRANSACTIONS}" \
-  "${SERVER_START_TIMEOUT_SECONDS}" "${TIMED_SHUTDOWN_GRACE}" \
-  "$( [[ -n "${WARMUP_SECONDS}" ]] && echo "--warmup-seconds ${WARMUP_SECONDS}" )" \
-  "$( [[ -n "${MEASURE_SECONDS}" ]] && echo "--measure-seconds ${MEASURE_SECONDS}" )" \
-  "$( [[ "${INIT_DB}" == "1" ]] && echo --init-db )" \
-  "$( [[ "${RUN_CHECK}" == "1" ]] && echo --check )" \
-  "$( [[ "${RUN_DIAGNOSE}" == "1" ]] && echo --diagnose )" \
-  "$( [[ "${SKIP_BUILD}" == "1" ]] && echo --skip-build )" \
-  "$( [[ "${SKIP_PERF_RECORD}" == "1" ]] && echo --skip-perf-record )" \
-  "$( [[ "${KEEP_DB_ARTIFACTS}" == "1" ]] && echo --keep-db-artifacts )" )
-EOF
-  chmod +x "${script_copy}"
-  nohup "${script_copy}" >"${RESULT_DIR}/detach_stdout.log" 2>"${RESULT_DIR}/detach_stderr.log" &
-  local detached_pid=$!
-  {
-    echo "pid=${detached_pid}"
-    echo "result_dir=${RESULT_DIR}"
-  } >"${status_file}"
-  echo "${status_file}"
-}
-
-record_system_info
-record_manifest
-record_tool_status
-
-if [[ "${DETACH}" == "1" ]]; then
-  run_detached
-  exit 0
-fi
+write_manifest
+record_tools
 
 if [[ "${MODE}" == "tools" ]]; then
-  generate_summary
-  log "results written to ${RESULT_DIR}"
+  WORKFLOW_SUCCEEDED=1
+  write_summary
+  log "tool report written to ${RESULT_DIR}"
   exit 0
 fi
 
-ensure_tpcc_tester
-build_rmdb
-prepare_database
+ensure_binaries
 
 case "${MODE}" in
-  benchmark)
-    run_benchmark_phase "benchmark" "${TRANSACTIONS}"
+  init)
+    start_new_database
+    run_setup
+    run_check online
+    stop_server
     ;;
-  perf)
-    run_perf_phase
+  rank)
+    if [[ "${INIT_BEFORE_RUN}" == "1" ]]; then
+      start_new_database
+      run_setup
+    else
+      start_existing_database
+    fi
+    run_rank
+    run_check online
+    stop_server
     ;;
-  callgrind)
-    run_callgrind_phase
-    ;;
-  heaptrack)
-    run_heaptrack_phase
+  recovery)
+    start_existing_database
+    run_check recovery
+    stop_server
     ;;
   all)
-    run_benchmark_phase "benchmark" "${TRANSACTIONS}"
-    run_perf_phase
-    run_callgrind_phase
-    run_heaptrack_phase
-    ;;
-  *)
-    die "unsupported mode: ${MODE}"
+    start_new_database
+    run_setup
+    run_rank
+    run_check online
+    crash_server
+    start_existing_database
+    run_check recovery
+    stop_server
     ;;
 esac
 
-generate_summary
+WORKFLOW_SUCCEEDED=1
+write_summary
 log "results written to ${RESULT_DIR}"
