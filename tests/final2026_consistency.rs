@@ -9,7 +9,7 @@ use consistency::{
     validate_relative_update_chain, CheckScope, CommittedLedger, FloatAggregateId, IdentifierMap,
     LedgerFloatRule, OnlineKeySample, PartitionExpectation, PartitionKey, PlanError,
     PublicFloatLedgerEvidence, RecoveryExpectations, RelativeUpdateEvidence, ScalarExpectation,
-    SetupExpectations, TypedResult, TypedValue, FLOAT_AGGREGATES,
+    SetupExpectations, TypedResult, TypedValue, FINAL_WAREHOUSES, FLOAT_AGGREGATES,
     PUBLIC_RECOVERY_INTEGER_CHECK_COUNT, PUBLIC_SPEC_NOTICE,
 };
 
@@ -383,6 +383,28 @@ fn recovery_integer_gate_covers_sf1_and_sf50_dynamic_line_extremes() {
         expectation(&sf50_max_lines, "recovery.order_line.sum_quantity"),
         ScalarExpectation::ExactInt(112_500_000)
     );
+
+    let new_order_keys = sf1
+        .queries
+        .iter()
+        .find(|query| query.id == "recovery.new_orders.key_range")
+        .unwrap();
+    assert!(new_order_keys.sql.contains("no_o_id >= 2101"));
+
+    assert!(matches!(
+        recovery_plan(RecoveryExpectations {
+            setup: SetupExpectations {
+                warehouses: FINAL_WAREHOUSES + 1,
+                order_line_rows: 7_650_000,
+                undelivered_order_line_rows: 2_295_000,
+            },
+            committed: CommittedLedger::default(),
+        }),
+        Err(PlanError::WarehouseCountExceedsPublicMaximum {
+            actual: 51,
+            maximum: 50
+        })
+    ));
 }
 
 #[test]

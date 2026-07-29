@@ -621,7 +621,7 @@ pub struct CommittedLedger {
     pub delivered_order_lines: i64,
 }
 
-/// Public recovery expectations derived only from committed transaction counts.
+/// Public recovery expectations derived from committed transaction evidence.
 ///
 /// The official checker retains additional hidden per-transaction evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -779,6 +779,12 @@ impl RecoveryExpectations {
 /// must not be represented as a clone of the official checker. The separate
 /// 500-partition audit and seven FLOAT32 checks are not counted here.
 pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, PlanError> {
+    if input.setup.warehouses > FINAL_WAREHOUSES {
+        return Err(PlanError::WarehouseCountExceedsPublicMaximum {
+            actual: input.setup.warehouses,
+            maximum: FINAL_WAREHOUSES,
+        });
+    }
     let counts = input.expected_counts()?;
     let mut plan = ConsistencyPlan::default();
 
@@ -829,6 +835,7 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
         input.committed.new_orders,
         "maximum recovery order id",
     )?;
+    let minimum_new_order_id = ORDERS_PER_DISTRICT - NEW_ORDERS_PER_DISTRICT + 1;
     let maximum_next_order_id = checked_add(
         maximum_order_id,
         1,
@@ -1046,7 +1053,8 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
         format!(
             "SELECT COUNT(*) FROM new_orders WHERE no_w_id >= 1 \
              AND no_w_id <= {} AND no_d_id >= 1 \
-             AND no_d_id <= {DISTRICTS_PER_WAREHOUSE} AND no_o_id >= 1 \
+             AND no_d_id <= {DISTRICTS_PER_WAREHOUSE} \
+             AND no_o_id >= {minimum_new_order_id} \
              AND no_o_id <= {maximum_order_id}",
             input.setup.warehouses
         ),
