@@ -2,7 +2,7 @@
 
 `run_workflow.sh` 是 RMDB 与 Rust `tpcc-tester` 的安全生命周期封装。Shell 只负责构建、数据库目录、进程、日志、`SIGKILL` 和同库重启；事务选择、32 个持久连接、Wire v3、预热、连续三窗口、重试、语义门槛和排名都由一次 Rust benchmark 调用完成。
 
-这是公开决赛契约的本地等价实现，不是官方隐藏客户端。官方 seed、精确校验 SQL/答案、运行与连接标识符，以及未公开的 socket response deadline 无法从公开赛题复刻。脚本默认 `--seed 2026` 仅用于本地可复现性；结果应标记为 `public_spec_aligned`。
+这是公开决赛契约的本地等价实现，不是官方隐藏客户端。官方 seed、精确校验 SQL/答案、运行与连接标识符，以及未公开的 socket response deadline 无法从公开赛题复刻。脚本默认 `--seed 2026` 仅用于本地可复现性。只有完整 `all` 流程通过全部必需证明后，最终结果才会标记为 `public_spec_aligned`；计划、运行中状态和拆分模式不会预先宣称该结论。
 
 ## 默认契约
 
@@ -45,7 +45,8 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 8. 原数据库目录重启，并在 90 秒内通过同一个精确 readiness probe；
 9. 载入同一个 `state-dir` 执行恢复校验；
 10. 汇总两代 RMDB 的最大 RSS、数据库峰值/最终占用，并按 Rust 发布的正式三窗口边界计算 server 进程树 CPU；
-11. 写出结果；成功时默认仅清理本次创建且所有权标记匹配的数据库。
+11. 由 Rust tester 只读重放并校验 dataset/contract、setup、rank ledger、online baseline、四个 crash transition 和 recovery receipt 的完整状态链；
+12. 写出结果；成功时默认仅清理本次创建且所有权标记匹配的数据库。
 
 需要保留成功后的数据库时添加：
 
@@ -98,7 +99,7 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 推导。为兼容旧的调用包装，可以再次传入 `--db-name`，但它只作为断言使用，必须与
 状态中的名称完全一致；不一致会在启动 RMDB 前失败。
 
-这里 `rank` 执行正式测量与在线检查后会正常停止服务，`recovery` 只启动已有数据库并运行恢复检查；这三条拆分命令不等价于 `all` 中相邻的在线检查 → `SIGKILL` → 同库恢复链路。需要验证公开 crash lifecycle 时必须使用 `--mode all`。
+这里 `rank` 执行正式测量与在线检查后会正常停止服务，`recovery` 只启动已有数据库并运行恢复检查；这三条拆分命令不等价于 `all` 中相邻的在线检查 → `SIGKILL` → 同库恢复链路。需要验证公开 crash lifecycle 时必须使用 `--mode all`。拆分模式即使各自成功，`ranking_eligible` 也始终为 `false`。
 
 `--mode benchmark` 是 `rank` 的兼容别名。`--mode rank --init-db` 可在一次诊断调用中先创建/装载新数据库，再执行 rank 与在线检查。
 
@@ -179,7 +180,7 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 
 可用 `--record-root` 覆盖。目录包含：
 
-- `manifest.txt`、`manifest.json`、`tool_status.txt`、`system_info.txt`；
+- `manifest.json`（唯一权威结果）、`tool_status.txt`、`system_info.txt`；
 - tester/RMDB 构建日志；
 - `server.log`、`ready_probe.log` 和登记过的 `server.pid`；
 - `setup.log`、`rank.log`、`check_online.log`、`check_recovery.log`（按所选模式生成）；
@@ -187,6 +188,14 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 - `state/`（未指定外部 `--state-dir` 时，其中含 sealed
   `database.identity`）；
 - 成功后的 `summary.md`。
+
+`manifest.json` 使用通用 required-attestations 列表。只有公开配置精确匹配、
+数据库身份为 opaque + sealed、五个正式阶段均通过，并且 Rust 对完整正式状态链
+的只读验证成功，且工作流最终状态为 `success` 时，才同时给出
+`conformance=public_spec_aligned` 和 `ranking_eligible=true`。缺失、损坏或
+符号链接状态工件会使正式 attestation 失败；显式偏差、`init`/`rank`/`recovery`
+拆分模式和 `tools` 始终非排名。`summary.md` 只从 `manifest.json` 生成，不读取
+旧式文本 manifest；manifest 缺失、损坏、自相矛盾或状态非成功时不会抽取吞吐。
 
 资源工件始终标记 `ranked=false`、`score_effect=none`。RSS 是登记 RMDB
 进程树在固定周期采样时的总和峰值；磁盘占用使用 `lstat`/allocated blocks，
@@ -197,5 +206,9 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 跳变或工件损坏都会降级为 `partial`/`unavailable`，不会改变 workflow、语义
 门禁或排名结果。公开赛题没有披露官方资源采样器的精确周期，因此这里不会把
 本地 1 秒峰值宣称为官方隐藏采样值。
+
+资源或诊断采集的 `partial`、`unavailable`、`failed` 只会作为
+`ranking effect: none` 的 WARN 写入 manifest/summary，不参与 required
+attestation，也不会推翻已经通过的正式语义结果。
 
 日志和本地状态只用于复现与诊断，不能据此推断官方隐藏 seed、SQL、答案、标识符或未公开 deadline。
