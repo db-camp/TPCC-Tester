@@ -1,6 +1,7 @@
 mod checker;
 mod config;
 mod connection;
+pub mod consistency;
 mod data_gen;
 mod error;
 mod executor;
