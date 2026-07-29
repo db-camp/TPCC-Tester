@@ -158,6 +158,26 @@ pub enum StreamResponse {
     },
 }
 
+/// Terminal result of an incrementally folded `EXEC_STREAM` response.
+///
+/// Query state is returned only after a matching `RESULT_END`. Error and abort
+/// terminals intentionally carry no provisional state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FoldStreamResponse<T> {
+    Query {
+        columns: Vec<Column>,
+        row_count: u64,
+        state: T,
+    },
+    CommandOk,
+    TransactionAbort {
+        diagnostic: String,
+    },
+    Error {
+        diagnostic: String,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct Frame {
     pub(crate) tag: FrameTag,
@@ -252,6 +272,27 @@ where
         self.exec_stream_inner(sql, None).await
     }
 
+    /// Execute ordinary SQL while folding each typed row into caller-owned
+    /// bounded state.
+    ///
+    /// Callback errors are remembered while the response is fully drained and
+    /// validated. The connection therefore remains aligned when draining
+    /// succeeds, while the provisional state is discarded.
+    pub async fn exec_stream_fold<T, M, R>(
+        &mut self,
+        sql: &str,
+        state: T,
+        on_meta: M,
+        on_row: R,
+    ) -> WireResult<FoldStreamResponse<T>>
+    where
+        M: FnMut(&[Column], &mut T) -> WireResult<()>,
+        R: FnMut(&[Column], Vec<WireValue>, &mut T) -> WireResult<()>,
+    {
+        self.exec_stream_fold_inner(sql, None, state, on_meta, on_row)
+            .await
+    }
+
     pub(crate) async fn exec_stream_with_timeout(
         &mut self,
         sql: &str,
@@ -265,6 +306,60 @@ where
         sql: &str,
         timeout: Option<Duration>,
     ) -> WireResult<StreamResponse> {
+        match self
+            .exec_stream_fold_inner(
+                sql,
+                timeout,
+                Vec::new(),
+                |_, _| Ok(()),
+                |_, row, rows| {
+                    rows.push(row);
+                    Ok(())
+                },
+            )
+            .await?
+        {
+            FoldStreamResponse::Query {
+                columns,
+                row_count: _,
+                state: rows,
+            } => Ok(StreamResponse::Query { columns, rows }),
+            FoldStreamResponse::CommandOk => Ok(StreamResponse::CommandOk),
+            FoldStreamResponse::TransactionAbort { diagnostic } => {
+                Ok(StreamResponse::TransactionAbort { diagnostic })
+            }
+            FoldStreamResponse::Error { diagnostic } => Ok(StreamResponse::Error { diagnostic }),
+        }
+    }
+
+    pub(crate) async fn exec_stream_fold_with_timeout<T, M, R>(
+        &mut self,
+        sql: &str,
+        timeout: Duration,
+        state: T,
+        on_meta: M,
+        on_row: R,
+    ) -> WireResult<FoldStreamResponse<T>>
+    where
+        M: FnMut(&[Column], &mut T) -> WireResult<()>,
+        R: FnMut(&[Column], Vec<WireValue>, &mut T) -> WireResult<()>,
+    {
+        self.exec_stream_fold_inner(sql, Some(timeout), state, on_meta, on_row)
+            .await
+    }
+
+    async fn exec_stream_fold_inner<T, M, R>(
+        &mut self,
+        sql: &str,
+        timeout: Option<Duration>,
+        mut state: T,
+        mut on_meta: M,
+        mut on_row: R,
+    ) -> WireResult<FoldStreamResponse<T>>
+    where
+        M: FnMut(&[Column], &mut T) -> WireResult<()>,
+        R: FnMut(&[Column], Vec<WireValue>, &mut T) -> WireResult<()>,
+    {
         self.ensure_handshaken("EXEC_STREAM")?;
         if sql.is_empty() {
             return Err(WireError::Protocol(
@@ -293,7 +388,8 @@ where
             .await?;
 
         let mut columns: Option<Vec<Column>> = None;
-        let mut rows = Vec::new();
+        let mut row_count = 0_u64;
+        let mut callback_error = None;
 
         loop {
             let frame = self
@@ -306,18 +402,32 @@ where
                             "EXEC_STREAM response contains duplicate META".to_owned(),
                         ));
                     }
-                    if !rows.is_empty() {
+                    if row_count != 0 {
                         return Err(WireError::Protocol(
                             "EXEC_STREAM META arrived after ROW".to_owned(),
                         ));
                     }
-                    columns = Some(parse_meta(&frame.payload)?);
+                    let parsed = parse_meta(&frame.payload)?;
+                    if callback_error.is_none() {
+                        if let Err(error) = on_meta(&parsed, &mut state) {
+                            callback_error = Some(error);
+                        }
+                    }
+                    columns = Some(parsed);
                 }
                 FrameTag::Row => {
                     let schema = columns.as_ref().ok_or_else(|| {
                         WireError::Protocol("EXEC_STREAM ROW arrived before META".to_owned())
                     })?;
-                    rows.push(parse_row(&frame.payload, schema)?);
+                    let row = parse_row(&frame.payload, schema)?;
+                    row_count = row_count.checked_add(1).ok_or_else(|| {
+                        WireError::Protocol("EXEC_STREAM ROW count overflow".to_owned())
+                    })?;
+                    if callback_error.is_none() {
+                        if let Err(error) = on_row(schema, row, &mut state) {
+                            callback_error = Some(error);
+                        }
+                    }
                 }
                 FrameTag::CommandOk => {
                     ensure_empty(&frame.payload, "COMMAND_OK")?;
@@ -326,7 +436,7 @@ where
                             "query response terminated with COMMAND_OK".to_owned(),
                         ));
                     }
-                    return Ok(StreamResponse::CommandOk);
+                    return Ok(FoldStreamResponse::CommandOk);
                 }
                 FrameTag::ResultEnd => {
                     if columns.is_none() {
@@ -334,27 +444,28 @@ where
                             "RESULT_END arrived before META".to_owned(),
                         ));
                     }
-                    let row_count = parse_result_end(&frame.payload)?;
-                    let actual = u64::try_from(rows.len()).map_err(|_| {
-                        WireError::Protocol("ROW count does not fit u64".to_owned())
-                    })?;
-                    if row_count != actual {
+                    let declared_row_count = parse_result_end(&frame.payload)?;
+                    if declared_row_count != row_count {
                         return Err(WireError::Protocol(format!(
-                            "RESULT_END row_count {row_count} does not match {actual} ROW frames"
+                            "RESULT_END row_count {declared_row_count} does not match {row_count} ROW frames"
                         )));
                     }
-                    return Ok(StreamResponse::Query {
+                    if let Some(error) = callback_error {
+                        return Err(error);
+                    }
+                    return Ok(FoldStreamResponse::Query {
                         columns: columns.expect("META presence checked"),
-                        rows,
+                        row_count,
+                        state,
                     });
                 }
                 FrameTag::TransactionAbort => {
-                    return Ok(StreamResponse::TransactionAbort {
+                    return Ok(FoldStreamResponse::TransactionAbort {
                         diagnostic: parse_diagnostic(&frame.payload, "TRANSACTION_ABORT")?,
                     });
                 }
                 FrameTag::Error => {
-                    return Ok(StreamResponse::Error {
+                    return Ok(FoldStreamResponse::Error {
                         diagnostic: parse_diagnostic(&frame.payload, "ERROR")?,
                     });
                 }
@@ -694,6 +805,8 @@ impl<'a> PayloadReader<'a> {
 mod tests {
     use std::cmp;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::task::{Context, Poll};
 
     use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -814,6 +927,32 @@ mod tests {
         result
     }
 
+    async fn fold_exchange<T, M, R>(
+        response: Vec<u8>,
+        state: T,
+        on_meta: M,
+        on_row: R,
+    ) -> WireResult<FoldStreamResponse<T>>
+    where
+        M: FnMut(&[Column], &mut T) -> WireResult<()>,
+        R: FnMut(&[Column], Vec<WireValue>, &mut T) -> WireResult<()>,
+    {
+        let (client_io, mut server_io) = duplex(128);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io.write_all(&response).await.unwrap();
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await?;
+        let result = connection
+            .exec_stream_fold("select i from t;", state, on_meta, on_row)
+            .await;
+        server.await.unwrap();
+        result
+    }
+
     async fn server_handshake(stream: &mut tokio::io::DuplexStream) {
         let mut handshake = [0_u8; 8];
         stream.read_exact(&mut handshake).await.unwrap();
@@ -872,6 +1011,262 @@ mod tests {
                 ]],
             }
         );
+    }
+
+    #[tokio::test]
+    async fn folded_stream_retains_only_bounded_terminal_state() {
+        const ROWS: u64 = 4_096;
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct FoldState {
+            meta_seen: bool,
+            rows_seen: u64,
+            sum: i64,
+        }
+
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let mut response = frame(FrameTag::Meta, 0, 0, &columns);
+        for value in 0..ROWS {
+            let mut row = Vec::new();
+            encode_value(
+                SqlType::Int32,
+                &WireValue::Int32((value % 17) as i32),
+                &mut row,
+            )
+            .unwrap();
+            response.extend(frame(FrameTag::Row, 0, 0, &row));
+        }
+        response.extend(frame(FrameTag::ResultEnd, 0, 0, &ROWS.to_be_bytes()));
+
+        let result = fold_exchange(
+            response,
+            FoldState {
+                meta_seen: false,
+                rows_seen: 0,
+                sum: 0,
+            },
+            |columns, state| {
+                assert_eq!(columns.len(), 1);
+                assert_eq!(columns[0].sql_type, SqlType::Int32);
+                state.meta_seen = true;
+                Ok(())
+            },
+            |_, row, state| {
+                let [WireValue::Int32(value)] = row.as_slice() else {
+                    return Err(WireError::Protocol("unexpected folded row".to_owned()));
+                };
+                state.rows_seen += 1;
+                state.sum += i64::from(*value);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let FoldStreamResponse::Query {
+            columns,
+            row_count,
+            state,
+        } = result
+        else {
+            panic!("folded query returned a non-query terminal");
+        };
+        assert_eq!(columns[0].sql_type, SqlType::Int32);
+        assert_eq!(row_count, ROWS);
+        assert_eq!(
+            state,
+            FoldState {
+                meta_seen: true,
+                rows_seen: ROWS,
+                sum: (0..ROWS).map(|value| (value % 17) as i64).sum(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn folded_error_and_abort_discard_provisional_state() {
+        #[derive(Debug)]
+        struct DropState(Arc<AtomicUsize>);
+
+        impl Drop for DropState {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for terminal in [FrameTag::Error, FrameTag::TransactionAbort] {
+            let columns = meta(&[("i", SqlType::Int32)]);
+            let mut row = Vec::new();
+            encode_value(SqlType::Int32, &WireValue::Int32(42), &mut row).unwrap();
+            let mut response = frame(FrameTag::Meta, 0, 0, &columns);
+            response.extend(frame(FrameTag::Row, 0, 0, &row));
+            response.extend(frame(terminal, 0, 0, b"discard provisional state"));
+
+            let drops = Arc::new(AtomicUsize::new(0));
+            let result = fold_exchange(
+                response,
+                DropState(Arc::clone(&drops)),
+                |_, _| Ok(()),
+                |_, _, _| Ok(()),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                result,
+                FoldStreamResponse::Error { .. } | FoldStreamResponse::TransactionAbort { .. }
+            ));
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn folded_callback_error_drains_response_before_reuse() {
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let mut row = Vec::new();
+        encode_value(SqlType::Int32, &WireValue::Int32(42), &mut row).unwrap();
+
+        let (client_io, mut server_io) = duplex(128);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io
+                .write_all(&frame(FrameTag::Meta, 0, 0, &columns))
+                .await
+                .unwrap();
+            server_io
+                .write_all(&frame(FrameTag::Row, 0, 0, &row))
+                .await
+                .unwrap();
+            server_io
+                .write_all(&frame(FrameTag::ResultEnd, 0, 0, &1_u64.to_be_bytes()))
+                .await
+                .unwrap();
+
+            read_exec_request(&mut server_io).await;
+            server_io
+                .write_all(&frame(FrameTag::CommandOk, 0, 0, &[]))
+                .await
+                .unwrap();
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let error = connection
+            .exec_stream_fold(
+                "select i from t;",
+                (),
+                |_, _| Ok(()),
+                |_, _, _| {
+                    Err(WireError::Protocol(
+                        "folded row violates expected type".to_owned(),
+                    ))
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("violates expected type"));
+        assert_eq!(
+            connection.exec_stream("show tables;").await.unwrap(),
+            StreamResponse::CommandOk
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn folded_row_count_mismatch_discards_state() {
+        #[derive(Debug)]
+        struct DropState(Arc<AtomicUsize>);
+
+        impl Drop for DropState {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let mut row = Vec::new();
+        encode_value(SqlType::Int32, &WireValue::Int32(42), &mut row).unwrap();
+        let mut response = frame(FrameTag::Meta, 0, 0, &columns);
+        response.extend(frame(FrameTag::Row, 0, 0, &row));
+        response.extend(frame(FrameTag::ResultEnd, 0, 0, &2_u64.to_be_bytes()));
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let error = fold_exchange(
+            response,
+            DropState(Arc::clone(&drops)),
+            |_, _| Ok(()),
+            |_, _, _| Ok(()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("row_count 2 does not match 1 ROW"));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn folded_rows_share_one_absolute_response_deadline() {
+        #[derive(Debug)]
+        struct DropState(Arc<AtomicUsize>);
+
+        impl Drop for DropState {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let timeout = Duration::from_millis(200);
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let mut row = Vec::new();
+        encode_value(SqlType::Int32, &WireValue::Int32(42), &mut row).unwrap();
+        let (client_io, mut server_io) = duplex(128);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io
+                .write_all(&frame(FrameTag::Meta, 0, 0, &columns))
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(120)).await;
+            server_io
+                .write_all(&frame(FrameTag::Row, 0, 0, &row))
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(120)).await;
+            let _ = server_io
+                .write_all(&frame(FrameTag::ResultEnd, 0, 0, &1_u64.to_be_bytes()))
+                .await;
+        });
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let error = connection
+            .exec_stream_fold_with_timeout(
+                "select i from t;",
+                timeout,
+                DropState(Arc::clone(&drops)),
+                |_, _| Ok(()),
+                |_, _, _| Ok(()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WireError::Timeout {
+                phase: WireTimeoutPhase::ResponseRead,
+                ..
+            }
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(connection
+            .exec_stream("show tables;")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be reused"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

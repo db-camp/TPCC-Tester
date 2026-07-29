@@ -6,7 +6,9 @@ use tokio::net::TcpStream;
 use tracing::{debug, trace};
 
 use crate::connection::prepared::{BatchResponse, Operation, PrepareResponse, Statement};
-use crate::connection::wire::{StreamResponse, WireConnection, WireError, WireValue};
+use crate::connection::wire::{
+    Column, FoldStreamResponse, StreamResponse, WireConnection, WireError, WireResult, WireValue,
+};
 use crate::error::TpccError;
 
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -97,6 +99,27 @@ impl RmdbClient {
             .exec_stream_with_timeout(cmd, self.response_timeout)
             .await
             .map_err(|error| map_exec_wire_error(error, cmd))
+    }
+
+    /// Execute one typed streaming query while retaining only caller-defined
+    /// fold state. SQL text is deliberately omitted from logs and error
+    /// mapping so recovery sample keys cannot leak through diagnostics.
+    pub async fn exec_stream_fold<T, M, R>(
+        &mut self,
+        sql: &str,
+        state: T,
+        on_meta: M,
+        on_row: R,
+    ) -> Result<FoldStreamResponse<T>, TpccError>
+    where
+        M: FnMut(&[Column], &mut T) -> WireResult<()>,
+        R: FnMut(&[Column], Vec<WireValue>, &mut T) -> WireResult<()>,
+    {
+        trace!("发送有界流式折叠 SQL");
+        self.connection
+            .exec_stream_fold_with_timeout(sql, self.response_timeout, state, on_meta, on_row)
+            .await
+            .map_err(map_wire_error)
     }
 
     pub async fn prepare_set(
@@ -271,6 +294,46 @@ mod tests {
         .to_string();
         assert!(read.contains("response read timeout"));
         assert!(read.contains("show tables;"));
+    }
+
+    #[tokio::test]
+    async fn folded_stream_timeout_does_not_disclose_sql() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; HANDSHAKE.len()];
+            socket.read_exact(&mut handshake).await.unwrap();
+            socket.write_all(&handshake).await.unwrap();
+
+            let mut header = [0_u8; 8];
+            socket.read_exact(&mut header).await.unwrap();
+            let payload_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+            let mut payload = vec![0_u8; payload_bytes];
+            socket.read_exact(&mut payload).await.unwrap();
+            assert!(String::from_utf8(payload)
+                .unwrap()
+                .contains("sample_secret_417"));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut client =
+            RmdbClient::connect_with_timeout("127.0.0.1", port, Duration::from_millis(100))
+                .await
+                .unwrap();
+        let error = client
+            .exec_stream_fold(
+                "SELECT sample_secret_417;",
+                (),
+                |_, _| Ok(()),
+                |_, _, _| Ok(()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("response read timeout"), "{error}");
+        assert!(!error.contains("sample_secret_417"), "{error}");
+        server.await.unwrap();
     }
 
     #[tokio::test]
