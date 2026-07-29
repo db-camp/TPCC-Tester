@@ -630,13 +630,28 @@ impl DatasetState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StateAuthority {
+    LegacyLedger,
+    TerminalEvidence,
+}
+
 #[derive(Clone, Debug)]
 pub struct StateStore {
     root: PathBuf,
+    authority: StateAuthority,
 }
 
 impl StateStore {
     pub fn open(root: &Path) -> Result<Self, StateError> {
+        Self::open_with_authority(root, StateAuthority::LegacyLedger)
+    }
+
+    pub fn open_terminal(root: &Path) -> Result<Self, StateError> {
+        Self::open_with_authority(root, StateAuthority::TerminalEvidence)
+    }
+
+    fn open_with_authority(root: &Path, authority: StateAuthority) -> Result<Self, StateError> {
         match fs::symlink_metadata(root) {
             Ok(metadata) => validate_real_directory(root, &metadata)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -647,13 +662,25 @@ impl StateStore {
         }
         let store = Self {
             root: root.to_path_buf(),
+            authority,
         };
-        let _directory_lock = lock_clean_state_directory(&store.root)?;
+        let _directory_lock = store.lock_clean()?;
         drop(_directory_lock);
         Ok(store)
     }
 
     pub fn open_existing(root: &Path) -> Result<Self, StateError> {
+        Self::open_existing_with_authority(root, StateAuthority::LegacyLedger)
+    }
+
+    pub fn open_existing_terminal(root: &Path) -> Result<Self, StateError> {
+        Self::open_existing_with_authority(root, StateAuthority::TerminalEvidence)
+    }
+
+    fn open_existing_with_authority(
+        root: &Path,
+        authority: StateAuthority,
+    ) -> Result<Self, StateError> {
         let metadata = fs::symlink_metadata(root).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 StateError::Invalid(format!(
@@ -667,10 +694,32 @@ impl StateStore {
         validate_real_directory(root, &metadata)?;
         let store = Self {
             root: root.to_path_buf(),
+            authority,
         };
-        let _directory_lock = lock_clean_state_directory(&store.root)?;
+        let _directory_lock = store.lock_clean()?;
         drop(_directory_lock);
         Ok(store)
+    }
+
+    fn lock_clean(&self) -> Result<StateDirectoryLock, StateError> {
+        match self.authority {
+            StateAuthority::LegacyLedger => lock_clean_state_directory(&self.root),
+            StateAuthority::TerminalEvidence => lock_clean_terminal_state_directory(&self.root),
+        }
+    }
+
+    fn require_authority(&self, expected: StateAuthority) -> Result<(), StateError> {
+        if self.authority != expected {
+            return Err(StateError::Invalid(match expected {
+                StateAuthority::LegacyLedger => {
+                    "legacy run-ledger operation requires a legacy state store".to_owned()
+                }
+                StateAuthority::TerminalEvidence => {
+                    "terminal-evidence operation requires a terminal state store".to_owned()
+                }
+            }));
+        }
+        Ok(())
     }
 
     pub fn publish_setup_intent(
@@ -679,7 +728,7 @@ impl StateStore {
         seed: u64,
         contract: &RunContract,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        let _directory_lock = self.lock_clean()?;
         self.create_setup_intent(run_id, seed, contract)?;
         Ok(())
     }
@@ -708,7 +757,7 @@ impl StateStore {
         seed: u64,
         contract: &RunContract,
     ) -> Result<(SetupClaim, SetupClaimOrigin), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        let _directory_lock = self.lock_clean()?;
         let (intent_checksum, origin) =
             match fs::symlink_metadata(self.root.join(SETUP_INTENT_FILE)) {
                 Ok(_) => (
@@ -766,7 +815,7 @@ impl StateStore {
         contract: &RunContract,
         claim: SetupClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        let _directory_lock = self.lock_clean()?;
         dataset.validate()?;
         contract.validate(dataset)?;
         self.ensure_setup_execution_pending()?;
@@ -808,7 +857,7 @@ impl StateStore {
     }
 
     pub fn load_bound_dataset(&self, expected: &RunContract) -> Result<DatasetState, StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        let _directory_lock = self.lock_clean()?;
         let dataset = self.load_dataset_unlocked()?;
         self.contract_checksum(&dataset, expected)?;
         Ok(dataset)
@@ -819,7 +868,7 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<SetupCheckClaim, StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let claim_checksum = self.publish_marker(
@@ -842,7 +891,7 @@ impl StateStore {
         contract: &RunContract,
         claim: SetupCheckClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
             contract,
@@ -865,7 +914,7 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<RankClaim, StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let setup_claim = self.load_marker(
@@ -903,7 +952,8 @@ impl StateStore {
         claim: RankClaim,
         ledger: &RunLedger,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::LegacyLedger)?;
+        let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
             contract,
@@ -928,7 +978,8 @@ impl StateStore {
         claim: RankClaim,
         terminal_evidence: &SealedTerminalEvidence,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::TerminalEvidence)?;
+        let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
             contract,
@@ -962,7 +1013,8 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<(OnlineCheckClaim, RunLedger), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::LegacyLedger)?;
+        let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, ledger, ledger_checksum) =
             self.load_bound_ledger(dataset, contract)?;
@@ -991,7 +1043,8 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<(TerminalOnlineCheckClaim, PersistedTerminalEvidence), StateError> {
-        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::TerminalEvidence)?;
+        let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, terminal_evidence, terminal_evidence_checksum) =
             self.load_bound_terminal_evidence(dataset, contract)?;
@@ -1022,7 +1075,8 @@ impl StateStore {
         claim: OnlineCheckClaim,
         values: &BTreeMap<FloatAggregateId, u32>,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::LegacyLedger)?;
+        let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
             contract,
@@ -1058,7 +1112,8 @@ impl StateStore {
         claim: TerminalOnlineCheckClaim,
         values: &BTreeMap<FloatAggregateId, u32>,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::TerminalEvidence)?;
+        let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
             contract,
@@ -1094,7 +1149,8 @@ impl StateStore {
         contract: &RunContract,
         event: CrashLifecycleEvent,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::LegacyLedger)?;
+        let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, ledger_checksum, baseline_checksum) =
             self.load_crash_context(dataset, contract)?;
@@ -1132,7 +1188,8 @@ impl StateStore {
         contract: &RunContract,
         event: CrashLifecycleEvent,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::TerminalEvidence)?;
+        let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, terminal_evidence_checksum, baseline_checksum) =
             self.load_terminal_crash_context(dataset, contract)?;
@@ -1176,7 +1233,8 @@ impl StateStore {
         ),
         StateError,
     > {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::LegacyLedger)?;
+        let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, ledger, ledger_checksum) =
             self.load_bound_ledger(dataset, contract)?;
@@ -1221,7 +1279,8 @@ impl StateStore {
         ),
         StateError,
     > {
-        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::TerminalEvidence)?;
+        let _directory_lock = self.lock_clean()?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, terminal_evidence, terminal_evidence_checksum) =
             self.load_bound_terminal_evidence(dataset, contract)?;
@@ -1264,7 +1323,8 @@ impl StateStore {
         contract: &RunContract,
         claim: RecoveryCheckClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::LegacyLedger)?;
+        let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
             contract,
@@ -1308,7 +1368,8 @@ impl StateStore {
         contract: &RunContract,
         claim: TerminalRecoveryCheckClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::TerminalEvidence)?;
+        let _directory_lock = self.lock_clean()?;
         self.validate_claim(
             dataset,
             contract,
@@ -1361,7 +1422,8 @@ impl StateStore {
         contract: &RunContract,
         stage: DiagnosticStage,
     ) -> Result<DiagnosticClaim, StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::LegacyLedger)?;
+        let _directory_lock = self.lock_clean()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let predecessor_checksum = match stage {
             DiagnosticStage::Warmup => {
@@ -1424,7 +1486,8 @@ impl StateStore {
         contract: &RunContract,
         stage: DiagnosticStage,
     ) -> Result<TerminalDiagnosticClaim, StateError> {
-        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::TerminalEvidence)?;
+        let _directory_lock = self.lock_clean()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let predecessor_checksum = match stage {
             DiagnosticStage::Warmup => {
@@ -1491,7 +1554,8 @@ impl StateStore {
         contract: &RunContract,
         claim: DiagnosticClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::LegacyLedger)?;
+        let _directory_lock = self.lock_clean()?;
         let (claim_file, claim_artifact) = diagnostic_claim_spec(claim.stage);
         self.validate_claim(dataset, contract, claim.token, claim_file, claim_artifact)?;
         let (receipt_file, receipt_artifact) = diagnostic_receipt_spec(claim.stage);
@@ -1511,7 +1575,8 @@ impl StateStore {
         contract: &RunContract,
         claim: TerminalDiagnosticClaim,
     ) -> Result<(), StateError> {
-        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.require_authority(StateAuthority::TerminalEvidence)?;
+        let _directory_lock = self.lock_clean()?;
         let (claim_file, claim_artifact) = diagnostic_claim_spec(claim.stage);
         self.validate_claim(dataset, contract, claim.token, claim_file, claim_artifact)?;
         let (receipt_file, receipt_artifact) = diagnostic_receipt_spec(claim.stage);
@@ -1624,7 +1689,7 @@ impl StateStore {
     }
 
     pub fn load_dataset(&self) -> Result<DatasetState, StateError> {
-        let _directory_lock = lock_clean_state_directory(&self.root)?;
+        let _directory_lock = self.lock_clean()?;
         self.load_dataset_unlocked()
     }
 
@@ -3421,12 +3486,43 @@ fn lock_clean_state_directory(root: &Path) -> Result<StateDirectoryLock, StateEr
 }
 
 fn lock_clean_terminal_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
+    lock_clean_terminal_state_directory_with_hook(root, || Ok(()))
+}
+
+fn lock_clean_terminal_state_directory_with_hook(
+    root: &Path,
+    after_snapshot: impl FnOnce() -> Result<(), StateError>,
+) -> Result<StateDirectoryLock, StateError> {
     let directory_lock = lock_state_directory(root)?;
+    let entries = state_directory_snapshot(root)?;
+    ensure_snapshot_legacy_state_absent(&entries)?;
+    let temporaries = validate_orphan_temporary_snapshot(root, &entries)?;
+    after_snapshot()?;
     ensure_legacy_state_absent(root)?;
-    cleanup_orphan_temporary_files(root, &directory_lock.0)?;
+    cleanup_orphan_temporary_batch_with_fault(&directory_lock.0, &temporaries, |_| Ok(()))?;
     ensure_legacy_state_absent(root)?;
     validate_locked_directory_identity(root, &directory_lock.0)?;
     Ok(directory_lock)
+}
+
+fn ensure_snapshot_legacy_state_absent(entries: &[PathBuf]) -> Result<(), StateError> {
+    for path in entries {
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        if file_name == LEDGER_FILE
+            || file_name
+                .to_str()
+                .and_then(temporary_target_name)
+                .is_some_and(|target| target == LEDGER_FILE)
+        {
+            return Err(StateError::Invalid(format!(
+                "legacy run-ledger state is incompatible with terminal-evidence authority: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_legacy_state_absent(root: &Path) -> Result<(), StateError> {
@@ -3474,13 +3570,30 @@ struct OrphanTemporary {
 fn cleanup_orphan_temporary_files_with_fault(
     root: &Path,
     directory: &File,
-    mut inject_fault: impl FnMut(OrphanCleanupStep) -> std::io::Result<()>,
+    inject_fault: impl FnMut(OrphanCleanupStep) -> std::io::Result<()>,
 ) -> Result<(), StateError> {
-    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
+    let entries = state_directory_snapshot(root)?;
+    let temporaries = validate_orphan_temporary_snapshot(root, &entries)?;
+    cleanup_orphan_temporary_batch_with_fault(directory, &temporaries, inject_fault)
+}
+
+fn state_directory_snapshot(root: &Path) -> Result<Vec<PathBuf>, StateError> {
+    let mut entries = fs::read_dir(root)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    Ok(entries)
+}
+
+fn validate_orphan_temporary_snapshot(
+    root: &Path,
+    entries: &[PathBuf],
+) -> Result<Vec<OrphanTemporary>, StateError> {
     let mut temporaries = Vec::new();
     for entry in entries {
-        let file_name = entry.file_name();
+        let Some(file_name) = entry.file_name() else {
+            continue;
+        };
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
@@ -3488,7 +3601,7 @@ fn cleanup_orphan_temporary_files_with_fault(
             continue;
         };
 
-        let temporary = entry.path();
+        let temporary = entry;
         let temporary_metadata = fs::symlink_metadata(&temporary)?;
         if temporary_metadata.file_type().is_symlink() || !temporary_metadata.is_file() {
             return Err(StateError::Invalid(format!(
@@ -3522,11 +3635,18 @@ fn cleanup_orphan_temporary_files_with_fault(
             Err(error) => return Err(StateError::Io(error)),
         };
         temporaries.push(OrphanTemporary {
-            path: temporary,
+            path: temporary.to_path_buf(),
             linked_to_target,
         });
     }
+    Ok(temporaries)
+}
 
+fn cleanup_orphan_temporary_batch_with_fault(
+    directory: &File,
+    temporaries: &[OrphanTemporary],
+    mut inject_fault: impl FnMut(OrphanCleanupStep) -> std::io::Result<()>,
+) -> Result<(), StateError> {
     if temporaries
         .iter()
         .any(|temporary| temporary.linked_to_target)
@@ -3534,7 +3654,7 @@ fn cleanup_orphan_temporary_files_with_fault(
         inject_fault(OrphanCleanupStep::BeforeTargetSync)?;
         directory.sync_all()?;
     }
-    for temporary in &temporaries {
+    for temporary in temporaries {
         fs::remove_file(&temporary.path)?;
     }
     if !temporaries.is_empty() {
@@ -4182,7 +4302,7 @@ mod tests {
     #[test]
     fn terminal_evidence_authority_round_trips_the_complete_state_chain() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-terminal-chain", 79);
         let contract = sample_contract(1);
         let evidence = sample_terminal_evidence(&dataset);
@@ -4265,7 +4385,7 @@ mod tests {
     #[test]
     fn terminal_evidence_rejects_same_length_payload_damage_and_republication() {
         let directory = TestDirectory::new();
-        let store = StateStore::open(&directory.0).unwrap();
+        let store = StateStore::open_terminal(&directory.0).unwrap();
         let dataset = sample_dataset("run-terminal-damage", 80);
         let contract = sample_contract(1);
         let evidence = sample_terminal_evidence(&dataset);
@@ -4295,7 +4415,7 @@ mod tests {
     #[test]
     fn strict_terminal_lock_rejects_legacy_target_and_temporary_without_mutation() {
         let target_directory = TestDirectory::new();
-        let target_store = StateStore::open(&target_directory.0).unwrap();
+        let target_store = StateStore::open_terminal(&target_directory.0).unwrap();
         let target_dataset = sample_dataset("run-terminal-legacy-target", 82);
         let target_contract = sample_contract(1);
         let target_evidence = sample_terminal_evidence(&target_dataset);
@@ -4315,6 +4435,10 @@ mod tests {
         target_store
             .save_ledger(&target_dataset, &RunLedger::default())
             .unwrap();
+        let target_unrelated_temporary = target_directory
+            .0
+            .join(format!(".{DATASET_FILE}.{}.100.tmp", std::process::id()));
+        fs::write(&target_unrelated_temporary, b"dataset-provisional").unwrap();
         assert!(target_store
             .begin_online_check_from_terminal_evidence(&target_dataset, &target_contract)
             .is_err());
@@ -4323,16 +4447,16 @@ mod tests {
             terminal_before
         );
         assert!(target_directory.0.join(LEDGER_FILE).exists());
+        assert_eq!(
+            fs::read(&target_unrelated_temporary).unwrap(),
+            b"dataset-provisional"
+        );
 
         let temporary_directory = TestDirectory::new();
-        let temporary_store = StateStore::open(&temporary_directory.0).unwrap();
+        let temporary_store = StateStore::open_terminal(&temporary_directory.0).unwrap();
         let temporary_dataset = sample_dataset("run-terminal-legacy-temporary", 83);
         let temporary_contract = sample_contract(1);
-        let temporary_evidence = sample_terminal_evidence(&temporary_dataset);
         initialize_checked_run(&temporary_store, &temporary_dataset, &temporary_contract);
-        let temporary_rank = temporary_store
-            .begin_rank(&temporary_dataset, &temporary_contract)
-            .unwrap();
         let legacy_temporary = temporary_directory
             .0
             .join(format!(".{LEDGER_FILE}.{}.0.tmp", std::process::id()));
@@ -4344,12 +4468,7 @@ mod tests {
         fs::write(&unrelated_temporary, b"terminal-provisional").unwrap();
 
         assert!(temporary_store
-            .complete_rank_with_terminal_evidence(
-                &temporary_dataset,
-                &temporary_contract,
-                temporary_rank,
-                &temporary_evidence,
-            )
+            .begin_rank(&temporary_dataset, &temporary_contract)
             .is_err());
         assert_eq!(fs::read(&legacy_temporary).unwrap(), b"legacy-provisional");
         assert_eq!(
@@ -4357,6 +4476,59 @@ mod tests {
             b"terminal-provisional"
         );
         assert!(!temporary_directory.0.join(TERMINAL_EVIDENCE_FILE).exists());
+    }
+
+    #[test]
+    fn terminal_open_rejects_preexisting_legacy_state_without_cleanup() {
+        let target_directory = TestDirectory::new();
+        let target = target_directory.0.join(LEDGER_FILE);
+        let ordinary = target_directory
+            .0
+            .join(format!(".{DATASET_FILE}.{}.101.tmp", std::process::id()));
+        fs::write(&target, b"legacy-target").unwrap();
+        fs::write(&ordinary, b"ordinary-orphan").unwrap();
+
+        assert!(StateStore::open_terminal(&target_directory.0).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"legacy-target");
+        assert_eq!(fs::read(&ordinary).unwrap(), b"ordinary-orphan");
+
+        let temporary_directory = TestDirectory::new();
+        let legacy = temporary_directory
+            .0
+            .join(format!(".{LEDGER_FILE}.{}.102.tmp", std::process::id()));
+        let ordinary = temporary_directory
+            .0
+            .join(format!(".{DATASET_FILE}.{}.103.tmp", std::process::id()));
+        fs::write(&legacy, b"legacy-orphan").unwrap();
+        fs::write(&ordinary, b"ordinary-orphan").unwrap();
+
+        assert!(StateStore::open_existing_terminal(&temporary_directory.0).is_err());
+        assert_eq!(fs::read(&legacy).unwrap(), b"legacy-orphan");
+        assert_eq!(fs::read(&ordinary).unwrap(), b"ordinary-orphan");
+    }
+
+    #[test]
+    fn terminal_cleanup_rechecks_legacy_state_before_mutating_snapshot() {
+        let directory = TestDirectory::new();
+        let ordinary = directory
+            .0
+            .join(format!(".{DATASET_FILE}.{}.104.tmp", std::process::id()));
+        let injected_legacy = directory
+            .0
+            .join(format!(".{LEDGER_FILE}.{}.105.tmp", std::process::id()));
+        fs::write(&ordinary, b"ordinary-orphan").unwrap();
+
+        let result = lock_clean_terminal_state_directory_with_hook(&directory.0, || {
+            fs::write(&injected_legacy, b"injected-after-snapshot")?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&ordinary).unwrap(), b"ordinary-orphan");
+        assert_eq!(
+            fs::read(&injected_legacy).unwrap(),
+            b"injected-after-snapshot"
+        );
     }
 
     #[test]
