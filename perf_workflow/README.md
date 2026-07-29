@@ -14,6 +14,7 @@
 - 公开的 160 槽热点轮盘、参数冻结、逐窗口事务/Delivery/warehouse 覆盖门槛，以及三个 NewOrder/min 的中位数排名；
 - 在线校验通过后，向本次工作流登记的 RMDB PID 发送 `SIGKILL`；
 - 以同一数据库目录重启，最多 90 秒内通过完整 Wire `show tables;` readiness，随后执行恢复校验。
+- 从每次 RMDB 进程登记到退出，以固定 1 秒本地采样周期观察完整进程树 RSS、数据库目录占用和 CPU；这些资源值只用于诊断，不参与排名。
 
 脚本不提供事务数、事务混合、输出文件、窗口数量或窗口内 timeout 选项，避免 Shell 与 Rust 产生两套时间线。官方未公开的 response deadline 和 phase-tail grace 使用 Rust 的本地安全默认值，不能视作官方参数。
 
@@ -39,7 +40,8 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 7. 只对本次登记的 RMDB PID 执行 `SIGKILL`；
 8. 原数据库目录重启，并在 90 秒内通过同一个精确 readiness probe；
 9. 载入同一个 `state-dir` 执行恢复校验；
-10. 写出结果；成功时默认仅清理本次创建且所有权标记匹配的数据库。
+10. 汇总两代 RMDB 的最大 RSS、数据库峰值/最终占用，并按 Rust 发布的正式三窗口边界计算 server 进程树 CPU；
+11. 写出结果；成功时默认仅清理本次创建且所有权标记匹配的数据库。
 
 需要保留成功后的数据库时添加：
 
@@ -168,7 +170,18 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 - tester/RMDB 构建日志；
 - `server.log`、`ready_probe.log` 和登记过的 `server.pid`；
 - `setup.log`、`rank.log`、`check_online.log`、`check_recovery.log`（按所选模式生成）；
+- `resource_segment_<n>.json`（每代服务）、`rank_timeline.state`、`rank_completion.json` 和汇总后的 `resource_metrics.json`；
 - `state/`（未指定外部 `--state-dir` 时）；
 - 成功后的 `summary.md`。
+
+资源工件始终标记 `ranked=false`、`score_effect=none`。RSS 是登记 RMDB
+进程树在固定周期采样时的总和峰值；磁盘占用使用 `lstat`/allocated blocks，
+按 inode 去重硬链接并拒绝目录内符号链接；CPU 同时给出“单核为 100%”和主机
+逻辑 CPU 占比。采样器覆盖到服务进程组确认退出并回收 root，且清理信号只会
+在连续两次确认 helper 的启动身份和直接父子关系后发送。任一 generation
+缺失、身份不匹配、区间重叠、采样缺口、时钟
+跳变或工件损坏都会降级为 `partial`/`unavailable`，不会改变 workflow、语义
+门禁或排名结果。公开赛题没有披露官方资源采样器的精确周期，因此这里不会把
+本地 1 秒峰值宣称为官方隐藏采样值。
 
 日志和本地状态只用于复现与诊断，不能据此推断官方隐藏 seed、SQL、答案、标识符或未公开 deadline。

@@ -379,6 +379,65 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
             self.assertEqual(segment["root_identity_observed"], "linux:10")
             self.assertEqual(segment["warnings"], [])
 
+            class InterruptedBackend:
+                def metadata(self):
+                    return {"backend": "test"}
+
+                def process_table(self):
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return {
+                        10: {
+                            "ppid": 1,
+                            "pgid": 10,
+                            "identity": "linux:10",
+                            "strong_identity": "linux-strong:10",
+                            "cpu_ns": 100,
+                            "rss_bytes": 1_000,
+                        }
+                    }
+
+            interrupted_output = temp_path / "interrupted.json"
+            old_sigint = signal.getsignal(signal.SIGINT)
+            old_sigterm = signal.getsignal(signal.SIGTERM)
+            try:
+                with mock.patch.object(
+                    RESOURCE_SAMPLER,
+                    "select_backend",
+                    return_value=InterruptedBackend(),
+                ), mock.patch.object(
+                    RESOURCE_SAMPLER,
+                    "online_cpu_count",
+                    return_value=4,
+                ):
+                    RESOURCE_SAMPLER.sample_segment(
+                        argparse.Namespace(
+                            output=interrupted_output,
+                            run_id="early-stop-run",
+                            generation=1,
+                            root_pid=10,
+                            root_identity="linux:10",
+                            process_group=10,
+                            database_path=database,
+                            database_identity=(
+                                database_stat.st_dev,
+                                database_stat.st_ino,
+                            ),
+                            interval_ms=100,
+                            proc_root=Path("/unused"),
+                        )
+                    )
+            finally:
+                signal.signal(signal.SIGINT, old_sigint)
+                signal.signal(signal.SIGTERM, old_sigterm)
+            interrupted = RESOURCE_SAMPLER.validate_segment(
+                interrupted_output
+            )
+            self.assertEqual(interrupted["status"], "partial")
+            self.assertIn(
+                "sampler_stopped_before_root_exit",
+                {warning["code"] for warning in interrupted["warnings"]},
+            )
+
     def test_resource_aggregate_fails_closed_on_incomplete_evidence(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
@@ -515,6 +574,54 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
                 aggregate([first_path], 1)["rank_cpu"]["status"],
                 "unavailable",
             )
+
+    def test_resource_monitor_refuses_a_reused_pid_identity(self):
+        script_text = SCRIPT.read_text(encoding="utf-8")
+        monotonic_start = script_text.index("monotonic_millis() {")
+        monotonic_end = script_text.index(
+            "\n}\n\nprocess_identity() {",
+            monotonic_start,
+        ) + 3
+        helper_start = script_text.index(
+            "resource_monitor_process_helper() {"
+        )
+        helper_end = script_text.index(
+            "\n}\n\nresource_monitor_job_running() {",
+            helper_start,
+        ) + 3
+        with tempfile.TemporaryDirectory() as temp:
+            harness = self.make_executable(
+                Path(temp) / "resource-identity-test",
+                "set -euo pipefail\n"
+                + script_text[monotonic_start:monotonic_end]
+                + "\n"
+                + script_text[helper_start:helper_end]
+                + """
+python3 -c 'import time; time.sleep(30)' &
+victim_pid=$!
+trap 'kill -KILL "${victim_pid}" 2>/dev/null || true' EXIT
+identity="$(
+  resource_monitor_process_helper capture "${victim_pid}" "" "$$"
+)"
+if resource_monitor_process_helper signal "${victim_pid}" \
+    "stale:${identity}" "$$" TERM; then
+  exit 91
+fi
+kill -0 "${victim_pid}"
+resource_monitor_process_helper signal "${victim_pid}" \
+  "${identity}" "$$" TERM
+wait "${victim_pid}" 2>/dev/null || true
+trap - EXIT
+""",
+            )
+            result = subprocess.run(
+                ["bash", str(harness)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(
         sys.platform == "darwin",
@@ -1085,6 +1192,174 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(database_file.read_text(), "database")
             self.assertEqual(source_csv.read_text(), "tracked csv")
+            result_dir = next((Path(temp) / "records").iterdir())
+            manifest = json.loads(
+                (result_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["resources"]["status"],
+                "not_applicable",
+            )
+            self.assertEqual(
+                manifest["resources"]["artifact"]["status"],
+                "missing",
+            )
+            self.assertFalse((result_dir / "resource_metrics.json").exists())
+
+    def test_resource_helper_failure_is_warning_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            broken_helper = self.make_python_executable(
+                temp_path / "broken-resource-helper",
+                "raise SystemExit(19)\n",
+            )
+            env["RMDB_TPCC_RESOURCE_HELPER_OVERRIDE"] = str(broken_helper)
+            records = temp_path / "records"
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("resource", result.stderr.lower())
+            manifest = json.loads(
+                (next(records.iterdir()) / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "success")
+            self.assertEqual(manifest["phases"]["setup"], "passed")
+            self.assertEqual(manifest["resources"]["status"], "failed")
+            self.assertFalse(manifest["resources"]["ranked"])
+
+    def test_rank_cpu_uses_the_published_three_window_timeline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            database = root / "tpcc_final2026"
+            database.mkdir()
+            (database / "page").write_bytes(b"x" * 8_192)
+            state = temp_path / "state"
+            state.mkdir()
+            (state / "dataset.state").write_text(
+                "version=2\nrun_id=resource.timeline.test\n",
+                encoding="utf-8",
+            )
+            server = self.make_python_executable(
+                temp_path / "busy-rmdb",
+                """
+import os
+import signal
+import socket
+import sys
+
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("0.0.0.0", int(os.environ["RMDB_PORT"])))
+listener.listen(4)
+running = True
+def stop(_signum, _frame):
+    global running
+    running = False
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+value = 0
+while running:
+    value = (value + 1) % 1000003
+listener.close()
+""",
+            )
+            tester = self.make_python_executable(
+                temp_path / "timeline-tpcc",
+                """
+import os
+from pathlib import Path
+import sys
+import time
+
+if "--probe-ready" in sys.argv:
+    time.sleep(0.2)
+if "--benchmark" in sys.argv:
+    time.sleep(0.2)
+    output = Path(os.environ["RMDB_TPCC_RESOURCE_TIMELINE_FILE"])
+    origin = time.time_ns()
+    output.write_text(
+        "schema_version=1\\n"
+        "kind=final2026_rank_timeline\\n"
+        f"origin_unix_ns={origin}\\n"
+        "warmup_ns=0\\n"
+        "measurement_windows=3\\n"
+        "measurement_window_ns=1000000000\\n",
+        encoding="ascii",
+    )
+    time.sleep(3.4)
+""",
+            )
+            records = temp_path / "records"
+            result = self.run_script(
+                "--mode",
+                "rank",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--state-dir",
+                state,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                self.reserve_port(),
+                "--allow-deviation",
+                "--warmup-seconds",
+                "0",
+                "--window-seconds",
+                "1",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result_dir = next(records.iterdir())
+            metrics = json.loads(
+                (result_dir / "resource_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(metrics["status"], "available")
+            self.assertEqual(metrics["rank_cpu"]["status"], "available")
+            self.assertEqual(len(metrics["rank_cpu"]["windows"]), 3)
+            self.assertTrue(
+                all(
+                    window["coverage_ratio"] >= 0.999
+                    for window in metrics["rank_cpu"]["windows"]
+                )
+            )
+            self.assertGreater(
+                metrics["rank_cpu"]["combined"][
+                    "average_single_core_percent"
+                ],
+                1.0,
+            )
+            self.assertGreater(
+                metrics["rank_cpu"]["combined"]["peak_host_percent"],
+                0.0,
+            )
 
     def test_refuses_to_adopt_symlinked_workflow_state_root(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1989,6 +2264,11 @@ while :; do sleep 0.05; done
             manifest = json.loads(
                 (result_dirs[0] / "manifest.json").read_text(encoding="utf-8")
             )
+            resource_metrics = json.loads(
+                (result_dirs[0] / "resource_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
             proc_delta = json.loads(
                 (result_dirs[0] / "diagnostic_proc_delta.json").read_text(
                     encoding="utf-8"
@@ -2002,6 +2282,63 @@ while :; do sleep 0.05; done
             self.assertEqual(manifest["conformance"], "public_spec_aligned")
             self.assertFalse(manifest["embeds_unpublished_official_values"])
             self.assertEqual(manifest["status"], "success")
+            self.assertEqual(resource_metrics["status"], "partial")
+            self.assertFalse(resource_metrics["ranked"])
+            self.assertEqual(resource_metrics["score_effect"], "none")
+            self.assertEqual(
+                resource_metrics["expected_server_generations"],
+                2,
+            )
+            self.assertEqual(
+                resource_metrics["valid_server_generations"],
+                2,
+            )
+            self.assertTrue(
+                all(
+                    segment["root_observed_exit"]
+                    for segment in resource_metrics["segments"]
+                )
+            )
+            self.assertTrue(
+                all(
+                    segment["status"] == "available"
+                    for segment in resource_metrics["segments"]
+                )
+            )
+            self.assertEqual(
+                resource_metrics["max_rss"]["status"],
+                "available",
+            )
+            self.assertGreater(resource_metrics["max_rss"]["bytes"], 0)
+            self.assertEqual(
+                resource_metrics["database_disk"]["status"],
+                "available",
+            )
+            self.assertEqual(
+                resource_metrics["rank_cpu"]["status"],
+                "unavailable",
+            )
+            self.assertEqual(
+                manifest["resources"]["status"],
+                resource_metrics["status"],
+            )
+            self.assertEqual(
+                manifest["resources"]["artifact"],
+                {
+                    "path": "resource_metrics.json",
+                    "status": "partial",
+                },
+            )
+            self.assertFalse(manifest["resources"]["ranked"])
+            self.assertEqual(
+                manifest["resources"]["score_effect"],
+                "none",
+            )
+            self.assertFalse(
+                manifest["resources"]["sampling"][
+                    "official_hidden_sampler_reproduced"
+                ]
+            )
             self.assertTrue(manifest["ranked_configuration"])
             self.assertEqual(
                 manifest["seed"],
@@ -2127,6 +2464,10 @@ while :; do sleep 0.05; done
             self.assertIn("[server start: existing database]", server_log)
             self.assertFalse((root / "tpcc_final2026").exists())
             self.assertEqual(source_csv.read_text(encoding="utf-8"), "tracked csv")
+            for sampler_pid in (
+                result_dirs[0] / "resource_sampler.pids"
+            ).read_text(encoding="utf-8").splitlines():
+                self.assert_pid_gone(int(sampler_pid))
             assert_cleanup_since(0)
 
             for failure_variable, diagnostic_status in (
@@ -2228,6 +2569,18 @@ while :; do sleep 0.05; done
                     "diagnostics": "skipped_due_to_failure",
                 },
             )
+            self.assertIn(
+                failed_manifest["resources"]["status"],
+                {"partial", "unavailable", "failed"},
+            )
+            self.assertNotIn(
+                failed_manifest["resources"]["status"],
+                {"pending", "collecting", "available"},
+            )
+            for sampler_pid in (
+                failed_result_dirs[0] / "resource_sampler.pids"
+            ).read_text(encoding="utf-8").splitlines():
+                self.assert_pid_gone(int(sampler_pid))
             assert_cleanup_since(prior_child_count)
 
 

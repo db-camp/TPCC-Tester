@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_RMDB_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd -P)"
 DEFAULT_TPCC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 DIAGNOSTIC_METRICS_HELPER="${SCRIPT_DIR}/diagnostic_metrics.py"
+RESOURCE_HELPER="${RMDB_TPCC_RESOURCE_HELPER_OVERRIDE:-${SCRIPT_DIR}/resource_sampler.py}"
 
 MODE="all"
 LABEL="final2026"
@@ -43,6 +44,15 @@ SERVER_IDENTITY=""
 PROBE_PID=""
 TRACE_PID=""
 TRACE_EXIT_STATUS=""
+RESOURCE_PID=""
+RESOURCE_IDENTITY=""
+RESOURCE_PARENT_PID=""
+RESOURCE_SEGMENT_PATH=""
+RESOURCE_GENERATION=0
+RESOURCE_DATABASE_IDENTITY=""
+RESOURCE_STATUS="pending"
+RESOURCE_FINALIZED=0
+TESTER_RESOURCE_TIMELINE=""
 STOPPING_SERVER=0
 SERVER_LOG=""
 RESULT_DIR=""
@@ -77,6 +87,7 @@ PUBLIC_WINDOW_SECONDS=150
 PUBLIC_READY_TIMEOUT_SECONDS=90
 DIAGNOSTIC_WARMUP_SECONDS=10
 DIAGNOSTIC_OBSERVATION_SECONDS=60
+RESOURCE_INTERVAL_MS=1000
 
 usage() {
   cat <<'EOF'
@@ -483,6 +494,9 @@ effective_windows=${PUBLIC_WINDOWS}
 effective_window_seconds=${EFFECTIVE_WINDOW_SECONDS}
 diagnostics_requested=${DIAGNOSTICS_REQUESTED}
 diagnostics_phase=${PHASE_DIAGNOSTICS}
+resource_sampler=${RESOURCE_HELPER}
+resource_sample_interval_ms=${RESOURCE_INTERVAL_MS}
+resource_ranked=false
 EOF
 }
 
@@ -512,6 +526,14 @@ mkdir "${RUN_TEMP_DIR}"
 mkdir "${CSV_DIR}"
 printf '%s\n' "${OWNER_TOKEN}" >"${RUN_MARKER}"
 SERVER_LOG="${RESULT_DIR}/server.log"
+RESOURCE_SEGMENT_LIST="${RUN_TEMP_DIR}/resource_segments.list"
+RESOURCE_TIMELINE="${RESULT_DIR}/rank_timeline.state"
+RESOURCE_RANK_COMPLETE="${RESULT_DIR}/rank_completion.json"
+RESOURCE_METRICS="${RESULT_DIR}/resource_metrics.json"
+: >"${RESOURCE_SEGMENT_LIST}"
+if [[ "${MODE}" == "tools" ]]; then
+  RESOURCE_STATUS="not_applicable"
+fi
 
 write_manifest() {
   {
@@ -528,6 +550,8 @@ write_manifest() {
     echo "phase_crash_restart=${PHASE_CRASH_RESTART}"
     echo "phase_recovery=${PHASE_RECOVERY}"
     echo "phase_diagnostics=${PHASE_DIAGNOSTICS}"
+    echo "resource_status=${RESOURCE_STATUS}"
+    echo "resource_artifact=resource_metrics.json"
   } >"${RESULT_DIR}/manifest.txt"
 
   python3 - "${RESULT_DIR}/manifest.json" \
@@ -540,7 +564,8 @@ write_manifest() {
     "${PHASE_SETUP}" "${PHASE_RANK}" "${PHASE_ONLINE}" \
     "${PHASE_CRASH_RESTART}" "${PHASE_RECOVERY}" "${PHASE_DIAGNOSTICS}" \
     "${DIAGNOSTICS_REQUESTED}" "${DIAGNOSTIC_WARMUP_SECONDS}" \
-    "${DIAGNOSTIC_OBSERVATION_SECONDS}" <<'PY'
+    "${DIAGNOSTIC_OBSERVATION_SECONDS}" "${RESOURCE_STATUS}" \
+    "${RESOURCE_INTERVAL_MS}" "${RESOURCE_METRICS}" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -578,6 +603,9 @@ import sys
     diagnostics_requested,
     diagnostic_warmup,
     diagnostic_observation,
+    resource_status,
+    resource_interval_ms,
+    resource_metrics_path,
 ) = sys.argv[1:]
 
 artifact_names = {
@@ -615,6 +643,115 @@ def describe_artifact(name):
     else:
         descriptor["status"] = "present"
     return descriptor
+
+
+def load_resource_metrics():
+    path = Path(resource_metrics_path)
+    descriptor = {"path": path.name, "status": "missing"}
+    if path.is_symlink():
+        descriptor["status"] = "unsafe"
+        return None, descriptor
+    if not path.is_file():
+        return None, descriptor
+    try:
+        if path.stat().st_size == 0:
+            descriptor["status"] = "empty"
+            return None, descriptor
+        with path.open("r", encoding="utf-8") as stream:
+            artifact = json.load(stream)
+    except (OSError, json.JSONDecodeError):
+        descriptor["status"] = "invalid"
+        return None, descriptor
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "status",
+        "ranked",
+        "score_effect",
+        "run_id",
+        "scope",
+        "database_path",
+        "database_identity",
+        "sample_interval_ms",
+        "expected_server_generations",
+        "requested_server_generations",
+        "valid_server_generations",
+        "max_rss",
+        "database_disk",
+        "rank_cpu",
+        "warnings",
+        "segments",
+    }
+    valid_statuses = {"available", "partial", "unavailable"}
+    if (
+        not isinstance(artifact, dict)
+        or set(artifact) != expected_fields
+        or artifact.get("schema_version") != 1
+        or artifact.get("kind") != "rmdb_resource_metrics"
+        or artifact.get("status") not in valid_statuses
+        or artifact.get("ranked") is not False
+        or artifact.get("score_effect") != "none"
+        or artifact.get("run_id") != run_id
+        or artifact.get("database_path") != db_path
+        or artifact.get("sample_interval_ms") != int(resource_interval_ms)
+        or not isinstance(artifact.get("max_rss"), dict)
+        or not isinstance(artifact.get("database_disk"), dict)
+        or not isinstance(artifact.get("rank_cpu"), dict)
+    ):
+        descriptor["status"] = "invalid"
+        return None, descriptor
+    if artifact["status"] == "available" and any(
+        artifact[key].get("status") != "available"
+        for key in ("max_rss", "database_disk", "rank_cpu")
+        if artifact[key].get("status") != "not_applicable"
+    ):
+        descriptor["status"] = "invalid"
+        return None, descriptor
+    descriptor["status"] = artifact["status"]
+    return artifact, descriptor
+
+
+resource_metrics, resource_descriptor = load_resource_metrics()
+if resource_metrics is None:
+    safe_resource_status = (
+        resource_status
+        if resource_status
+        in {
+            "pending",
+            "collecting",
+            "partial",
+            "unavailable",
+            "failed",
+            "not_applicable",
+        }
+        else "failed"
+    )
+    resource_max_rss = {"status": "unavailable"}
+    resource_database_disk = {"status": "unavailable"}
+    resource_rank_cpu = {
+        "status": (
+            "not_applicable"
+            if mode in {"init", "recovery", "tools"}
+            else "unavailable"
+        )
+    }
+    resource_scope = None
+    resource_generations = {
+        "expected": 0,
+        "requested": 0,
+        "valid": 0,
+    }
+else:
+    safe_resource_status = resource_metrics["status"]
+    resource_max_rss = resource_metrics["max_rss"]
+    resource_database_disk = resource_metrics["database_disk"]
+    resource_rank_cpu = resource_metrics["rank_cpu"]
+    resource_scope = resource_metrics["scope"]
+    resource_generations = {
+        "expected": resource_metrics["expected_server_generations"],
+        "requested": resource_metrics["requested_server_generations"],
+        "valid": resource_metrics["valid_server_generations"],
+    }
 
 
 payload = {
@@ -687,6 +824,24 @@ payload = {
             key: describe_artifact(name)
             for key, name in artifact_names.items()
         },
+    },
+    "resources": {
+        "observation_only": True,
+        "ranked": False,
+        "score_effect": "none",
+        "status": safe_resource_status,
+        "sample_interval_ms": int(resource_interval_ms),
+        "sampling": {
+            "cadence": "fixed_local_one_second",
+            "process_scope": "registered_rmdb_process_tree",
+            "official_hidden_sampler_reproduced": False,
+        },
+        "scope": resource_scope,
+        "server_generations": resource_generations,
+        "max_rss": resource_max_rss,
+        "database_disk": resource_database_disk,
+        "rank_cpu": resource_rank_cpu,
+        "artifact": resource_descriptor,
     },
 }
 
@@ -1560,6 +1715,499 @@ wait_for_listener_gone() {
   done
 }
 
+capture_resource_database_identity() {
+  local identity=""
+  if ! identity="$(python3 - "${DB_PATH}" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+try:
+    metadata = path.lstat()
+except OSError:
+    raise SystemExit(1)
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit(1)
+print(f"{metadata.st_dev}:{metadata.st_ino}")
+PY
+)"; then
+    warn "could not bind non-ranked resource evidence to database ${DB_PATH}"
+    return 1
+  fi
+  RESOURCE_DATABASE_IDENTITY="${identity}"
+}
+
+resource_monitor_process_helper() {
+  local action="$1"
+  local pid="$2"
+  local expected_identity="$3"
+  local expected_parent_pid="$4"
+  local signal_name="${5-}"
+  local deadline_millis=""
+  deadline_millis=$(( $(monotonic_millis) + 1000 ))
+  python3 - "${action}" "${pid}" "${expected_identity}" \
+    "${expected_parent_pid}" "${signal_name}" "${deadline_millis}" <<'PY'
+import ctypes
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+(
+    action,
+    pid_text,
+    expected_identity,
+    expected_parent_text,
+    signal_name,
+    deadline_text,
+) = sys.argv[1:]
+pid = int(pid_text)
+expected_parent = int(expected_parent_text)
+deadline_millis = int(deadline_text)
+
+
+def remaining_seconds():
+    remaining = (
+        deadline_millis - time.monotonic_ns() // 1_000_000
+    ) / 1000.0
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
+
+
+def linux_record():
+    try:
+        text = (Path("/proc") / str(pid) / "stat").read_text(
+            encoding="ascii"
+        )
+        fields = text[text.rfind(")") + 2 :].split()
+        state = fields[0]
+        parent_pid = int(fields[1])
+        identity = f"linux:{fields[19]}"
+    except (OSError, IndexError, ValueError):
+        return None
+    if state.upper().startswith("Z"):
+        return None
+    return identity, parent_pid
+
+
+def darwin_record():
+    class ProcBsdInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    library.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    library.proc_pidinfo.restype = ctypes.c_int
+    info = ProcBsdInfo()
+    copied = library.proc_pidinfo(
+        pid,
+        3,
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if copied != ctypes.sizeof(info) or info.pbi_status == 5:
+        return None
+    return (
+        f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}",
+        int(info.pbi_ppid),
+    )
+
+
+def portable_record():
+    try:
+        result = subprocess.run(
+            [
+                "ps",
+                "-o",
+                "state=",
+                "-o",
+                "ppid=",
+                "-o",
+                "lstart=",
+                "-p",
+                str(pid),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=remaining_seconds(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    fields = result.stdout.strip().split(None, 2)
+    if result.returncode != 0 or len(fields) != 3:
+        return None
+    try:
+        parent_pid = int(fields[1])
+    except ValueError:
+        return None
+    if fields[0].upper().startswith("Z"):
+        return None
+    return f"ps:{fields[2]}", parent_pid
+
+
+def sample_record():
+    remaining_seconds()
+    if (Path("/proc") / "self" / "stat").is_file():
+        record = linux_record()
+    elif sys.platform == "darwin":
+        record = darwin_record()
+    else:
+        record = portable_record()
+    remaining_seconds()
+    return record
+
+
+try:
+    first = sample_record()
+    if first is None:
+        raise SystemExit(1)
+    time.sleep(min(0.005, remaining_seconds()))
+    second = sample_record()
+except TimeoutError:
+    raise SystemExit(124)
+if (
+    second is None
+    or first != second
+    or second[1] != expected_parent
+    or (expected_identity and second[0] != expected_identity)
+):
+    raise SystemExit(1)
+if action == "capture":
+    print(second[0])
+    raise SystemExit(0)
+if action == "alive":
+    raise SystemExit(0)
+if action != "signal" or signal_name not in {"INT", "TERM", "KILL"}:
+    raise SystemExit(2)
+try:
+    os.kill(pid, getattr(signal, f"SIG{signal_name}"))
+except ProcessLookupError:
+    raise SystemExit(1)
+PY
+}
+
+resource_monitor_job_running() {
+  local expected_pid="$1"
+  local active_pid=""
+  while IFS= read -r active_pid; do
+    [[ "${active_pid}" == "${expected_pid}" ]] && return 0
+  done < <(jobs -pr)
+  return 1
+}
+
+start_resource_monitor() {
+  local database_identity="${RESOURCE_DATABASE_IDENTITY:-auto}"
+  local generation=""
+  local monitor_identity=""
+  local output=""
+  [[ -n "${SERVER_PID}" && -n "${SERVER_PGID}" \
+    && -n "${SERVER_IDENTITY}" ]] || {
+    warn "resource monitor cannot bind an unregistered RMDB process"
+    RESOURCE_STATUS="unavailable"
+    return 0
+  }
+  if [[ -n "${RESOURCE_PID}" ]]; then
+    warn "stopping an unexpectedly active resource monitor before restart"
+    stop_resource_monitor
+  fi
+
+  RESOURCE_GENERATION=$((RESOURCE_GENERATION + 1))
+  generation="${RESOURCE_GENERATION}"
+  output="${RESULT_DIR}/resource_segment_${generation}.json"
+  RESOURCE_SEGMENT_PATH="${output}"
+  printf '%s\n' "${output}" >>"${RESOURCE_SEGMENT_LIST}"
+
+  if [[ ! -f "${RESOURCE_HELPER}" || -L "${RESOURCE_HELPER}" ]]; then
+    warn "resource sampler is missing or unsafe; ranked workflow continues"
+    RESOURCE_STATUS="unavailable"
+    return 0
+  fi
+  RESOURCE_STATUS="collecting"
+  python3 "${RESOURCE_HELPER}" sample \
+    --run-id "${RUN_ID}" \
+    --generation "${generation}" \
+    --root-pid "${SERVER_PID}" \
+    --root-identity "${SERVER_IDENTITY}" \
+    --process-group "${SERVER_PGID}" \
+    --database-path "${DB_PATH}" \
+    --database-identity "${database_identity}" \
+    --interval-ms "${RESOURCE_INTERVAL_MS}" \
+    --output "${output}" \
+    >"${RESULT_DIR}/resource_sampler_${generation}.log" 2>&1 &
+  RESOURCE_PID=$!
+  RESOURCE_PARENT_PID="$$"
+  printf '%s\n' "${RESOURCE_PID}" >>"${RESULT_DIR}/resource_sampler.pids"
+  if monitor_identity="$(
+    resource_monitor_process_helper capture "${RESOURCE_PID}" "" \
+      "${RESOURCE_PARENT_PID}"
+  )"; then
+    RESOURCE_IDENTITY="${monitor_identity}"
+  else
+    RESOURCE_IDENTITY=""
+    warn "could not bind resource sampler ${RESOURCE_PID} to a stable child identity"
+  fi
+}
+
+stop_resource_monitor() {
+  local pid="${RESOURCE_PID}"
+  local identity="${RESOURCE_IDENTITY}"
+  local parent_pid="${RESOURCE_PARENT_PID}"
+  local output="${RESOURCE_SEGMENT_PATH}"
+  local attempts=0
+  local monitor_rc=0
+  local recaptured_identity=""
+  local status=""
+  [[ -n "${pid}" ]] || return 0
+
+  if [[ -z "${identity}" || -z "${parent_pid}" ]]; then
+    parent_pid="$$"
+    if recaptured_identity="$(
+      resource_monitor_process_helper capture "${pid}" "" "${parent_pid}"
+    )"; then
+      identity="${recaptured_identity}"
+    fi
+  fi
+
+  if resource_monitor_job_running "${pid}"; then
+    if [[ -n "${identity}" && -n "${parent_pid}" ]] \
+      && resource_monitor_process_helper signal "${pid}" "${identity}" \
+        "${parent_pid}" INT; then
+      :
+    else
+      warn "refusing SIGINT for unverified resource sampler pid ${pid}"
+    fi
+    while resource_monitor_job_running "${pid}" \
+      && [[ -n "${identity}" && -n "${parent_pid}" ]] \
+      && resource_monitor_process_helper alive "${pid}" "${identity}" \
+        "${parent_pid}" \
+      && (( attempts < 100 )); do
+      sleep 0.05
+      attempts=$((attempts + 1))
+    done
+  fi
+  if resource_monitor_job_running "${pid}"; then
+    warn "resource sampler ${pid} did not stop after SIGINT; escalating"
+    if [[ -n "${identity}" && -n "${parent_pid}" ]] \
+      && resource_monitor_process_helper signal "${pid}" "${identity}" \
+        "${parent_pid}" TERM; then
+      attempts=0
+    else
+      warn "refusing SIGTERM for unverified resource sampler pid ${pid}"
+      attempts=20
+    fi
+    while resource_monitor_job_running "${pid}" \
+      && [[ -n "${identity}" && -n "${parent_pid}" ]] \
+      && resource_monitor_process_helper alive "${pid}" "${identity}" \
+        "${parent_pid}" \
+      && (( attempts < 20 )); do
+      sleep 0.05
+      attempts=$((attempts + 1))
+    done
+  fi
+  if resource_monitor_job_running "${pid}"; then
+    if [[ -n "${identity}" && -n "${parent_pid}" ]] \
+      && resource_monitor_process_helper signal "${pid}" "${identity}" \
+        "${parent_pid}" KILL; then
+      attempts=0
+      while resource_monitor_job_running "${pid}" \
+        && (( attempts < 20 )); do
+        sleep 0.05
+        attempts=$((attempts + 1))
+      done
+    else
+      warn "refusing SIGKILL for unverified resource sampler pid ${pid}"
+    fi
+  fi
+  if resource_monitor_job_running "${pid}"; then
+    monitor_rc=125
+    warn "resource sampler ${pid} remains active after safe bounded cleanup"
+  else
+    wait "${pid}" 2>/dev/null || monitor_rc=$?
+  fi
+  RESOURCE_PID=""
+  RESOURCE_IDENTITY=""
+  RESOURCE_PARENT_PID=""
+  RESOURCE_SEGMENT_PATH=""
+  if [[ "${monitor_rc}" != "0" ]]; then
+    warn "resource sampler exited with status ${monitor_rc}; ranking is unchanged"
+  fi
+
+  if ! status="$(python3 - "${output}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+try:
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+if (
+    not isinstance(payload, dict)
+    or payload.get("schema_version") != 1
+    or payload.get("kind") != "rmdb_resource_segment"
+    or payload.get("ranked") is not False
+    or payload.get("score_effect") != "none"
+    or payload.get("status")
+    not in {"available", "partial", "unavailable", "failed"}
+):
+    raise SystemExit(1)
+print(payload["status"])
+PY
+)"; then
+    warn "resource sampler did not publish a valid terminal segment"
+  elif [[ "${status}" != "available" ]]; then
+    warn "resource segment ended ${status}; ranking is unchanged"
+  fi
+}
+
+publish_rank_completion() {
+  if [[ ! -f "${RESOURCE_HELPER}" || -L "${RESOURCE_HELPER}" ]]; then
+    warn "resource sampler cannot bind rank completion; ranking is unchanged"
+    return 0
+  fi
+  if ! python3 "${RESOURCE_HELPER}" complete-rank \
+      --run-id "${RUN_ID}" \
+      --timeline "${RESOURCE_TIMELINE}" \
+      --output "${RESOURCE_RANK_COMPLETE}" \
+      >>"${RESULT_DIR}/resource_aggregate.log" 2>&1; then
+    warn "rank resource timeline is unavailable; ranking is unchanged"
+  fi
+}
+
+read_resource_metrics_status() {
+  python3 - "${RESOURCE_METRICS}" "${RUN_ID}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path, run_id = Path(sys.argv[1]), sys.argv[2]
+try:
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+if (
+    not isinstance(payload, dict)
+    or payload.get("schema_version") != 1
+    or payload.get("kind") != "rmdb_resource_metrics"
+    or payload.get("ranked") is not False
+    or payload.get("score_effect") != "none"
+):
+    raise SystemExit(1)
+status = payload.get("status")
+if status == "failed":
+    print(status)
+    raise SystemExit(0)
+if status not in {"available", "partial", "unavailable"}:
+    raise SystemExit(1)
+if payload.get("run_id") != run_id:
+    raise SystemExit(1)
+print(status)
+PY
+}
+
+finalize_resource_metrics() {
+  local -a command
+  local segment=""
+  local status=""
+  [[ "${RESOURCE_FINALIZED}" == "0" ]] || return 0
+  RESOURCE_FINALIZED=1
+  stop_resource_monitor
+
+  if [[ "${MODE}" == "tools" ]]; then
+    RESOURCE_STATUS="not_applicable"
+    return 0
+  fi
+  if (( RESOURCE_GENERATION == 0 )); then
+    RESOURCE_STATUS="unavailable"
+    warn "no RMDB resource generation was registered"
+    return 0
+  fi
+  if [[ -z "${RESOURCE_DATABASE_IDENTITY}" ]]; then
+    capture_resource_database_identity || {
+      RESOURCE_STATUS="unavailable"
+      return 0
+    }
+  fi
+  if [[ ! -f "${RESOURCE_HELPER}" || -L "${RESOURCE_HELPER}" ]]; then
+    RESOURCE_STATUS="unavailable"
+    warn "resource sampler is missing or unsafe; no metrics were aggregated"
+    return 0
+  fi
+
+  command=(
+    python3 "${RESOURCE_HELPER}" aggregate
+    --run-id "${RUN_ID}"
+    --expected-generations "${RESOURCE_GENERATION}"
+    --database-path "${DB_PATH}"
+    --database-identity "${RESOURCE_DATABASE_IDENTITY}"
+    --timeline "${RESOURCE_TIMELINE}"
+    --rank-complete "${RESOURCE_RANK_COMPLETE}"
+    --expected-warmup-seconds "${EFFECTIVE_WARMUP_SECONDS}"
+    --expected-window-seconds "${EFFECTIVE_WINDOW_SECONDS}"
+    --mode "${MODE}"
+    --interval-ms "${RESOURCE_INTERVAL_MS}"
+    --output "${RESOURCE_METRICS}"
+  )
+  while IFS= read -r segment; do
+    [[ -n "${segment}" ]] || continue
+    command+=(--segment "${segment}")
+  done <"${RESOURCE_SEGMENT_LIST}"
+  if ! "${command[@]}" >>"${RESULT_DIR}/resource_aggregate.log" 2>&1; then
+    warn "resource aggregation failed; workflow and ranking remain unchanged"
+  fi
+  if ! status="$(read_resource_metrics_status)"; then
+    RESOURCE_STATUS="failed"
+    warn "resource metrics artifact is missing or invalid"
+    return 0
+  fi
+  RESOURCE_STATUS="${status}"
+  if [[ "${RESOURCE_STATUS}" != "available" ]]; then
+    warn "resource observation is ${RESOURCE_STATUS}; ranking is unchanged"
+  fi
+  return 0
+}
+
 clear_server_registration() {
   SERVER_PID=""
   SERVER_PGID=""
@@ -1627,6 +2275,7 @@ stop_server() {
     fi
   fi
   wait "${pid}" 2>/dev/null || true
+  stop_resource_monitor
   phase_deadline=$(( $(monotonic_millis) + 5000 ))
   if ! wait_for_listener_gone "${phase_deadline}"; then
     warn "listener ${HOST}:${PORT} remained after registered RMDB shutdown"
@@ -1715,6 +2364,7 @@ force_stop_server() {
   wait_for_server_group_exit "${process_deadline}" \
     || return 1
   wait "${pid}" 2>/dev/null || true
+  stop_resource_monitor
   listener_deadline=$(( $(monotonic_millis) + listener_timeout_millis ))
   if ! wait_for_listener_gone "${listener_deadline}"; then
     clear_server_registration
@@ -1746,14 +2396,16 @@ cleanup() {
   CLEANUP_RC=$?
   local rc="${CLEANUP_RC}"
   trap - EXIT
+  stop_trace || true
+  stop_probe || true
+  stop_server || true
+  stop_resource_monitor || true
+  finalize_resource_metrics || true
   if [[ "${rc}" != "0" && "${MANIFEST_READY}" == "1" ]]; then
     WORKFLOW_STATUS="failed"
     mark_unfinished_phases_after_failure
     write_manifest || true
   fi
-  stop_trace || true
-  stop_probe || true
-  stop_server || true
   if [[ "${WORKFLOW_SUCCEEDED}" == "1" && "${CLEAN_DB_ON_EXIT}" == "1" ]]; then
     remove_current_owned_database || rc=$?
   fi
@@ -2032,6 +2684,7 @@ os.execv(sys.argv[1], sys.argv[1:])' \
     force_stop_server 1000 || true
     die "RMDB process registration exceeded the shared readiness budget"
   fi
+  start_resource_monitor
   printf '%s\n' "${SERVER_PID}" >"${RESULT_DIR}/server.pid"
   if ! wait_for_ready "${readiness_deadline_millis}"; then
     force_stop_server 1000 || true
@@ -2054,23 +2707,33 @@ start_new_database() {
   fi
   start_server "new database setup"
   claim_new_database
+  capture_resource_database_identity || true
 }
 
 start_existing_database() {
   [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] \
     || die "existing database directory is missing or unsafe: ${DB_PATH}"
+  capture_resource_database_identity || true
   start_server "existing database"
 }
 
 run_tester() {
   local log_path="$1"
+  local -a tester_environment
   shift
+  tester_environment=(
+    "RMDB_TPCC_CSV_DIR=${CSV_DIR}"
+    "RMDB_TPCC_LOAD_DIR=${LOAD_DIR}"
+    "RMDB_TPCC_RUN_ID=${DATASET_RUN_ID}"
+  )
+  if [[ -n "${TESTER_RESOURCE_TIMELINE}" ]]; then
+    tester_environment+=(
+      "RMDB_TPCC_RESOURCE_TIMELINE_FILE=${TESTER_RESOURCE_TIMELINE}"
+    )
+  fi
   (
     cd "${TPCC_DIR}"
-    RMDB_TPCC_CSV_DIR="${CSV_DIR}" \
-    RMDB_TPCC_LOAD_DIR="${LOAD_DIR}" \
-    RMDB_TPCC_RUN_ID="${DATASET_RUN_ID}" \
-      "${TPCC_BIN}" "$@" \
+    env "${tester_environment[@]}" "${TPCC_BIN}" "$@" \
       --recovery-ready-budget-seconds "${READY_TIMEOUT_SECONDS}"
   ) >"${log_path}" 2>&1
 }
@@ -2107,12 +2770,17 @@ run_setup() {
 }
 
 run_rank() {
+  local rank_rc=0
   log "running one Rust-owned final2026 benchmark"
   set_phase_status rank running
-  if run_profile_tester "${RESULT_DIR}/rank.log" \
+  TESTER_RESOURCE_TIMELINE="${RESOURCE_TIMELINE}"
+  run_profile_tester "${RESULT_DIR}/rank.log" \
       --benchmark --profile "${PROFILE}" --seed "${SEED}" \
       --state-dir "${STATE_DIR}" \
-      --host "${HOST}" --port "${PORT}"; then
+      --host "${HOST}" --port "${PORT}" || rank_rc=$?
+  TESTER_RESOURCE_TIMELINE=""
+  if [[ "${rank_rc}" == "0" ]]; then
+    publish_rank_completion
     set_phase_status rank passed
   else
     set_phase_status rank failed
@@ -2273,6 +2941,7 @@ write_summary() {
     echo "- status: success"
     echo "- Rust owns warmup, all three formal windows, and semantic gates."
     echo "- final diagnostics: ${PHASE_DIAGNOSTICS} (never ranked)"
+    echo "- resource observation: ${RESOURCE_STATUS} (never ranked)"
   } >"${RESULT_DIR}/summary.md"
 }
 
@@ -2324,6 +2993,7 @@ case "${MODE}" in
     ;;
 esac
 
+finalize_resource_metrics
 WORKFLOW_STATUS="success"
 write_manifest
 write_summary

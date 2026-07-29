@@ -750,7 +750,14 @@ def sample_segment(arguments):
         except ResourceError as error:
             append_warning(payload["warnings"], "disk_sample_failed", error)
 
-        if stop_after_sample or stop_event.is_set():
+        if stop_after_sample:
+            break
+        if stop_event.is_set():
+            append_warning(
+                payload["warnings"],
+                "sampler_stopped_before_root_exit",
+                "registered RMDB process was still present",
+            )
             break
         deadline += interval_ns
         now = time.monotonic_ns()
@@ -1643,6 +1650,7 @@ def aggregate_segments(arguments):
                 "status": segment["status"],
                 "root_pid": segment["root_pid"],
                 "root_identity": segment["root_identity_observed"],
+                "root_observed_exit": segment["root_observed_exit"],
             }
             for segment in segments
         ],
