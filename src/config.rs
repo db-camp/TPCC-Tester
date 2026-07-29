@@ -364,8 +364,6 @@ impl Config {
             return Err(ConfigError::InitCheckScopeMustBeSetup);
         }
 
-        self.resolved_profile()?;
-
         if (self.create_schema
             || self.init
             || self.benchmark
@@ -384,6 +382,7 @@ impl Config {
         {
             return Err(ConfigError::MissingStateDir);
         }
+        self.resolved_profile()?;
 
         if self.probe_ready
             && (self.create_schema
