@@ -534,8 +534,12 @@ pub struct IntervalCollector {
     stock_roots: Box<dyn StockRootProvider>,
     customers: Vec<CustomerSample>,
     stocks: Vec<StockSample>,
+    retired_customers: Vec<CustomerSample>,
+    retired_stocks: Vec<StockSample>,
     customer_scratch: Vec<CustomerSample>,
     stock_scratch: Vec<StockSample>,
+    retired_customer_scratch: Vec<CustomerSample>,
+    retired_stock_scratch: Vec<StockSample>,
     pending: Vec<PendingSegment>,
     pending_scratch: Vec<PendingSegment>,
     customer_updates: u64,
@@ -552,6 +556,8 @@ impl fmt::Debug for IntervalCollector {
             .field("warehouses", &self.warehouses)
             .field("selected_customers", &self.customers.len())
             .field("selected_stocks", &self.stocks.len())
+            .field("retired_customers", &self.retired_customers.len())
+            .field("retired_stocks", &self.retired_stocks.len())
             .field("pending_intervals", &self.pending.len())
             .field("pending_limit", &self.pending_limit)
             .field("poisoned", &self.poisoned.is_some())
@@ -583,8 +589,12 @@ impl IntervalCollector {
             stock_roots: Box::new(stock_roots),
             customers: Vec::with_capacity(SAMPLE_LIMIT),
             stocks: Vec::with_capacity(SAMPLE_LIMIT),
+            retired_customers: Vec::with_capacity(pending_limit),
+            retired_stocks: Vec::with_capacity(pending_limit),
             customer_scratch: Vec::with_capacity(SAMPLE_LIMIT),
             stock_scratch: Vec::with_capacity(SAMPLE_LIMIT),
+            retired_customer_scratch: Vec::with_capacity(pending_limit),
+            retired_stock_scratch: Vec::with_capacity(pending_limit),
             pending: Vec::with_capacity(pending_capacity),
             pending_scratch: Vec::with_capacity(pending_capacity),
             customer_updates: 0,
@@ -617,6 +627,8 @@ impl IntervalCollector {
         if let Err(error) = result {
             self.customer_scratch.clear();
             self.stock_scratch.clear();
+            self.retired_customer_scratch.clear();
+            self.retired_stock_scratch.clear();
             self.pending_scratch.clear();
             self.poisoned = Some(error.to_string());
             return Err(error);
@@ -628,6 +640,8 @@ impl IntervalCollector {
         CollectorStorage {
             selected_customers: self.customers.len(),
             selected_stocks: self.stocks.len(),
+            retired_customers: self.retired_customers.len(),
+            retired_stocks: self.retired_stocks.len(),
             pending_intervals: self.pending.len(),
             pending_limit: self.pending_limit,
             owned_buffer_capacity_bytes: self.owned_buffer_capacity_bytes(),
@@ -644,11 +658,13 @@ impl IntervalCollector {
         clients: u16,
     ) -> Result<usize, CollectorError> {
         validate_configuration(warehouses, clients)?;
-        let pending_capacity = usize::from(clients)
+        let pending_limit = usize::from(clients)
             .checked_mul(MAX_EDGES_PER_TERMINAL)
-            .and_then(|limit| limit.checked_add(MAX_EDGES_PER_TERMINAL))
+            .ok_or(CollectorError::Overflow("pending interval limit"))?;
+        let pending_capacity = pending_limit
+            .checked_add(MAX_EDGES_PER_TERMINAL)
             .ok_or(CollectorError::Overflow("pending scratch capacity"))?;
-        2_usize
+        let selected_bytes = 2_usize
             .checked_mul(SAMPLE_LIMIT)
             .and_then(|count| count.checked_mul(size_of::<CustomerSample>()))
             .and_then(|customer_bytes| {
@@ -657,6 +673,19 @@ impl IntervalCollector {
                     .and_then(|count| count.checked_mul(size_of::<StockSample>()))
                     .and_then(|stock_bytes| customer_bytes.checked_add(stock_bytes))
             })
+            .ok_or(CollectorError::Overflow("selected collector capacity"))?;
+        let retired_bytes = 2_usize
+            .checked_mul(pending_limit)
+            .and_then(|count| count.checked_mul(size_of::<CustomerSample>()))
+            .and_then(|customer_bytes| {
+                2_usize
+                    .checked_mul(pending_limit)
+                    .and_then(|count| count.checked_mul(size_of::<StockSample>()))
+                    .and_then(|stock_bytes| customer_bytes.checked_add(stock_bytes))
+            })
+            .ok_or(CollectorError::Overflow("retired collector capacity"))?;
+        selected_bytes
+            .checked_add(retired_bytes)
             .and_then(|sample_bytes| {
                 2_usize
                     .checked_mul(pending_capacity)
@@ -674,6 +703,9 @@ impl IntervalCollector {
             return Err(CollectorError::Disconnected {
                 pending: self.pending.len(),
             });
+        }
+        if !self.retired_customers.is_empty() || !self.retired_stocks.is_empty() {
+            return Err(CollectorError::Disconnected { pending: 0 });
         }
         if self.customers.iter().any(|sample| !sample.slot.is_rooted())
             || self.stocks.iter().any(|sample| !sample.slot.is_rooted())
@@ -719,11 +751,13 @@ impl IntervalCollector {
             let rank = sample_rank(self.sample_seed, CUSTOMER_SAMPLE_DOMAIN, edge.key_index);
             select_customer(
                 &mut self.customer_scratch,
+                &mut self.retired_customer_scratch,
                 &mut self.pending_scratch,
                 edge.key_index,
                 rank,
                 &mut next_rejected,
-            );
+                self.pending_limit,
+            )?;
         }
         for edge in validated[..updates.len()].iter().flatten() {
             if let Some(position) = self
@@ -737,13 +771,30 @@ impl IntervalCollector {
                     edge.segment,
                     &mut self.pending_scratch,
                 )?;
+            } else if let Some(position) = self
+                .retired_customer_scratch
+                .iter()
+                .position(|sample| sample.key_index == edge.key_index)
+            {
+                insert_customer(
+                    edge.key_index,
+                    &mut self.retired_customer_scratch[position].slot,
+                    edge.segment,
+                    &mut self.pending_scratch,
+                )?;
             }
         }
+        prune_rooted_retired_customers(&mut self.retired_customer_scratch, &self.pending_scratch)?;
         validate_pending_limit(self.pending_scratch.len(), self.pending_limit)?;
 
         swap(&mut self.customers, &mut self.customer_scratch);
+        swap(
+            &mut self.retired_customers,
+            &mut self.retired_customer_scratch,
+        );
         swap(&mut self.pending, &mut self.pending_scratch);
         self.customer_scratch.clear();
+        self.retired_customer_scratch.clear();
         self.pending_scratch.clear();
         self.customer_updates = next_updates;
         self.customer_rejected = next_rejected;
@@ -776,11 +827,13 @@ impl IntervalCollector {
             let rank = sample_rank(self.sample_seed, STOCK_SAMPLE_DOMAIN, edge.key_index);
             select_stock(
                 &mut self.stock_scratch,
+                &mut self.retired_stock_scratch,
                 &mut self.pending_scratch,
                 edge.key_index,
                 rank,
                 &mut next_rejected,
-            );
+                self.pending_limit,
+            )?;
         }
         for edge in validated[..updates.len()].iter().flatten() {
             if let Some(position) = self
@@ -796,13 +849,29 @@ impl IntervalCollector {
                     edge.segment,
                     &mut self.pending_scratch,
                 )?;
+            } else if let Some(position) = self
+                .retired_stock_scratch
+                .iter()
+                .position(|sample| sample.key_index == edge.key_index)
+            {
+                insert_stock(
+                    self.stock_roots.as_ref(),
+                    edge.key,
+                    edge.key_index,
+                    &mut self.retired_stock_scratch[position].slot,
+                    edge.segment,
+                    &mut self.pending_scratch,
+                )?;
             }
         }
+        prune_rooted_retired_stocks(&mut self.retired_stock_scratch, &self.pending_scratch)?;
         validate_pending_limit(self.pending_scratch.len(), self.pending_limit)?;
 
         swap(&mut self.stocks, &mut self.stock_scratch);
+        swap(&mut self.retired_stocks, &mut self.retired_stock_scratch);
         swap(&mut self.pending, &mut self.pending_scratch);
         self.stock_scratch.clear();
+        self.retired_stock_scratch.clear();
         self.pending_scratch.clear();
         self.stock_updates = next_updates;
         self.stock_rejected = next_rejected;
@@ -812,6 +881,9 @@ impl IntervalCollector {
     fn reset_customer_scratch(&mut self) {
         self.customer_scratch.clear();
         self.customer_scratch.extend(self.customers.iter().copied());
+        self.retired_customer_scratch.clear();
+        self.retired_customer_scratch
+            .extend(self.retired_customers.iter().copied());
         self.pending_scratch.clear();
         self.pending_scratch.extend(self.pending.iter().copied());
     }
@@ -819,6 +891,9 @@ impl IntervalCollector {
     fn reset_stock_scratch(&mut self) {
         self.stock_scratch.clear();
         self.stock_scratch.extend(self.stocks.iter().copied());
+        self.retired_stock_scratch.clear();
+        self.retired_stock_scratch
+            .extend(self.retired_stocks.iter().copied());
         self.pending_scratch.clear();
         self.pending_scratch.extend(self.pending.iter().copied());
     }
@@ -826,6 +901,10 @@ impl IntervalCollector {
     fn owned_buffer_capacity_bytes(&self) -> usize {
         (self.customers.capacity() + self.customer_scratch.capacity()) * size_of::<CustomerSample>()
             + (self.stocks.capacity() + self.stock_scratch.capacity()) * size_of::<StockSample>()
+            + (self.retired_customers.capacity() + self.retired_customer_scratch.capacity())
+                * size_of::<CustomerSample>()
+            + (self.retired_stocks.capacity() + self.retired_stock_scratch.capacity())
+                * size_of::<StockSample>()
             + (self.pending.capacity() + self.pending_scratch.capacity())
                 * size_of::<PendingSegment>()
     }
@@ -834,6 +913,8 @@ impl IntervalCollector {
 pub struct CollectorStorage {
     selected_customers: usize,
     selected_stocks: usize,
+    retired_customers: usize,
+    retired_stocks: usize,
     pending_intervals: usize,
     pending_limit: usize,
     owned_buffer_capacity_bytes: usize,
@@ -847,6 +928,14 @@ impl CollectorStorage {
 
     pub fn selected_stock_count(&self) -> usize {
         self.selected_stocks
+    }
+
+    pub fn retired_customer_count(&self) -> usize {
+        self.retired_customers
+    }
+
+    pub fn retired_stock_count(&self) -> usize {
+        self.retired_stocks
     }
 
     pub fn pending_intervals(&self) -> usize {
@@ -1331,16 +1420,21 @@ impl<'a> Iterator for SealedStockIter<'a> {
 
 fn select_customer(
     samples: &mut Vec<CustomerSample>,
+    retired: &mut Vec<CustomerSample>,
     pending: &mut Vec<PendingSegment>,
     key_index: u32,
     rank: u64,
     rejected: &mut Option<CanonicalRejectedSample>,
-) -> Option<usize> {
+    pending_limit: usize,
+) -> Result<Option<usize>, CollectorError> {
     if let Some(position) = samples
         .iter()
         .position(|sample| sample.key_index == key_index)
     {
-        return Some(position);
+        return Ok(Some(position));
+    }
+    if retired.iter().any(|sample| sample.key_index == key_index) {
+        return Ok(None);
     }
     if samples.len() == SAMPLE_LIMIT {
         let worst = samples
@@ -1351,40 +1445,45 @@ fn select_customer(
             .expect("a full reservoir is nonempty");
         if (rank, key_index) >= (samples[worst].rank, samples[worst].key_index) {
             observe_rejected(rejected, rank, key_index);
-            return None;
+            return Ok(None);
         }
         let evicted = samples.swap_remove(worst);
         observe_rejected(rejected, evicted.rank, evicted.key_index);
-        pending.retain(|entry| {
-            !matches!(
-                entry,
-                PendingSegment::Customer {
-                    key_index: candidate,
-                    ..
-                } if *candidate == evicted.key_index
-            )
-        });
+        if has_pending_customer(pending, evicted.key_index) {
+            if retired.len() >= pending_limit {
+                return Err(CollectorError::PendingLimit {
+                    actual: retired.len() + 1,
+                    limit: pending_limit,
+                });
+            }
+            retired.push(evicted);
+        }
     }
     samples.push(CustomerSample {
         rank,
         key_index,
         slot: CustomerSlot::EMPTY,
     });
-    Some(samples.len() - 1)
+    Ok(Some(samples.len() - 1))
 }
 
 fn select_stock(
     samples: &mut Vec<StockSample>,
+    retired: &mut Vec<StockSample>,
     pending: &mut Vec<PendingSegment>,
     key_index: u32,
     rank: u64,
     rejected: &mut Option<CanonicalRejectedSample>,
-) -> Option<usize> {
+    pending_limit: usize,
+) -> Result<Option<usize>, CollectorError> {
     if let Some(position) = samples
         .iter()
         .position(|sample| sample.key_index == key_index)
     {
-        return Some(position);
+        return Ok(Some(position));
+    }
+    if retired.iter().any(|sample| sample.key_index == key_index) {
+        return Ok(None);
     }
     if samples.len() == SAMPLE_LIMIT {
         let worst = samples
@@ -1395,26 +1494,76 @@ fn select_stock(
             .expect("a full reservoir is nonempty");
         if (rank, key_index) >= (samples[worst].rank, samples[worst].key_index) {
             observe_rejected(rejected, rank, key_index);
-            return None;
+            return Ok(None);
         }
         let evicted = samples.swap_remove(worst);
         observe_rejected(rejected, evicted.rank, evicted.key_index);
-        pending.retain(|entry| {
-            !matches!(
-                entry,
-                PendingSegment::Stock {
-                    key_index: candidate,
-                    ..
-                } if *candidate == evicted.key_index
-            )
-        });
+        if has_pending_stock(pending, evicted.key_index) {
+            if retired.len() >= pending_limit {
+                return Err(CollectorError::PendingLimit {
+                    actual: retired.len() + 1,
+                    limit: pending_limit,
+                });
+            }
+            retired.push(evicted);
+        }
     }
     samples.push(StockSample {
         rank,
         key_index,
         slot: StockSlot::EMPTY,
     });
-    Some(samples.len() - 1)
+    Ok(Some(samples.len() - 1))
+}
+
+fn has_pending_customer(pending: &[PendingSegment], key_index: u32) -> bool {
+    pending.iter().any(|entry| {
+        matches!(
+            entry,
+            PendingSegment::Customer {
+                key_index: candidate,
+                ..
+            } if *candidate == key_index
+        )
+    })
+}
+
+fn has_pending_stock(pending: &[PendingSegment], key_index: u32) -> bool {
+    pending.iter().any(|entry| {
+        matches!(
+            entry,
+            PendingSegment::Stock {
+                key_index: candidate,
+                ..
+            } if *candidate == key_index
+        )
+    })
+}
+
+fn prune_rooted_retired_customers(
+    retired: &mut Vec<CustomerSample>,
+    pending: &[PendingSegment],
+) -> Result<(), CollectorError> {
+    for sample in retired.iter() {
+        if !has_pending_customer(pending, sample.key_index) && !sample.slot.is_rooted() {
+            return Err(CollectorError::Disconnected { pending: 0 });
+        }
+    }
+    retired.retain(|sample| has_pending_customer(pending, sample.key_index));
+    Ok(())
+}
+
+fn prune_rooted_retired_stocks(
+    retired: &mut Vec<StockSample>,
+    pending: &[PendingSegment],
+) -> Result<(), CollectorError> {
+    for sample in retired.iter() {
+        if !has_pending_stock(pending, sample.key_index) && !sample.slot.is_rooted() {
+            return Err(CollectorError::Disconnected { pending: 0 });
+        }
+    }
+    retired.retain(|sample| has_pending_stock(pending, sample.key_index));
+    Ok(())
 }
 
 fn observe_rejected(rejected: &mut Option<CanonicalRejectedSample>, rank: u64, key_index: u32) {
@@ -2193,7 +2342,7 @@ mod tests {
         assert_eq!(size_of::<StockSample>(), 32);
         assert_eq!(size_of::<PendingSegment>(), 64);
         let bound = IntervalCollector::owned_buffer_capacity_upper_bound_for(50, 32).unwrap();
-        assert_eq!(bound, 71_552);
+        assert_eq!(bound, 132_992);
         let collector = collector(32);
         assert_eq!(collector.storage().owned_buffer_capacity_bytes(), bound);
         assert_eq!(collector.storage().pending_limit(), 480);
@@ -2278,6 +2427,8 @@ mod tests {
     fn equal_hash_ranks_use_the_canonical_key_tiebreak() {
         let mut forward = Vec::with_capacity(SAMPLE_LIMIT);
         let mut reverse = Vec::with_capacity(SAMPLE_LIMIT);
+        let mut forward_retired = Vec::new();
+        let mut reverse_retired = Vec::new();
         let mut forward_pending = Vec::new();
         let mut reverse_pending = Vec::new();
         let mut forward_rejected = None;
@@ -2285,20 +2436,26 @@ mod tests {
         for key_index in 0..=SAMPLE_LIMIT as u32 {
             let _ = select_stock(
                 &mut forward,
+                &mut forward_retired,
                 &mut forward_pending,
                 key_index,
                 7,
                 &mut forward_rejected,
-            );
+                MAX_EDGES_PER_TERMINAL,
+            )
+            .unwrap();
         }
         for key_index in (0..=SAMPLE_LIMIT as u32).rev() {
             let _ = select_stock(
                 &mut reverse,
+                &mut reverse_retired,
                 &mut reverse_pending,
                 key_index,
                 7,
                 &mut reverse_rejected,
-            );
+                MAX_EDGES_PER_TERMINAL,
+            )
+            .unwrap();
         }
         let mut forward_keys = forward
             .iter()
@@ -2316,11 +2473,14 @@ mod tests {
         let before = reverse_keys;
         let _ = select_stock(
             &mut reverse,
+            &mut reverse_retired,
             &mut reverse_pending,
             SAMPLE_LIMIT as u32,
             7,
             &mut reverse_rejected,
-        );
+            MAX_EDGES_PER_TERMINAL,
+        )
+        .unwrap();
         let mut after = reverse
             .iter()
             .map(|sample| sample.key_index)
@@ -2330,7 +2490,7 @@ mod tests {
     }
 
     #[test]
-    fn evicting_a_selected_key_drops_its_chain_and_pending_interval() {
+    fn evicted_pending_stock_is_retired_until_its_missing_bridge_arrives() {
         let keys = (1..=SAMPLE_LIMIT as i32)
             .map(|item_id| StockKey {
                 warehouse_id: 1,
@@ -2384,7 +2544,8 @@ mod tests {
         collector
             .record_terminal(TerminalEvidence::stocks(&update))
             .unwrap();
-        assert_eq!(collector.storage().pending_intervals(), 0);
+        assert_eq!(collector.storage().pending_intervals(), 1);
+        assert_eq!(collector.storage().retired_stock_count(), 1);
         assert!(!collector
             .stocks
             .iter()
@@ -2399,6 +2560,7 @@ mod tests {
             .iter()
             .any(|sample| sample.key_index == worst.key_index));
         assert_eq!(collector.storage().pending_intervals(), 0);
+        assert_eq!(collector.storage().retired_stock_count(), 0);
     }
 
     #[test]
@@ -2486,7 +2648,14 @@ mod tests {
                 .unwrap();
             roots.push(root_edges);
         }
-        assert!(collector.storage().pending_intervals() <= SAMPLE_LIMIT);
+        assert!(
+            collector.storage().pending_intervals() > SAMPLE_LIMIT,
+            "evicted selected keys must retain their pending receipt-only state"
+        );
+        assert!(
+            collector.storage().pending_intervals() <= collector.storage().pending_limit(),
+            "the receipt-only retired set must remain bounded by one full terminal per worker"
+        );
         assert_eq!(collector.storage().selected_stock_count(), SAMPLE_LIMIT);
         for terminal in &roots {
             collector

@@ -259,9 +259,10 @@ impl TerminalEvidenceCollector {
             mut guard,
         } = registered;
 
-        if let Err(error) =
-            tokio::try_join!(interval_receipt.wait(), wait_for_payment(payment_receipt))
-        {
+        if let Err(error) = tokio::try_join!(
+            interval_receipt.wait(),
+            wait_for_payment(payment_receipt, Arc::clone(&self.tracker))
+        ) {
             self.poison_with(error.to_string()).await;
             return Err(error);
         }
@@ -458,12 +459,16 @@ impl TerminalEvidenceCollector {
         }
         *worker = WorkerState::Finished;
 
-        let pending = state
+        let interval_pending = state
             .intervals
             .as_ref()
             .ok_or(TerminalEvidenceError::AlreadySealed)?
             .storage()
             .pending_intervals();
+        let payment_pending = self.payment.storage().await.pending_edges;
+        let pending = interval_pending.checked_add(payment_pending).ok_or(
+            TerminalEvidenceError::CounterOverflow("pending terminal evidence"),
+        )?;
         if pending != 0
             && !state
                 .workers
@@ -617,9 +622,25 @@ impl TerminalEvidenceCollector {
     }
 }
 
-async fn wait_for_payment(receipt: Option<PaymentAckReceipt>) -> Result<(), TerminalEvidenceError> {
+async fn wait_for_payment(
+    receipt: Option<PaymentAckReceipt>,
+    tracker: Arc<AckTracker>,
+) -> Result<(), TerminalEvidenceError> {
     match receipt {
-        Some(receipt) => receipt.wait().await.map_err(TerminalEvidenceError::Payment),
+        Some(receipt) => {
+            let mut abandoned = tracker.abandoned_tx.subscribe();
+            if tracker.is_abandoned() || *abandoned.borrow() {
+                return Err(TerminalEvidenceError::Poisoned {
+                    cause: "terminal ACK gate was abandoned".to_owned(),
+                });
+            }
+            tokio::select! {
+                result = receipt.wait() => result.map_err(TerminalEvidenceError::Payment),
+                _ = abandoned.changed() => Err(TerminalEvidenceError::Poisoned {
+                    cause: "terminal ACK gate was abandoned".to_owned(),
+                }),
+            }
+        }
         None => Ok(()),
     }
 }
@@ -888,8 +909,21 @@ mod tests {
         ytd: f32,
         amount: f32,
     ) -> CustomerMutation {
+        customer_payment_for(1, payment_count, balance, ytd, amount)
+    }
+
+    fn customer_payment_for(
+        customer_id: i32,
+        payment_count: i32,
+        balance: f32,
+        ytd: f32,
+        amount: f32,
+    ) -> CustomerMutation {
         CustomerMutation::new(
-            customer_key(),
+            CustomerKey {
+                customer_id,
+                ..customer_key()
+            },
             CustomerUpdateEvidence {
                 kind: CustomerUpdateKind::Payment,
                 before_version: CustomerLogicalVersion {
@@ -1110,6 +1144,141 @@ mod tests {
                 | Err(TerminalEvidenceError::Poisoned { .. })
         ));
         assert!(collector.storage().await.poisoned);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn last_idle_worker_cannot_finish_while_payment_needs_a_bridge() {
+        let collector = collector(2);
+        let first_collector = Arc::clone(&collector);
+        let first = tokio::spawn(async move {
+            first_collector
+                .record_prepared_without_stats(
+                    0,
+                    PreparedIntervals::Empty,
+                    Some(payment_terminal(1.0, 1.0)),
+                )
+                .await
+        });
+        wait_for_state(&collector, 1, 0).await;
+        assert_eq!(collector.storage().await.payment_pending_edges, 2);
+
+        collector
+            .record_prepared_without_stats(1, PreparedIntervals::Empty, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            collector.worker_finished(1).await,
+            Err(TerminalEvidenceError::NoPotentialBridge { pending: 2 })
+                | Err(TerminalEvidenceError::Poisoned { .. })
+        ));
+        assert!(tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("poison must wake the Payment-only waiter")
+            .unwrap()
+            .is_err());
+        assert!(collector.storage().await.poisoned);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_interval_waiter_wakes_payment_only_waiter() {
+        let collector = collector(3);
+        let payment_collector = Arc::clone(&collector);
+        let payment_waiter = tokio::spawn(async move {
+            payment_collector
+                .record_prepared_without_stats(
+                    0,
+                    PreparedIntervals::Empty,
+                    Some(payment_terminal(1.0, 1.0)),
+                )
+                .await
+        });
+        wait_for_state(&collector, 1, 0).await;
+
+        let interval_collector = Arc::clone(&collector);
+        let interval_waiter = tokio::spawn(async move {
+            interval_collector
+                .record_prepared_without_stats(
+                    1,
+                    PreparedIntervals::Customers(vec![customer_payment(2, -11.0, 11.0, 1.0)]),
+                    None,
+                )
+                .await
+        });
+        wait_for_state(&collector, 2, 1).await;
+
+        interval_waiter.abort();
+        assert!(interval_waiter.await.unwrap_err().is_cancelled());
+        assert!(tokio::time::timeout(Duration::from_secs(1), payment_waiter)
+            .await
+            .expect("composite cancellation must wake the Payment-only waiter")
+            .unwrap()
+            .is_err());
+        assert!(collector.storage().await.poisoned);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn evicted_pending_customer_waits_in_retired_set_for_its_bridge() {
+        let collector = collector(3);
+        for customer_id in 1..=64 {
+            collector
+                .record_prepared_without_stats(
+                    0,
+                    PreparedIntervals::Customers(vec![customer_payment_for(
+                        customer_id,
+                        1,
+                        -10.0,
+                        10.0,
+                        1.0,
+                    )]),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let gap_collector = Arc::clone(&collector);
+        let gap = tokio::spawn(async move {
+            gap_collector
+                .record_prepared_without_stats(
+                    0,
+                    PreparedIntervals::Customers(vec![customer_payment_for(
+                        58, 3, -12.0, 12.0, 1.0,
+                    )]),
+                    None,
+                )
+                .await
+        });
+        wait_for_state(&collector, 1, 1).await;
+
+        let replacement_collector = Arc::clone(&collector);
+        let replacement = tokio::spawn(async move {
+            replacement_collector
+                .record_prepared_without_stats(
+                    1,
+                    PreparedIntervals::Customers(vec![customer_payment_for(
+                        65, 1, -10.0, 10.0, 1.0,
+                    )]),
+                    None,
+                )
+                .await
+        });
+        wait_for_state(&collector, 2, 1).await;
+        assert!(!gap.is_finished());
+        assert!(!replacement.is_finished());
+        let storage = collector.storage().await;
+        assert_eq!(storage.interval_pending, 1);
+
+        collector
+            .record_prepared_without_stats(
+                2,
+                PreparedIntervals::Customers(vec![customer_payment_for(58, 2, -11.0, 11.0, 1.0)]),
+                None,
+            )
+            .await
+            .unwrap();
+        replacement.await.unwrap().unwrap();
+        gap.await.unwrap().unwrap();
+        assert_eq!(collector.storage().await.interval_pending, 0);
     }
 
     fn payment_ticket() -> TransactionTicket {
