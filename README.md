@@ -149,5 +149,7 @@ response frame 与 terminal”，且不会把本地生成的 SQL 写入超时诊
 
 若正式排名在本机先于崩溃阶段失败，可在对同一 SF50 数据库执行真实 `SIGKILL`、重启并
 通过 `show tables;` 测活后，使用 `--post-crash-response-probe --seed <setup-seed>
---state-dir <setup-state>` 做只读的本地 37+7 响应面探测。该模式不比较数值、不写
-recovery receipt，也不推断未公开 SQL/答案，结果始终不构成排名或正式恢复通过证明。
+--state-dir <setup-state>` 做只读的本地响应面探测。它依次执行公开 37+7、装载期关系/
+内容样本以及 500 分区分组查询形状，并为每个脱敏 ordinal/shape 记录发送、首个完整
+响应帧和 terminal 的耗时。该模式不比较数值、不写 recovery receipt，也不推断未公开
+SQL/答案，结果始终不构成排名或正式恢复通过证明。

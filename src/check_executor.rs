@@ -1,11 +1,14 @@
 //! Typed Wire-v3 executor for public-spec consistency plans.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 use tracing::{info, warn};
 
 use crate::connection::client::RmdbClient;
-use crate::connection::wire::{StreamResponse, WireValue};
+use crate::connection::wire::{FoldStreamResponse, StreamResponse, WireValue};
 use crate::consistency::{
     float32_matches, float_aggregate_plan, public_online_integer_plan,
     recovery_partition_audits_for_warehouses, recovery_plan, setup_plan, sum_f32_as_f64_once,
@@ -604,23 +607,119 @@ pub async fn probe_public_post_crash_responses(
         committed: Default::default(),
     })
     .map_err(|error| protocol_error("invalid local recovery response plan", error))?;
+    let mut ordinal = 0_usize;
     for query in &plan.queries {
-        let result = execute_query(client, &dataset.runtime_schema, query).await?;
-        info!(
-            "post-crash response terminal PASS: {} ({} row(s))",
-            query.id,
-            result.rows.len()
-        );
+        ordinal += 1;
+        probe_response(
+            client,
+            &dataset.runtime_schema,
+            ordinal,
+            &query.id,
+            &query.sql,
+        )
+        .await?;
     }
     for query in &float_aggregate_plan(CheckScope::Recovery).queries {
-        let result = execute_query(client, &dataset.runtime_schema, query).await?;
-        info!(
-            "post-crash response terminal PASS: {} ({} row(s))",
-            query.id,
-            result.rows.len()
-        );
+        ordinal += 1;
+        probe_response(
+            client,
+            &dataset.runtime_schema,
+            ordinal,
+            &query.id,
+            &query.sql,
+        )
+        .await?;
     }
-    info!("non-scoring public post-crash response probe completed all 37+7 requests");
+    for query in setup_sample_queries(dataset.setup_evidence())? {
+        ordinal += 1;
+        probe_response(
+            client,
+            &dataset.runtime_schema,
+            ordinal,
+            query.id,
+            &query.sql,
+        )
+        .await?;
+    }
+    for (id, sql) in grouped_partition_query_specs() {
+        ordinal += 1;
+        probe_response(client, &dataset.runtime_schema, ordinal, id, sql).await?;
+    }
+    info!(
+        "non-scoring public post-crash response probe completed {ordinal} public-spec request shapes"
+    );
+    Ok(())
+}
+
+async fn probe_response(
+    client: &mut RmdbClient,
+    schema: &RuntimeSchema,
+    ordinal: usize,
+    shape: &str,
+    sql: &str,
+) -> Result<(), TpccError> {
+    let started = Instant::now();
+    let first_frame_seen = Arc::new(AtomicBool::new(false));
+    let meta_seen = Arc::clone(&first_frame_seen);
+    let row_seen = Arc::clone(&first_frame_seen);
+    info!("post-crash probe SEND ordinal={ordinal} shape={shape}");
+
+    let rendered = schema.render_sql(sql);
+    let response = client
+        .exec_stream_fold(
+            &terminated_sql(&rendered),
+            0_u64,
+            move |_, _| {
+                if !meta_seen.swap(true, Ordering::Relaxed) {
+                    info!(
+                        "post-crash probe FIRST_FRAME ordinal={ordinal} shape={shape} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                }
+                Ok(())
+            },
+            move |_, _, rows| {
+                if !row_seen.swap(true, Ordering::Relaxed) {
+                    info!(
+                        "post-crash probe FIRST_FRAME ordinal={ordinal} shape={shape} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                }
+                *rows = rows.checked_add(1).ok_or_else(|| {
+                    crate::connection::wire::WireError::Protocol(
+                        "post-crash probe row count overflow".to_owned(),
+                    )
+                })?;
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|error| {
+            TpccError::Protocol(format!(
+                "post-crash probe ordinal={ordinal} shape={shape} failed after {} ms: {error}",
+                started.elapsed().as_millis()
+            ))
+        })?;
+
+    let (terminal, rows) = match response {
+        FoldStreamResponse::Query {
+            row_count, state, ..
+        } => {
+            if row_count != state {
+                return Err(TpccError::Protocol(format!(
+                    "post-crash probe ordinal={ordinal} shape={shape} folded {state} rows but terminal declared {row_count}"
+                )));
+            }
+            ("RESULT_END", row_count)
+        }
+        FoldStreamResponse::CommandOk => ("COMMAND_OK", 0),
+        FoldStreamResponse::TransactionAbort { .. } => ("TRANSACTION_ABORT", 0),
+        FoldStreamResponse::Error { .. } => ("ERROR", 0),
+    };
+    info!(
+        "post-crash probe TERMINAL ordinal={ordinal} shape={shape} terminal={terminal} rows={rows} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -1090,6 +1189,37 @@ enum PartitionMetric {
     CarrierZero,
 }
 
+const GROUPED_PARTITION_QUERIES: [(&str, &str); 6] = [
+    (
+        "recovery.partition.grouped.orders",
+        "SELECT o_w_id, o_d_id, COUNT(*) FROM orders GROUP BY o_w_id, o_d_id",
+    ),
+    (
+        "recovery.partition.grouped.order_lines",
+        "SELECT ol_w_id, ol_d_id, COUNT(*) FROM order_line GROUP BY ol_w_id, ol_d_id",
+    ),
+    (
+        "recovery.partition.grouped.new_orders",
+        "SELECT no_w_id, no_d_id, COUNT(*) FROM new_orders GROUP BY no_w_id, no_d_id",
+    ),
+    (
+        "recovery.partition.grouped.empty_delivery_times",
+        "SELECT ol_w_id, ol_d_id, COUNT(*) FROM order_line WHERE ol_delivery_d = '' GROUP BY ol_w_id, ol_d_id",
+    ),
+    (
+        "recovery.partition.grouped.carrier_zero",
+        "SELECT o_w_id, o_d_id, COUNT(*) FROM orders WHERE o_carrier_id = 0 GROUP BY o_w_id, o_d_id",
+    ),
+    (
+        "recovery.partition.grouped.next_order_id",
+        "SELECT d_w_id, d_id, d_next_o_id FROM district",
+    ),
+];
+
+fn grouped_partition_query_specs() -> impl Iterator<Item = (&'static str, &'static str)> {
+    GROUPED_PARTITION_QUERIES.into_iter()
+}
+
 impl PartitionMetric {
     fn expected(self, partition: PartitionExpectation) -> i64 {
         match self {
@@ -1107,33 +1237,13 @@ async fn run_grouped_partition_audit(
     schema: &RuntimeSchema,
     partitions: &[PartitionExpectation],
 ) -> Result<(), TpccError> {
-    for (id, sql, metric) in [
-        (
-            "recovery.partition.grouped.orders",
-            "SELECT o_w_id, o_d_id, COUNT(*) FROM orders GROUP BY o_w_id, o_d_id",
-            PartitionMetric::Orders,
-        ),
-        (
-            "recovery.partition.grouped.order_lines",
-            "SELECT ol_w_id, ol_d_id, COUNT(*) FROM order_line GROUP BY ol_w_id, ol_d_id",
-            PartitionMetric::OrderLines,
-        ),
-        (
-            "recovery.partition.grouped.new_orders",
-            "SELECT no_w_id, no_d_id, COUNT(*) FROM new_orders GROUP BY no_w_id, no_d_id",
-            PartitionMetric::NewOrders,
-        ),
-        (
-            "recovery.partition.grouped.empty_delivery_times",
-            "SELECT ol_w_id, ol_d_id, COUNT(*) FROM order_line WHERE ol_delivery_d = '' GROUP BY ol_w_id, ol_d_id",
-            PartitionMetric::EmptyDeliveryTimes,
-        ),
-        (
-            "recovery.partition.grouped.carrier_zero",
-            "SELECT o_w_id, o_d_id, COUNT(*) FROM orders WHERE o_carrier_id = 0 GROUP BY o_w_id, o_d_id",
-            PartitionMetric::CarrierZero,
-        ),
-    ] {
+    for ((id, sql), metric) in GROUPED_PARTITION_QUERIES[..5].iter().copied().zip([
+        PartitionMetric::Orders,
+        PartitionMetric::OrderLines,
+        PartitionMetric::NewOrders,
+        PartitionMetric::EmptyDeliveryTimes,
+        PartitionMetric::CarrierZero,
+    ]) {
         let result = execute_typed_sql(client, schema, id, sql).await?;
         validate_grouped_partition_counts(id, result, partitions, metric)?;
         info!(
@@ -1142,13 +1252,8 @@ async fn run_grouped_partition_audit(
         );
     }
 
-    let result = execute_typed_sql(
-        client,
-        schema,
-        "recovery.partition.grouped.next_order_id",
-        "SELECT d_w_id, d_id, d_next_o_id FROM district",
-    )
-    .await?;
+    let (id, sql) = GROUPED_PARTITION_QUERIES[5];
+    let result = execute_typed_sql(client, schema, id, sql).await?;
     validate_partition_next_order_ids(result, partitions)?;
     info!(
         "consistency PASS: recovery.partition.grouped.next_order_id ({} partitions in one typed response)",
@@ -1823,6 +1928,23 @@ mod tests {
             PartitionMetric::NewOrders
         )
         .is_ok());
+    }
+
+    #[test]
+    fn response_probe_covers_every_grouped_partition_shape_once() {
+        let specs = grouped_partition_query_specs().collect::<Vec<_>>();
+        assert_eq!(specs.len(), 6);
+        assert_eq!(
+            specs
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            specs.len()
+        );
+        assert!(specs.iter().all(
+            |(id, sql)| id.starts_with("recovery.partition.grouped.") && sql.contains("SELECT")
+        ));
     }
 
     #[test]
