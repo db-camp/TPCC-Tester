@@ -7,11 +7,20 @@
 
 use thiserror::Error;
 
+use crate::consistency::{FloatError, NonNegativeF32Accumulator};
+
+use super::bounded_stats::{
+    BoundedPhysicalStats, BoundedStatsError, ClassTotals, PartitionTotals, LEDGER_CLASS_COUNT,
+    PHYSICAL_PARTITION_COUNT,
+};
+
 const SECTION_MAGIC: [u8; 4] = *b"TCS1";
 const SECTION_VERSION: u16 = 1;
 
 pub(crate) const MAX_CORE_SECTION_BYTES: usize = 20 * 1024;
 pub(crate) const MAX_CORE_SECTION_HEX_CHARS: usize = MAX_CORE_SECTION_BYTES * 2;
+pub(crate) const MAX_PHYSICAL_STATS_SECTION_BYTES: usize = MAX_CORE_SECTION_BYTES;
+const MAX_ACCUMULATOR_WORDS: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -63,6 +72,14 @@ pub(crate) enum CoreCodecError {
     InvalidHexLength,
     #[error("canonical lower-hex input contains a non-lowercase-hex byte")]
     InvalidHexDigit,
+    #[error("invalid canonical bounded physical statistics: {0}")]
+    InvalidPhysicalStats(#[source] BoundedStatsError),
+    #[error("invalid canonical {field} accumulator: {source}")]
+    InvalidAccumulator {
+        field: &'static str,
+        #[source]
+        source: FloatError,
+    },
 }
 
 /// A limit-aware writer for fixed-width little-endian canonical values.
@@ -285,6 +302,173 @@ fn lower_hex_nibble(byte: u8) -> Result<u8, CoreCodecError> {
     }
 }
 
+pub(crate) fn encode_physical_stats_section(
+    stats: &BoundedPhysicalStats,
+) -> Result<Vec<u8>, CoreCodecError> {
+    stats
+        .validate()
+        .map_err(CoreCodecError::InvalidPhysicalStats)?;
+    let mut writer = section_writer(SectionKind::PhysicalStats, MAX_PHYSICAL_STATS_SECTION_BYTES)?;
+    let (classes, partitions, payment_history, new_order_lines, delivery_customers) =
+        stats.canonical_parts();
+    for totals in classes {
+        encode_class_totals(&mut writer, *totals)?;
+    }
+    for totals in partitions {
+        encode_partition_totals(&mut writer, *totals)?;
+    }
+    for (field, accumulators) in [
+        ("Payment/history amount", payment_history),
+        ("NewOrder line amount", new_order_lines),
+        ("Delivery customer amount", delivery_customers),
+    ] {
+        for accumulator in accumulators {
+            encode_accumulator(&mut writer, field, accumulator)?;
+        }
+    }
+    Ok(writer.finish())
+}
+
+pub(crate) fn decode_physical_stats_section(
+    bytes: &[u8],
+) -> Result<BoundedPhysicalStats, CoreCodecError> {
+    let mut reader = section_reader(
+        bytes,
+        SectionKind::PhysicalStats,
+        MAX_PHYSICAL_STATS_SECTION_BYTES,
+    )?;
+    let mut classes = [ClassTotals::default(); LEDGER_CLASS_COUNT];
+    for totals in &mut classes {
+        *totals = decode_class_totals(&mut reader)?;
+    }
+    let mut partitions = [PartitionTotals::default(); PHYSICAL_PARTITION_COUNT];
+    for totals in &mut partitions {
+        *totals = decode_partition_totals(&mut reader)?;
+    }
+    let mut payment_history = std::array::from_fn(|_| NonNegativeF32Accumulator::default());
+    let mut new_order_lines = std::array::from_fn(|_| NonNegativeF32Accumulator::default());
+    let mut delivery_customers = std::array::from_fn(|_| NonNegativeF32Accumulator::default());
+    for accumulator in &mut payment_history {
+        *accumulator = decode_accumulator(&mut reader, "Payment/history amount")?;
+    }
+    for accumulator in &mut new_order_lines {
+        *accumulator = decode_accumulator(&mut reader, "NewOrder line amount")?;
+    }
+    for accumulator in &mut delivery_customers {
+        *accumulator = decode_accumulator(&mut reader, "Delivery customer amount")?;
+    }
+    reader.finish()?;
+    BoundedPhysicalStats::from_canonical_parts(
+        classes,
+        partitions,
+        payment_history,
+        new_order_lines,
+        delivery_customers,
+    )
+    .map_err(CoreCodecError::InvalidPhysicalStats)
+}
+
+fn encode_class_totals(
+    writer: &mut CanonicalWriter,
+    totals: ClassTotals,
+) -> Result<(), CoreCodecError> {
+    for value in [
+        totals.new_order_commits,
+        totals.payment_commits,
+        totals.order_status_commits,
+        totals.delivery_commits,
+        totals.stock_level_commits,
+        totals.expected_rollbacks,
+        totals.new_orders,
+        totals.new_order_lines,
+        totals.remote_new_order_lines,
+        totals.stock_quantity_delta,
+        totals.delivered_orders,
+        totals.delivered_order_lines,
+    ] {
+        writer.put_u64(value)?;
+    }
+    Ok(())
+}
+
+fn decode_class_totals(reader: &mut CanonicalReader<'_>) -> Result<ClassTotals, CoreCodecError> {
+    Ok(ClassTotals {
+        new_order_commits: reader.get_u64()?,
+        payment_commits: reader.get_u64()?,
+        order_status_commits: reader.get_u64()?,
+        delivery_commits: reader.get_u64()?,
+        stock_level_commits: reader.get_u64()?,
+        expected_rollbacks: reader.get_u64()?,
+        new_orders: reader.get_u64()?,
+        new_order_lines: reader.get_u64()?,
+        remote_new_order_lines: reader.get_u64()?,
+        stock_quantity_delta: reader.get_u64()?,
+        delivered_orders: reader.get_u64()?,
+        delivered_order_lines: reader.get_u64()?,
+    })
+}
+
+fn encode_partition_totals(
+    writer: &mut CanonicalWriter,
+    totals: PartitionTotals,
+) -> Result<(), CoreCodecError> {
+    writer.put_u64(totals.new_orders)?;
+    writer.put_u64(totals.new_order_lines)?;
+    writer.put_u64(totals.delivered_orders)?;
+    writer.put_u64(totals.delivered_order_lines)
+}
+
+fn decode_partition_totals(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<PartitionTotals, CoreCodecError> {
+    Ok(PartitionTotals {
+        new_orders: reader.get_u64()?,
+        new_order_lines: reader.get_u64()?,
+        delivered_orders: reader.get_u64()?,
+        delivered_order_lines: reader.get_u64()?,
+    })
+}
+
+fn encode_accumulator(
+    writer: &mut CanonicalWriter,
+    field: &'static str,
+    accumulator: &NonNegativeF32Accumulator,
+) -> Result<(), CoreCodecError> {
+    let (term_count, words) = accumulator.to_words();
+    let word_count = u32::try_from(words.len()).map_err(|_| CoreCodecError::OversizedCount {
+        field,
+        actual: u64::MAX,
+        maximum: u64::from(MAX_ACCUMULATOR_WORDS),
+    })?;
+    if word_count > MAX_ACCUMULATOR_WORDS {
+        return Err(CoreCodecError::OversizedCount {
+            field,
+            actual: u64::from(word_count),
+            maximum: u64::from(MAX_ACCUMULATOR_WORDS),
+        });
+    }
+    writer.put_u64(term_count)?;
+    writer.put_u32(word_count)?;
+    for word in words {
+        writer.put_u64(word)?;
+    }
+    Ok(())
+}
+
+fn decode_accumulator(
+    reader: &mut CanonicalReader<'_>,
+    field: &'static str,
+) -> Result<NonNegativeF32Accumulator, CoreCodecError> {
+    let term_count = reader.get_u64()?;
+    let word_count = reader.bounded_count(field, MAX_ACCUMULATOR_WORDS)?;
+    let mut words = Vec::with_capacity(word_count as usize);
+    for _ in 0..word_count {
+        words.push(reader.get_u64()?);
+    }
+    NonNegativeF32Accumulator::from_words(term_count, &words)
+        .map_err(|source| CoreCodecError::InvalidAccumulator { field, source })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +563,51 @@ mod tests {
         assert!(matches!(
             section_reader(&wrong_magic, SectionKind::PhysicalStats, 32),
             Err(CoreCodecError::InvalidMagic)
+        ));
+    }
+
+    #[test]
+    fn physical_stats_section_round_trips_and_reencodes_identically() {
+        let default = BoundedPhysicalStats::default();
+        let (classes, partitions, payment, new_order, delivery) = default.canonical_parts();
+        let mut classes = *classes;
+        let mut payment = payment.clone();
+        classes[0].payment_commits = 1;
+        payment[0].add_bits(1.25_f32.to_bits()).unwrap();
+        let stats = BoundedPhysicalStats::from_canonical_parts(
+            classes,
+            *partitions,
+            payment,
+            new_order.clone(),
+            delivery.clone(),
+        )
+        .unwrap();
+
+        let encoded = encode_physical_stats_section(&stats).unwrap();
+        let restored = decode_physical_stats_section(&encoded).unwrap();
+        assert_eq!(restored, stats);
+        assert_eq!(encode_physical_stats_section(&restored).unwrap(), encoded);
+    }
+
+    #[test]
+    fn physical_stats_decoder_rejects_truncation_trailing_and_oversize() {
+        let encoded = encode_physical_stats_section(&BoundedPhysicalStats::default()).unwrap();
+        for end in [0, 1, 6, encoded.len() / 2, encoded.len() - 1] {
+            assert!(
+                decode_physical_stats_section(&encoded[..end]).is_err(),
+                "accepted truncation at {end}"
+            );
+        }
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(matches!(
+            decode_physical_stats_section(&trailing),
+            Err(CoreCodecError::TrailingBytes { remaining: 1 })
+        ));
+        assert!(matches!(
+            decode_physical_stats_section(&vec![0; MAX_PHYSICAL_STATS_SECTION_BYTES + 1]),
+            Err(CoreCodecError::OversizedSection { .. })
         ));
     }
 }
