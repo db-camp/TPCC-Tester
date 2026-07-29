@@ -6,7 +6,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::consistency::{FloatAggregateId, NonNegativeF32Accumulator, FLOAT_AGGREGATES};
+use crate::consistency::{
+    FloatAggregateId, NonNegativeF32Accumulator, OnlineKeySample, FLOAT_AGGREGATES,
+};
 use crate::loader::{LoadSummary, PartitionLoadSummary};
 use crate::profile::{
     LOAD_BUDGET_SECONDS, MEASUREMENT_SECONDS, MEASUREMENT_WINDOWS, OFFICIAL_CLIENTS,
@@ -531,6 +533,17 @@ impl DatasetState {
 
     pub fn setup_evidence(&self) -> &SetupEvidence {
         &self.setup_evidence
+    }
+
+    pub fn online_key_sample(&self) -> Result<OnlineKeySample, StateError> {
+        self.validate()?;
+        self.setup_evidence
+            .online_key_sample(self.warehouses, self.seed)
+            .map_err(|error| {
+                StateError::Invalid(format!(
+                    "cannot select dataset-bound online setup evidence: {error}"
+                ))
+            })
     }
 }
 
@@ -2739,6 +2752,24 @@ mod tests {
             dataset_checksum(&dataset)
         );
         assert!(decode_artifact(&oversized, "sample", &dataset, 128).is_err());
+    }
+
+    #[test]
+    fn online_key_sample_is_stable_seeded_and_dataset_bound() {
+        let dataset = sample_dataset_with_warehouses("online-keys-a", 2026, 50);
+        let sample = dataset.online_key_sample().unwrap();
+        assert_eq!(sample, dataset.online_key_sample().unwrap());
+
+        let different_seed = sample_dataset_with_warehouses("online-keys-b", 2027, 50);
+        assert_ne!(sample, different_seed.online_key_sample().unwrap());
+
+        let mut crossed_evidence = different_seed.clone();
+        crossed_evidence.setup_evidence = dataset.setup_evidence.clone();
+        assert!(crossed_evidence.online_key_sample().is_err());
+
+        let mut crossed_schema = dataset;
+        crossed_schema.runtime_schema = RuntimeSchema::opaque(2027).unwrap();
+        assert!(crossed_schema.online_key_sample().is_err());
     }
 
     #[test]

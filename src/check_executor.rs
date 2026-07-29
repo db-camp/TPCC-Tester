@@ -572,7 +572,10 @@ pub async fn run_final_online(
 ) -> Result<FloatBaseline, TpccError> {
     warn!("{PUBLIC_SPEC_NOTICE}");
     let expectations = final_expectations(dataset, ledger, initial_order_line_amounts)?;
-    let plan = public_online_integer_plan(expectations)
+    let sample = dataset
+        .online_key_sample()
+        .map_err(|error| protocol_error("invalid online setup-evidence binding", error))?;
+    let plan = public_online_integer_plan(expectations, sample)
         .map_err(|error| protocol_error("invalid public online plan", error))?;
     run_plan(client, &plan, &dataset.runtime_schema).await?;
 

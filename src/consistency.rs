@@ -343,6 +343,7 @@ pub enum PlanError {
     WarehouseCountExceedsPublicMaximum { actual: i32, maximum: i32 },
     NegativeCount(&'static str),
     ArithmeticOverflow(&'static str),
+    InvalidOnlineSample(&'static str),
     InvalidPartitionCount { expected: usize, actual: usize },
     InvalidPartitionKey(PartitionKey),
     DuplicatePartition(PartitionKey),
@@ -362,6 +363,9 @@ impl fmt::Display for PlanError {
             ),
             Self::NegativeCount(name) => write!(f, "{name} must not be negative"),
             Self::ArithmeticOverflow(name) => write!(f, "{name} overflowed i64"),
+            Self::InvalidOnlineSample(message) => {
+                write!(f, "invalid online setup-evidence sample: {message}")
+            }
             Self::InvalidPartitionCount { expected, actual } => write!(
                 f,
                 "expected {expected} partition expectations, got {actual}"
@@ -603,6 +607,53 @@ pub struct RecoveryExpectations {
     pub committed: CommittedLedger,
 }
 
+/// One coherent set of logical keys selected from persisted setup evidence.
+///
+/// This is a local public-spec approximation only. The official six online
+/// statements and their generated keys remain hidden.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnlineKeySample {
+    pub item_id: i32,
+    pub customer_warehouse_id: i32,
+    pub customer_district_id: i32,
+    pub customer_id: i32,
+    pub stock_warehouse_id: i32,
+    pub stock_item_id: i32,
+}
+
+impl OnlineKeySample {
+    fn validate(self, warehouses: i32) -> Result<(), PlanError> {
+        if !(1..=ITEMS as i32).contains(&self.item_id) {
+            return Err(PlanError::InvalidOnlineSample(
+                "item id is outside the public key range",
+            ));
+        }
+        if !(1..=warehouses).contains(&self.customer_warehouse_id)
+            || !(1..=DISTRICTS_PER_WAREHOUSE).contains(&self.customer_district_id)
+            || !(1..=CUSTOMERS_PER_DISTRICT as i32).contains(&self.customer_id)
+        {
+            return Err(PlanError::InvalidOnlineSample(
+                "customer key is outside the dataset keyspace",
+            ));
+        }
+        if !(1..=warehouses).contains(&self.stock_warehouse_id)
+            || !(1..=ITEMS as i32).contains(&self.stock_item_id)
+        {
+            return Err(PlanError::InvalidOnlineSample(
+                "stock key is outside the dataset keyspace",
+            ));
+        }
+        if self.item_id != self.stock_item_id
+            || self.customer_warehouse_id != self.stock_warehouse_id
+        {
+            return Err(PlanError::InvalidOnlineSample(
+                "item, customer, and stock keys are not one setup-evidence relationship",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl RecoveryExpectations {
     fn expected_counts(self) -> Result<BTreeMap<&'static str, i64>, PlanError> {
         for (name, value) in [
@@ -830,8 +881,10 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
 /// be labelled as the official query set.
 pub fn public_online_integer_plan(
     input: RecoveryExpectations,
+    sample: OnlineKeySample,
 ) -> Result<ConsistencyPlan, PlanError> {
     let counts = input.expected_counts()?;
+    sample.validate(input.setup.warehouses)?;
     let partition_count = i64::from(input.setup.warehouses) * i64::from(DISTRICTS_PER_WAREHOUSE);
     let initial_next_order_sum = checked_mul(
         partition_count,
@@ -870,22 +923,28 @@ pub fn public_online_integer_plan(
             int_query(
                 CheckScope::Online,
                 "online.public.item_key",
-                "one stable item index key remains visible",
-                "SELECT COUNT(*) FROM item WHERE i_id = 1",
+                "one persisted setup-evidence item index key remains visible",
+                format!("SELECT COUNT(*) FROM item WHERE i_id = {}", sample.item_id),
                 1,
             ),
             int_query(
                 CheckScope::Online,
                 "online.public.customer_key",
-                "one stable customer composite-index key remains visible",
-                "SELECT COUNT(*) FROM customer WHERE c_w_id = 1 AND c_d_id = 1 AND c_id = 1",
+                "one persisted setup-evidence customer composite-index key remains visible",
+                format!(
+                    "SELECT COUNT(*) FROM customer WHERE c_w_id = {} AND c_d_id = {} AND c_id = {}",
+                    sample.customer_warehouse_id, sample.customer_district_id, sample.customer_id
+                ),
                 1,
             ),
             int_query(
                 CheckScope::Online,
                 "online.public.stock_key",
-                "one stable stock composite-index key remains visible",
-                "SELECT COUNT(*) FROM stock WHERE s_w_id = 1 AND s_i_id = 1",
+                "one persisted setup-evidence stock composite-index key remains visible",
+                format!(
+                    "SELECT COUNT(*) FROM stock WHERE s_w_id = {} AND s_i_id = {}",
+                    sample.stock_warehouse_id, sample.stock_item_id
+                ),
                 1,
             ),
         ],

@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::connection::cursor::SqlParam;
+use crate::consistency::OnlineKeySample;
 use crate::data_gen::{
     TpccDataGen, CUSTOMERS_PER_DISTRICT, DISTRICTS_PER_WAREHOUSE, ITEMS_TOTAL,
     NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT,
@@ -19,6 +20,8 @@ pub const SETUP_SAMPLE_LIMIT: usize = 16;
 pub const MAX_SETUP_SAMPLE_LINES: usize = SETUP_SAMPLE_LIMIT * 15;
 const FIRST_UNDELIVERED_ORDER_ID: i32 = ORDERS_PER_DISTRICT - NEW_ORDERS_PER_DISTRICT + 1;
 const SAMPLE_ORDER_DOMAIN: u64 = 0xa954_6f3c_7d1e_b820;
+const ONLINE_ANCHOR_DOMAIN: u64 = 0x5d9b_2a74_c381_e60f;
+const ONLINE_LINE_DOMAIN: u64 = 0xb217_45ce_68a9_03fd;
 const EVIDENCE_VERSION: u32 = 1;
 const MAX_EVIDENCE_HEX_BYTES: usize = 512 * 1024;
 
@@ -319,6 +322,35 @@ impl SetupEvidence {
             return Err("setup evidence exceeds its bounded row limit".to_owned());
         }
         Ok(())
+    }
+
+    pub fn online_key_sample(
+        &self,
+        warehouses: i32,
+        expected_seed: u64,
+    ) -> Result<OnlineKeySample, String> {
+        if self.load_seed != expected_seed {
+            return Err("setup evidence does not belong to the requested dataset seed".to_owned());
+        }
+        self.validate(warehouses)?;
+        let anchor_index =
+            (splitmix64(expected_seed ^ ONLINE_ANCHOR_DOMAIN) % self.anchors.len() as u64) as usize;
+        let anchor = &self.anchors[anchor_index];
+        let line_index = (splitmix64(
+            expected_seed
+                ^ ONLINE_LINE_DOMAIN
+                ^ anchor.warehouse.id as u32 as u64
+                ^ (anchor.district.id as u32 as u64).rotate_left(32),
+        ) % anchor.lines.len() as u64) as usize;
+        let line = &anchor.lines[line_index];
+        Ok(OnlineKeySample {
+            item_id: line.item_id,
+            customer_warehouse_id: anchor.customer.warehouse_id,
+            customer_district_id: anchor.customer.district_id,
+            customer_id: anchor.customer.id,
+            stock_warehouse_id: line.supply_warehouse_id,
+            stock_item_id: line.item_id,
+        })
     }
 
     pub fn encode_hex(&self) -> String {

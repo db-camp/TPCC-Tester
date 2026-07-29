@@ -6,7 +6,7 @@ use consistency::{
     large_set_boundary_from_f32, public_online_integer_plan, recovery_partition_audits,
     recovery_plan, setup_plan, sum_f32_as_f64_once, ulp_distance, validate_crash_float_baseline,
     validate_public_float_ledger, validate_relative_add, validate_relative_update_chain,
-    CheckScope, CommittedLedger, FloatAggregateId, IdentifierMap, LedgerFloatRule,
+    CheckScope, CommittedLedger, FloatAggregateId, IdentifierMap, LedgerFloatRule, OnlineKeySample,
     PartitionExpectation, PartitionKey, PublicFloatLedgerEvidence, RecoveryExpectations,
     RelativeUpdateEvidence, ScalarExpectation, SetupExpectations, TypedResult, TypedValue,
     FLOAT_AGGREGATES, PUBLIC_SPEC_NOTICE,
@@ -126,7 +126,15 @@ fn committed_ledger_drives_public_online_and_recovery_answers() {
         },
     };
 
-    let online = public_online_integer_plan(input).unwrap();
+    let sample = OnlineKeySample {
+        item_id: 72_345,
+        customer_warehouse_id: 17,
+        customer_district_id: 6,
+        customer_id: 2_149,
+        stock_warehouse_id: 17,
+        stock_item_id: 72_345,
+    };
+    let online = public_online_integer_plan(input, sample).unwrap();
     assert_eq!(online.queries.len(), 6);
     assert!(online
         .queries
@@ -143,6 +151,35 @@ fn committed_ledger_drives_public_online_and_recovery_answers() {
     assert!(online.queries.iter().all(|query| {
         !query.sql.contains("FROM new_orders") && !query.sql.contains("FROM orders")
     }));
+    assert!(online
+        .queries
+        .iter()
+        .find(|query| query.id == "online.public.item_key")
+        .unwrap()
+        .sql
+        .contains("i_id = 72345"));
+    assert!(online
+        .queries
+        .iter()
+        .find(|query| query.id == "online.public.customer_key")
+        .unwrap()
+        .sql
+        .contains("c_w_id = 17 AND c_d_id = 6 AND c_id = 2149"));
+    assert!(online
+        .queries
+        .iter()
+        .find(|query| query.id == "online.public.stock_key")
+        .unwrap()
+        .sql
+        .contains("s_w_id = 17 AND s_i_id = 72345"));
+    assert!(public_online_integer_plan(
+        input,
+        OnlineKeySample {
+            stock_item_id: sample.stock_item_id + 1,
+            ..sample
+        }
+    )
+    .is_err());
 
     let recovery = recovery_plan(input).unwrap();
     for (id, expected) in [
