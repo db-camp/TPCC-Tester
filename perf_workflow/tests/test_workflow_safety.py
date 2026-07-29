@@ -1465,6 +1465,9 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 tester,
                 "--port",
                 port,
+                "--allow-deviation",
+                "--scale",
+                "1",
                 env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -1558,9 +1561,6 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 tester,
                 "--port",
                 port,
-                "--allow-deviation",
-                "--scale",
-                "1",
                 env=env,
             )
             self.assertNotEqual(result.returncode, 0)
