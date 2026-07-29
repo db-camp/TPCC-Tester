@@ -111,7 +111,7 @@ fn setup_sample_queries(evidence: &SetupEvidence) -> Result<Vec<ExactSetupQuery>
     // index-friendly point lookup instead of combining unrelated sample keys.
     let mut queries = Vec::new();
     let mut seen_warehouses = BTreeSet::new();
-    for anchor in &evidence.anchors {
+    for (anchor_index, anchor) in evidence.anchors.iter().enumerate() {
         let warehouse = &anchor.warehouse;
         if seen_warehouses.insert(warehouse.id) {
             queries.push(ExactSetupQuery {
@@ -164,19 +164,24 @@ fn setup_sample_queries(evidence: &SetupEvidence) -> Result<Vec<ExactSetupQuery>
             expected_rows: vec![new_order_typed_row(new_order)],
         });
 
-        let history = &anchor.history;
-        queries.push(ExactSetupQuery {
-            id: "setup.sample.history_to_customer",
-            sql: format!(
-                "SELECT history.h_c_w_id, history.h_c_d_id, history.h_c_id, history.h_w_id, history.h_d_id, history.h_date, history.h_amount, history.h_data FROM history, customer WHERE history.h_c_w_id = {} AND history.h_c_d_id = {} AND history.h_c_id = {} AND history.h_w_id = {} AND history.h_d_id = {} AND customer.c_w_id = history.h_c_w_id AND customer.c_d_id = history.h_c_d_id AND customer.c_id = history.h_c_id",
-                history.customer_warehouse_id,
-                history.customer_district_id,
-                history.customer_id,
-                history.warehouse_id,
-                history.district_id,
-            ),
-            expected_rows: vec![history_typed_row(history)],
-        });
+        // The published ten-index schema has no history index. Probe the
+        // deterministic first/last anchors so the relationship still crosses
+        // partitions without repeating a large sequential scan 16 times.
+        if anchor_index == 0 || anchor_index + 1 == evidence.anchors.len() {
+            let history = &anchor.history;
+            queries.push(ExactSetupQuery {
+                id: "setup.sample.history_to_customer",
+                sql: format!(
+                    "SELECT history.h_c_w_id, history.h_c_d_id, history.h_c_id, history.h_w_id, history.h_d_id, history.h_date, history.h_amount, history.h_data FROM history, customer WHERE history.h_c_w_id = {} AND history.h_c_d_id = {} AND history.h_c_id = {} AND history.h_w_id = {} AND history.h_d_id = {} AND customer.c_w_id = history.h_c_w_id AND customer.c_d_id = history.h_c_d_id AND customer.c_id = history.h_c_id",
+                    history.customer_warehouse_id,
+                    history.customer_district_id,
+                    history.customer_id,
+                    history.warehouse_id,
+                    history.district_id,
+                ),
+                expected_rows: vec![history_typed_row(history)],
+            });
+        }
 
         queries.push(ExactSetupQuery {
             id: "setup.sample.order_line_relationships",
@@ -1660,7 +1665,8 @@ mod tests {
         assert_eq!(
             queries.len(),
             warehouse_count
-                + 7 * evidence.anchors.len()
+                + 6 * evidence.anchors.len()
+                + evidence.anchors.len().min(2)
                 + evidence.items.len()
                 + evidence.stocks.len()
         );
@@ -1670,7 +1676,7 @@ mod tests {
                 .iter()
                 .filter(|query| query.id == "setup.sample.history_to_customer")
                 .count(),
-            evidence.anchors.len()
+            evidence.anchors.len().min(2)
         );
         assert_eq!(
             queries
@@ -1721,10 +1727,27 @@ mod tests {
         }
         let history = queries
             .iter()
-            .find(|query| query.id == "setup.sample.history_to_customer")
-            .unwrap();
-        assert!(history.sql.contains("customer.c_id = history.h_c_id"));
-        assert_eq!(history.expected_rows.len(), 1);
+            .filter(|query| query.id == "setup.sample.history_to_customer")
+            .collect::<Vec<_>>();
+        assert!(history
+            .iter()
+            .all(|query| query.sql.contains("customer.c_id = history.h_c_id")));
+        assert!(history.iter().all(|query| query.expected_rows.len() == 1));
+        assert_eq!(
+            history.first().unwrap().expected_rows[0][..2],
+            [
+                TypedValue::Int32(evidence.anchors[0].history.customer_warehouse_id),
+                TypedValue::Int32(evidence.anchors[0].history.customer_district_id),
+            ]
+        );
+        let last = evidence.anchors.last().unwrap();
+        assert_eq!(
+            history.last().unwrap().expected_rows[0][..2],
+            [
+                TypedValue::Int32(last.history.customer_warehouse_id),
+                TypedValue::Int32(last.history.customer_district_id),
+            ]
+        );
     }
 
     #[test]
