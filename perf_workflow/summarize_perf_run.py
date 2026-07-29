@@ -334,6 +334,10 @@ def validate_tester_binary(manifest: dict[str, Any]) -> bool:
         raise ManifestError("manifest.json has invalid tester binary provenance")
     if not isinstance(tester.get("path"), str) or not tester["path"]:
         raise ManifestError("manifest.json has an invalid tester binary path")
+    paths = manifest.get("paths")
+    source_root = paths.get("tpcc_tester") if isinstance(paths, dict) else None
+    if not isinstance(source_root, str) or not source_root:
+        raise ManifestError("manifest.json has no tester source path")
     for name in (
         "source_matches_workflow",
         "built_this_invocation",
@@ -368,6 +372,10 @@ def validate_tester_binary(manifest: dict[str, Any]) -> bool:
     )
     if status == "verified_fresh_build" and not trusted:
         raise ManifestError("manifest.json has invalid trusted tester provenance")
+    if trusted and tester["path"] != str(
+        pathlib.Path(source_root) / "target" / "release" / "tpcc-tester"
+    ):
+        raise ManifestError("manifest.json tester path contradicts its source")
     if status == "pending_fresh_build":
         if (
             digest is not None

@@ -95,6 +95,7 @@ class WorkflowSafetyTests(unittest.TestCase):
         dataset_run_id = "summary-test-dataset"
         database_name = "tpcc_opaque_summary_test"
         database_path = result_dir / database_name
+        tester_source = result_dir / "tpcc-source"
         manifest = {
             "schema_version": 3,
             "authority": "manifest.json",
@@ -108,7 +109,9 @@ class WorkflowSafetyTests(unittest.TestCase):
             "ranked_configuration": True,
             "tester_binary": {
                 "status": "verified_fresh_build",
-                "path": str(result_dir / "tpcc-tester"),
+                "path": str(
+                    tester_source / "target" / "release" / "tpcc-tester"
+                ),
                 "sha256": "5" * 64,
                 "filesystem": {
                     "device": 1,
@@ -151,6 +154,7 @@ class WorkflowSafetyTests(unittest.TestCase):
                 "database": str(database_path),
                 "result": str(result_dir.resolve()),
                 "state": str(result_dir / "state"),
+                "tpcc_tester": str(tester_source),
             },
             "database_identity": {
                 "status": "verified",
@@ -333,6 +337,9 @@ class WorkflowSafetyTests(unittest.TestCase):
                 built_this_invocation=False,
                 binary_override=True,
             ),
+            "tester source mismatch": lambda manifest: manifest[
+                "tester_binary"
+            ].update(path="/tmp/not-the-workflow-build"),
             "unfinished phase": lambda manifest: manifest["phases"].update(
                 recovery="failed",
             ),
