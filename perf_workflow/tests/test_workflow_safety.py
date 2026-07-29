@@ -116,6 +116,33 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.assertIn("conformance=non_ranked_deviation", accepted.stdout)
             self.assertIn("ranked_configuration=0", accepted.stdout)
 
+    def test_existing_database_modes_reuse_dataset_run_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            state = Path(temp) / "state"
+            state.mkdir()
+            (state / "dataset.state").write_text(
+                "version=2\nrun_id=original.dataset:42\n",
+                encoding="utf-8",
+            )
+
+            for mode in ("rank", "recovery"):
+                with self.subTest(mode=mode):
+                    result = self.run_script(
+                        "--plan-only",
+                        "--mode",
+                        mode,
+                        "--target-dir",
+                        root,
+                        "--state-dir",
+                        state,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(
+                        "dataset_run_id=original.dataset:42\n",
+                        result.stdout,
+                    )
+
     def test_tools_mode_preserves_existing_database_and_source_csv(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)

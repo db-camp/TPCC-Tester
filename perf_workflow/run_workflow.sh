@@ -50,6 +50,7 @@ RUN_MARKER=""
 DB_MARKER=""
 OWNER_TOKEN=""
 DB_PATH=""
+DATASET_RUN_ID=""
 DB_OWNED=0
 WORKFLOW_SUCCEEDED=0
 WORKFLOW_STATUS="running"
@@ -360,6 +361,22 @@ if [[ "${MODE}" == "recovery" ]] \
   [[ -n "${STATE_DIR_OVERRIDE}" ]] \
     || die "--mode ${MODE} on an existing database requires --state-dir from its setup run"
 fi
+DATASET_RUN_ID="${RUN_ID}"
+if [[ "${MODE}" == "recovery" ]] \
+  || { [[ "${MODE}" == "rank" ]] && [[ "${INIT_BEFORE_RUN}" != "1" ]]; }; then
+  DATASET_FILE="${STATE_DIR}/dataset.state"
+  [[ -f "${DATASET_FILE}" && ! -L "${DATASET_FILE}" ]] \
+    || die "existing state-dir must contain a real dataset.state file"
+  DATASET_RUN_ID="$(sed -n 's/^run_id=//p' "${DATASET_FILE}")"
+  if [[ -z "${DATASET_RUN_ID}" || "${DATASET_RUN_ID}" == *$'\n'* \
+    || ${#DATASET_RUN_ID} -gt 120 ]]; then
+    die "dataset.state must contain exactly one safe run_id"
+  fi
+  case "${DATASET_RUN_ID}" in
+    *[!A-Za-z0-9._:-]*)
+      die "dataset.state contains an unsafe run_id" ;;
+  esac
+fi
 
 if [[ "${CLEAN_DB_ON_EXIT}" == "auto" ]]; then
   if [[ "${MODE}" == "all" ]]; then
@@ -417,6 +434,7 @@ ranked_configuration=${RANKED_CONFIGURATION}
 seed=${SEED}
 seed_caller_supplied=${SEED_CALLER_SUPPLIED}
 run_id=${RUN_ID}
+dataset_run_id=${DATASET_RUN_ID}
 rmdb_dir=${RMDB_DIR}
 tpcc_dir=${TPCC_DIR}
 rmdb_sha=${RMDB_SHA}
@@ -486,7 +504,7 @@ write_manifest() {
   } >"${RESULT_DIR}/manifest.txt"
 
   python3 - "${RESULT_DIR}/manifest.json" \
-    "${WORKFLOW_STATUS}" "${MODE}" "${RUN_ID}" "${PROFILE}" \
+    "${WORKFLOW_STATUS}" "${MODE}" "${RUN_ID}" "${DATASET_RUN_ID}" "${PROFILE}" \
     "${RANKED_CONFIGURATION}" "${SEED}" "${SEED_CALLER_SUPPLIED}" \
     "${ALLOW_DEVIATION}" "${EFFECTIVE_SCALE}" "${EFFECTIVE_CLIENTS}" \
     "${EFFECTIVE_WARMUP_SECONDS}" "${PUBLIC_WINDOWS}" \
@@ -506,6 +524,7 @@ import sys
     workflow_status,
     mode,
     run_id,
+    dataset_run_id,
     profile,
     ranked_configuration,
     seed,
@@ -545,6 +564,7 @@ payload = {
     "status": workflow_status,
     "mode": mode,
     "run_id": run_id,
+    "dataset_run_id": dataset_run_id,
     "profile": profile,
     "ranked_configuration": ranked_configuration == "1",
     "seed": {
@@ -952,7 +972,7 @@ run_tester() {
     cd "${TPCC_DIR}"
     RMDB_TPCC_CSV_DIR="${CSV_DIR}" \
     RMDB_TPCC_LOAD_DIR="${LOAD_DIR}" \
-    RMDB_TPCC_RUN_ID="${RUN_ID}" \
+    RMDB_TPCC_RUN_ID="${DATASET_RUN_ID}" \
       "${TPCC_BIN}" "$@"
   ) >"${log_path}" 2>&1
 }
