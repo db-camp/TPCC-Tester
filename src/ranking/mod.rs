@@ -16,3 +16,4 @@ pub mod recovery_samples;
 pub mod runner;
 pub mod session;
 pub mod stock_level;
+pub mod terminal_evidence;
