@@ -4,6 +4,7 @@ mod config;
 mod connection;
 pub mod consistency;
 mod data_gen;
+mod diagnostic_executor;
 mod error;
 mod executor;
 mod loader;
@@ -92,16 +93,25 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         return run_diagnose(&config).await;
     }
 
+    if config.diagnostic_workload_seconds.is_some() {
+        info!("启动 final2026 非排名诊断负载；不会写入排名 ledger 或 crash baseline");
+        let exec = diagnostic_executor::DiagnosticExecutor::new(config, effective);
+        let result = exec.run().await?;
+        result.print_report();
+        return Ok(());
+    }
+
     let needs_connection =
         config.create_schema || config.init || config.check || config.stats || config.benchmark;
 
     if !needs_connection {
-        info!("用法: tpcc-tester --create-schema | --init | --check | --stats | --benchmark | --diagnose");
+        info!("用法: tpcc-tester --create-schema | --init | --check | --stats | --benchmark | --diagnostic-workload-seconds N | --diagnose");
         info!("  --create-schema 创建 TPC-C 表和索引");
         info!("  --init          加载 TPC-C 初始数据");
         info!("  --check         运行一致性检查");
         info!("  --stats         显示各表行数统计");
         info!("  --benchmark     运行并发基准测试");
+        info!("  --diagnostic-workload-seconds N 运行 N 秒非排名诊断负载");
         info!("  --diagnose      运行数据库兼容性诊断");
         info!("  -v / -vv        详细日志");
         return Ok(());
@@ -295,7 +305,12 @@ fn print_effective_profile(config: &Config, effective: &ResolvedProfile) {
         seed
     );
 
-    if effective.is_ranked_configuration() {
+    if config.diagnostic_workload_seconds.is_some() {
+        info!(
+            "Effective execution conformance: explicit non_ranked diagnostic workload \
+             (ranking ledger/baseline disabled)"
+        );
+    } else if effective.is_ranked_configuration() {
         info!("Effective profile conformance: public-spec ranked configuration");
     } else {
         warn!("Effective profile conformance: NON-RANKED (--allow-deviation)");

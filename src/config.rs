@@ -89,6 +89,10 @@ pub struct Config {
     #[arg(long)]
     pub benchmark: bool,
 
+    /// Run one explicitly non-ranked final2026 diagnostic workload phase
+    #[arg(long = "diagnostic-workload-seconds")]
+    pub diagnostic_workload_seconds: Option<u64>,
+
     /// Complete a Wire v3 handshake and exact `show tables;` request, then exit
     #[arg(long = "probe-ready")]
     pub probe_ready: bool,
@@ -164,25 +168,65 @@ pub enum ConfigError {
     #[error("non-ranked overrides require --allow-deviation; differing fields: {fields}")]
     DeviationRequiresOptIn { fields: String },
 
-    #[error("--seed is required for --init and --benchmark (no grader seed is embedded)")]
+    #[error(
+        "--seed is required for --init, --benchmark, and --diagnostic-workload-seconds \
+         (no grader seed is embedded)"
+    )]
     MissingSeed,
 
-    #[error("--state-dir is required for init, benchmark, online check, and recovery check")]
+    #[error(
+        "--state-dir is required for init, benchmark, diagnostic workload, online check, \
+         and recovery check"
+    )]
     MissingStateDir,
 
     #[error("--probe-ready must be used by itself")]
     ProbeReadyMustBeExclusive,
+
+    #[error("--diagnostic-workload-seconds must be used by itself")]
+    DiagnosticWorkloadMustBeExclusive,
+
+    #[error(
+        "final2026 diagnostic workload requires exactly 50 warehouses and 32 clients; \
+         it is non-ranked but retains the published workload shape"
+    )]
+    DiagnosticWorkloadRequiresOfficialShape,
 }
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_raw()?;
+        let diagnostic_workload = self.diagnostic_workload_seconds.is_some();
+        if diagnostic_workload
+            && (self.create_schema
+                || self.init
+                || self.check
+                || self.stats
+                || self.benchmark
+                || self.probe_ready
+                || self.diagnose
+                || self.expected_new_orders.is_some()
+                || self.warmup_seconds.is_some()
+                || self.window_seconds.is_some()
+                || self.check_scope != CheckScope::Setup)
+        {
+            return Err(ConfigError::DiagnosticWorkloadMustBeExclusive);
+        }
+        if diagnostic_workload
+            && (self.scale_factor != i32::from(crate::profile::OFFICIAL_WAREHOUSES)
+                || self.threads != usize::from(crate::profile::OFFICIAL_CLIENTS))
+        {
+            return Err(ConfigError::DiagnosticWorkloadRequiresOfficialShape);
+        }
+
         self.resolved_profile()?;
 
-        if (self.init || self.benchmark) && self.seed.is_none() {
+        if (self.init || self.benchmark || diagnostic_workload) && self.seed.is_none() {
             return Err(ConfigError::MissingSeed);
         }
-        if (self.init || self.benchmark || self.check) && self.state_dir.is_none() {
+        if (self.init || self.benchmark || self.check || diagnostic_workload)
+            && self.state_dir.is_none()
+        {
             return Err(ConfigError::MissingStateDir);
         }
 
@@ -192,6 +236,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
+                || diagnostic_workload
                 || self.diagnose)
         {
             return Err(ConfigError::ProbeReadyMustBeExclusive);
@@ -257,6 +302,12 @@ impl Config {
         if self.phase_tail_grace_seconds == 0 {
             return Err(ConfigError::OutOfRange {
                 field: "phase-tail-grace-seconds",
+                range: "1..",
+            });
+        }
+        if self.diagnostic_workload_seconds == Some(0) {
+            return Err(ConfigError::OutOfRange {
+                field: "diagnostic-workload-seconds",
                 range: "1..",
             });
         }
@@ -386,6 +437,89 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ProbeReadyMustBeExclusive)
+        ));
+    }
+
+    #[test]
+    fn diagnostic_workload_is_explicit_non_ranked_and_state_bound() {
+        let missing_state = Config::try_parse_from([
+            "tpcc-tester",
+            "--diagnostic-workload-seconds",
+            "10",
+            "--seed",
+            "7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            missing_state.validate(),
+            Err(ConfigError::MissingStateDir)
+        ));
+
+        let config = Config::try_parse_from([
+            "tpcc-tester",
+            "--diagnostic-workload-seconds",
+            "60",
+            "--seed",
+            "7",
+            "--state-dir",
+            "/tmp/tpcc-final2026-diagnostic-state",
+        ])
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.diagnostic_workload_seconds, Some(60));
+    }
+
+    #[test]
+    fn diagnostic_workload_rejects_ranked_actions_and_shape_deviations() {
+        let combined = Config::try_parse_from([
+            "tpcc-tester",
+            "--diagnostic-workload-seconds",
+            "10",
+            "--benchmark",
+            "--seed",
+            "7",
+            "--state-dir",
+            "/tmp/tpcc-final2026-diagnostic-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            combined.validate(),
+            Err(ConfigError::DiagnosticWorkloadMustBeExclusive)
+        ));
+
+        let wrong_clients = Config::try_parse_from([
+            "tpcc-tester",
+            "--diagnostic-workload-seconds",
+            "10",
+            "--clients",
+            "1",
+            "--allow-deviation",
+            "--seed",
+            "7",
+            "--state-dir",
+            "/tmp/tpcc-final2026-diagnostic-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            wrong_clients.validate(),
+            Err(ConfigError::DiagnosticWorkloadRequiresOfficialShape)
+        ));
+
+        let ignored_ranked_timing = Config::try_parse_from([
+            "tpcc-tester",
+            "--diagnostic-workload-seconds",
+            "10",
+            "--warmup-seconds",
+            "30",
+            "--seed",
+            "7",
+            "--state-dir",
+            "/tmp/tpcc-final2026-diagnostic-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            ignored_ranked_timing.validate(),
+            Err(ConfigError::DiagnosticWorkloadMustBeExclusive)
         ));
     }
 }
