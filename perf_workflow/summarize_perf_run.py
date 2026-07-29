@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+from decimal import Decimal
 import hashlib
 import json
 import os
@@ -954,28 +955,61 @@ def load_authoritative_manifest(
         ):
             raise ManifestError("rank.log does not match its manifest binding")
         rank_text = rank_bytes.decode("utf-8", errors="replace")
+        extract_ranked_new_order_metrics(rank_text)
     elif ranking_eligible:
         raise ManifestError("manifest.json does not bind its ranked result")
     return manifest, rank_text
 
 
-def extract_report_metrics(text: str) -> list[str]:
-    patterns = [
-        r"Total Transactions:\s+.+",
-        r"Successful:\s+.+",
-        r"Failed \(retried\):\s+.+",
-        r"Success Rate:\s+.+",
-        r"Total Duration:\s+.+",
-        r"Average Response:\s+.+",
-        r"Throughput:\s+.+",
-        r"tpmC:\s+.+",
+def extract_ranked_new_order_metrics(text: str) -> list[str]:
+    rate = r"(?:0|[1-9][0-9]*)\.[0-9]{3}"
+    window_pattern = re.compile(
+        rf"^window([1-3]): new_order_per_min=({rate}),"
+    )
+    median_pattern = re.compile(
+        rf"^ranked_new_order_per_min_median=({rate})$"
+    )
+    windows: list[tuple[int, str, Decimal, int]] = []
+    medians: list[tuple[str, Decimal, int]] = []
+    for line_number, line in enumerate(text.splitlines()):
+        window = window_pattern.match(line)
+        if window is not None:
+            number = int(window.group(1))
+            value = window.group(2)
+            windows.append(
+                (number, value, Decimal(value), line_number)
+            )
+            continue
+        if line.startswith("window") and "new_order_per_min" in line:
+            raise ManifestError(
+                "rank.log has a malformed NewOrder/min window"
+            )
+        median = median_pattern.fullmatch(line)
+        if median is not None:
+            value = median.group(1)
+            medians.append((value, Decimal(value), line_number))
+            continue
+        if line.startswith("ranked_new_order_per_min_median"):
+            raise ManifestError(
+                "rank.log has a malformed NewOrder/min median"
+            )
+    if [item[0] for item in windows] != [1, 2, 3]:
+        raise ManifestError(
+            "rank.log must contain exactly ordered windows 1, 2, and 3"
+        )
+    if len(medians) != 1 or medians[0][2] <= windows[-1][3]:
+        raise ManifestError(
+            "rank.log must contain one median after all three windows"
+        )
+    expected_median = sorted(item[2] for item in windows)[1]
+    if medians[0][1] != expected_median:
+        raise ManifestError(
+            "rank.log NewOrder/min median disagrees with its windows"
+        )
+    return [
+        *(f"NewOrder/min window{number}: {value}" for number, value, _, _ in windows),
+        f"NewOrder/min median: {medians[0][0]}",
     ]
-    lines: list[str] = []
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            lines.append(match.group(0))
-    return lines
 
 
 def summarize_perf_stat(result_dir: pathlib.Path) -> list[str]:
@@ -1130,7 +1164,7 @@ def main() -> int:
             if manifest["ranking_eligible"]
             else "Non-ranked Metrics"
         )
-        metrics = extract_report_metrics(rank_text)
+        metrics = extract_ranked_new_order_metrics(rank_text)
         if metrics:
             summary.extend(["", f"## {metric_heading} From `rank.log`"])
             summary.extend(f"- {line}" for line in metrics)

@@ -47,6 +47,13 @@ class WorkflowSafetyTests(unittest.TestCase):
             "sha256": None,
         }
         if rank_text is not None:
+            if "ranked_new_order_per_min_median=" not in rank_text:
+                rank_text += (
+                    "window1: new_order_per_min=1.000, fixture=true\n"
+                    "window2: new_order_per_min=2.000, fixture=true\n"
+                    "window3: new_order_per_min=3.000, fixture=true\n"
+                    "ranked_new_order_per_min_median=2.000\n"
+                )
             rank_bytes = rank_text.encode("utf-8")
             (result_dir / "rank.log").write_bytes(rank_bytes)
             rank_result = {
@@ -297,8 +304,12 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("ranking_eligible: true", result.stdout)
             self.assertIn("Ranked Metrics", result.stdout)
-            self.assertIn("Throughput: 12345 txn/s", result.stdout)
-            self.assertIn("tpmC: 67890", result.stdout)
+            self.assertIn("NewOrder/min window1: 1.000", result.stdout)
+            self.assertIn("NewOrder/min window2: 2.000", result.stdout)
+            self.assertIn("NewOrder/min window3: 3.000", result.stdout)
+            self.assertIn("NewOrder/min median: 2.000", result.stdout)
+            self.assertNotIn("Throughput: 12345", result.stdout)
+            self.assertNotIn("tpmC: 67890", result.stdout)
             terminal_path = (
                 result_dir / "state" / "terminal_evidence.state"
             )
@@ -366,6 +377,73 @@ class WorkflowSafetyTests(unittest.TestCase):
                     result.stdout.lower(),
                 )
                 self.assertNotIn("12345", result.stdout)
+
+    def test_summary_requires_exact_three_window_new_order_median(self):
+        cases = {
+            "missing": (
+                "window1: new_order_per_min=1.000, fixture=true\n"
+                "window2: new_order_per_min=2.000, fixture=true\n"
+                "ranked_new_order_per_min_median=2.000\n"
+            ),
+            "duplicate": (
+                "window1: new_order_per_min=1.000, fixture=true\n"
+                "window2: new_order_per_min=2.000, fixture=true\n"
+                "window2: new_order_per_min=2.000, fixture=true\n"
+                "window3: new_order_per_min=3.000, fixture=true\n"
+                "ranked_new_order_per_min_median=2.000\n"
+            ),
+            "out of order": (
+                "window1: new_order_per_min=1.000, fixture=true\n"
+                "window3: new_order_per_min=3.000, fixture=true\n"
+                "window2: new_order_per_min=2.000, fixture=true\n"
+                "ranked_new_order_per_min_median=2.000\n"
+            ),
+            "false median": (
+                "window1: new_order_per_min=1.000, fixture=true\n"
+                "window2: new_order_per_min=2.000, fixture=true\n"
+                "window3: new_order_per_min=3.000, fixture=true\n"
+                "ranked_new_order_per_min_median=3.000\n"
+            ),
+            "non finite": (
+                "window1: new_order_per_min=1.000, fixture=true\n"
+                "window2: new_order_per_min=NaN, fixture=true\n"
+                "window3: new_order_per_min=3.000, fixture=true\n"
+                "ranked_new_order_per_min_median=NaN\n"
+            ),
+        }
+        for label, rank_text in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                result_dir = Path(temp)
+                self.write_summary_manifest(
+                    result_dir,
+                    status="success",
+                    ranking_eligible=True,
+                    conformance="public_spec_aligned",
+                    attestation_status="verified",
+                    rank_text="valid fixture\n",
+                )
+                rank_path = result_dir / "rank.log"
+                rank_bytes = rank_text.encode("utf-8")
+                rank_path.write_bytes(rank_bytes)
+                manifest_path = result_dir / "manifest.json"
+                manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                manifest["rank_result"].update(
+                    size_bytes=len(rank_bytes),
+                    sha256=hashlib.sha256(rank_bytes).hexdigest(),
+                )
+                manifest_path.write_text(
+                    json.dumps(manifest),
+                    encoding="utf-8",
+                )
+                result = self.run_summary(result_dir)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn(
+                    "metrics: suppressed",
+                    result.stdout.lower(),
+                )
+                self.assertNotIn("NewOrder/min median:", result.stdout)
 
     def test_summary_rejects_every_legacy_run_ledger_shape_without_reading_it(self):
         def create_legacy(state_dir, mode):
@@ -582,7 +660,7 @@ class WorkflowSafetyTests(unittest.TestCase):
 
             result = self.run_summary(result_dir)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Throughput: 12345 txn/s", result.stdout)
+            self.assertIn("NewOrder/min median: 2.000", result.stdout)
             self.assertNotIn("99999", result.stdout)
 
             (result_dir / "rank.log").write_text(
@@ -825,6 +903,10 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
 if "--benchmark" in sys.argv:
     print("Throughput: 1 txn/s")
     print("tpmC: 1")
+    print("window1: new_order_per_min=1.000, fixture=true")
+    print("window2: new_order_per_min=2.000, fixture=true")
+    print("window3: new_order_per_min=3.000, fixture=true")
+    print("ranked_new_order_per_min_median=2.000")
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
     state_dir.mkdir(parents=True, exist_ok=True)
     terminal = state_dir / "terminal_evidence.state"
@@ -4200,6 +4282,10 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
 if "--benchmark" in sys.argv:
     print("Throughput: 1 txn/s")
     print("tpmC: 1")
+    print("window1: new_order_per_min=1.000, fixture=true")
+    print("window2: new_order_per_min=2.000, fixture=true")
+    print("window3: new_order_per_min=3.000, fixture=true")
+    print("ranked_new_order_per_min_median=2.000")
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "terminal_evidence.state").write_bytes(
