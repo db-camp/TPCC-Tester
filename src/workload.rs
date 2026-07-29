@@ -82,6 +82,14 @@ impl TransactionTicket {
     pub fn parameters(&self) -> &TransactionParameters {
         &self.0.parameters
     }
+
+    /// Stable digest of every routed coordinate and bound parameter.
+    ///
+    /// The phase scheduler uses this only as an immutable retry identity; it is
+    /// not a random seed and is never used to generate later parameters.
+    pub fn parameter_fingerprint(&self) -> u64 {
+        parameter_fingerprint(&self.0)
+    }
 }
 
 impl PartialEq for TransactionTicket {
@@ -397,6 +405,82 @@ fn last_name(number: u16) -> String {
     )
 }
 
+fn parameter_fingerprint(selected: &SelectedTransaction) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn write(state: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *state ^= u64::from(*byte);
+            *state = state.wrapping_mul(PRIME);
+        }
+    }
+
+    fn write_u64(state: &mut u64, value: u64) {
+        write(state, &value.to_be_bytes());
+    }
+
+    fn write_selector(state: &mut u64, selector: &CustomerSelector) {
+        match selector {
+            CustomerSelector::Id(id) => {
+                write_u64(state, 0);
+                write_u64(state, u64::from(*id));
+            }
+            CustomerSelector::LastName(last) => {
+                write_u64(state, 1);
+                write_u64(state, u64::from(last.number));
+                write(state, last.value.as_bytes());
+            }
+        }
+    }
+
+    let route = &selected.route;
+    let mut state = OFFSET;
+    for value in [
+        route.stage.value(),
+        u64::from(route.client_id),
+        route.txn_no,
+        u64::from(route.home_warehouse),
+        u64::from(route.home_district),
+        u64::from(route.payment_customer_warehouse),
+        route.kind as u64,
+    ] {
+        write_u64(&mut state, value);
+    }
+
+    match &selected.parameters {
+        TransactionParameters::NewOrder(input) => {
+            write_u64(&mut state, u64::from(input.customer_id));
+            write_u64(&mut state, input.expected_rollback as u64);
+            write_u64(&mut state, input.all_local as u64);
+            write_u64(&mut state, input.lines.len() as u64);
+            for line in input.lines.iter() {
+                write_u64(&mut state, u64::from(line.number));
+                write_u64(&mut state, u64::from(line.item_id));
+                write_u64(&mut state, u64::from(line.supply_warehouse));
+                write_u64(&mut state, u64::from(line.quantity));
+            }
+        }
+        TransactionParameters::Payment(input) => {
+            write_u64(&mut state, u64::from(input.customer_warehouse));
+            write_u64(&mut state, u64::from(input.customer_district));
+            write_selector(&mut state, &input.customer);
+            write_u64(&mut state, u64::from(input.amount_cents));
+            write_u64(&mut state, u64::from(input.amount_bits));
+        }
+        TransactionParameters::OrderStatus(input) => {
+            write_selector(&mut state, &input.customer);
+        }
+        TransactionParameters::Delivery(input) => {
+            write_u64(&mut state, u64::from(input.carrier_id));
+        }
+        TransactionParameters::StockLevel(input) => {
+            write_u64(&mut state, u64::from(input.threshold));
+        }
+    }
+    state
+}
+
 fn chance(route: &RoutedTransaction, domain: &'static str, ordinal: u64, percent: u8) -> bool {
     route.parameter_sample(domain, ordinal, 100) < u64::from(percent)
 }
@@ -438,5 +522,23 @@ mod tests {
             let amount = amount_cents as f32 / 100.0_f32;
             assert_eq!(f32::from_bits(amount.to_bits()).to_bits(), amount.to_bits());
         }
+    }
+
+    #[test]
+    fn parameter_fingerprint_is_stable_for_the_exact_retry_ticket() {
+        let router = OfficialRouter::new(crate::routing::WorkloadSeed(73));
+        let wheel = router.wheel(crate::routing::StageId::measurement(1));
+        let workload = Final2026Workload::new(&router, &wheel);
+        let mut sequence = ClientSequence::new(5).unwrap();
+
+        let first = workload.select(&mut sequence).unwrap();
+        let retry = first.retry();
+        let second = workload.select(&mut sequence).unwrap();
+
+        assert_eq!(first.parameter_fingerprint(), retry.parameter_fingerprint());
+        assert_ne!(
+            first.parameter_fingerprint(),
+            second.parameter_fingerprint()
+        );
     }
 }
