@@ -9,12 +9,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::consistency::{
     FloatAggregateId, NonNegativeF32Accumulator, OnlineKeySample, FLOAT_AGGREGATES,
 };
+use crate::data_gen::TpccDataGen;
 use crate::loader::{LoadSummary, PartitionLoadSummary};
 use crate::profile::{
     LOAD_BUDGET_SECONDS, MEASUREMENT_SECONDS, MEASUREMENT_WINDOWS, OFFICIAL_CLIENTS,
     OFFICIAL_WAREHOUSES, RECOVERY_READY_BUDGET_SECONDS, WARMUP_SECONDS,
 };
+use crate::ranking::core_artifact_codec::{
+    decode_terminal_artifact_hex, encode_terminal_artifact_hex, PersistedTerminalEvidence,
+    TerminalArtifactBinding, MAX_TERMINAL_ARTIFACT_HEX_CHARS,
+};
+use crate::ranking::evidence_collector::CustomerKey;
 use crate::ranking::ledger::RunLedger;
+use crate::ranking::rich_recovery_samples::{InitialCustomerData, InitialHistoryRow};
+use crate::ranking::terminal_evidence::SealedTerminalEvidence;
 use crate::runtime_schema::{RuntimeSchema, ENCODED_BEGIN_MARKER, ENCODED_END_MARKER};
 use crate::sample_evidence::SetupEvidence;
 
@@ -39,6 +47,9 @@ const NON_RANKED_LEDGER_ARTIFACT: &str = "non_ranked_run_ledger";
 #[cfg(test)]
 const LEDGER_ARTIFACT: &str = "run_ledger";
 const LEDGER_FILE: &str = "run_ledger.state";
+const RANKED_TERMINAL_EVIDENCE_ARTIFACT: &str = "ranked_terminal_evidence";
+const NON_RANKED_TERMINAL_EVIDENCE_ARTIFACT: &str = "non_ranked_terminal_evidence";
+const TERMINAL_EVIDENCE_FILE: &str = "terminal_evidence.state";
 const ONLINE_CLAIM_ARTIFACT: &str = "online_check_claim";
 const ONLINE_CLAIM_FILE: &str = "online_check.started";
 const FLOAT_BASELINE_ARTIFACT: &str = "float_baseline";
@@ -63,7 +74,7 @@ const DIAGNOSTIC_OBSERVATION_CLAIM_ARTIFACT: &str = "diagnostic_observation_clai
 const DIAGNOSTIC_OBSERVATION_CLAIM_FILE: &str = "diagnostic_observation.started";
 const DIAGNOSTIC_OBSERVATION_RECEIPT_ARTIFACT: &str = "diagnostic_observation_receipt";
 const DIAGNOSTIC_OBSERVATION_RECEIPT_FILE: &str = "diagnostic_observation.passed";
-const STATE_ARTIFACT_FILES: [&str; 20] = [
+const STATE_ARTIFACT_FILES: [&str; 21] = [
     DATASET_FILE,
     SETUP_INTENT_FILE,
     SETUP_EXECUTION_FILE,
@@ -72,6 +83,7 @@ const STATE_ARTIFACT_FILES: [&str; 20] = [
     SETUP_RECEIPT_FILE,
     RANK_CLAIM_FILE,
     LEDGER_FILE,
+    TERMINAL_EVIDENCE_FILE,
     ONLINE_CLAIM_FILE,
     FLOAT_BASELINE_FILE,
     CRASH_INTENT_FILE,
@@ -87,6 +99,19 @@ const STATE_ARTIFACT_FILES: [&str; 20] = [
 ];
 const MAX_ARTIFACT_HEADER_BYTES: u64 = 4 * 1024;
 const MAX_LEDGER_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+const MAX_TERMINAL_EVIDENCE_HEX_CHARS: usize = 16_777_216;
+const MAX_BOUND_PAYLOAD_OVERHEAD_BYTES: usize = 128;
+const MAX_TERMINAL_EVIDENCE_PAYLOAD_BYTES: usize = 16_777_344;
+const MAX_TERMINAL_EVIDENCE_FILE_BYTES: u64 = 16_781_440;
+const _: () = assert!(MAX_TERMINAL_ARTIFACT_HEX_CHARS == MAX_TERMINAL_EVIDENCE_HEX_CHARS);
+const _: () = assert!(
+    MAX_TERMINAL_EVIDENCE_PAYLOAD_BYTES
+        == MAX_TERMINAL_EVIDENCE_HEX_CHARS + MAX_BOUND_PAYLOAD_OVERHEAD_BYTES
+);
+const _: () = assert!(
+    MAX_TERMINAL_EVIDENCE_FILE_BYTES
+        == MAX_TERMINAL_EVIDENCE_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES
+);
 const MAX_FLOAT_BASELINE_PAYLOAD_BYTES: usize = 4 * 1024;
 const MAX_CONTRACT_PAYLOAD_BYTES: usize = 4 * 1024;
 const MAX_MARKER_PAYLOAD_BYTES: usize = 256;
@@ -280,13 +305,32 @@ pub struct OnlineCheckClaim {
 }
 
 #[derive(Debug)]
+pub struct TerminalOnlineCheckClaim {
+    token: ClaimToken,
+    terminal_evidence_checksum: u64,
+}
+
+#[derive(Debug)]
 pub struct RecoveryCheckClaim {
     token: ClaimToken,
     baseline_checksum: u64,
 }
 
 #[derive(Debug)]
+pub struct TerminalRecoveryCheckClaim {
+    token: ClaimToken,
+    terminal_evidence_checksum: u64,
+    baseline_checksum: u64,
+}
+
+#[derive(Debug)]
 pub struct DiagnosticClaim {
+    token: ClaimToken,
+    stage: DiagnosticStage,
+}
+
+#[derive(Debug)]
+pub struct TerminalDiagnosticClaim {
     token: ClaimToken,
     stage: DiagnosticStage,
 }
@@ -877,6 +921,42 @@ impl StateStore {
         atomic_publish_new(&self.root, LEDGER_FILE, encoded.as_bytes())
     }
 
+    pub fn complete_rank_with_terminal_evidence(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: RankClaim,
+        terminal_evidence: &SealedTerminalEvidence,
+    ) -> Result<(), StateError> {
+        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.validate_claim(
+            dataset,
+            contract,
+            claim.0,
+            RANK_CLAIM_FILE,
+            RANK_CLAIM_ARTIFACT,
+        )?;
+        let binding = terminal_artifact_binding(dataset)?;
+        let inner = encode_terminal_artifact_hex(terminal_evidence, binding).map_err(|error| {
+            StateError::Invalid(format!("cannot encode terminal evidence: {error}"))
+        })?;
+        let payload =
+            encode_bound_payload(claim.0.contract_checksum, claim.0.claim_checksum, &inner);
+        let artifact = terminal_evidence_artifact(contract.conformance);
+        let encoded = encode_artifact(
+            artifact,
+            dataset,
+            &payload,
+            MAX_TERMINAL_EVIDENCE_PAYLOAD_BYTES,
+        )?;
+        if encoded.len() as u64 > MAX_TERMINAL_EVIDENCE_FILE_BYTES {
+            return Err(StateError::Invalid(format!(
+                "{artifact} file exceeds {MAX_TERMINAL_EVIDENCE_FILE_BYTES} bytes"
+            )));
+        }
+        atomic_publish_new(&self.root, TERMINAL_EVIDENCE_FILE, encoded.as_bytes())
+    }
+
     pub fn begin_online_check(
         &self,
         dataset: &DatasetState,
@@ -906,6 +986,35 @@ impl StateStore {
         ))
     }
 
+    pub fn begin_online_check_from_terminal_evidence(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<(TerminalOnlineCheckClaim, PersistedTerminalEvidence), StateError> {
+        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.ensure_no_diagnostic_drift()?;
+        let (contract_checksum, _, terminal_evidence, terminal_evidence_checksum) =
+            self.load_bound_terminal_evidence(dataset, contract)?;
+        let claim_checksum = self.publish_marker(
+            ONLINE_CLAIM_FILE,
+            ONLINE_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+        )?;
+        Ok((
+            TerminalOnlineCheckClaim {
+                token: ClaimToken {
+                    contract_checksum,
+                    claim_checksum,
+                    predecessor_checksum: terminal_evidence_checksum,
+                },
+                terminal_evidence_checksum,
+            },
+            terminal_evidence,
+        ))
+    }
+
     pub fn complete_online_check(
         &self,
         dataset: &DatasetState,
@@ -928,6 +1037,43 @@ impl StateStore {
             ));
         }
         let baseline = encode_float_baseline(values, ledger_checksum)?;
+        let payload = encode_bound_payload(
+            claim.token.contract_checksum,
+            claim.token.claim_checksum,
+            &baseline,
+        );
+        let encoded = encode_artifact(
+            FLOAT_BASELINE_ARTIFACT,
+            dataset,
+            &payload,
+            MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
+        )?;
+        atomic_publish_new(&self.root, FLOAT_BASELINE_FILE, encoded.as_bytes())
+    }
+
+    pub fn complete_online_check_from_terminal_evidence(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: TerminalOnlineCheckClaim,
+        values: &BTreeMap<FloatAggregateId, u32>,
+    ) -> Result<(), StateError> {
+        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.validate_claim(
+            dataset,
+            contract,
+            claim.token,
+            ONLINE_CLAIM_FILE,
+            ONLINE_CLAIM_ARTIFACT,
+        )?;
+        let (_, _, _, terminal_evidence_checksum) =
+            self.load_bound_terminal_evidence(dataset, contract)?;
+        if terminal_evidence_checksum != claim.terminal_evidence_checksum {
+            return Err(StateError::Invalid(
+                "online claim belongs to different terminal evidence".to_owned(),
+            ));
+        }
+        let baseline = encode_terminal_float_baseline(values, terminal_evidence_checksum)?;
         let payload = encode_bound_payload(
             claim.token.contract_checksum,
             claim.token.claim_checksum,
@@ -980,6 +1126,44 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn record_crash_lifecycle_from_terminal_evidence(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        event: CrashLifecycleEvent,
+    ) -> Result<(), StateError> {
+        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.ensure_no_diagnostic_drift()?;
+        let (contract_checksum, terminal_evidence_checksum, baseline_checksum) =
+            self.load_terminal_crash_context(dataset, contract)?;
+        let specifications = crash_lifecycle_specs();
+        let target_index = crash_lifecycle_index(event);
+        let mut predecessor_checksum = baseline_checksum;
+        for &(file, artifact) in &specifications[..target_index] {
+            predecessor_checksum = self.load_terminal_crash_lifecycle_marker(
+                file,
+                artifact,
+                dataset,
+                contract_checksum,
+                terminal_evidence_checksum,
+                baseline_checksum,
+                predecessor_checksum,
+            )?;
+        }
+        self.ensure_lifecycle_tail_absent(&specifications[target_index..])?;
+        let (file, artifact) = specifications[target_index];
+        self.publish_terminal_crash_lifecycle_marker(
+            file,
+            artifact,
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+            baseline_checksum,
+            predecessor_checksum,
+        )?;
+        Ok(())
+    }
+
     pub fn begin_recovery_check(
         &self,
         dataset: &DatasetState,
@@ -1025,6 +1209,55 @@ impl StateStore {
         ))
     }
 
+    pub fn begin_recovery_check_from_terminal_evidence(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<
+        (
+            TerminalRecoveryCheckClaim,
+            PersistedTerminalEvidence,
+            BTreeMap<FloatAggregateId, u32>,
+        ),
+        StateError,
+    > {
+        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.ensure_no_diagnostic_drift()?;
+        let (contract_checksum, _, terminal_evidence, terminal_evidence_checksum) =
+            self.load_bound_terminal_evidence(dataset, contract)?;
+        let (baseline, baseline_checksum) = self.load_bound_terminal_baseline(
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+        )?;
+        let restart_ready_checksum = self.load_complete_terminal_crash_lifecycle(
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+            baseline_checksum,
+        )?;
+        let claim_checksum = self.publish_marker(
+            RECOVERY_CLAIM_FILE,
+            RECOVERY_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            restart_ready_checksum,
+        )?;
+        Ok((
+            TerminalRecoveryCheckClaim {
+                token: ClaimToken {
+                    contract_checksum,
+                    claim_checksum,
+                    predecessor_checksum: restart_ready_checksum,
+                },
+                terminal_evidence_checksum,
+                baseline_checksum,
+            },
+            terminal_evidence,
+            baseline,
+        ))
+    }
+
     pub fn complete_recovery_check(
         &self,
         dataset: &DatasetState,
@@ -1049,6 +1282,59 @@ impl StateStore {
             ledger_checksum,
             baseline_checksum,
         )?;
+        if baseline_checksum != claim.baseline_checksum {
+            return Err(StateError::Invalid(
+                "recovery claim belongs to a different FLOAT baseline".to_owned(),
+            ));
+        }
+        if restart_ready_checksum != claim.token.predecessor_checksum {
+            return Err(StateError::Invalid(
+                "recovery claim belongs to a different restart-ready transition".to_owned(),
+            ));
+        }
+        self.publish_marker(
+            RECOVERY_RECEIPT_FILE,
+            RECOVERY_RECEIPT_ARTIFACT,
+            dataset,
+            claim.token.contract_checksum,
+            claim.token.claim_checksum,
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_recovery_check_from_terminal_evidence(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: TerminalRecoveryCheckClaim,
+    ) -> Result<(), StateError> {
+        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        self.validate_claim(
+            dataset,
+            contract,
+            claim.token,
+            RECOVERY_CLAIM_FILE,
+            RECOVERY_CLAIM_ARTIFACT,
+        )?;
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        let (_, _, _, terminal_evidence_checksum) =
+            self.load_bound_terminal_evidence(dataset, contract)?;
+        let (_, baseline_checksum) = self.load_bound_terminal_baseline(
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+        )?;
+        let restart_ready_checksum = self.load_complete_terminal_crash_lifecycle(
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+            baseline_checksum,
+        )?;
+        if terminal_evidence_checksum != claim.terminal_evidence_checksum {
+            return Err(StateError::Invalid(
+                "recovery claim belongs to different terminal evidence".to_owned(),
+            ));
+        }
         if baseline_checksum != claim.baseline_checksum {
             return Err(StateError::Invalid(
                 "recovery claim belongs to a different FLOAT baseline".to_owned(),
@@ -1132,6 +1418,73 @@ impl StateStore {
         })
     }
 
+    pub fn begin_diagnostic_from_terminal_evidence(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        stage: DiagnosticStage,
+    ) -> Result<TerminalDiagnosticClaim, StateError> {
+        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        let predecessor_checksum = match stage {
+            DiagnosticStage::Warmup => {
+                let (_, _, _, terminal_evidence_checksum) =
+                    self.load_bound_terminal_evidence(dataset, contract)?;
+                let (_, baseline_checksum) = self.load_bound_terminal_baseline(
+                    dataset,
+                    contract_checksum,
+                    terminal_evidence_checksum,
+                )?;
+                let restart_ready_checksum = self.load_complete_terminal_crash_lifecycle(
+                    dataset,
+                    contract_checksum,
+                    terminal_evidence_checksum,
+                    baseline_checksum,
+                )?;
+                let recovery_claim = self.load_marker(
+                    RECOVERY_CLAIM_FILE,
+                    RECOVERY_CLAIM_ARTIFACT,
+                    dataset,
+                    contract_checksum,
+                    restart_ready_checksum,
+                )?;
+                self.load_marker(
+                    RECOVERY_RECEIPT_FILE,
+                    RECOVERY_RECEIPT_ARTIFACT,
+                    dataset,
+                    contract_checksum,
+                    recovery_claim,
+                )?
+            }
+            DiagnosticStage::Observation => {
+                let warmup_claim = self.load_terminal_diagnostic_warmup_claim(dataset, contract)?;
+                self.load_marker(
+                    DIAGNOSTIC_WARMUP_RECEIPT_FILE,
+                    DIAGNOSTIC_WARMUP_RECEIPT_ARTIFACT,
+                    dataset,
+                    contract_checksum,
+                    warmup_claim,
+                )?
+            }
+        };
+        let (file, artifact) = diagnostic_claim_spec(stage);
+        let claim_checksum = self.publish_marker(
+            file,
+            artifact,
+            dataset,
+            contract_checksum,
+            predecessor_checksum,
+        )?;
+        Ok(TerminalDiagnosticClaim {
+            token: ClaimToken {
+                contract_checksum,
+                claim_checksum,
+                predecessor_checksum,
+            },
+            stage,
+        })
+    }
+
     pub fn complete_diagnostic(
         &self,
         dataset: &DatasetState,
@@ -1139,6 +1492,26 @@ impl StateStore {
         claim: DiagnosticClaim,
     ) -> Result<(), StateError> {
         let _directory_lock = lock_clean_state_directory(&self.root)?;
+        let (claim_file, claim_artifact) = diagnostic_claim_spec(claim.stage);
+        self.validate_claim(dataset, contract, claim.token, claim_file, claim_artifact)?;
+        let (receipt_file, receipt_artifact) = diagnostic_receipt_spec(claim.stage);
+        self.publish_marker(
+            receipt_file,
+            receipt_artifact,
+            dataset,
+            claim.token.contract_checksum,
+            claim.token.claim_checksum,
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_diagnostic_from_terminal_evidence(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: TerminalDiagnosticClaim,
+    ) -> Result<(), StateError> {
+        let _directory_lock = lock_clean_terminal_state_directory(&self.root)?;
         let (claim_file, claim_artifact) = diagnostic_claim_spec(claim.stage);
         self.validate_claim(dataset, contract, claim.token, claim_file, claim_artifact)?;
         let (receipt_file, receipt_artifact) = diagnostic_receipt_spec(claim.stage);
@@ -1504,6 +1877,35 @@ impl StateStore {
         Ok((contract_checksum, rank_claim, ledger, ledger_checksum))
     }
 
+    fn load_bound_terminal_evidence(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<(u64, u64, PersistedTerminalEvidence, u64), StateError> {
+        self.ensure_terminal_evidence_authority()?;
+        let (contract_checksum, rank_claim) = self.load_rank_claim(dataset, contract)?;
+        let input = read_limited(
+            &self.root.join(TERMINAL_EVIDENCE_FILE),
+            MAX_TERMINAL_EVIDENCE_FILE_BYTES,
+        )?;
+        let artifact = terminal_evidence_artifact(contract.conformance);
+        let (payload, terminal_evidence_checksum) = decode_artifact_and_checksum(
+            &input,
+            artifact,
+            dataset,
+            MAX_TERMINAL_EVIDENCE_PAYLOAD_BYTES,
+        )?;
+        let inner =
+            decode_bound_payload(payload, contract_checksum, rank_claim, "terminal evidence")?;
+        let terminal_evidence = decode_persisted_terminal_evidence(dataset, inner)?;
+        Ok((
+            contract_checksum,
+            rank_claim,
+            terminal_evidence,
+            terminal_evidence_checksum,
+        ))
+    }
+
     fn load_bound_baseline(
         &self,
         dataset: &DatasetState,
@@ -1535,6 +1937,37 @@ impl StateStore {
         ))
     }
 
+    fn load_bound_terminal_baseline(
+        &self,
+        dataset: &DatasetState,
+        contract_checksum: u64,
+        terminal_evidence_checksum: u64,
+    ) -> Result<(BTreeMap<FloatAggregateId, u32>, u64), StateError> {
+        let online_claim = self.load_marker(
+            ONLINE_CLAIM_FILE,
+            ONLINE_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+        )?;
+        let input = read_limited(
+            &self.root.join(FLOAT_BASELINE_FILE),
+            MAX_FLOAT_BASELINE_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+        )?;
+        let (payload, baseline_checksum) = decode_artifact_and_checksum(
+            &input,
+            FLOAT_BASELINE_ARTIFACT,
+            dataset,
+            MAX_FLOAT_BASELINE_PAYLOAD_BYTES,
+        )?;
+        let inner =
+            decode_bound_payload(payload, contract_checksum, online_claim, "FLOAT baseline")?;
+        Ok((
+            decode_terminal_float_baseline(inner, terminal_evidence_checksum)?,
+            baseline_checksum,
+        ))
+    }
+
     fn load_crash_context(
         &self,
         dataset: &DatasetState,
@@ -1545,6 +1978,25 @@ impl StateStore {
         let (_, baseline_checksum) =
             self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
         Ok((contract_checksum, ledger_checksum, baseline_checksum))
+    }
+
+    fn load_terminal_crash_context(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<(u64, u64, u64), StateError> {
+        let (contract_checksum, _, _, terminal_evidence_checksum) =
+            self.load_bound_terminal_evidence(dataset, contract)?;
+        let (_, baseline_checksum) = self.load_bound_terminal_baseline(
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+        )?;
+        Ok((
+            contract_checksum,
+            terminal_evidence_checksum,
+            baseline_checksum,
+        ))
     }
 
     fn publish_crash_lifecycle_marker(
@@ -1572,6 +2024,32 @@ impl StateStore {
         )
     }
 
+    fn publish_terminal_crash_lifecycle_marker(
+        &self,
+        file: &str,
+        artifact: &str,
+        dataset: &DatasetState,
+        contract_checksum: u64,
+        terminal_evidence_checksum: u64,
+        baseline_checksum: u64,
+        predecessor_checksum: u64,
+    ) -> Result<u64, StateError> {
+        let inner =
+            encode_terminal_crash_lifecycle_binding(terminal_evidence_checksum, baseline_checksum);
+        let payload = encode_bound_payload(contract_checksum, predecessor_checksum, inner.as_str());
+        let encoded = encode_artifact(artifact, dataset, &payload, MAX_MARKER_PAYLOAD_BYTES)?;
+        atomic_publish_new(&self.root, file, encoded.as_bytes())?;
+        self.load_terminal_crash_lifecycle_marker(
+            file,
+            artifact,
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+            baseline_checksum,
+            predecessor_checksum,
+        )
+    }
+
     fn load_crash_lifecycle_marker(
         &self,
         file: &str,
@@ -1594,6 +2072,33 @@ impl StateStore {
         Ok(checksum)
     }
 
+    fn load_terminal_crash_lifecycle_marker(
+        &self,
+        file: &str,
+        artifact: &str,
+        dataset: &DatasetState,
+        contract_checksum: u64,
+        terminal_evidence_checksum: u64,
+        baseline_checksum: u64,
+        predecessor_checksum: u64,
+    ) -> Result<u64, StateError> {
+        let input = read_limited(
+            &self.root.join(file),
+            MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+        )?;
+        let (payload, checksum) =
+            decode_artifact_and_checksum(&input, artifact, dataset, MAX_MARKER_PAYLOAD_BYTES)?;
+        let inner =
+            decode_bound_payload(payload, contract_checksum, predecessor_checksum, artifact)?;
+        decode_terminal_crash_lifecycle_binding(
+            inner,
+            terminal_evidence_checksum,
+            baseline_checksum,
+            artifact,
+        )?;
+        Ok(checksum)
+    }
+
     fn load_complete_crash_lifecycle(
         &self,
         dataset: &DatasetState,
@@ -1609,6 +2114,28 @@ impl StateStore {
                 dataset,
                 contract_checksum,
                 ledger_checksum,
+                baseline_checksum,
+                predecessor_checksum,
+            )?;
+        }
+        Ok(predecessor_checksum)
+    }
+
+    fn load_complete_terminal_crash_lifecycle(
+        &self,
+        dataset: &DatasetState,
+        contract_checksum: u64,
+        terminal_evidence_checksum: u64,
+        baseline_checksum: u64,
+    ) -> Result<u64, StateError> {
+        let mut predecessor_checksum = baseline_checksum;
+        for (file, artifact) in crash_lifecycle_specs() {
+            predecessor_checksum = self.load_terminal_crash_lifecycle_marker(
+                file,
+                artifact,
+                dataset,
+                contract_checksum,
+                terminal_evidence_checksum,
                 baseline_checksum,
                 predecessor_checksum,
             )?;
@@ -1691,6 +2218,60 @@ impl StateStore {
             contract_checksum,
             recovery_receipt,
         )
+    }
+
+    fn load_terminal_diagnostic_warmup_claim(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<u64, StateError> {
+        let contract_checksum = self.contract_checksum(dataset, contract)?;
+        let (_, _, _, terminal_evidence_checksum) =
+            self.load_bound_terminal_evidence(dataset, contract)?;
+        let (_, baseline_checksum) = self.load_bound_terminal_baseline(
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+        )?;
+        let restart_ready_checksum = self.load_complete_terminal_crash_lifecycle(
+            dataset,
+            contract_checksum,
+            terminal_evidence_checksum,
+            baseline_checksum,
+        )?;
+        let recovery_claim = self.load_marker(
+            RECOVERY_CLAIM_FILE,
+            RECOVERY_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            restart_ready_checksum,
+        )?;
+        let recovery_receipt = self.load_marker(
+            RECOVERY_RECEIPT_FILE,
+            RECOVERY_RECEIPT_ARTIFACT,
+            dataset,
+            contract_checksum,
+            recovery_claim,
+        )?;
+        self.load_marker(
+            DIAGNOSTIC_WARMUP_CLAIM_FILE,
+            DIAGNOSTIC_WARMUP_CLAIM_ARTIFACT,
+            dataset,
+            contract_checksum,
+            recovery_receipt,
+        )
+    }
+
+    fn ensure_terminal_evidence_authority(&self) -> Result<(), StateError> {
+        let path = self.root.join(LEDGER_FILE);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(StateError::Io(error)),
+            Ok(_) => Err(StateError::Invalid(format!(
+                "legacy run ledger is incompatible with terminal-evidence authority: {}",
+                path.display()
+            ))),
+        }
     }
 
     fn ensure_no_diagnostic_drift(&self) -> Result<(), StateError> {
@@ -2001,6 +2582,78 @@ fn ledger_artifact(conformance: RunConformance) -> &'static str {
     }
 }
 
+fn terminal_evidence_artifact(conformance: RunConformance) -> &'static str {
+    match conformance {
+        RunConformance::PublicSpecAligned => RANKED_TERMINAL_EVIDENCE_ARTIFACT,
+        RunConformance::NonRankedDeviation => NON_RANKED_TERMINAL_EVIDENCE_ARTIFACT,
+    }
+}
+
+fn terminal_artifact_binding(
+    dataset: &DatasetState,
+) -> Result<TerminalArtifactBinding, StateError> {
+    dataset.validate_setup_evidence_binding()?;
+    let warehouses = u16::try_from(dataset.warehouses).map_err(|_| {
+        StateError::Invalid("dataset warehouse count does not fit terminal evidence".to_owned())
+    })?;
+    Ok(TerminalArtifactBinding::new(
+        warehouses,
+        dataset.seed,
+        dataset.setup_evidence().load_seed,
+    ))
+}
+
+fn terminal_evidence_generator(dataset: &DatasetState) -> Result<TpccDataGen, StateError> {
+    dataset.validate_setup_evidence_binding()?;
+    let setup = dataset.setup_evidence();
+    let load_timestamp = String::from_utf8(setup.load_timestamp.clone())
+        .map_err(|_| StateError::Invalid("setup load timestamp is not valid UTF-8".to_owned()))?;
+    Ok(TpccDataGen::with_seed_and_timestamp(
+        dataset.warehouses,
+        setup.load_seed,
+        load_timestamp,
+    ))
+}
+
+fn decode_persisted_terminal_evidence(
+    dataset: &DatasetState,
+    input: &str,
+) -> Result<PersistedTerminalEvidence, StateError> {
+    let binding = terminal_artifact_binding(dataset)?;
+    let history_generator = terminal_evidence_generator(dataset)?;
+    let customer_generator = terminal_evidence_generator(dataset)?;
+    let initial_history = |customer: CustomerKey| {
+        history_generator
+            .initial_history(
+                customer.warehouse_id,
+                customer.district_id,
+                customer.customer_id,
+            )
+            .map(|history| {
+                InitialHistoryRow::new(
+                    history.h_date.into_bytes(),
+                    (history.h_amount as f32).to_bits(),
+                    history.h_data.into_bytes(),
+                )
+                .expect("validated setup generator produces bounded History roots")
+            })
+    };
+    let initial_customer = |customer: CustomerKey| {
+        customer_generator
+            .initial_customer_profile(
+                customer.warehouse_id,
+                customer.district_id,
+                customer.customer_id,
+            )
+            .map(|profile| {
+                InitialCustomerData::new(*profile.credit(), profile.data().to_vec())
+                    .expect("validated setup generator produces bounded Customer roots")
+            })
+    };
+    decode_terminal_artifact_hex(input, binding, &initial_history, &initial_customer)
+        .map_err(|error| StateError::Invalid(format!("invalid terminal evidence payload: {error}")))
+}
+
 fn crash_lifecycle_specs() -> [(&'static str, &'static str); 4] {
     [
         (CRASH_INTENT_FILE, CRASH_INTENT_ARTIFACT),
@@ -2047,6 +2700,45 @@ fn decode_crash_lifecycle_binding(
     {
         return Err(StateError::Invalid(format!(
             "{artifact} belongs to a different ledger or online baseline"
+        )));
+    }
+    Ok(())
+}
+
+fn encode_terminal_crash_lifecycle_binding(
+    terminal_evidence_checksum: u64,
+    baseline_checksum: u64,
+) -> String {
+    format!(
+        "terminal_evidence_checksum={terminal_evidence_checksum:016x}\nbaseline_checksum={baseline_checksum:016x}\n"
+    )
+}
+
+fn decode_terminal_crash_lifecycle_binding(
+    input: &str,
+    expected_terminal_evidence_checksum: u64,
+    expected_baseline_checksum: u64,
+    artifact: &str,
+) -> Result<(), StateError> {
+    if !input.ends_with('\n') {
+        return Err(StateError::Invalid(format!(
+            "{artifact} binding must end with a newline"
+        )));
+    }
+    let mut lines = input.split_terminator('\n');
+    let terminal_evidence_checksum =
+        parse_checksum(value(&mut lines, "terminal_evidence_checksum")?)?;
+    let baseline_checksum = parse_checksum(value(&mut lines, "baseline_checksum")?)?;
+    if lines.next().is_some() {
+        return Err(StateError::Invalid(format!(
+            "{artifact} binding contains trailing fields"
+        )));
+    }
+    if terminal_evidence_checksum != expected_terminal_evidence_checksum
+        || baseline_checksum != expected_baseline_checksum
+    {
+        return Err(StateError::Invalid(format!(
+            "{artifact} belongs to different terminal evidence or online baseline"
         )));
     }
     Ok(())
@@ -2450,6 +3142,108 @@ fn decode_float_baseline(
     Ok(values)
 }
 
+fn encode_terminal_float_baseline(
+    values: &BTreeMap<FloatAggregateId, u32>,
+    terminal_evidence_checksum: u64,
+) -> Result<String, StateError> {
+    if values.len() != FLOAT_AGGREGATES.len()
+        || FLOAT_AGGREGATES
+            .iter()
+            .any(|spec| !values.contains_key(&spec.id))
+    {
+        return Err(StateError::Invalid(
+            "FLOAT baseline must contain all seven aggregate categories exactly once".to_owned(),
+        ));
+    }
+
+    let mut payload = format!("terminal_evidence_checksum={terminal_evidence_checksum:016x}\n");
+    for spec in FLOAT_AGGREGATES {
+        let bits = values
+            .get(&spec.id)
+            .ok_or_else(|| StateError::Invalid("missing FLOAT baseline category".to_owned()))?;
+        if !f32::from_bits(*bits).is_finite() {
+            return Err(StateError::Invalid(format!(
+                "FLOAT baseline {} must be finite",
+                float_aggregate_name(spec.id)
+            )));
+        }
+        payload.push_str(float_aggregate_name(spec.id));
+        payload.push('=');
+        payload.push_str(&format!("{bits:08x}"));
+        payload.push('\n');
+    }
+    Ok(payload)
+}
+
+fn decode_terminal_float_baseline(
+    payload: &str,
+    terminal_evidence_checksum: u64,
+) -> Result<BTreeMap<FloatAggregateId, u32>, StateError> {
+    if !payload.ends_with('\n') {
+        return Err(StateError::Invalid(
+            "FLOAT baseline payload must end with a newline".to_owned(),
+        ));
+    }
+
+    let mut lines = payload.split_terminator('\n');
+    let encoded_terminal_evidence_checksum =
+        parse_checksum(value(&mut lines, "terminal_evidence_checksum")?)?;
+    if encoded_terminal_evidence_checksum != terminal_evidence_checksum {
+        return Err(StateError::Invalid(
+            "FLOAT baseline belongs to different terminal evidence".to_owned(),
+        ));
+    }
+
+    let mut values = BTreeMap::new();
+    for line in lines {
+        if line.is_empty() {
+            return Err(StateError::Invalid(
+                "FLOAT baseline contains an empty field".to_owned(),
+            ));
+        }
+        let (name, encoded_bits) = line
+            .split_once('=')
+            .ok_or_else(|| StateError::Invalid(format!("invalid FLOAT baseline field {line:?}")))?;
+        let id = parse_float_aggregate_name(name).ok_or_else(|| {
+            StateError::Invalid(format!("unknown FLOAT baseline category {name:?}"))
+        })?;
+        if encoded_bits.len() != 8
+            || !encoded_bits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(StateError::Invalid(format!(
+                "FLOAT baseline {name} must contain eight lower-case hexadecimal digits"
+            )));
+        }
+        let bits = u32::from_str_radix(encoded_bits, 16).map_err(|_| {
+            StateError::Invalid(format!("FLOAT baseline {name} is not valid hexadecimal"))
+        })?;
+        if !f32::from_bits(bits).is_finite() {
+            return Err(StateError::Invalid(format!(
+                "FLOAT baseline {name} must be finite"
+            )));
+        }
+        if values.insert(id, bits).is_some() {
+            return Err(StateError::Invalid(format!(
+                "duplicate FLOAT baseline category {name:?}"
+            )));
+        }
+    }
+
+    if values.len() != FLOAT_AGGREGATES.len() {
+        let missing = FLOAT_AGGREGATES
+            .iter()
+            .find(|spec| !values.contains_key(&spec.id))
+            .map(|spec| float_aggregate_name(spec.id))
+            .unwrap_or("unknown");
+        return Err(StateError::Invalid(format!(
+            "missing FLOAT baseline category {missing:?}"
+        )));
+    }
+    Ok(values)
+}
+
 fn float_aggregate_name(id: FloatAggregateId) -> &'static str {
     match id {
         FloatAggregateId::WarehouseYtd => "warehouse_ytd",
@@ -2624,6 +3418,42 @@ fn lock_clean_state_directory(root: &Path) -> Result<StateDirectoryLock, StateEr
     cleanup_orphan_temporary_files(root, &directory_lock.0)?;
     validate_locked_directory_identity(root, &directory_lock.0)?;
     Ok(directory_lock)
+}
+
+fn lock_clean_terminal_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
+    let directory_lock = lock_state_directory(root)?;
+    ensure_legacy_state_absent(root)?;
+    cleanup_orphan_temporary_files(root, &directory_lock.0)?;
+    ensure_legacy_state_absent(root)?;
+    validate_locked_directory_identity(root, &directory_lock.0)?;
+    Ok(directory_lock)
+}
+
+fn ensure_legacy_state_absent(root: &Path) -> Result<(), StateError> {
+    let legacy = root.join(LEDGER_FILE);
+    match fs::symlink_metadata(&legacy) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(StateError::Io(error)),
+        Ok(_) => {
+            return Err(StateError::Invalid(format!(
+                "legacy run ledger is incompatible with terminal-evidence authority: {}",
+                legacy.display()
+            )));
+        }
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if temporary_target_name(&file_name) == Some(LEDGER_FILE) {
+            return Err(StateError::Invalid(format!(
+                "legacy run-ledger publication temporary is incompatible with terminal-evidence authority: {}",
+                entry.path().display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn cleanup_orphan_temporary_files(root: &Path, directory: &File) -> Result<(), StateError> {
@@ -2981,6 +3811,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::ranking::evidence_collector::StockKey;
+    use crate::ranking::preflight::StalePaymentPreflightProof;
+    use crate::ranking::runner::StockVersion;
+    use crate::ranking::terminal_evidence::TerminalEvidenceCollector;
     use crate::sample_evidence::setup_evidence_fixture;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -3099,6 +3933,65 @@ mod tests {
             .enumerate()
             .map(|(index, spec)| (spec.id, 0x3f80_0000 + index as u32))
             .collect()
+    }
+
+    fn sample_terminal_evidence(dataset: &DatasetState) -> SealedTerminalEvidence {
+        let warehouses = u16::try_from(dataset.warehouses).unwrap();
+        let history_generator = terminal_evidence_generator(dataset).unwrap();
+        let customer_generator = terminal_evidence_generator(dataset).unwrap();
+        let initial_history = move |customer: CustomerKey| {
+            history_generator
+                .initial_history(
+                    customer.warehouse_id,
+                    customer.district_id,
+                    customer.customer_id,
+                )
+                .map(|history| {
+                    InitialHistoryRow::new(
+                        history.h_date.into_bytes(),
+                        (history.h_amount as f32).to_bits(),
+                        history.h_data.into_bytes(),
+                    )
+                    .unwrap()
+                })
+        };
+        let initial_customer = move |customer: CustomerKey| {
+            customer_generator
+                .initial_customer_profile(
+                    customer.warehouse_id,
+                    customer.district_id,
+                    customer.customer_id,
+                )
+                .map(|profile| {
+                    InitialCustomerData::new(*profile.credit(), profile.data().to_vec()).unwrap()
+                })
+        };
+        let stock_roots = |_stock: StockKey| {
+            Some(StockVersion {
+                quantity: 50,
+                ytd_bits: 0.0_f32.to_bits(),
+                order_count: 0,
+                remote_count: 0,
+            })
+        };
+        let collector = TerminalEvidenceCollector::new(
+            warehouses,
+            1,
+            dataset.seed,
+            stock_roots,
+            initial_history,
+            initial_customer,
+            StalePaymentPreflightProof::verified_for_test(dataset.seed, warehouses),
+        )
+        .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                collector.worker_finished(0).await.unwrap();
+                collector.seal().await.unwrap()
+            })
     }
 
     #[test]
@@ -3284,6 +4177,186 @@ mod tests {
             ledger_checksum
         )
         .is_err());
+    }
+
+    #[test]
+    fn terminal_evidence_authority_round_trips_the_complete_state_chain() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset("run-terminal-chain", 79);
+        let contract = sample_contract(1);
+        let evidence = sample_terminal_evidence(&dataset);
+        let binding = terminal_artifact_binding(&dataset).unwrap();
+        let expected = encode_terminal_artifact_hex(&evidence, binding).unwrap();
+        initialize_checked_run(&store, &dataset, &contract);
+
+        let rank = store.begin_rank(&dataset, &contract).unwrap();
+        store
+            .complete_rank_with_terminal_evidence(&dataset, &contract, rank, &evidence)
+            .unwrap();
+        assert!(directory.0.join(TERMINAL_EVIDENCE_FILE).is_file());
+        assert!(!directory.0.join(LEDGER_FILE).exists());
+
+        let (online, restored) = store
+            .begin_online_check_from_terminal_evidence(&dataset, &contract)
+            .unwrap();
+        assert_eq!(
+            encode_terminal_artifact_hex(&restored, binding).unwrap(),
+            expected
+        );
+        store
+            .complete_online_check_from_terminal_evidence(
+                &dataset,
+                &contract,
+                online,
+                &sample_float_baseline(),
+            )
+            .unwrap();
+        let baseline = fs::read_to_string(directory.0.join(FLOAT_BASELINE_FILE)).unwrap();
+        assert!(baseline.contains("terminal_evidence_checksum="));
+        assert!(!baseline.contains("ledger_checksum="));
+
+        for event in [
+            CrashLifecycleEvent::Intent,
+            CrashLifecycleEvent::Killed,
+            CrashLifecycleEvent::RestartStarted,
+            CrashLifecycleEvent::RestartReady,
+        ] {
+            store
+                .record_crash_lifecycle_from_terminal_evidence(&dataset, &contract, event)
+                .unwrap();
+        }
+        for (file, _) in crash_lifecycle_specs() {
+            let marker = fs::read_to_string(directory.0.join(file)).unwrap();
+            assert!(marker.contains("terminal_evidence_checksum="));
+            assert!(!marker.contains("ledger_checksum="));
+        }
+
+        let (recovery, restored, baseline) = store
+            .begin_recovery_check_from_terminal_evidence(&dataset, &contract)
+            .unwrap();
+        assert_eq!(
+            encode_terminal_artifact_hex(&restored, binding).unwrap(),
+            expected
+        );
+        assert_eq!(baseline, sample_float_baseline());
+        store
+            .complete_recovery_check_from_terminal_evidence(&dataset, &contract, recovery)
+            .unwrap();
+
+        let warmup = store
+            .begin_diagnostic_from_terminal_evidence(&dataset, &contract, DiagnosticStage::Warmup)
+            .unwrap();
+        store
+            .complete_diagnostic_from_terminal_evidence(&dataset, &contract, warmup)
+            .unwrap();
+        let observation = store
+            .begin_diagnostic_from_terminal_evidence(
+                &dataset,
+                &contract,
+                DiagnosticStage::Observation,
+            )
+            .unwrap();
+        store
+            .complete_diagnostic_from_terminal_evidence(&dataset, &contract, observation)
+            .unwrap();
+    }
+
+    #[test]
+    fn terminal_evidence_rejects_same_length_payload_damage_and_republication() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset("run-terminal-damage", 80);
+        let contract = sample_contract(1);
+        let evidence = sample_terminal_evidence(&dataset);
+        initialize_checked_run(&store, &dataset, &contract);
+
+        let rank = store.begin_rank(&dataset, &contract).unwrap();
+        let duplicate_rank = RankClaim(rank.0);
+        store
+            .complete_rank_with_terminal_evidence(&dataset, &contract, rank, &evidence)
+            .unwrap();
+        let path = directory.0.join(TERMINAL_EVIDENCE_FILE);
+        let original = fs::read(&path).unwrap();
+        assert!(store
+            .complete_rank_with_terminal_evidence(&dataset, &contract, duplicate_rank, &evidence)
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        let mut damaged = original;
+        let last = damaged.last_mut().unwrap();
+        *last = if *last == b'0' { b'1' } else { b'0' };
+        fs::write(&path, damaged).unwrap();
+        assert!(store
+            .begin_online_check_from_terminal_evidence(&dataset, &contract)
+            .is_err());
+    }
+
+    #[test]
+    fn strict_terminal_lock_rejects_legacy_target_and_temporary_without_mutation() {
+        let target_directory = TestDirectory::new();
+        let target_store = StateStore::open(&target_directory.0).unwrap();
+        let target_dataset = sample_dataset("run-terminal-legacy-target", 82);
+        let target_contract = sample_contract(1);
+        let target_evidence = sample_terminal_evidence(&target_dataset);
+        initialize_checked_run(&target_store, &target_dataset, &target_contract);
+        let target_rank = target_store
+            .begin_rank(&target_dataset, &target_contract)
+            .unwrap();
+        target_store
+            .complete_rank_with_terminal_evidence(
+                &target_dataset,
+                &target_contract,
+                target_rank,
+                &target_evidence,
+            )
+            .unwrap();
+        let terminal_before = fs::read(target_directory.0.join(TERMINAL_EVIDENCE_FILE)).unwrap();
+        target_store
+            .save_ledger(&target_dataset, &RunLedger::default())
+            .unwrap();
+        assert!(target_store
+            .begin_online_check_from_terminal_evidence(&target_dataset, &target_contract)
+            .is_err());
+        assert_eq!(
+            fs::read(target_directory.0.join(TERMINAL_EVIDENCE_FILE)).unwrap(),
+            terminal_before
+        );
+        assert!(target_directory.0.join(LEDGER_FILE).exists());
+
+        let temporary_directory = TestDirectory::new();
+        let temporary_store = StateStore::open(&temporary_directory.0).unwrap();
+        let temporary_dataset = sample_dataset("run-terminal-legacy-temporary", 83);
+        let temporary_contract = sample_contract(1);
+        let temporary_evidence = sample_terminal_evidence(&temporary_dataset);
+        initialize_checked_run(&temporary_store, &temporary_dataset, &temporary_contract);
+        let temporary_rank = temporary_store
+            .begin_rank(&temporary_dataset, &temporary_contract)
+            .unwrap();
+        let legacy_temporary = temporary_directory
+            .0
+            .join(format!(".{LEDGER_FILE}.{}.0.tmp", std::process::id()));
+        fs::write(&legacy_temporary, b"legacy-provisional").unwrap();
+        let unrelated_temporary = temporary_directory.0.join(format!(
+            ".{TERMINAL_EVIDENCE_FILE}.{}.1.tmp",
+            std::process::id()
+        ));
+        fs::write(&unrelated_temporary, b"terminal-provisional").unwrap();
+
+        assert!(temporary_store
+            .complete_rank_with_terminal_evidence(
+                &temporary_dataset,
+                &temporary_contract,
+                temporary_rank,
+                &temporary_evidence,
+            )
+            .is_err());
+        assert_eq!(fs::read(&legacy_temporary).unwrap(), b"legacy-provisional");
+        assert_eq!(
+            fs::read(&unrelated_temporary).unwrap(),
+            b"terminal-provisional"
+        );
+        assert!(!temporary_directory.0.join(TERMINAL_EVIDENCE_FILE).exists());
     }
 
     #[test]
