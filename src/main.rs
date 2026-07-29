@@ -325,8 +325,16 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             let (store, contract, claim, run_id, seed) = setup_run
                 .take()
                 .ok_or("validated init configuration lost its pre-DDL setup claim")?;
-            let state =
-                run_state::DatasetState::from_load(run_id, seed, config.scale_factor, load)?;
+            let state = run_state::DatasetState::from_load_with_schema(
+                run_id,
+                seed,
+                config.scale_factor,
+                load,
+                setup_schema
+                    .as_deref()
+                    .ok_or("validated init configuration lost its runtime schema")?
+                    .clone(),
+            )?;
             store.complete_dataset(&state, &contract, claim)?;
             info!(
                 "已保存版本化装载状态: {}",
@@ -437,15 +445,27 @@ fn load_bound_state(
     let run_id_mismatch = std::env::var("RMDB_TPCC_RUN_ID")
         .ok()
         .is_some_and(|run_id| dataset.run_id != run_id);
-    if dataset.warehouses != config.scale_factor || seed_mismatch || run_id_mismatch {
+    let expected_schema_mode = if config.canonical_schema {
+        runtime_schema::SchemaMode::Canonical
+    } else {
+        runtime_schema::SchemaMode::LocalSeedOpaqueV1
+    };
+    let schema_mismatch = dataset.runtime_schema.mode() != expected_schema_mode;
+    if dataset.warehouses != config.scale_factor
+        || seed_mismatch
+        || run_id_mismatch
+        || schema_mismatch
+    {
         return Err(format!(
-            "run state mismatch: state run/seed/SF={}/{}/{}, CLI run/seed/SF={:?}/{:?}/{}",
+            "run state mismatch: state run/seed/SF/schema={}/{}/{}/{}, CLI run/seed/SF/schema={:?}/{:?}/{}/{}",
             dataset.run_id,
             dataset.seed,
             dataset.warehouses,
+            dataset.runtime_schema.mode().as_str(),
             std::env::var("RMDB_TPCC_RUN_ID").ok(),
             effective.seed,
-            config.scale_factor
+            config.scale_factor,
+            expected_schema_mode.as_str()
         )
         .into());
     }

@@ -13,8 +13,9 @@ use crate::profile::{
     OFFICIAL_WAREHOUSES, RECOVERY_READY_BUDGET_SECONDS, WARMUP_SECONDS,
 };
 use crate::ranking::ledger::RunLedger;
+use crate::runtime_schema::{RuntimeSchema, ENCODED_BEGIN_MARKER, ENCODED_END_MARKER};
 
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 const DATASET_FILE: &str = "dataset.state";
 const MAX_DATASET_STATE_BYTES: usize = 256 * 1024;
 const ARTIFACT_VERSION: u32 = 1;
@@ -272,6 +273,7 @@ pub struct DatasetState {
     pub warehouses: i32,
     pub order_line_rows: i64,
     pub undelivered_order_line_rows: i64,
+    pub runtime_schema: RuntimeSchema,
     initial_order_line_amounts: NonNegativeF32Accumulator,
     pub partitions: Vec<PartitionLoadSummary>,
 }
@@ -282,6 +284,19 @@ impl DatasetState {
         seed: u64,
         warehouses: i32,
         load: LoadSummary,
+    ) -> Result<Self, StateError> {
+        let runtime_schema = RuntimeSchema::opaque(seed).map_err(|error| {
+            StateError::Invalid(format!("cannot derive runtime schema: {error}"))
+        })?;
+        Self::from_load_with_schema(run_id, seed, warehouses, load, runtime_schema)
+    }
+
+    pub fn from_load_with_schema(
+        run_id: String,
+        seed: u64,
+        warehouses: i32,
+        load: LoadSummary,
+        runtime_schema: RuntimeSchema,
     ) -> Result<Self, StateError> {
         validate_run_id(&run_id)?;
         if warehouses <= 0 || load.order_line_rows < 0 || load.undelivered_order_line_rows < 0 {
@@ -302,6 +317,7 @@ impl DatasetState {
             warehouses,
             order_line_rows: load.order_line_rows,
             undelivered_order_line_rows: load.undelivered_order_line_rows,
+            runtime_schema,
             initial_order_line_amounts: load.order_line_amounts,
             partitions: load.partitions,
         };
@@ -314,6 +330,14 @@ impl DatasetState {
         if self.warehouses <= 0 || self.order_line_rows < 0 || self.undelivered_order_line_rows < 0
         {
             return Err(StateError::Invalid("invalid dataset dimensions".to_owned()));
+        }
+        self.runtime_schema
+            .validate()
+            .map_err(|error| StateError::Invalid(format!("invalid runtime schema: {error}")))?;
+        if self.runtime_schema.seed() != self.seed {
+            return Err(StateError::Invalid(
+                "runtime schema seed does not match dataset seed".to_owned(),
+            ));
         }
         if self.partitions.len() != self.warehouses as usize * 10 {
             return Err(StateError::Invalid(
@@ -386,6 +410,7 @@ impl DatasetState {
             self.order_line_rows,
             self.undelivered_order_line_rows
         );
+        output.push_str(&self.runtime_schema.encode());
         for partition in &self.partitions {
             output.push_str(&format!(
                 "partition={},{},{},{}\n",
@@ -422,6 +447,28 @@ impl DatasetState {
                     ))
                 },
             )?;
+        let first_schema_line = lines
+            .next()
+            .ok_or_else(|| StateError::Invalid("missing runtime schema".to_owned()))?;
+        if first_schema_line != ENCODED_BEGIN_MARKER {
+            return Err(StateError::Invalid(format!(
+                "expected {ENCODED_BEGIN_MARKER}, got {first_schema_line:?}"
+            )));
+        }
+        let mut encoded_schema = String::from(ENCODED_BEGIN_MARKER);
+        encoded_schema.push('\n');
+        loop {
+            let line = lines
+                .next()
+                .ok_or_else(|| StateError::Invalid(format!("missing {ENCODED_END_MARKER}")))?;
+            encoded_schema.push_str(line);
+            encoded_schema.push('\n');
+            if line == ENCODED_END_MARKER {
+                break;
+            }
+        }
+        let runtime_schema = RuntimeSchema::decode(&encoded_schema)
+            .map_err(|error| StateError::Invalid(format!("invalid runtime schema: {error}")))?;
         let mut partitions = Vec::new();
         for line in lines {
             let raw = line
@@ -446,6 +493,7 @@ impl DatasetState {
             warehouses,
             order_line_rows,
             undelivered_order_line_rows,
+            runtime_schema,
             initial_order_line_amounts,
             partitions,
         };
@@ -2588,12 +2636,35 @@ mod tests {
     #[test]
     fn dataset_round_trip_rejects_wrong_partition_totals() {
         let state = sample_dataset("run-1", 9);
-        assert_eq!(DatasetState::decode(&state.encode()).unwrap(), state);
+        let encoded = state.encode();
+        assert_eq!(DatasetState::decode(&encoded).unwrap(), state);
+        assert_eq!(
+            DatasetState::decode(&encoded)
+                .unwrap()
+                .runtime_schema
+                .fingerprint(),
+            state.runtime_schema.fingerprint()
+        );
 
-        let malformed = state
-            .encode()
-            .replace("order_line_rows=7", "order_line_rows=8");
+        let malformed = encoded.replace("order_line_rows=7", "order_line_rows=8");
         assert!(DatasetState::decode(&malformed).is_err());
+
+        let encoded_fingerprint =
+            format!("fingerprint={:016x}", state.runtime_schema.fingerprint());
+        let damaged_fingerprint = format!(
+            "fingerprint={:016x}",
+            state.runtime_schema.fingerprint() ^ 1
+        );
+        assert!(DatasetState::decode(&encoded.replacen(
+            &encoded_fingerprint,
+            &damaged_fingerprint,
+            1
+        ))
+        .is_err());
+
+        let mut wrong_seed = state;
+        wrong_seed.runtime_schema = RuntimeSchema::opaque(10).unwrap();
+        assert!(wrong_seed.validate().is_err());
     }
 
     #[test]

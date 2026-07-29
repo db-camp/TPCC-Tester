@@ -11,8 +11,8 @@ pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
 pub const OPAQUE_SCHEMA_ALGORITHM: &str = "local_seed_opaque_v1";
 pub const CANONICAL_SCHEMA_ALGORITHM: &str = "canonical";
 
-const BEGIN_MARKER: &str = "runtime_schema_begin";
-const END_MARKER: &str = "runtime_schema_end";
+pub const ENCODED_BEGIN_MARKER: &str = "runtime_schema_begin";
+pub const ENCODED_END_MARKER: &str = "runtime_schema_end";
 
 const DOMAIN_TABLE_NAMES: &str = "final2026/runtime/table-name/v1";
 const DOMAIN_COLUMN_NAMES: &str = "final2026/runtime/column-name/v1";
@@ -696,7 +696,7 @@ impl RuntimeSchema {
 
     pub fn encode(&self) -> String {
         let mut output = String::new();
-        output.push_str(BEGIN_MARKER);
+        output.push_str(ENCODED_BEGIN_MARKER);
         output.push('\n');
         output.push_str(&format!("version={}\n", self.version));
         output.push_str(&format!("mode={}\n", self.mode.as_str()));
@@ -755,14 +755,14 @@ impl RuntimeSchema {
             "check_order={}\n",
             self.schedule.setup_checks().join(",")
         ));
-        output.push_str(END_MARKER);
+        output.push_str(ENCODED_END_MARKER);
         output.push('\n');
         output
     }
 
     pub fn decode(input: &str) -> Result<Self, RuntimeSchemaError> {
         let mut lines = input.lines();
-        expect_line(&mut lines, BEGIN_MARKER)?;
+        expect_line(&mut lines, ENCODED_BEGIN_MARKER)?;
         let version = parse_field::<u32>(&mut lines, "version")?;
         if version != RUNTIME_SCHEMA_VERSION {
             return Err(RuntimeSchemaError::Invalid(format!(
@@ -827,7 +827,7 @@ impl RuntimeSchema {
             count_tables: decode_tables(field(&mut lines, "count_order")?)?,
             setup_checks: decode_checks(field(&mut lines, "check_order")?)?,
         };
-        expect_line(&mut lines, END_MARKER)?;
+        expect_line(&mut lines, ENCODED_END_MARKER)?;
         if lines.next().is_some() {
             return Err(RuntimeSchemaError::Invalid(
                 "runtime schema contains trailing fields".to_owned(),
