@@ -20,6 +20,8 @@ const MAX_DATASET_STATE_BYTES: usize = 256 * 1024;
 const ARTIFACT_VERSION: u32 = 1;
 const SETUP_INTENT_ARTIFACT: &str = "setup_claim";
 const SETUP_INTENT_FILE: &str = "setup.started";
+const SETUP_EXECUTION_ARTIFACT: &str = "setup_execution_claim";
+const SETUP_EXECUTION_FILE: &str = "setup.execution.started";
 const RUN_CONTRACT_ARTIFACT: &str = "run_contract";
 const RUN_CONTRACT_FILE: &str = "run_contract.state";
 const SETUP_CHECK_CLAIM_ARTIFACT: &str = "setup_check_claim";
@@ -37,6 +39,14 @@ const ONLINE_CLAIM_ARTIFACT: &str = "online_check_claim";
 const ONLINE_CLAIM_FILE: &str = "online_check.started";
 const FLOAT_BASELINE_ARTIFACT: &str = "float_baseline";
 const FLOAT_BASELINE_FILE: &str = "float_baseline.state";
+const CRASH_INTENT_ARTIFACT: &str = "crash_intent";
+const CRASH_INTENT_FILE: &str = "crash.intent";
+const CRASH_KILLED_ARTIFACT: &str = "crash_killed";
+const CRASH_KILLED_FILE: &str = "crash.killed";
+const RESTART_STARTED_ARTIFACT: &str = "restart_started";
+const RESTART_STARTED_FILE: &str = "restart.started";
+const RESTART_READY_ARTIFACT: &str = "restart_ready";
+const RESTART_READY_FILE: &str = "restart.ready";
 const RECOVERY_CLAIM_ARTIFACT: &str = "recovery_check_claim";
 const RECOVERY_CLAIM_FILE: &str = "recovery_check.started";
 const RECOVERY_RECEIPT_ARTIFACT: &str = "recovery_check_receipt";
@@ -200,7 +210,22 @@ impl RunContract {
 
 #[derive(Debug)]
 pub struct SetupClaim {
-    checksum: u64,
+    intent_checksum: u64,
+    execution_checksum: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupClaimOrigin {
+    Created,
+    Resumed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CrashLifecycleEvent {
+    Intent,
+    Killed,
+    RestartStarted,
+    RestartReady,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -470,12 +495,22 @@ impl StateStore {
         })
     }
 
-    pub fn begin_setup(
+    pub fn publish_setup_intent(
         &self,
         run_id: &str,
         seed: u64,
         contract: &RunContract,
-    ) -> Result<SetupClaim, StateError> {
+    ) -> Result<(), StateError> {
+        self.create_setup_intent(run_id, seed, contract)?;
+        Ok(())
+    }
+
+    fn create_setup_intent(
+        &self,
+        run_id: &str,
+        seed: u64,
+        contract: &RunContract,
+    ) -> Result<u64, StateError> {
         validate_run_id(run_id)?;
         contract.validate_shape()?;
         self.ensure_fresh_setup_root()?;
@@ -485,7 +520,64 @@ impl StateStore {
             &self.root.join(SETUP_INTENT_FILE),
             MAX_SETUP_INTENT_BYTES as u64,
         )?)?;
-        Ok(SetupClaim { checksum })
+        Ok(checksum)
+    }
+
+    pub fn begin_or_resume_setup(
+        &self,
+        run_id: &str,
+        seed: u64,
+        contract: &RunContract,
+    ) -> Result<(SetupClaim, SetupClaimOrigin), StateError> {
+        let (intent_checksum, origin) =
+            match fs::symlink_metadata(self.root.join(SETUP_INTENT_FILE)) {
+                Ok(_) => (
+                    self.resume_setup_intent(run_id, seed, contract)?,
+                    SetupClaimOrigin::Resumed,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                    self.create_setup_intent(run_id, seed, contract)?,
+                    SetupClaimOrigin::Created,
+                ),
+                Err(error) => return Err(StateError::Io(error)),
+            };
+        let encoded = encode_setup_execution(run_id, seed, contract, intent_checksum)?;
+        atomic_publish_new(&self.root, SETUP_EXECUTION_FILE, encoded.as_bytes())?;
+        let (execution, execution_checksum) = self.load_setup_execution()?;
+        if execution.intent_checksum != intent_checksum
+            || execution.run_id != run_id
+            || execution.seed != seed
+            || execution.contract != *contract
+        {
+            return Err(StateError::Invalid(
+                "setup execution claim changed while it was published".to_owned(),
+            ));
+        }
+        Ok((
+            SetupClaim {
+                intent_checksum,
+                execution_checksum,
+            },
+            origin,
+        ))
+    }
+
+    fn resume_setup_intent(
+        &self,
+        run_id: &str,
+        seed: u64,
+        contract: &RunContract,
+    ) -> Result<u64, StateError> {
+        validate_run_id(run_id)?;
+        contract.validate_shape()?;
+        self.ensure_pending_setup_only()?;
+        let (intent, checksum) = self.load_setup_intent()?;
+        if intent.run_id != run_id || intent.seed != seed || intent.contract != *contract {
+            return Err(StateError::Invalid(
+                "pre-start setup claim does not match requested run/seed/profile".to_owned(),
+            ));
+        }
+        Ok(checksum)
     }
 
     pub fn complete_dataset(
@@ -496,18 +588,25 @@ impl StateStore {
     ) -> Result<(), StateError> {
         dataset.validate()?;
         contract.validate(dataset)?;
+        self.ensure_setup_execution_pending()?;
         let (intent, checksum) = self.load_setup_intent()?;
-        if checksum != claim.checksum
+        let (execution, execution_checksum) = self.load_setup_execution()?;
+        if checksum != claim.intent_checksum
+            || execution_checksum != claim.execution_checksum
             || intent.run_id != dataset.run_id
             || intent.seed != dataset.seed
             || intent.contract != *contract
+            || execution.run_id != dataset.run_id
+            || execution.seed != dataset.seed
+            || execution.contract != *contract
+            || execution.intent_checksum != checksum
         {
             return Err(StateError::Invalid(
-                "loaded dataset does not match the pre-DDL setup claim".to_owned(),
+                "loaded dataset does not match its setup intent and execution claim".to_owned(),
             ));
         }
         self.save_dataset(dataset)?;
-        let payload = encode_setup_bound_contract(checksum, contract);
+        let payload = encode_setup_bound_contract(checksum, execution_checksum, contract);
         let encoded = encode_artifact(
             RUN_CONTRACT_ARTIFACT,
             dataset,
@@ -523,7 +622,7 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<(), StateError> {
-        let claim = self.begin_setup(&dataset.run_id, dataset.seed, contract)?;
+        let (claim, _) = self.begin_or_resume_setup(&dataset.run_id, dataset.seed, contract)?;
         self.complete_dataset(dataset, contract, claim)
     }
 
@@ -699,6 +798,43 @@ impl StateStore {
         atomic_publish_new(&self.root, FLOAT_BASELINE_FILE, encoded.as_bytes())
     }
 
+    pub fn record_crash_lifecycle(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        event: CrashLifecycleEvent,
+    ) -> Result<(), StateError> {
+        self.ensure_no_diagnostic_drift()?;
+        let (contract_checksum, ledger_checksum, baseline_checksum) =
+            self.load_crash_context(dataset, contract)?;
+        let specifications = crash_lifecycle_specs();
+        let target_index = crash_lifecycle_index(event);
+        let mut predecessor_checksum = baseline_checksum;
+        for &(file, artifact) in &specifications[..target_index] {
+            predecessor_checksum = self.load_crash_lifecycle_marker(
+                file,
+                artifact,
+                dataset,
+                contract_checksum,
+                ledger_checksum,
+                baseline_checksum,
+                predecessor_checksum,
+            )?;
+        }
+        self.ensure_lifecycle_tail_absent(&specifications[target_index..])?;
+        let (file, artifact) = specifications[target_index];
+        self.publish_crash_lifecycle_marker(
+            file,
+            artifact,
+            dataset,
+            contract_checksum,
+            ledger_checksum,
+            baseline_checksum,
+            predecessor_checksum,
+        )?;
+        Ok(())
+    }
+
     pub fn begin_recovery_check(
         &self,
         dataset: &DatasetState,
@@ -716,19 +852,25 @@ impl StateStore {
             self.load_bound_ledger(dataset, contract)?;
         let (baseline, baseline_checksum) =
             self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
+        let restart_ready_checksum = self.load_complete_crash_lifecycle(
+            dataset,
+            contract_checksum,
+            ledger_checksum,
+            baseline_checksum,
+        )?;
         let claim_checksum = self.publish_marker(
             RECOVERY_CLAIM_FILE,
             RECOVERY_CLAIM_ARTIFACT,
             dataset,
             contract_checksum,
-            baseline_checksum,
+            restart_ready_checksum,
         )?;
         Ok((
             RecoveryCheckClaim {
                 token: ClaimToken {
                     contract_checksum,
                     claim_checksum,
-                    predecessor_checksum: baseline_checksum,
+                    predecessor_checksum: restart_ready_checksum,
                 },
                 baseline_checksum,
             },
@@ -754,9 +896,20 @@ impl StateStore {
         let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
         let (_, baseline_checksum) =
             self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
+        let restart_ready_checksum = self.load_complete_crash_lifecycle(
+            dataset,
+            contract_checksum,
+            ledger_checksum,
+            baseline_checksum,
+        )?;
         if baseline_checksum != claim.baseline_checksum {
             return Err(StateError::Invalid(
                 "recovery claim belongs to a different FLOAT baseline".to_owned(),
+            ));
+        }
+        if restart_ready_checksum != claim.token.predecessor_checksum {
+            return Err(StateError::Invalid(
+                "recovery claim belongs to a different restart-ready transition".to_owned(),
             ));
         }
         self.publish_marker(
@@ -781,12 +934,18 @@ impl StateStore {
                 let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
                 let (_, baseline_checksum) =
                     self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
+                let restart_ready_checksum = self.load_complete_crash_lifecycle(
+                    dataset,
+                    contract_checksum,
+                    ledger_checksum,
+                    baseline_checksum,
+                )?;
                 let recovery_claim = self.load_marker(
                     RECOVERY_CLAIM_FILE,
                     RECOVERY_CLAIM_ARTIFACT,
                     dataset,
                     contract_checksum,
-                    baseline_checksum,
+                    restart_ready_checksum,
                 )?;
                 self.load_marker(
                     RECOVERY_RECEIPT_FILE,
@@ -854,12 +1013,81 @@ impl StateStore {
         Ok(())
     }
 
+    fn ensure_pending_setup_only(&self) -> Result<(), StateError> {
+        let mut entries = fs::read_dir(&self.root)?;
+        let entry = entries
+            .next()
+            .transpose()?
+            .ok_or_else(|| StateError::Invalid("pre-start setup claim is missing".to_owned()))?;
+        if entry.file_name() != SETUP_INTENT_FILE || entries.next().transpose()?.is_some() {
+            return Err(StateError::Invalid(
+                "setup state contains orphan or out-of-order artifacts".to_owned(),
+            ));
+        }
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() || entry.file_type()?.is_symlink() {
+            return Err(StateError::Invalid(
+                "pre-start setup claim is not a real file".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_setup_execution_pending(&self) -> Result<(), StateError> {
+        let mut saw_intent = false;
+        let mut saw_execution = false;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(StateError::Invalid(format!(
+                    "unsafe pre-dataset state entry: {}",
+                    entry.path().display()
+                )));
+            }
+            if entry.file_name() == SETUP_INTENT_FILE {
+                if saw_intent {
+                    return Err(StateError::Invalid(
+                        "duplicate setup intent directory entry".to_owned(),
+                    ));
+                }
+                saw_intent = true;
+            } else if entry.file_name() == SETUP_EXECUTION_FILE {
+                if saw_execution {
+                    return Err(StateError::Invalid(
+                        "duplicate setup execution directory entry".to_owned(),
+                    ));
+                }
+                saw_execution = true;
+            } else {
+                return Err(StateError::Invalid(format!(
+                    "setup state contains an orphan or out-of-order artifact: {}",
+                    entry.path().display()
+                )));
+            }
+        }
+        if !saw_intent || !saw_execution {
+            return Err(StateError::Invalid(
+                "setup intent or execution claim is missing".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn load_setup_intent(&self) -> Result<(SetupIntent, u64), StateError> {
         let input = read_limited(
             &self.root.join(SETUP_INTENT_FILE),
             MAX_SETUP_INTENT_BYTES as u64,
         )?;
         decode_setup_intent(&input)
+    }
+
+    fn load_setup_execution(&self) -> Result<(SetupExecution, u64), StateError> {
+        let input = read_limited(
+            &self.root.join(SETUP_EXECUTION_FILE),
+            MAX_SETUP_INTENT_BYTES as u64,
+        )?;
+        decode_setup_execution(&input)
     }
 
     fn save_dataset(&self, state: &DatasetState) -> Result<(), StateError> {
@@ -970,6 +1198,17 @@ impl StateStore {
                 "setup claim does not match dataset.state and requested contract".to_owned(),
             ));
         }
+        let (execution, execution_checksum) = self.load_setup_execution()?;
+        if execution.run_id != dataset.run_id
+            || execution.seed != dataset.seed
+            || execution.contract != *expected
+            || execution.intent_checksum != setup_checksum
+        {
+            return Err(StateError::Invalid(
+                "setup execution claim does not match dataset.state and requested contract"
+                    .to_owned(),
+            ));
+        }
         let input = read_limited(
             &self.root.join(RUN_CONTRACT_FILE),
             MAX_CONTRACT_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
@@ -980,7 +1219,7 @@ impl StateStore {
             dataset,
             MAX_CONTRACT_PAYLOAD_BYTES,
         )?;
-        let actual = decode_setup_bound_contract(payload, setup_checksum)?;
+        let actual = decode_setup_bound_contract(payload, setup_checksum, execution_checksum)?;
         actual.validate(dataset)?;
         if actual != *expected {
             return Err(StateError::Invalid(format!(
@@ -1142,6 +1381,126 @@ impl StateStore {
         ))
     }
 
+    fn load_crash_context(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+    ) -> Result<(u64, u64, u64), StateError> {
+        let (contract_checksum, _, _, ledger_checksum) =
+            self.load_bound_ledger(dataset, contract)?;
+        let (_, baseline_checksum) =
+            self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
+        Ok((contract_checksum, ledger_checksum, baseline_checksum))
+    }
+
+    fn publish_crash_lifecycle_marker(
+        &self,
+        file: &str,
+        artifact: &str,
+        dataset: &DatasetState,
+        contract_checksum: u64,
+        ledger_checksum: u64,
+        baseline_checksum: u64,
+        predecessor_checksum: u64,
+    ) -> Result<u64, StateError> {
+        let inner = encode_crash_lifecycle_binding(ledger_checksum, baseline_checksum);
+        let payload = encode_bound_payload(contract_checksum, predecessor_checksum, inner.as_str());
+        let encoded = encode_artifact(artifact, dataset, &payload, MAX_MARKER_PAYLOAD_BYTES)?;
+        atomic_publish_new(&self.root, file, encoded.as_bytes())?;
+        self.load_crash_lifecycle_marker(
+            file,
+            artifact,
+            dataset,
+            contract_checksum,
+            ledger_checksum,
+            baseline_checksum,
+            predecessor_checksum,
+        )
+    }
+
+    fn load_crash_lifecycle_marker(
+        &self,
+        file: &str,
+        artifact: &str,
+        dataset: &DatasetState,
+        contract_checksum: u64,
+        ledger_checksum: u64,
+        baseline_checksum: u64,
+        predecessor_checksum: u64,
+    ) -> Result<u64, StateError> {
+        let input = read_limited(
+            &self.root.join(file),
+            MAX_MARKER_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
+        )?;
+        let (payload, checksum) =
+            decode_artifact_and_checksum(&input, artifact, dataset, MAX_MARKER_PAYLOAD_BYTES)?;
+        let inner =
+            decode_bound_payload(payload, contract_checksum, predecessor_checksum, artifact)?;
+        decode_crash_lifecycle_binding(inner, ledger_checksum, baseline_checksum, artifact)?;
+        Ok(checksum)
+    }
+
+    fn load_complete_crash_lifecycle(
+        &self,
+        dataset: &DatasetState,
+        contract_checksum: u64,
+        ledger_checksum: u64,
+        baseline_checksum: u64,
+    ) -> Result<u64, StateError> {
+        let mut predecessor_checksum = baseline_checksum;
+        for (file, artifact) in crash_lifecycle_specs() {
+            predecessor_checksum = self.load_crash_lifecycle_marker(
+                file,
+                artifact,
+                dataset,
+                contract_checksum,
+                ledger_checksum,
+                baseline_checksum,
+                predecessor_checksum,
+            )?;
+        }
+        Ok(predecessor_checksum)
+    }
+
+    fn ensure_lifecycle_tail_absent(
+        &self,
+        lifecycle_tail: &[(&str, &str)],
+    ) -> Result<(), StateError> {
+        for (file, _) in lifecycle_tail.iter().copied().chain([
+            (RECOVERY_CLAIM_FILE, RECOVERY_CLAIM_ARTIFACT),
+            (RECOVERY_RECEIPT_FILE, RECOVERY_RECEIPT_ARTIFACT),
+            (
+                DIAGNOSTIC_WARMUP_CLAIM_FILE,
+                DIAGNOSTIC_WARMUP_CLAIM_ARTIFACT,
+            ),
+            (
+                DIAGNOSTIC_WARMUP_RECEIPT_FILE,
+                DIAGNOSTIC_WARMUP_RECEIPT_ARTIFACT,
+            ),
+            (
+                DIAGNOSTIC_OBSERVATION_CLAIM_FILE,
+                DIAGNOSTIC_OBSERVATION_CLAIM_ARTIFACT,
+            ),
+            (
+                DIAGNOSTIC_OBSERVATION_RECEIPT_FILE,
+                DIAGNOSTIC_OBSERVATION_RECEIPT_ARTIFACT,
+            ),
+        ]) {
+            let path = self.root.join(file);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(StateError::Io(error)),
+                Ok(_) => {
+                    return Err(StateError::Invalid(format!(
+                        "lifecycle transition is repeated or has an orphan successor: {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn load_diagnostic_warmup_claim(
         &self,
         dataset: &DatasetState,
@@ -1151,12 +1510,18 @@ impl StateStore {
         let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
         let (_, baseline_checksum) =
             self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
+        let restart_ready_checksum = self.load_complete_crash_lifecycle(
+            dataset,
+            contract_checksum,
+            ledger_checksum,
+            baseline_checksum,
+        )?;
         let recovery_claim = self.load_marker(
             RECOVERY_CLAIM_FILE,
             RECOVERY_CLAIM_ARTIFACT,
             dataset,
             contract_checksum,
-            baseline_checksum,
+            restart_ready_checksum,
         )?;
         let recovery_receipt = self.load_marker(
             RECOVERY_RECEIPT_FILE,
@@ -1205,6 +1570,14 @@ pub enum StateError {
 struct SetupIntent {
     run_id: String,
     seed: u64,
+    contract: RunContract,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SetupExecution {
+    run_id: String,
+    seed: u64,
+    intent_checksum: u64,
     contract: RunContract,
 }
 
@@ -1287,9 +1660,114 @@ fn decode_setup_intent(input: &str) -> Result<(SetupIntent, u64), StateError> {
     Ok((intent, checksum))
 }
 
-fn encode_setup_bound_contract(setup_checksum: u64, contract: &RunContract) -> String {
+fn encode_setup_execution(
+    run_id: &str,
+    seed: u64,
+    contract: &RunContract,
+    intent_checksum: u64,
+) -> Result<String, StateError> {
+    validate_run_id(run_id)?;
+    contract.validate_shape()?;
+    let payload = format!(
+        "setup_intent_checksum={intent_checksum:016x}\n{}",
+        contract.encode()
+    );
+    let metadata = format!(
+        "artifact={SETUP_EXECUTION_ARTIFACT}\nversion={ARTIFACT_VERSION}\nrun_id={run_id}\nseed={seed}\nwarehouses={}\npayload_len={}\n",
+        contract.warehouses,
+        payload.len()
+    );
+    let checksum = checksum64(metadata.as_bytes(), payload.as_bytes());
+    let encoded = format!("{metadata}checksum={checksum:016x}\n{payload}");
+    if encoded.len() > MAX_SETUP_INTENT_BYTES {
+        return Err(StateError::Invalid(format!(
+            "setup execution claim exceeds {MAX_SETUP_INTENT_BYTES} bytes"
+        )));
+    }
+    Ok(encoded)
+}
+
+fn decode_setup_execution(input: &str) -> Result<(SetupExecution, u64), StateError> {
+    if input.len() > MAX_SETUP_INTENT_BYTES {
+        return Err(StateError::Invalid(format!(
+            "setup execution claim exceeds {MAX_SETUP_INTENT_BYTES} bytes"
+        )));
+    }
+    let mut sections = input.splitn(8, '\n');
+    let artifact = value(&mut sections, "artifact")?;
+    if artifact != SETUP_EXECUTION_ARTIFACT {
+        return Err(StateError::Invalid(format!(
+            "expected {SETUP_EXECUTION_ARTIFACT} artifact, got {artifact:?}"
+        )));
+    }
+    expect_exact(&mut sections, "version", ARTIFACT_VERSION)?;
+    let run_id = value(&mut sections, "run_id")?.to_owned();
+    validate_run_id(&run_id)?;
+    let seed = parse(value(&mut sections, "seed")?, "setup execution seed")?;
+    let warehouses = parse(
+        value(&mut sections, "warehouses")?,
+        "setup execution warehouses",
+    )?;
+    let payload_len: usize = parse(
+        value(&mut sections, "payload_len")?,
+        "setup execution payload length",
+    )?;
+    let checksum = parse_checksum(value(&mut sections, "checksum")?)?;
+    let payload = sections.next().ok_or_else(|| {
+        StateError::Invalid("setup execution claim is missing its binding".to_owned())
+    })?;
+    if payload_len != payload.len() || payload_len > MAX_CONTRACT_PAYLOAD_BYTES {
+        return Err(StateError::Invalid(
+            "setup execution claim payload length is invalid".to_owned(),
+        ));
+    }
+    let metadata = format!(
+        "artifact={SETUP_EXECUTION_ARTIFACT}\nversion={ARTIFACT_VERSION}\nrun_id={run_id}\nseed={seed}\nwarehouses={warehouses}\npayload_len={payload_len}\n"
+    );
+    if checksum64(metadata.as_bytes(), payload.as_bytes()) != checksum {
+        return Err(StateError::Invalid(
+            "setup execution claim checksum mismatch".to_owned(),
+        ));
+    }
+    let mut payload_sections = payload.splitn(2, '\n');
+    let intent_checksum = parse_checksum(value(&mut payload_sections, "setup_intent_checksum")?)?;
+    let encoded_contract = payload_sections.next().ok_or_else(|| {
+        StateError::Invalid("setup execution claim is missing its contract".to_owned())
+    })?;
+    let contract = RunContract::decode(encoded_contract)?;
+    contract.validate_shape()?;
+    if contract.warehouses != warehouses {
+        return Err(StateError::Invalid(
+            "setup execution warehouse count does not match its contract".to_owned(),
+        ));
+    }
+    let execution = SetupExecution {
+        run_id,
+        seed,
+        intent_checksum,
+        contract,
+    };
+    if encode_setup_execution(
+        &execution.run_id,
+        execution.seed,
+        &execution.contract,
+        execution.intent_checksum,
+    )? != input
+    {
+        return Err(StateError::Invalid(
+            "setup execution claim is not canonically encoded".to_owned(),
+        ));
+    }
+    Ok((execution, checksum))
+}
+
+fn encode_setup_bound_contract(
+    setup_checksum: u64,
+    execution_checksum: u64,
+    contract: &RunContract,
+) -> String {
     format!(
-        "setup_claim_checksum={setup_checksum:016x}\n{}",
+        "setup_claim_checksum={setup_checksum:016x}\nsetup_execution_checksum={execution_checksum:016x}\n{}",
         contract.encode()
     )
 }
@@ -1297,12 +1775,19 @@ fn encode_setup_bound_contract(setup_checksum: u64, contract: &RunContract) -> S
 fn decode_setup_bound_contract(
     payload: &str,
     expected_setup_checksum: u64,
+    expected_execution_checksum: u64,
 ) -> Result<RunContract, StateError> {
-    let mut sections = payload.splitn(2, '\n');
+    let mut sections = payload.splitn(3, '\n');
     let setup_checksum = parse_checksum(value(&mut sections, "setup_claim_checksum")?)?;
     if setup_checksum != expected_setup_checksum {
         return Err(StateError::Invalid(
             "run contract belongs to a different setup claim".to_owned(),
+        ));
+    }
+    let execution_checksum = parse_checksum(value(&mut sections, "setup_execution_checksum")?)?;
+    if execution_checksum != expected_execution_checksum {
+        return Err(StateError::Invalid(
+            "run contract belongs to a different setup execution claim".to_owned(),
         ));
     }
     let encoded_contract = sections
@@ -1360,6 +1845,57 @@ fn ledger_artifact(conformance: RunConformance) -> &'static str {
         RunConformance::PublicSpecAligned => RANKED_LEDGER_ARTIFACT,
         RunConformance::NonRankedDeviation => NON_RANKED_LEDGER_ARTIFACT,
     }
+}
+
+fn crash_lifecycle_specs() -> [(&'static str, &'static str); 4] {
+    [
+        (CRASH_INTENT_FILE, CRASH_INTENT_ARTIFACT),
+        (CRASH_KILLED_FILE, CRASH_KILLED_ARTIFACT),
+        (RESTART_STARTED_FILE, RESTART_STARTED_ARTIFACT),
+        (RESTART_READY_FILE, RESTART_READY_ARTIFACT),
+    ]
+}
+
+fn crash_lifecycle_index(event: CrashLifecycleEvent) -> usize {
+    match event {
+        CrashLifecycleEvent::Intent => 0,
+        CrashLifecycleEvent::Killed => 1,
+        CrashLifecycleEvent::RestartStarted => 2,
+        CrashLifecycleEvent::RestartReady => 3,
+    }
+}
+
+fn encode_crash_lifecycle_binding(ledger_checksum: u64, baseline_checksum: u64) -> String {
+    format!("ledger_checksum={ledger_checksum:016x}\nbaseline_checksum={baseline_checksum:016x}\n")
+}
+
+fn decode_crash_lifecycle_binding(
+    input: &str,
+    expected_ledger_checksum: u64,
+    expected_baseline_checksum: u64,
+    artifact: &str,
+) -> Result<(), StateError> {
+    if !input.ends_with('\n') {
+        return Err(StateError::Invalid(format!(
+            "{artifact} binding must end with a newline"
+        )));
+    }
+    let mut lines = input.split_terminator('\n');
+    let ledger_checksum = parse_checksum(value(&mut lines, "ledger_checksum")?)?;
+    let baseline_checksum = parse_checksum(value(&mut lines, "baseline_checksum")?)?;
+    if lines.next().is_some() {
+        return Err(StateError::Invalid(format!(
+            "{artifact} binding contains trailing fields"
+        )));
+    }
+    if ledger_checksum != expected_ledger_checksum
+        || baseline_checksum != expected_baseline_checksum
+    {
+        return Err(StateError::Invalid(format!(
+            "{artifact} belongs to a different ledger or online baseline"
+        )));
+    }
+    Ok(())
 }
 
 fn diagnostic_claim_spec(stage: DiagnosticStage) -> (&'static str, &'static str) {
@@ -1928,6 +2464,7 @@ fn atomic_publish_new(root: &Path, name: &str, bytes: &[u8]) -> Result<(), State
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
 
     use super::*;
 
@@ -2024,6 +2561,19 @@ mod tests {
         let setup = store.begin_setup_check(dataset, contract).unwrap();
         store
             .complete_setup_check(dataset, contract, setup)
+            .unwrap();
+    }
+
+    fn initialize_online_run(store: &StateStore, dataset: &DatasetState, contract: &RunContract) {
+        initialize_checked_run(store, dataset, contract);
+        let rank = store.begin_rank(dataset, contract).unwrap();
+        store
+            .complete_rank(dataset, contract, rank, &RunLedger::default())
+            .unwrap();
+        let (online, ledger) = store.begin_online_check(dataset, contract).unwrap();
+        assert_eq!(ledger, RunLedger::default());
+        store
+            .complete_online_check(dataset, contract, online, &sample_float_baseline())
             .unwrap();
     }
 
@@ -2169,6 +2719,17 @@ mod tests {
         assert!(store
             .begin_diagnostic(&dataset, &contract, DiagnosticStage::Warmup)
             .is_err());
+        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+        for event in [
+            CrashLifecycleEvent::Intent,
+            CrashLifecycleEvent::Killed,
+            CrashLifecycleEvent::RestartStarted,
+            CrashLifecycleEvent::RestartReady,
+        ] {
+            store
+                .record_crash_lifecycle(&dataset, &contract, event)
+                .unwrap();
+        }
         let (recovery, ledger, baseline) = store.begin_recovery_check(&dataset, &contract).unwrap();
         assert_eq!(ledger, RunLedger::default());
         assert_eq!(baseline, sample_float_baseline());
@@ -2198,6 +2759,84 @@ mod tests {
         assert!(reopened.begin_rank(&dataset, &contract).is_err());
         assert!(reopened
             .begin_diagnostic(&dataset, &contract, DiagnosticStage::Observation)
+            .is_err());
+    }
+
+    #[test]
+    fn crash_lifecycle_rejects_repeats_and_out_of_order_transitions() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset("run-crash-order", 91);
+        let contract = sample_contract(1);
+        initialize_online_run(&store, &dataset, &contract);
+
+        assert!(store
+            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::Killed)
+            .is_err());
+        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+
+        store
+            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::Intent)
+            .unwrap();
+        assert!(store
+            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::Intent)
+            .is_err());
+        assert!(store
+            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::RestartStarted)
+            .is_err());
+        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+
+        store
+            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::Killed)
+            .unwrap();
+        assert!(store
+            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::RestartReady)
+            .is_err());
+        store
+            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::RestartStarted)
+            .unwrap();
+        assert!(store.begin_recovery_check(&dataset, &contract).is_err());
+        store
+            .record_crash_lifecycle(&dataset, &contract, CrashLifecycleEvent::RestartReady)
+            .unwrap();
+        assert!(store.begin_recovery_check(&dataset, &contract).is_ok());
+    }
+
+    #[test]
+    fn crash_lifecycle_is_fail_closed_on_orphans_and_tampering() {
+        let orphan_directory = TestDirectory::new();
+        let orphan_store = StateStore::open(&orphan_directory.0).unwrap();
+        let orphan_dataset = sample_dataset("run-crash-orphan", 92);
+        let contract = sample_contract(1);
+        initialize_online_run(&orphan_store, &orphan_dataset, &contract);
+        fs::write(orphan_directory.0.join(RESTART_READY_FILE), b"orphan").unwrap();
+        assert!(orphan_store
+            .record_crash_lifecycle(&orphan_dataset, &contract, CrashLifecycleEvent::Intent)
+            .is_err());
+        assert!(orphan_store
+            .begin_recovery_check(&orphan_dataset, &contract)
+            .is_err());
+
+        let tamper_directory = TestDirectory::new();
+        let tamper_store = StateStore::open(&tamper_directory.0).unwrap();
+        let tamper_dataset = sample_dataset("run-crash-tamper", 93);
+        initialize_online_run(&tamper_store, &tamper_dataset, &contract);
+        for event in [
+            CrashLifecycleEvent::Intent,
+            CrashLifecycleEvent::Killed,
+            CrashLifecycleEvent::RestartStarted,
+            CrashLifecycleEvent::RestartReady,
+        ] {
+            tamper_store
+                .record_crash_lifecycle(&tamper_dataset, &contract, event)
+                .unwrap();
+        }
+        let killed_path = tamper_directory.0.join(CRASH_KILLED_FILE);
+        let mut killed = fs::read(&killed_path).unwrap();
+        *killed.last_mut().unwrap() ^= 1;
+        fs::write(killed_path, killed).unwrap();
+        assert!(tamper_store
+            .begin_recovery_check(&tamper_dataset, &contract)
             .is_err());
     }
 
@@ -2275,13 +2914,24 @@ mod tests {
         let dataset = sample_dataset("run-setup-claim", 87);
         let contract = sample_contract(1);
 
-        let claim = store
-            .begin_setup(&dataset.run_id, dataset.seed, &contract)
+        store
+            .publish_setup_intent(&dataset.run_id, dataset.seed, &contract)
             .unwrap();
         assert!(directory.0.join(SETUP_INTENT_FILE).is_file());
         assert!(!directory.0.join(DATASET_FILE).exists());
         assert!(store
-            .begin_setup(&dataset.run_id, dataset.seed, &contract)
+            .publish_setup_intent(&dataset.run_id, dataset.seed, &contract)
+            .is_err());
+        assert!(store
+            .begin_or_resume_setup(&dataset.run_id, dataset.seed + 1, &contract)
+            .is_err());
+        let (claim, origin) = store
+            .begin_or_resume_setup(&dataset.run_id, dataset.seed, &contract)
+            .unwrap();
+        assert_eq!(origin, SetupClaimOrigin::Resumed);
+        assert!(directory.0.join(SETUP_EXECUTION_FILE).is_file());
+        assert!(store
+            .begin_or_resume_setup(&dataset.run_id, dataset.seed, &contract)
             .is_err());
 
         let mut wrong_dataset = dataset.clone();
@@ -2293,19 +2943,59 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_init_claims_cannot_consume_one_setup_intent_twice() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset("run-concurrent-setup", 94);
+        let contract = sample_contract(1);
+        store
+            .publish_setup_intent(&dataset.run_id, dataset.seed, &contract)
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let seed = dataset.seed;
+        let handles = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let run_id = dataset.run_id.clone();
+                let contract = contract.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .begin_or_resume_setup(&run_id, seed, &contract)
+                        .is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1);
+        assert!(directory.0.join(SETUP_EXECUTION_FILE).is_file());
+    }
+
+    #[test]
     fn completed_dataset_is_bound_to_pre_ddl_setup_claim() {
         let directory = TestDirectory::new();
         let store = StateStore::open(&directory.0).unwrap();
         let dataset = sample_dataset("run-complete-setup", 88);
         let contract = sample_contract(1);
-        let claim = store
-            .begin_setup(&dataset.run_id, dataset.seed, &contract)
+        store
+            .publish_setup_intent(&dataset.run_id, dataset.seed, &contract)
             .unwrap();
+        let (claim, origin) = store
+            .begin_or_resume_setup(&dataset.run_id, dataset.seed, &contract)
+            .unwrap();
+        assert_eq!(origin, SetupClaimOrigin::Resumed);
         store.complete_dataset(&dataset, &contract, claim).unwrap();
 
         assert_eq!(store.load_bound_dataset(&contract).unwrap(), dataset);
         assert!(store
-            .begin_setup("different-run", dataset.seed, &contract)
+            .publish_setup_intent("different-run", dataset.seed, &contract)
             .is_err());
     }
 

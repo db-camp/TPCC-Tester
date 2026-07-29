@@ -26,11 +26,13 @@ use std::time::Duration;
 use clap::Parser;
 use tracing::{error, info, warn};
 
-use config::{Config, DiagnosticSegment, ResolvedProfile};
+use config::{Config, DiagnosticSegment, LifecycleEvent, ResolvedProfile};
 use connection::client::RmdbClient;
 use connection::cursor::RmdbCursor;
 use error::TpccError;
-use run_state::{DiagnosticStage, RunConformance, RunContract};
+use run_state::{
+    CrashLifecycleEvent, DiagnosticStage, RunConformance, RunContract, SetupClaimOrigin,
+};
 
 fn setup_tracing(verbose: u8) {
     use tracing_subscriber::EnvFilter;
@@ -95,6 +97,48 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         std::env::set_var("RMDB_TPCC_SEED", seed.to_string());
     }
 
+    if let Some(event) = config.lifecycle_event {
+        let seed = effective
+            .seed
+            .ok_or("validated lifecycle event lost its seed")?;
+        let contract = run_contract(&config, &effective);
+        match event {
+            LifecycleEvent::SetupIntent => {
+                let run_id = run_id_for_seed(seed);
+                let store = run_state::StateStore::open(
+                    config
+                        .state_dir
+                        .as_deref()
+                        .ok_or("validated setup-intent lost its state directory")?,
+                )?;
+                store.publish_setup_intent(&run_id, seed, &contract)?;
+                info!(
+                    "已在 RMDB 启动前持久化 setup intent: {}",
+                    store.root().join("setup.started").display()
+                );
+            }
+            LifecycleEvent::CrashIntent
+            | LifecycleEvent::CrashKilled
+            | LifecycleEvent::RestartStarted
+            | LifecycleEvent::RestartReady => {
+                let (store, dataset, contract) = load_bound_state(&config, &effective)?;
+                let crash_event = match event {
+                    LifecycleEvent::CrashIntent => CrashLifecycleEvent::Intent,
+                    LifecycleEvent::CrashKilled => CrashLifecycleEvent::Killed,
+                    LifecycleEvent::RestartStarted => CrashLifecycleEvent::RestartStarted,
+                    LifecycleEvent::RestartReady => CrashLifecycleEvent::RestartReady,
+                    LifecycleEvent::SetupIntent => unreachable!(),
+                };
+                store.record_crash_lifecycle(&dataset, &contract, crash_event)?;
+                info!(
+                    "已持久化 write-once lifecycle transition: {}",
+                    event.as_str()
+                );
+            }
+        }
+        return Ok(());
+    }
+
     // Diagnose mode
     if config.diagnose {
         return run_diagnose(&config).await;
@@ -144,8 +188,7 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             let seed = effective
                 .seed
                 .ok_or("validated init configuration lost its seed")?;
-            let run_id =
-                std::env::var("RMDB_TPCC_RUN_ID").unwrap_or_else(|_| format!("local-{seed}"));
+            let run_id = run_id_for_seed(seed);
             let store = run_state::StateStore::open(
                 config
                     .state_dir
@@ -153,15 +196,46 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                     .ok_or("validated init configuration lost its state directory")?,
             )?;
             let contract = run_contract(&config, &effective);
-            let claim = store.begin_setup(&run_id, seed, &contract)?;
-            info!(
-                "已在连接/首个 setup SQL 前持久化 write-once setup claim: {}",
-                store.root().join("setup.started").display()
-            );
+            let (claim, origin) = store.begin_or_resume_setup(&run_id, seed, &contract)?;
+            match origin {
+                SetupClaimOrigin::Created => info!(
+                    "已在连接/首个 setup SQL 前持久化本地 setup claim: {}",
+                    store.root().join("setup.started").display()
+                ),
+                SetupClaimOrigin::Resumed => info!(
+                    "已在连接前消费 RMDB 启动前持久化的 setup claim: {}",
+                    store.root().join("setup.started").display()
+                ),
+            }
             Some((store, contract, claim, run_id, seed))
         } else {
             None
         };
+        let mut setup_check_run = None;
+        let mut online_check_run = None;
+        let mut recovery_check_run = None;
+        if config.check && !config.init {
+            let (store, dataset, contract) = load_bound_state(&config, &effective)?;
+            match config.check_scope {
+                config::CheckScope::Setup => {
+                    let claim = store.begin_setup_check(&dataset, &contract)?;
+                    setup_check_run = Some((store, dataset, contract, claim));
+                }
+                config::CheckScope::Online => {
+                    let (claim, ledger) = store.begin_online_check(&dataset, &contract)?;
+                    online_check_run = Some((store, dataset, contract, claim, ledger));
+                }
+                config::CheckScope::Recovery => {
+                    let (claim, ledger, baseline) =
+                        store.begin_recovery_check(&dataset, &contract)?;
+                    recovery_check_run = Some((store, dataset, contract, claim, ledger, baseline));
+                }
+            }
+            info!(
+                "已在 tester 首个 connect/ping 前持久化独立 {} check claim",
+                config.check_scope.as_str()
+            );
+        }
 
         info!("连接 RMDB: {}:{} ...", config.host, config.port);
         let client = RmdbClient::connect_with_timeout(
@@ -217,10 +291,16 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 
         if config.check {
             info!("运行 {} 阶段一致性检查", config.check_scope.as_str());
-            let (store, dataset, contract) = load_bound_state(&config, &effective)?;
             match config.check_scope {
                 config::CheckScope::Setup => {
-                    let claim = store.begin_setup_check(&dataset, &contract)?;
+                    let (store, dataset, contract, claim) =
+                        if let Some(preflight) = setup_check_run.take() {
+                            preflight
+                        } else {
+                            let (store, dataset, contract) = load_bound_state(&config, &effective)?;
+                            let claim = store.begin_setup_check(&dataset, &contract)?;
+                            (store, dataset, contract, claim)
+                        };
                     setup_step(
                         setup_deadline,
                         "run public setup integrity checks",
@@ -230,7 +310,9 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                     store.complete_setup_check(&dataset, &contract, claim)?;
                 }
                 config::CheckScope::Online => {
-                    let (claim, ledger) = store.begin_online_check(&dataset, &contract)?;
+                    let (store, dataset, contract, claim, ledger) = online_check_run
+                        .take()
+                        .ok_or("independent online check lost its pre-connect claim")?;
                     let baseline = check_executor::run_final_online(
                         cursor.client_mut(),
                         &dataset,
@@ -245,8 +327,9 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                     );
                 }
                 config::CheckScope::Recovery => {
-                    let (claim, ledger, baseline) =
-                        store.begin_recovery_check(&dataset, &contract)?;
+                    let (store, dataset, contract, claim, ledger, baseline) = recovery_check_run
+                        .take()
+                        .ok_or("independent recovery check lost its pre-connect claim")?;
                     check_executor::run_final_recovery(
                         cursor.client_mut(),
                         &dataset,
@@ -285,6 +368,10 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
     }
 
     Ok(())
+}
+
+fn run_id_for_seed(seed: u64) -> String {
+    std::env::var("RMDB_TPCC_RUN_ID").unwrap_or_else(|_| format!("local-{seed}"))
 }
 
 fn load_bound_state(

@@ -34,6 +34,27 @@ impl CheckScope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LifecycleEvent {
+    SetupIntent,
+    CrashIntent,
+    CrashKilled,
+    RestartStarted,
+    RestartReady,
+}
+
+impl LifecycleEvent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SetupIntent => "setup-intent",
+            Self::CrashIntent => "crash-intent",
+            Self::CrashKilled => "crash-killed",
+            Self::RestartStarted => "restart-started",
+            Self::RestartReady => "restart-ready",
+        }
+    }
+}
+
 pub const DIAGNOSTIC_WARMUP_SECONDS: u64 = 10;
 pub const DIAGNOSTIC_OBSERVATION_SECONDS: u64 = 60;
 
@@ -126,6 +147,10 @@ pub struct Config {
     #[arg(long = "probe-ready")]
     pub probe_ready: bool,
 
+    /// Persist one write-once workflow lifecycle transition, then exit
+    #[arg(long = "lifecycle-event", value_enum)]
+    pub lifecycle_event: Option<LifecycleEvent>,
+
     /// 并发客户端数 (`--threads` is retained as a compatibility alias)
     #[arg(long = "clients", visible_alias = "threads", default_value_t = 32)]
     pub threads: usize,
@@ -206,19 +231,26 @@ pub enum ConfigError {
     DeviationRequiresOptIn { fields: String },
 
     #[error(
-        "--seed is required for --init, --benchmark, and --diagnostic-workload-seconds \
+        "--seed is required for --init, --benchmark, --diagnostic-workload-seconds, \
+         and --lifecycle-event \
          (no grader seed is embedded)"
     )]
     MissingSeed,
 
     #[error(
         "--state-dir is required for init, benchmark, diagnostic workload, online check, \
-         and recovery check"
+         recovery check, and lifecycle events"
     )]
     MissingStateDir,
 
     #[error("--probe-ready must be used by itself")]
     ProbeReadyMustBeExclusive,
+
+    #[error("--lifecycle-event must be used by itself")]
+    LifecycleEventMustBeExclusive,
+
+    #[error("--init --check may only use --check-scope setup")]
+    InitCheckScopeMustBeSetup,
 
     #[error("--diagnose must be used by itself")]
     DiagnoseMustBeExclusive,
@@ -272,6 +304,7 @@ impl Config {
                 || self.benchmark
                 || diagnostic_workload
                 || self.probe_ready
+                || self.lifecycle_event.is_some()
                 || self.allow_deviation
                 || self.seed.is_some()
                 || self.expected_new_orders.is_some()
@@ -290,6 +323,7 @@ impl Config {
                 || self.stats
                 || self.benchmark
                 || self.probe_ready
+                || self.lifecycle_event.is_some()
                 || self.diagnose
                 || self.expected_new_orders.is_some()
                 || self.warmup_seconds.is_some()
@@ -305,12 +339,37 @@ impl Config {
             return Err(ConfigError::DiagnosticWorkloadRequiresOfficialShape);
         }
 
+        if self.lifecycle_event.is_some()
+            && (self.create_schema
+                || self.init
+                || self.check
+                || self.stats
+                || self.benchmark
+                || diagnostic_workload
+                || self.probe_ready
+                || self.diagnose
+                || self.expected_new_orders.is_some()
+                || self.diagnostic_segment.is_some()
+                || self.check_scope != CheckScope::Setup)
+        {
+            return Err(ConfigError::LifecycleEventMustBeExclusive);
+        }
+        if self.init && self.check && self.check_scope != CheckScope::Setup {
+            return Err(ConfigError::InitCheckScopeMustBeSetup);
+        }
+
         self.resolved_profile()?;
 
-        if (self.init || self.benchmark || diagnostic_workload) && self.seed.is_none() {
+        if (self.init || self.benchmark || diagnostic_workload || self.lifecycle_event.is_some())
+            && self.seed.is_none()
+        {
             return Err(ConfigError::MissingSeed);
         }
-        if (self.init || self.benchmark || self.check || diagnostic_workload)
+        if (self.init
+            || self.benchmark
+            || self.check
+            || diagnostic_workload
+            || self.lifecycle_event.is_some())
             && self.state_dir.is_none()
         {
             return Err(ConfigError::MissingStateDir);
@@ -323,6 +382,7 @@ impl Config {
                 || self.stats
                 || self.benchmark
                 || diagnostic_workload
+                || self.lifecycle_event.is_some()
                 || self.diagnose)
         {
             return Err(ConfigError::ProbeReadyMustBeExclusive);
@@ -343,7 +403,14 @@ impl Config {
             ..SmokeOverrides::default()
         })?;
 
-        let extra_deviations: Vec<EffectiveDeviation> = Vec::new();
+        let mut extra_deviations: Vec<EffectiveDeviation> = Vec::new();
+        if self.create_schema && !self.init {
+            extra_deviations.push(EffectiveDeviation {
+                field: "setup_actions",
+                official: "--create-schema --init".to_owned(),
+                effective: "--create-schema without --init".to_owned(),
+            });
+        }
 
         let mut differing_fields = final2026
             .deviations()
@@ -563,6 +630,103 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ProbeReadyMustBeExclusive)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_events_are_exclusive_seeded_and_state_bound() {
+        for event in [
+            "setup-intent",
+            "crash-intent",
+            "crash-killed",
+            "restart-started",
+            "restart-ready",
+        ] {
+            let missing_seed = Config::try_parse_from([
+                "tpcc-tester",
+                "--lifecycle-event",
+                event,
+                "--state-dir",
+                "/tmp/tpcc-final2026-lifecycle-state",
+            ])
+            .unwrap();
+            assert!(matches!(
+                missing_seed.validate(),
+                Err(ConfigError::MissingSeed)
+            ));
+
+            let missing_state =
+                Config::try_parse_from(["tpcc-tester", "--lifecycle-event", event, "--seed", "11"])
+                    .unwrap();
+            assert!(matches!(
+                missing_state.validate(),
+                Err(ConfigError::MissingStateDir)
+            ));
+
+            let valid = Config::try_parse_from([
+                "tpcc-tester",
+                "--lifecycle-event",
+                event,
+                "--seed",
+                "11",
+                "--state-dir",
+                "/tmp/tpcc-final2026-lifecycle-state",
+            ])
+            .unwrap();
+            valid.validate().unwrap();
+        }
+
+        let combined = Config::try_parse_from([
+            "tpcc-tester",
+            "--lifecycle-event",
+            "crash-intent",
+            "--benchmark",
+            "--seed",
+            "11",
+            "--state-dir",
+            "/tmp/tpcc-final2026-lifecycle-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            combined.validate(),
+            Err(ConfigError::LifecycleEventMustBeExclusive)
+        ));
+    }
+
+    #[test]
+    fn standalone_formal_schema_creation_is_an_explicit_deviation() {
+        let formal =
+            Config::try_parse_from(["tpcc-tester", "--create-schema"]).expect("valid CLI syntax");
+        assert!(matches!(
+            formal.validate(),
+            Err(ConfigError::DeviationRequiresOptIn { .. })
+        ));
+
+        let local = Config {
+            allow_deviation: true,
+            ..formal
+        };
+        local.validate().unwrap();
+        assert!(!local.resolved_profile().unwrap().is_ranked_configuration());
+    }
+
+    #[test]
+    fn init_can_only_combine_with_the_setup_check() {
+        let config = Config::try_parse_from([
+            "tpcc-tester",
+            "--init",
+            "--check",
+            "--check-scope",
+            "recovery",
+            "--seed",
+            "11",
+            "--state-dir",
+            "/tmp/tpcc-final2026-init-check-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InitCheckScopeMustBeSetup)
         ));
     }
 
