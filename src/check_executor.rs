@@ -21,6 +21,8 @@ use crate::error::TpccError;
 use crate::ranking::bounded_stats::BoundedPhysicalStats;
 use crate::ranking::ledger::{LedgerEvent, RunLedger};
 use crate::ranking::payment_endpoints::PaymentEndpointView;
+use crate::ranking::terminal_evidence::{validate_terminal_evidence, TerminalEvidenceView};
+use crate::recovery_sample_checker;
 use crate::run_state::DatasetState;
 use crate::runtime_schema::RuntimeSchema;
 use crate::sample_evidence::{
@@ -508,6 +510,57 @@ pub async fn run_final_recovery(
     run_grouped_partition_audit(client, &dataset.runtime_schema, &partitions).await?;
     info!(
         "public recovery consistency PASS; hidden official 37 SQL, generated keys, seed, and answers remain unavailable"
+    );
+    Ok(())
+}
+
+/// Execute post-crash validation from the bounded, canonically restorable
+/// terminal oracle.
+///
+/// This path never reconstructs or accepts a physical `RunLedger`: public
+/// counts and partitions come from bounded statistics, exact Warehouse and
+/// District values come from the Payment endpoint certificate, and retained
+/// per-key mutations are checked by the bounded recovery sample executor.
+pub async fn run_final_recovery_from_terminal_evidence(
+    client: &mut RmdbClient,
+    dataset: &DatasetState,
+    evidence: &dyn TerminalEvidenceView,
+    initial_order_line_amounts: &NonNegativeF32Accumulator,
+    online_baseline: &FloatBaseline,
+) -> Result<(), TpccError> {
+    warn!("{PUBLIC_SPEC_NOTICE}");
+    validate_terminal_evidence(evidence).map_err(|_| {
+        TpccError::Protocol("recovery terminal evidence failed validation".to_owned())
+    })?;
+    let expectations =
+        bounded_recovery_expectations(dataset, evidence.stats(), initial_order_line_amounts)?;
+    // Construct every bounded oracle before issuing the first query so a
+    // malformed or cross-dataset artifact cannot partially execute recovery.
+    bounded_payment_endpoint_expectations(dataset.warehouses, evidence.payment())?;
+    let partitions = bounded_partition_expectations(dataset, evidence.stats())?;
+
+    let plan = recovery_plan(expectations)
+        .map_err(|error| protocol_error("invalid public recovery plan", error))?;
+    run_plan(client, &plan, &dataset.runtime_schema).await?;
+
+    let recovered =
+        read_float_aggregates(client, CheckScope::Recovery, &dataset.runtime_schema).await?;
+    validate_float_baseline(online_baseline, &recovered)?;
+    validate_bounded_payment_endpoints(
+        client,
+        &dataset.runtime_schema,
+        dataset.warehouses,
+        evidence.payment(),
+    )
+    .await?;
+
+    recovery_partition_audits_for_warehouses(dataset.warehouses, partitions.clone())
+        .map_err(|error| protocol_error("invalid bounded recovery partitions", error))?;
+    run_grouped_partition_audit(client, &dataset.runtime_schema, &partitions).await?;
+    recovery_sample_checker::check_recovery_samples(client, &dataset.runtime_schema, evidence)
+        .await?;
+    info!(
+        "public bounded recovery consistency PASS; hidden official 37 SQL, generated keys, seed, and answers remain unavailable"
     );
     Ok(())
 }
