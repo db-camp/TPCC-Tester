@@ -51,6 +51,9 @@ const MAX_HISTORY_TIMESTAMP_BYTES: usize = 19;
 const MAX_DELIVERY_TIMESTAMP_BYTES: usize = 30;
 const MAX_HISTORY_DATA_BYTES: usize = 24;
 const MAX_CUSTOMER_DATA_BYTES: usize = 50;
+const MIN_BAD_CREDIT_PREFIX_BYTES: usize = 15;
+const MAX_BAD_CREDIT_PREFIX_BYTES: usize = 25;
+const MAX_BAD_CREDIT_SUFFIX_ENTRIES: usize = 4;
 const DISTRICT_INFO_BYTES: usize = 24;
 const INITIAL_ORDER_ID_CEILING: i32 = CUSTOMERS_PER_DISTRICT as i32;
 const CUSTOMER_INITIAL_PAYMENT_COUNT: i32 = 1;
@@ -69,6 +72,14 @@ pub struct OrderKey {
 }
 
 impl OrderKey {
+    pub(crate) const fn from_parts(warehouse_id: u16, district_id: u8, order_id: i32) -> Self {
+        Self {
+            warehouse_id,
+            district_id,
+            order_id,
+        }
+    }
+
     pub const fn warehouse_id(self) -> u16 {
         self.warehouse_id
     }
@@ -243,6 +254,27 @@ impl SealedDeliverySample {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SealedBadCreditPaymentPrefix {
+    home_warehouse_id: u16,
+    home_district_id: u8,
+    amount_cents: u32,
+}
+
+impl SealedBadCreditPaymentPrefix {
+    pub const fn home_warehouse_id(&self) -> u16 {
+        self.home_warehouse_id
+    }
+
+    pub const fn home_district_id(&self) -> u8 {
+        self.home_district_id
+    }
+
+    pub const fn amount_cents(&self) -> u32 {
+        self.amount_cents
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedBadCreditCustomerSample {
     score: SampleScore,
@@ -251,6 +283,7 @@ pub struct SealedBadCreditCustomerSample {
     credit: [u8; 2],
     data: Vec<u8>,
     committed_payment_updates: u64,
+    payment_suffix: Vec<SealedBadCreditPaymentPrefix>,
 }
 
 impl SealedBadCreditCustomerSample {
@@ -280,6 +313,10 @@ impl SealedBadCreditCustomerSample {
     pub const fn committed_payment_updates(&self) -> u64 {
         self.committed_payment_updates
     }
+
+    pub fn payment_suffix(&self) -> &[SealedBadCreditPaymentPrefix] {
+        &self.payment_suffix
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -292,6 +329,22 @@ pub struct HistoryGroupKey {
 }
 
 impl HistoryGroupKey {
+    pub(crate) const fn from_parts(
+        customer_id: i32,
+        customer_district_id: u8,
+        customer_warehouse_id: u16,
+        home_district_id: u8,
+        home_warehouse_id: u16,
+    ) -> Self {
+        Self {
+            customer_id,
+            customer_district_id,
+            customer_warehouse_id,
+            home_district_id,
+            home_warehouse_id,
+        }
+    }
+
     pub const fn customer_id(self) -> i32 {
         self.customer_id
     }
@@ -544,6 +597,343 @@ impl HistoryCutoffWitness {
     }
 }
 
+/// Parsed fixed-width metadata for one persisted rich-recovery section.
+///
+/// This is deliberately not a sealed value. The canonical reconstruction
+/// entry point below treats every field as untrusted and recomputes all
+/// derived state before constructing [`SealedRichRecoverySamples`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichRecoveryHeader {
+    warehouses: u16,
+    run_seed: u64,
+    policy_version: u32,
+    raw_size_bytes: usize,
+    new_order_commits: u64,
+    delivered_orders: u64,
+    history_rows: u64,
+    bad_credit_payments: u64,
+}
+
+impl CanonicalRichRecoveryHeader {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new(
+        warehouses: u16,
+        run_seed: u64,
+        policy_version: u32,
+        raw_size_bytes: usize,
+        new_order_commits: u64,
+        delivered_orders: u64,
+        history_rows: u64,
+        bad_credit_payments: u64,
+    ) -> Self {
+        Self {
+            warehouses,
+            run_seed,
+            policy_version,
+            raw_size_bytes,
+            new_order_commits,
+            delivered_orders,
+            history_rows,
+            bad_credit_payments,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichOrderLine {
+    number: u8,
+    item_id: u32,
+    supply_warehouse: u16,
+    delivery_timestamp: Vec<u8>,
+    quantity: u8,
+    amount_bits: u32,
+    district_info: Vec<u8>,
+}
+
+impl CanonicalRichOrderLine {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        number: u8,
+        item_id: u32,
+        supply_warehouse: u16,
+        delivery_timestamp: Vec<u8>,
+        quantity: u8,
+        amount_bits: u32,
+        district_info: Vec<u8>,
+    ) -> Self {
+        Self {
+            number,
+            item_id,
+            supply_warehouse,
+            delivery_timestamp,
+            quantity,
+            amount_bits,
+            district_info,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichNewOrder {
+    score: SampleScore,
+    key: OrderKey,
+    customer_id: u16,
+    entry_timestamp: Vec<u8>,
+    carrier_id: u8,
+    line_count: u8,
+    all_local: bool,
+    queue_present: bool,
+    lines: Vec<CanonicalRichOrderLine>,
+}
+
+impl CanonicalRichNewOrder {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new<I>(
+        score: SampleScore,
+        key: OrderKey,
+        customer_id: u16,
+        entry_timestamp: Vec<u8>,
+        carrier_id: u8,
+        line_count: u8,
+        all_local: bool,
+        queue_present: bool,
+        lines: I,
+    ) -> Result<Self, RichRecoveryError>
+    where
+        I: ExactSizeIterator<Item = CanonicalRichOrderLine>,
+    {
+        let lines = collect_canonical_exact(
+            "NewOrder line DTOs",
+            lines,
+            usize::from(MIN_ORDER_LINES),
+            usize::from(MAX_ORDER_LINES),
+        )?;
+        if usize::from(line_count) != lines.len() {
+            return Err(RichRecoveryError::InvalidEvidence(
+                "canonical NewOrder line_count differs from its DTO count",
+            ));
+        }
+        Ok(Self {
+            score,
+            key,
+            customer_id,
+            entry_timestamp,
+            carrier_id,
+            line_count,
+            all_local,
+            queue_present,
+            lines,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichDeliveryLine {
+    number: u8,
+    delivery_timestamp: Vec<u8>,
+    amount_bits: u32,
+}
+
+impl CanonicalRichDeliveryLine {
+    pub(crate) fn new(number: u8, delivery_timestamp: Vec<u8>, amount_bits: u32) -> Self {
+        Self {
+            number,
+            delivery_timestamp,
+            amount_bits,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichDelivery {
+    score: SampleScore,
+    key: OrderKey,
+    customer_id: i32,
+    carrier_id: u8,
+    queue_present: bool,
+    delivery_timestamp: Vec<u8>,
+    lines: Vec<CanonicalRichDeliveryLine>,
+}
+
+impl CanonicalRichDelivery {
+    pub(crate) fn new<I>(
+        score: SampleScore,
+        key: OrderKey,
+        customer_id: i32,
+        carrier_id: u8,
+        queue_present: bool,
+        delivery_timestamp: Vec<u8>,
+        lines: I,
+    ) -> Result<Self, RichRecoveryError>
+    where
+        I: ExactSizeIterator<Item = CanonicalRichDeliveryLine>,
+    {
+        let lines = collect_canonical_exact(
+            "Delivery line DTOs",
+            lines,
+            usize::from(MIN_ORDER_LINES),
+            usize::from(MAX_ORDER_LINES),
+        )?;
+        Ok(Self {
+            score,
+            key,
+            customer_id,
+            carrier_id,
+            queue_present,
+            delivery_timestamp,
+            lines,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichBadCreditPrefix {
+    home_warehouse_id: u16,
+    home_district_id: u8,
+    amount_cents: u32,
+}
+
+impl CanonicalRichBadCreditPrefix {
+    pub(crate) const fn new(
+        home_warehouse_id: u16,
+        home_district_id: u8,
+        amount_cents: u32,
+    ) -> Self {
+        Self {
+            home_warehouse_id,
+            home_district_id,
+            amount_cents,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichBadCreditCustomer {
+    score: SampleScore,
+    key: CustomerKey,
+    final_payment_count: i32,
+    credit: [u8; 2],
+    data: Vec<u8>,
+    committed_payment_updates: u64,
+    payment_suffix: Vec<CanonicalRichBadCreditPrefix>,
+}
+
+impl CanonicalRichBadCreditCustomer {
+    pub(crate) fn new<I>(
+        score: SampleScore,
+        key: CustomerKey,
+        final_payment_count: i32,
+        credit: [u8; 2],
+        data: Vec<u8>,
+        committed_payment_updates: u64,
+        payment_suffix: I,
+    ) -> Result<Self, RichRecoveryError>
+    where
+        I: ExactSizeIterator<Item = CanonicalRichBadCreditPrefix>,
+    {
+        let payment_suffix = collect_canonical_exact(
+            "bad-credit Payment suffix DTOs",
+            payment_suffix,
+            0,
+            MAX_BAD_CREDIT_SUFFIX_ENTRIES,
+        )?;
+        Ok(Self {
+            score,
+            key,
+            final_payment_count,
+            credit,
+            data,
+            committed_payment_updates,
+            payment_suffix,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichHistoryTuple {
+    score: SampleScore,
+    group: HistoryGroupKey,
+    timestamp: Vec<u8>,
+    amount_bits: u32,
+    data: Vec<u8>,
+    committed_multiplicity: u64,
+    setup_collision_multiplicity: u8,
+}
+
+impl CanonicalRichHistoryTuple {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        score: SampleScore,
+        group: HistoryGroupKey,
+        timestamp: Vec<u8>,
+        amount_bits: u32,
+        data: Vec<u8>,
+        committed_multiplicity: u64,
+        setup_collision_multiplicity: u8,
+    ) -> Self {
+        Self {
+            score,
+            group,
+            timestamp,
+            amount_bits,
+            data,
+            committed_multiplicity,
+            setup_collision_multiplicity,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichOrderWitness {
+    score: SampleScore,
+    key: OrderKey,
+}
+
+impl CanonicalRichOrderWitness {
+    pub(crate) const fn new(score: SampleScore, key: OrderKey) -> Self {
+        Self { score, key }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichCustomerWitness {
+    score: SampleScore,
+    key: CustomerKey,
+}
+
+impl CanonicalRichCustomerWitness {
+    pub(crate) const fn new(score: SampleScore, key: CustomerKey) -> Self {
+        Self { score, key }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRichHistoryWitness {
+    score: SampleScore,
+    group: HistoryGroupKey,
+    timestamp: Vec<u8>,
+    amount_bits: u32,
+    data: Vec<u8>,
+}
+
+impl CanonicalRichHistoryWitness {
+    pub(crate) fn new(
+        score: SampleScore,
+        group: HistoryGroupKey,
+        timestamp: Vec<u8>,
+        amount_bits: u32,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            score,
+            group,
+            timestamp,
+            amount_bits,
+            data,
+        }
+    }
+}
+
 /// Fully validated typed recovery sample sections.
 ///
 /// The section remains independent of the event ledger. Its observed totals
@@ -638,6 +1028,539 @@ impl SealedRichRecoverySamples {
 
     pub fn history_rejected_witness(&self) -> Option<&HistoryCutoffWitness> {
         self.history_rejected.as_ref()
+    }
+
+    /// Rebuild a persisted rich section from parsed DTOs.
+    ///
+    /// The codec is expected to reject encoded lengths before allocating its
+    /// DTO vectors. This API independently requires exact-size iterators and
+    /// checks every top-level and nested capacity before allocating sealed
+    /// vectors. No encoded score, total, witness, setup collision, raw-size
+    /// value, or row-domain claim is trusted.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_canonical_parts<O, D, C, H>(
+        header: CanonicalRichRecoveryHeader,
+        orders: O,
+        deliveries: D,
+        customers: C,
+        histories: H,
+        order_rejected: Option<CanonicalRichOrderWitness>,
+        delivery_rejected: Option<CanonicalRichOrderWitness>,
+        customer_rejected: Option<CanonicalRichCustomerWitness>,
+        history_rejected: Option<CanonicalRichHistoryWitness>,
+        intervals: &SealedIntervalEvidence,
+        initial_history: &dyn InitialHistoryProvider,
+        initial_customers: &dyn InitialCustomerDataProvider,
+    ) -> Result<Self, RichRecoveryError>
+    where
+        O: ExactSizeIterator<Item = CanonicalRichNewOrder>,
+        D: ExactSizeIterator<Item = CanonicalRichDelivery>,
+        C: ExactSizeIterator<Item = CanonicalRichBadCreditCustomer>,
+        H: ExactSizeIterator<Item = CanonicalRichHistoryTuple>,
+    {
+        if header.warehouses == 0 || header.warehouses > OFFICIAL_WAREHOUSES {
+            return Err(RichRecoveryError::InvalidConfiguration(
+                "warehouses must be in 1..=50",
+            ));
+        }
+        if header.policy_version != RICH_RECOVERY_POLICY_VERSION {
+            return Err(RichRecoveryError::UnsupportedPolicy {
+                actual: header.policy_version,
+                expected: RICH_RECOVERY_POLICY_VERSION,
+            });
+        }
+        if header.raw_size_bytes > MAX_RICH_RECOVERY_RAW_BYTES {
+            return Err(RichRecoveryError::RawSizeCeiling {
+                actual: header.raw_size_bytes,
+                limit: MAX_RICH_RECOVERY_RAW_BYTES,
+            });
+        }
+        if intervals.warehouses() != header.warehouses || intervals.sample_seed() != header.run_seed
+        {
+            return Err(RichRecoveryError::IntervalBindingMismatch);
+        }
+        if header.bad_credit_payments > header.history_rows {
+            return Err(RichRecoveryError::InvalidEvidence(
+                "bad-credit Payment count exceeds the committed History row count",
+            ));
+        }
+
+        let order_count = orders.len();
+        let delivery_count = deliveries.len();
+        let customer_count = customers.len();
+        let history_count = histories.len();
+        validate_canonical_count(
+            "NewOrder sample DTOs",
+            order_count,
+            0,
+            RICH_RECOVERY_SAMPLE_CAPACITY,
+        )?;
+        validate_canonical_count(
+            "Delivery sample DTOs",
+            delivery_count,
+            0,
+            RICH_RECOVERY_SAMPLE_CAPACITY,
+        )?;
+        validate_canonical_count(
+            "bad-credit Customer sample DTOs",
+            customer_count,
+            0,
+            RICH_RECOVERY_SAMPLE_CAPACITY,
+        )?;
+        validate_canonical_count(
+            "History tuple DTOs",
+            history_count,
+            0,
+            RICH_HISTORY_SAMPLE_CAPACITY,
+        )?;
+
+        let mut new_orders = Vec::with_capacity(order_count);
+        let mut previous_order = None;
+        for (index, encoded) in orders.enumerate() {
+            validate_exact_iterator_step("NewOrder sample DTOs", index, order_count)?;
+            validate_order_key(header.warehouses, encoded.key, true)?;
+            let expected_score = order_score(header.run_seed, encoded.key);
+            validate_decoded_rank(
+                "NewOrder final state",
+                encoded.score,
+                expected_score,
+                encoded.key,
+                &mut previous_order,
+            )?;
+            if !(1..=CUSTOMERS_PER_DISTRICT).contains(&encoded.customer_id)
+                || usize::from(encoded.line_count) != encoded.lines.len()
+            {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "canonical NewOrder header is outside the row domain",
+                ));
+            }
+            validate_canonical_count(
+                "canonical NewOrder lines",
+                encoded.lines.len(),
+                usize::from(MIN_ORDER_LINES),
+                usize::from(MAX_ORDER_LINES),
+            )?;
+            validate_bounded_char(
+                "canonical NewOrder entry timestamp",
+                &encoded.entry_timestamp,
+                1,
+                MAX_ENTRY_TIMESTAMP_BYTES,
+            )?;
+
+            let state_is_valid = if encoded.queue_present {
+                encoded.carrier_id == 0
+                    && encoded
+                        .lines
+                        .iter()
+                        .all(|line| line.delivery_timestamp.is_empty())
+            } else {
+                (MIN_CARRIER_ID..=MAX_CARRIER_ID).contains(&encoded.carrier_id)
+                    && encoded.lines.first().is_some_and(|first| {
+                        !first.delivery_timestamp.is_empty()
+                            && encoded
+                                .lines
+                                .iter()
+                                .all(|line| line.delivery_timestamp == first.delivery_timestamp)
+                    })
+            };
+            if !state_is_valid {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "canonical NewOrder queue, carrier, and delivery timestamps disagree",
+                ));
+            }
+
+            let mut derived_all_local = true;
+            let mut lines = Vec::with_capacity(encoded.lines.len());
+            for (line_index, line) in encoded.lines.into_iter().enumerate() {
+                if usize::from(line.number) != line_index + 1
+                    || !(1..=ITEM_COUNT).contains(&line.item_id)
+                    || line.supply_warehouse == 0
+                    || line.supply_warehouse > header.warehouses
+                    || !(MIN_ITEM_QUANTITY..=MAX_ITEM_QUANTITY).contains(&line.quantity)
+                {
+                    return Err(RichRecoveryError::InvalidEvidence(
+                        "canonical NewOrder line is outside the row domain",
+                    ));
+                }
+                validate_f32_range(
+                    "canonical NewOrder line amount",
+                    line.amount_bits,
+                    f32::MIN_POSITIVE,
+                    1_000.0,
+                )?;
+                let (minimum_timestamp, maximum_timestamp) = if encoded.queue_present {
+                    (0, 0)
+                } else {
+                    (1, MAX_DELIVERY_TIMESTAMP_BYTES)
+                };
+                validate_bounded_char(
+                    "canonical NewOrder line delivery timestamp",
+                    &line.delivery_timestamp,
+                    minimum_timestamp,
+                    maximum_timestamp,
+                )?;
+                validate_bounded_char(
+                    "canonical NewOrder district information",
+                    &line.district_info,
+                    DISTRICT_INFO_BYTES,
+                    DISTRICT_INFO_BYTES,
+                )?;
+                derived_all_local &= line.supply_warehouse == encoded.key.warehouse_id;
+                lines.push(SealedOrderLine {
+                    number: line.number,
+                    item_id: line.item_id,
+                    supply_warehouse: line.supply_warehouse,
+                    delivery_timestamp: line.delivery_timestamp,
+                    quantity: line.quantity,
+                    amount_bits: line.amount_bits,
+                    district_info: line.district_info,
+                });
+            }
+            if encoded.all_local != derived_all_local {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "canonical NewOrder all_local flag disagrees with its lines",
+                ));
+            }
+            new_orders.push(SealedNewOrderSample {
+                score: expected_score,
+                key: encoded.key,
+                customer_id: encoded.customer_id,
+                entry_timestamp: encoded.entry_timestamp,
+                carrier_id: encoded.carrier_id,
+                line_count: encoded.line_count,
+                all_local: encoded.all_local,
+                queue_present: encoded.queue_present,
+                lines,
+            });
+        }
+        validate_exact_iterator_end("NewOrder sample DTOs", order_count, new_orders.len())?;
+
+        let mut sealed_deliveries = Vec::with_capacity(delivery_count);
+        let mut previous_delivery = None;
+        for (index, encoded) in deliveries.enumerate() {
+            validate_exact_iterator_step("Delivery sample DTOs", index, delivery_count)?;
+            validate_order_key(header.warehouses, encoded.key, false)?;
+            let expected_score = delivery_score(header.run_seed, encoded.key);
+            validate_decoded_rank(
+                "Delivery final state",
+                encoded.score,
+                expected_score,
+                encoded.key,
+                &mut previous_delivery,
+            )?;
+            if encoded.queue_present
+                || !(MIN_CARRIER_ID..=MAX_CARRIER_ID).contains(&encoded.carrier_id)
+                || !(1..=i32::from(CUSTOMERS_PER_DISTRICT)).contains(&encoded.customer_id)
+            {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "canonical Delivery does not describe a delivered order",
+                ));
+            }
+            validate_bounded_char(
+                "canonical Delivery timestamp",
+                &encoded.delivery_timestamp,
+                1,
+                MAX_DELIVERY_TIMESTAMP_BYTES,
+            )?;
+            validate_canonical_count(
+                "canonical Delivery lines",
+                encoded.lines.len(),
+                usize::from(MIN_ORDER_LINES),
+                usize::from(MAX_ORDER_LINES),
+            )?;
+            let mut lines = Vec::with_capacity(encoded.lines.len());
+            for (line_index, line) in encoded.lines.into_iter().enumerate() {
+                if usize::from(line.number) != line_index + 1
+                    || line.delivery_timestamp != encoded.delivery_timestamp
+                {
+                    return Err(RichRecoveryError::InvalidEvidence(
+                        "canonical Delivery line sequence or timestamp is invalid",
+                    ));
+                }
+                validate_bounded_char(
+                    "canonical Delivery line timestamp",
+                    &line.delivery_timestamp,
+                    1,
+                    MAX_DELIVERY_TIMESTAMP_BYTES,
+                )?;
+                validate_f32_range(
+                    "canonical Delivery line amount",
+                    line.amount_bits,
+                    0.01,
+                    9_999.99,
+                )?;
+                lines.push(SealedDeliveryLine {
+                    number: line.number,
+                    delivery_timestamp: line.delivery_timestamp,
+                    amount_bits: line.amount_bits,
+                });
+            }
+            sealed_deliveries.push(SealedDeliverySample {
+                score: expected_score,
+                key: encoded.key,
+                customer_id: encoded.customer_id,
+                carrier_id: encoded.carrier_id,
+                queue_present: false,
+                delivery_timestamp: encoded.delivery_timestamp,
+                lines,
+            });
+        }
+        validate_exact_iterator_end(
+            "Delivery sample DTOs",
+            delivery_count,
+            sealed_deliveries.len(),
+        )?;
+        validate_order_delivery_intersections(&new_orders, &sealed_deliveries)?;
+
+        let mut bad_credit_customers = Vec::with_capacity(customer_count);
+        let mut previous_customer = None;
+        let mut selected_bad_credit_updates = 0_u64;
+        for (index, encoded) in customers.enumerate() {
+            validate_exact_iterator_step("bad-credit Customer sample DTOs", index, customer_count)?;
+            validate_customer_key(header.warehouses, encoded.key)?;
+            let expected_score = bad_customer_score(header.run_seed, encoded.key);
+            validate_decoded_rank(
+                "bad-credit Customer data",
+                encoded.score,
+                expected_score,
+                encoded.key,
+                &mut previous_customer,
+            )?;
+            let initial = initial_customers
+                .initial_customer_data(encoded.key)
+                .ok_or(RichRecoveryError::MissingInitialCustomer(encoded.key))?;
+            if initial.credit != *b"BC" || encoded.credit != *b"BC" {
+                return Err(RichRecoveryError::CustomerCreditFlagMismatch {
+                    key: encoded.key,
+                    generated: initial.credit,
+                    claimed_bad_credit: encoded.credit == *b"BC",
+                });
+            }
+            validate_bounded_char(
+                "canonical bad-credit Customer data",
+                &encoded.data,
+                0,
+                MAX_CUSTOMER_DATA_BYTES,
+            )?;
+            if encoded.committed_payment_updates == 0 {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "canonical bad-credit Customer has no committed Payment update",
+                ));
+            }
+            let update_count = i64::try_from(encoded.committed_payment_updates)
+                .map_err(|_| RichRecoveryError::Overflow("bad-credit Payment update count"))?;
+            let expected_payment_count = i64::from(CUSTOMER_INITIAL_PAYMENT_COUNT)
+                .checked_add(update_count)
+                .ok_or(RichRecoveryError::Overflow(
+                    "bad-credit final Payment count",
+                ))?;
+            if i64::from(encoded.final_payment_count) != expected_payment_count {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "canonical bad-credit final Payment count is not setup-rooted",
+                ));
+            }
+            let payment_suffix = encoded
+                .payment_suffix
+                .into_iter()
+                .map(|prefix| SealedBadCreditPaymentPrefix {
+                    home_warehouse_id: prefix.home_warehouse_id,
+                    home_district_id: prefix.home_district_id,
+                    amount_cents: prefix.amount_cents,
+                })
+                .collect::<Vec<_>>();
+            validate_bad_credit_suffix(
+                header.warehouses,
+                encoded.key,
+                encoded.committed_payment_updates,
+                &initial.data,
+                &encoded.data,
+                &payment_suffix,
+            )?;
+            selected_bad_credit_updates = selected_bad_credit_updates
+                .checked_add(encoded.committed_payment_updates)
+                .ok_or(RichRecoveryError::Overflow(
+                    "selected bad-credit Payment updates",
+                ))?;
+            bad_credit_customers.push(SealedBadCreditCustomerSample {
+                score: expected_score,
+                key: encoded.key,
+                final_payment_count: encoded.final_payment_count,
+                credit: *b"BC",
+                data: encoded.data,
+                committed_payment_updates: encoded.committed_payment_updates,
+                payment_suffix,
+            });
+        }
+        validate_exact_iterator_end(
+            "bad-credit Customer sample DTOs",
+            customer_count,
+            bad_credit_customers.len(),
+        )?;
+
+        let mut history_groups = BTreeMap::<HistoryGroupKey, Vec<SealedHistoryTuple>>::new();
+        let mut previous_history = None;
+        let mut selected_history_rows = 0_u64;
+        let mut decoded_history_count = 0_usize;
+        for (index, encoded) in histories.enumerate() {
+            validate_exact_iterator_step("History tuple DTOs", index, history_count)?;
+            decoded_history_count = decoded_history_count
+                .checked_add(1)
+                .ok_or(RichRecoveryError::Overflow("decoded History tuple count"))?;
+            validate_history_group(header.warehouses, encoded.group)?;
+            validate_bounded_char(
+                "canonical History timestamp",
+                &encoded.timestamp,
+                1,
+                MAX_HISTORY_TIMESTAMP_BYTES,
+            )?;
+            validate_f32_range(
+                "canonical History amount",
+                encoded.amount_bits,
+                MIN_PAYMENT_CENTS as f32 / 100.0,
+                MAX_PAYMENT_CENTS as f32 / 100.0,
+            )?;
+            validate_bounded_char(
+                "canonical History data",
+                &encoded.data,
+                1,
+                MAX_HISTORY_DATA_BYTES,
+            )?;
+            if encoded.committed_multiplicity == 0 {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "canonical History tuple multiplicity is zero",
+                ));
+            }
+            let key = HistoryTupleKey {
+                group: encoded.group,
+                timestamp: encoded.timestamp.clone(),
+                amount_bits: encoded.amount_bits,
+                data: encoded.data.clone(),
+            };
+            let expected_score = history_score(header.run_seed, &key);
+            validate_decoded_rank(
+                "History tuple",
+                encoded.score,
+                expected_score,
+                key.clone(),
+                &mut previous_history,
+            )?;
+            let trusted_collision = setup_history_collision(initial_history, &key)?;
+            if encoded.setup_collision_multiplicity != trusted_collision {
+                return Err(RichRecoveryError::SetupCollisionMismatch {
+                    encoded: encoded.setup_collision_multiplicity,
+                    trusted: trusted_collision,
+                });
+            }
+            selected_history_rows = selected_history_rows
+                .checked_add(encoded.committed_multiplicity)
+                .ok_or(RichRecoveryError::Overflow(
+                    "selected History tuple multiplicities",
+                ))?;
+            history_groups
+                .entry(encoded.group)
+                .or_default()
+                .push(SealedHistoryTuple {
+                    score: expected_score,
+                    timestamp: encoded.timestamp,
+                    amount_bits: encoded.amount_bits,
+                    data: encoded.data,
+                    committed_multiplicity: encoded.committed_multiplicity,
+                    setup_collision_multiplicity: trusted_collision,
+                });
+        }
+        validate_exact_iterator_end("History tuple DTOs", history_count, decoded_history_count)?;
+        let history_groups = history_groups
+            .into_iter()
+            .map(|(key, tuples)| SealedHistoryGroup { key, tuples })
+            .collect::<Vec<_>>();
+
+        let (order_rejected, order_rejected_rank) =
+            decode_order_witness(header, order_rejected, true, order_score)?;
+        let (delivery_rejected, delivery_rejected_rank) =
+            decode_order_witness(header, delivery_rejected, false, delivery_score)?;
+        let (customer_rejected, customer_rejected_rank) =
+            decode_customer_witness(header, customer_rejected)?;
+        let (history_rejected, history_rejected_rank) =
+            decode_history_witness(header, history_rejected)?;
+
+        validate_decoded_cutoff(
+            "NewOrder final state",
+            new_orders.len(),
+            RICH_RECOVERY_SAMPLE_CAPACITY,
+            new_orders.len() as u64,
+            header.new_order_commits,
+            previous_order.as_ref(),
+            order_rejected_rank.as_ref(),
+        )?;
+        validate_decoded_cutoff(
+            "Delivery final state",
+            sealed_deliveries.len(),
+            RICH_RECOVERY_SAMPLE_CAPACITY,
+            sealed_deliveries.len() as u64,
+            header.delivered_orders,
+            previous_delivery.as_ref(),
+            delivery_rejected_rank.as_ref(),
+        )?;
+        validate_decoded_cutoff(
+            "bad-credit Customer data",
+            bad_credit_customers.len(),
+            RICH_RECOVERY_SAMPLE_CAPACITY,
+            selected_bad_credit_updates,
+            header.bad_credit_payments,
+            previous_customer.as_ref(),
+            customer_rejected_rank.as_ref(),
+        )?;
+        validate_decoded_cutoff(
+            "History tuple",
+            decoded_history_count,
+            RICH_HISTORY_SAMPLE_CAPACITY,
+            selected_history_rows,
+            header.history_rows,
+            previous_history.as_ref(),
+            history_rejected_rank.as_ref(),
+        )?;
+
+        let raw_size_bytes = sealed_raw_size(
+            &new_orders,
+            &sealed_deliveries,
+            &bad_credit_customers,
+            &history_groups,
+            order_rejected.as_ref(),
+            delivery_rejected.as_ref(),
+            customer_rejected.as_ref(),
+            history_rejected.as_ref(),
+        )?;
+        if raw_size_bytes != header.raw_size_bytes {
+            return Err(RichRecoveryError::RawSizeMismatch {
+                encoded: header.raw_size_bytes,
+                computed: raw_size_bytes,
+            });
+        }
+        if raw_size_bytes > MAX_RICH_RECOVERY_RAW_BYTES {
+            return Err(RichRecoveryError::RawSizeCeiling {
+                actual: raw_size_bytes,
+                limit: MAX_RICH_RECOVERY_RAW_BYTES,
+            });
+        }
+
+        Ok(Self {
+            warehouses: header.warehouses,
+            run_seed: header.run_seed,
+            policy_version: RICH_RECOVERY_POLICY_VERSION,
+            raw_size_bytes,
+            new_order_commits: header.new_order_commits,
+            delivered_orders: header.delivered_orders,
+            history_rows: header.history_rows,
+            bad_credit_payments: header.bad_credit_payments,
+            new_orders,
+            deliveries: sealed_deliveries,
+            bad_credit_customers,
+            history_groups,
+            order_rejected,
+            delivery_rejected,
+            customer_rejected,
+            history_rejected,
+        })
     }
 }
 
@@ -831,21 +1754,29 @@ struct DeliveryProjection {
 
 #[derive(Clone, Debug)]
 struct CustomerDataState {
+    warehouses: u16,
+    key: CustomerKey,
+    setup_data: Vec<u8>,
     update_count: u64,
     endpoint: CustomerVersion,
     endpoint_data: Vec<u8>,
+    payment_suffix: Vec<SealedBadCreditPaymentPrefix>,
     pending: BTreeMap<i32, CustomerDataEdge>,
 }
 
 impl CustomerDataState {
-    fn new(setup_data: Vec<u8>) -> Self {
+    fn new(warehouses: u16, key: CustomerKey, setup_data: Vec<u8>) -> Self {
         Self {
+            warehouses,
+            key,
+            setup_data: setup_data.clone(),
             update_count: 0,
             endpoint: CustomerVersion {
                 payment_count: CUSTOMER_INITIAL_PAYMENT_COUNT,
                 delivery_count: CUSTOMER_INITIAL_DELIVERY_COUNT,
             },
             endpoint_data: setup_data,
+            payment_suffix: Vec::with_capacity(MAX_BAD_CREDIT_SUFFIX_ENTRIES),
             pending: BTreeMap::new(),
         }
     }
@@ -857,6 +1788,7 @@ struct CustomerDataEdge {
     after_version: CustomerVersion,
     before_data: Vec<u8>,
     after_data: Vec<u8>,
+    prefix: SealedBadCreditPaymentPrefix,
 }
 
 #[derive(Clone, Debug)]
@@ -892,6 +1824,7 @@ struct PreparedBadCustomer {
     after_version: CustomerVersion,
     data_before: Vec<u8>,
     data_after: Vec<u8>,
+    prefix: SealedBadCreditPaymentPrefix,
 }
 
 struct PreparedDeliveryOrder {
@@ -1292,6 +2225,11 @@ impl RichRecoveryCollector {
             });
         }
 
+        let payment_prefix = SealedBadCreditPaymentPrefix {
+            home_warehouse_id: evidence.warehouse_id,
+            home_district_id: evidence.district_id,
+            amount_cents: input.amount_cents(),
+        };
         if evidence.customer_is_bad_credit {
             let prefix = bad_credit_prefix(
                 evidence.customer_id,
@@ -1333,6 +2271,7 @@ impl RichRecoveryCollector {
                 after_version: evidence.customer_version_after,
                 data_before: evidence.customer_data_before.clone(),
                 data_after: evidence.customer_data_after.clone(),
+                prefix: payment_prefix,
             })
         } else {
             None
@@ -1529,7 +2468,10 @@ impl RichRecoveryCollector {
             let Some(evicted) = self.customers.insertion_eviction(score, &customer.key) else {
                 return Ok(());
             };
-            (CustomerDataState::new(customer.setup_data.clone()), evicted)
+            (
+                CustomerDataState::new(self.warehouses, customer.key, customer.setup_data.clone()),
+                evicted,
+            )
         };
         let old_pending = state.pending.len();
         state.update_count = state
@@ -1543,6 +2485,7 @@ impl RichRecoveryCollector {
                 after_version: customer.after_version,
                 before_data: customer.data_before.clone(),
                 after_data: customer.data_after.clone(),
+                prefix: customer.prefix,
             },
         )?;
         let projected_pending = self
@@ -1630,6 +2573,7 @@ impl RichRecoveryCollector {
                                 after_version: customer.after_version,
                                 before_data: customer.data_before,
                                 after_data: customer.data_after,
+                                prefix: customer.prefix,
                             },
                         )
                         .expect("preflight validated the bad-credit data edge");
@@ -1655,6 +2599,7 @@ impl RichRecoveryCollector {
                                 after_version: customer.after_version,
                                 before_data: customer.data_before,
                                 after_data: customer.data_after,
+                                prefix: customer.prefix,
                             },
                         )
                         .expect("preflight validated the bad-credit data edge");
@@ -1676,7 +2621,11 @@ impl RichRecoveryCollector {
                                 self.retired_customers.insert(evicted_key, state);
                             }
                         }
-                        let mut state = CustomerDataState::new(customer.setup_data);
+                        let mut state = CustomerDataState::new(
+                            self.warehouses,
+                            customer.key,
+                            customer.setup_data,
+                        );
                         state.update_count = 1;
                         apply_customer_data_edge(
                             &mut state,
@@ -1685,6 +2634,7 @@ impl RichRecoveryCollector {
                                 after_version: customer.after_version,
                                 before_data: customer.data_before,
                                 after_data: customer.data_after,
+                                prefix: customer.prefix,
                             },
                         )
                         .expect("preflight validated the new bad-credit data edge");
@@ -1944,6 +2894,7 @@ impl RichRecoveryCollector {
                 credit: *b"BC",
                 data: state.endpoint_data,
                 committed_payment_updates: state.update_count,
+                payment_suffix: state.payment_suffix,
             });
         }
 
@@ -2033,6 +2984,7 @@ impl RichRecoveryCollector {
         for (ranked, customer) in &self.customers.entries {
             size = checked_size_add(size, 48 + customer_key_size(ranked.key))?;
             size = checked_size_add(size, customer.endpoint_data.len())?;
+            size = checked_size_add(size, customer.payment_suffix.len() * (2 + 1 + 4))?;
         }
         for (ranked, _) in &self.histories.entries {
             size = checked_size_add(
@@ -2052,6 +3004,19 @@ pub enum RichRecoveryError {
     InvalidConfiguration(&'static str),
     #[error("invalid rich recovery evidence: {0}")]
     InvalidEvidence(&'static str),
+    #[error("unsupported rich recovery policy {actual}, expected {expected}")]
+    UnsupportedPolicy { actual: u32, expected: u32 },
+    #[error("{domain} canonical count is {actual}, expected {minimum}..={maximum}")]
+    CanonicalCount {
+        domain: &'static str,
+        actual: usize,
+        minimum: usize,
+        maximum: usize,
+    },
+    #[error("{domain} persisted sample score is not canonical")]
+    ForgedCanonicalScore { domain: &'static str },
+    #[error("{domain} persisted samples are not in strict canonical rank order")]
+    NonCanonicalOrder { domain: &'static str },
     #[error(
         "{field} CHAR bytes are unsafe: length {actual}, expected {minimum}..={maximum}, valid UTF-8 with no NUL or quote"
     )]
@@ -2069,6 +3034,12 @@ pub enum RichRecoveryError {
     Overflow(&'static str),
     #[error("rich recovery raw evidence is {actual} bytes, limit is {limit}")]
     RawSizeCeiling { actual: usize, limit: usize },
+    #[error("rich recovery raw-size metadata is {encoded}, recomputed value is {computed}")]
+    RawSizeMismatch { encoded: usize, computed: usize },
+    #[error(
+        "History setup-collision multiplicity is {encoded}, trusted setup provider reports {trusted}"
+    )]
+    SetupCollisionMismatch { encoded: u8, trusted: u8 },
     #[error("{domain} weighted bottom-k evidence is inconsistent with its global count")]
     InvalidWeightedSelection { domain: &'static str },
     #[error("retained NewOrder {0:?} has no committed creation terminal")]
@@ -2098,6 +3069,354 @@ pub enum RichRecoveryError {
 fn checked_size_add(left: usize, right: usize) -> Result<usize, RichRecoveryError> {
     left.checked_add(right)
         .ok_or(RichRecoveryError::Overflow("raw sample size"))
+}
+
+fn validate_canonical_count(
+    domain: &'static str,
+    actual: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), RichRecoveryError> {
+    if !(minimum..=maximum).contains(&actual) {
+        return Err(RichRecoveryError::CanonicalCount {
+            domain,
+            actual,
+            minimum,
+            maximum,
+        });
+    }
+    Ok(())
+}
+
+fn collect_canonical_exact<T, I>(
+    domain: &'static str,
+    values: I,
+    minimum: usize,
+    maximum: usize,
+) -> Result<Vec<T>, RichRecoveryError>
+where
+    I: ExactSizeIterator<Item = T>,
+{
+    let declared = values.len();
+    validate_canonical_count(domain, declared, minimum, maximum)?;
+    let mut collected = Vec::with_capacity(declared);
+    for (index, value) in values.enumerate() {
+        if index >= declared || index >= maximum {
+            return Err(RichRecoveryError::CanonicalCount {
+                domain,
+                actual: index.saturating_add(1),
+                minimum: declared,
+                maximum: declared,
+            });
+        }
+        collected.push(value);
+    }
+    validate_exact_iterator_end(domain, declared, collected.len())?;
+    Ok(collected)
+}
+
+fn validate_exact_iterator_step(
+    domain: &'static str,
+    zero_based_index: usize,
+    declared: usize,
+) -> Result<(), RichRecoveryError> {
+    if zero_based_index >= declared {
+        return Err(RichRecoveryError::CanonicalCount {
+            domain,
+            actual: zero_based_index.saturating_add(1),
+            minimum: declared,
+            maximum: declared,
+        });
+    }
+    Ok(())
+}
+
+fn validate_exact_iterator_end(
+    domain: &'static str,
+    declared: usize,
+    consumed: usize,
+) -> Result<(), RichRecoveryError> {
+    if declared != consumed {
+        return Err(RichRecoveryError::CanonicalCount {
+            domain,
+            actual: consumed,
+            minimum: declared,
+            maximum: declared,
+        });
+    }
+    Ok(())
+}
+
+fn validate_order_key(
+    warehouses: u16,
+    key: OrderKey,
+    requires_runtime_origin: bool,
+) -> Result<(), RichRecoveryError> {
+    let minimum_order_id = if requires_runtime_origin {
+        INITIAL_ORDER_ID_CEILING
+            .checked_add(1)
+            .ok_or(RichRecoveryError::Overflow("runtime Order id floor"))?
+    } else {
+        1
+    };
+    if key.warehouse_id == 0
+        || key.warehouse_id > warehouses
+        || key.district_id == 0
+        || key.district_id > DISTRICTS_PER_WAREHOUSE
+        || key.order_id < minimum_order_id
+    {
+        return Err(RichRecoveryError::InvalidEvidence(
+            if requires_runtime_origin {
+                "canonical NewOrder key is outside the configured runtime row domain"
+            } else {
+                "canonical Delivery key is outside the configured row domain"
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn validate_history_group(warehouses: u16, key: HistoryGroupKey) -> Result<(), RichRecoveryError> {
+    if !(1..=i32::from(CUSTOMERS_PER_DISTRICT)).contains(&key.customer_id)
+        || key.customer_district_id == 0
+        || key.customer_district_id > DISTRICTS_PER_WAREHOUSE
+        || key.customer_warehouse_id == 0
+        || key.customer_warehouse_id > warehouses
+        || key.home_district_id == 0
+        || key.home_district_id > DISTRICTS_PER_WAREHOUSE
+        || key.home_warehouse_id == 0
+        || key.home_warehouse_id > warehouses
+    {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "canonical History group key is outside the configured row domain",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_decoded_rank<K>(
+    domain: &'static str,
+    encoded_score: SampleScore,
+    expected_score: SampleScore,
+    key: K,
+    previous: &mut Option<RankedKey<K>>,
+) -> Result<(), RichRecoveryError>
+where
+    K: Clone + Ord,
+{
+    if encoded_score != expected_score {
+        return Err(RichRecoveryError::ForgedCanonicalScore { domain });
+    }
+    let current = RankedKey {
+        score: expected_score,
+        key,
+    };
+    if previous.as_ref().is_some_and(|prior| prior >= &current) {
+        return Err(RichRecoveryError::NonCanonicalOrder { domain });
+    }
+    *previous = Some(current);
+    Ok(())
+}
+
+fn validate_order_delivery_intersections(
+    orders: &[SealedNewOrderSample],
+    deliveries: &[SealedDeliverySample],
+) -> Result<(), RichRecoveryError> {
+    let deliveries_by_key = deliveries
+        .iter()
+        .map(|delivery| (delivery.key, delivery))
+        .collect::<BTreeMap<_, _>>();
+    for order in orders {
+        let Some(delivery) = deliveries_by_key.get(&order.key) else {
+            continue;
+        };
+        let header_matches = !order.queue_present
+            && i32::from(order.customer_id) == delivery.customer_id
+            && order.carrier_id == delivery.carrier_id
+            && order.lines.len() == delivery.lines.len()
+            && order.lines.first().is_some_and(|line| {
+                line.delivery_timestamp.as_slice() == delivery.delivery_timestamp.as_slice()
+            });
+        let lines_match =
+            order
+                .lines
+                .iter()
+                .zip(&delivery.lines)
+                .all(|(order_line, delivery_line)| {
+                    order_line.number == delivery_line.number
+                        && order_line.amount_bits == delivery_line.amount_bits
+                        && order_line.delivery_timestamp == delivery_line.delivery_timestamp
+                });
+        if !header_matches || !lines_match {
+            return Err(RichRecoveryError::InvalidEvidence(
+                "canonical NewOrder and Delivery samples disagree for one retained order",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decode_order_witness(
+    header: CanonicalRichRecoveryHeader,
+    encoded: Option<CanonicalRichOrderWitness>,
+    requires_runtime_origin: bool,
+    score_fn: fn(u64, OrderKey) -> SampleScore,
+) -> Result<(Option<OrderCutoffWitness>, Option<RankedKey<OrderKey>>), RichRecoveryError> {
+    let Some(encoded) = encoded else {
+        return Ok((None, None));
+    };
+    validate_order_key(header.warehouses, encoded.key, requires_runtime_origin)?;
+    let expected_score = score_fn(header.run_seed, encoded.key);
+    if encoded.score != expected_score {
+        return Err(RichRecoveryError::ForgedCanonicalScore {
+            domain: if requires_runtime_origin {
+                "NewOrder rejection witness"
+            } else {
+                "Delivery rejection witness"
+            },
+        });
+    }
+    Ok((
+        Some(OrderCutoffWitness {
+            score: expected_score,
+            key: encoded.key,
+        }),
+        Some(RankedKey {
+            score: expected_score,
+            key: encoded.key,
+        }),
+    ))
+}
+
+fn decode_customer_witness(
+    header: CanonicalRichRecoveryHeader,
+    encoded: Option<CanonicalRichCustomerWitness>,
+) -> Result<
+    (
+        Option<CustomerCutoffWitness>,
+        Option<RankedKey<CustomerKey>>,
+    ),
+    RichRecoveryError,
+> {
+    let Some(encoded) = encoded else {
+        return Ok((None, None));
+    };
+    validate_customer_key(header.warehouses, encoded.key)?;
+    let expected_score = bad_customer_score(header.run_seed, encoded.key);
+    if encoded.score != expected_score {
+        return Err(RichRecoveryError::ForgedCanonicalScore {
+            domain: "bad-credit Customer rejection witness",
+        });
+    }
+    Ok((
+        Some(CustomerCutoffWitness {
+            score: expected_score,
+            key: encoded.key,
+        }),
+        Some(RankedKey {
+            score: expected_score,
+            key: encoded.key,
+        }),
+    ))
+}
+
+fn decode_history_witness(
+    header: CanonicalRichRecoveryHeader,
+    encoded: Option<CanonicalRichHistoryWitness>,
+) -> Result<
+    (
+        Option<HistoryCutoffWitness>,
+        Option<RankedKey<HistoryTupleKey>>,
+    ),
+    RichRecoveryError,
+> {
+    let Some(encoded) = encoded else {
+        return Ok((None, None));
+    };
+    validate_history_group(header.warehouses, encoded.group)?;
+    validate_bounded_char(
+        "canonical History rejection timestamp",
+        &encoded.timestamp,
+        1,
+        MAX_HISTORY_TIMESTAMP_BYTES,
+    )?;
+    validate_f32_range(
+        "canonical History rejection amount",
+        encoded.amount_bits,
+        MIN_PAYMENT_CENTS as f32 / 100.0,
+        MAX_PAYMENT_CENTS as f32 / 100.0,
+    )?;
+    validate_bounded_char(
+        "canonical History rejection data",
+        &encoded.data,
+        1,
+        MAX_HISTORY_DATA_BYTES,
+    )?;
+    let key = HistoryTupleKey {
+        group: encoded.group,
+        timestamp: encoded.timestamp.clone(),
+        amount_bits: encoded.amount_bits,
+        data: encoded.data.clone(),
+    };
+    let expected_score = history_score(header.run_seed, &key);
+    if encoded.score != expected_score {
+        return Err(RichRecoveryError::ForgedCanonicalScore {
+            domain: "History rejection witness",
+        });
+    }
+    Ok((
+        Some(HistoryCutoffWitness {
+            score: expected_score,
+            group: encoded.group,
+            timestamp: encoded.timestamp,
+            amount_bits: encoded.amount_bits,
+            data: encoded.data,
+        }),
+        Some(RankedKey {
+            score: expected_score,
+            key,
+        }),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_decoded_cutoff<K>(
+    domain: &'static str,
+    selected_count: usize,
+    capacity: usize,
+    selected_weight: u64,
+    global_weight: u64,
+    selected_cutoff: Option<&RankedKey<K>>,
+    rejected: Option<&RankedKey<K>>,
+) -> Result<(), RichRecoveryError>
+where
+    K: Ord,
+{
+    validate_canonical_count(domain, selected_count, 0, capacity)?;
+    if (global_weight == 0) != (selected_count == 0)
+        || u64::try_from(selected_count).map_or(true, |count| count > selected_weight)
+        || selected_weight > global_weight
+    {
+        return Err(RichRecoveryError::InvalidWeightedSelection { domain });
+    }
+    match rejected {
+        None if selected_weight == global_weight => Ok(()),
+        None => Err(RichRecoveryError::InvalidWeightedSelection { domain }),
+        Some(rejected) => {
+            if selected_count != capacity || selected_weight >= global_weight {
+                return Err(RichRecoveryError::InvalidWeightedSelection { domain });
+            }
+            let Some(selected_cutoff) = selected_cutoff else {
+                return Err(RichRecoveryError::InvalidWeightedSelection { domain });
+            };
+            if selected_cutoff >= rejected {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "canonical rejection witness does not follow the selected cutoff",
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 const fn order_key_size(_: &OrderKey) -> usize {
@@ -2153,6 +3472,13 @@ fn apply_customer_data_edge(
     state: &mut CustomerDataState,
     edge: CustomerDataEdge,
 ) -> Result<(), RichRecoveryError> {
+    let prefix_bytes =
+        validate_bad_credit_payment_prefix(state.warehouses, state.key, edge.prefix)?;
+    if prepend_bad_credit_data(&prefix_bytes, &edge.before_data) != edge.after_data {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "bad-credit Payment prefix does not produce its after-data",
+        ));
+    }
     if edge.before_version.payment_count < state.endpoint.payment_count {
         return Err(RichRecoveryError::InvalidEvidence(
             "bad-credit Payment edge precedes the rooted data endpoint",
@@ -2160,31 +3486,9 @@ fn apply_customer_data_edge(
     }
 
     if edge.before_version.payment_count == state.endpoint.payment_count {
-        if state.endpoint_data != edge.before_data {
-            return Err(RichRecoveryError::InvalidEvidence(
-                "bad-credit Payment before-data does not continue the rooted chain",
-            ));
-        }
-        if edge.before_version.delivery_count < state.endpoint.delivery_count {
-            return Err(RichRecoveryError::InvalidEvidence(
-                "bad-credit Customer delivery version moved backwards",
-            ));
-        }
-        state.endpoint = edge.after_version;
-        state.endpoint_data = edge.after_data;
+        apply_rooted_customer_data_edge(state, edge)?;
         while let Some(next) = state.pending.remove(&state.endpoint.payment_count) {
-            if state.endpoint_data != next.before_data {
-                return Err(RichRecoveryError::InvalidEvidence(
-                    "pending bad-credit Payment data does not continue the rooted chain",
-                ));
-            }
-            if next.before_version.delivery_count < state.endpoint.delivery_count {
-                return Err(RichRecoveryError::InvalidEvidence(
-                    "pending bad-credit Customer delivery version moved backwards",
-                ));
-            }
-            state.endpoint = next.after_version;
-            state.endpoint_data = next.after_data;
+            apply_rooted_customer_data_edge(state, next)?;
         }
         return Ok(());
     }
@@ -2219,6 +3523,30 @@ fn apply_customer_data_edge(
     Ok(())
 }
 
+fn apply_rooted_customer_data_edge(
+    state: &mut CustomerDataState,
+    edge: CustomerDataEdge,
+) -> Result<(), RichRecoveryError> {
+    if state.endpoint_data != edge.before_data {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "bad-credit Payment before-data does not continue the rooted chain",
+        ));
+    }
+    if edge.before_version.payment_count != state.endpoint.payment_count
+        || edge.before_version.delivery_count < state.endpoint.delivery_count
+    {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "bad-credit Customer logical version does not continue the rooted chain",
+        ));
+    }
+    let mut suffix = state.payment_suffix.clone();
+    append_bad_credit_suffix(state.warehouses, state.key, &mut suffix, edge.prefix)?;
+    state.endpoint = edge.after_version;
+    state.endpoint_data = edge.after_data;
+    state.payment_suffix = suffix;
+    Ok(())
+}
+
 fn validate_rooted_customer_state(state: &CustomerDataState) -> Result<(), RichRecoveryError> {
     if !state.pending.is_empty() {
         return Err(RichRecoveryError::DisconnectedCustomerData {
@@ -2238,7 +3566,14 @@ fn validate_rooted_customer_state(state: &CustomerDataState) -> Result<(), RichR
             "bad-credit c_data chain is not complete and rooted",
         ));
     }
-    Ok(())
+    validate_bad_credit_suffix(
+        state.warehouses,
+        state.key,
+        state.update_count,
+        &state.setup_data,
+        &state.endpoint_data,
+        &state.payment_suffix,
+    )
 }
 
 fn validate_origin_delivery(
@@ -2360,6 +3695,130 @@ fn bad_credit_prefix(
         amount_cents % 100
     )
     .into_bytes()
+}
+
+fn validate_bad_credit_payment_prefix(
+    warehouses: u16,
+    customer: CustomerKey,
+    prefix: SealedBadCreditPaymentPrefix,
+) -> Result<Vec<u8>, RichRecoveryError> {
+    validate_customer_key(warehouses, customer)?;
+    if prefix.home_warehouse_id == 0
+        || prefix.home_warehouse_id > warehouses
+        || prefix.home_district_id == 0
+        || prefix.home_district_id > DISTRICTS_PER_WAREHOUSE
+        || !(MIN_PAYMENT_CENTS..=MAX_PAYMENT_CENTS).contains(&prefix.amount_cents)
+    {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "bad-credit Payment suffix entry is outside the configured row domain",
+        ));
+    }
+    let customer_warehouse = u16::try_from(customer.warehouse_id)
+        .map_err(|_| RichRecoveryError::InvalidEvidence("invalid Customer warehouse id"))?;
+    let customer_district = u8::try_from(customer.district_id)
+        .map_err(|_| RichRecoveryError::InvalidEvidence("invalid Customer district id"))?;
+    let bytes = bad_credit_prefix(
+        customer.customer_id,
+        customer_district,
+        customer_warehouse,
+        prefix.home_district_id,
+        prefix.home_warehouse_id,
+        prefix.amount_cents,
+    );
+    validate_bounded_char(
+        "bad-credit Payment canonical prefix",
+        &bytes,
+        MIN_BAD_CREDIT_PREFIX_BYTES,
+        MAX_BAD_CREDIT_PREFIX_BYTES,
+    )?;
+    Ok(bytes)
+}
+
+fn bad_credit_suffix_bytes(
+    warehouses: u16,
+    customer: CustomerKey,
+    suffix: &[SealedBadCreditPaymentPrefix],
+) -> Result<usize, RichRecoveryError> {
+    suffix.iter().try_fold(0_usize, |total, prefix| {
+        total
+            .checked_add(validate_bad_credit_payment_prefix(warehouses, customer, *prefix)?.len())
+            .ok_or(RichRecoveryError::Overflow(
+                "bad-credit Payment suffix bytes",
+            ))
+    })
+}
+
+fn append_bad_credit_suffix(
+    warehouses: u16,
+    customer: CustomerKey,
+    suffix: &mut Vec<SealedBadCreditPaymentPrefix>,
+    prefix: SealedBadCreditPaymentPrefix,
+) -> Result<(), RichRecoveryError> {
+    validate_bad_credit_payment_prefix(warehouses, customer, prefix)?;
+    suffix.push(prefix);
+    while suffix.len() > 1
+        && bad_credit_suffix_bytes(warehouses, customer, &suffix[1..])? >= MAX_CUSTOMER_DATA_BYTES
+    {
+        suffix.remove(0);
+    }
+    if suffix.len() > MAX_BAD_CREDIT_SUFFIX_ENTRIES {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "bad-credit Payment suffix exceeds its fixed bound",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bad_credit_suffix(
+    warehouses: u16,
+    customer: CustomerKey,
+    committed_updates: u64,
+    initial_data: &[u8],
+    final_data: &[u8],
+    suffix: &[SealedBadCreditPaymentPrefix],
+) -> Result<(), RichRecoveryError> {
+    validate_canonical_count(
+        "bad-credit Payment suffix",
+        suffix.len(),
+        0,
+        MAX_BAD_CREDIT_SUFFIX_ENTRIES,
+    )?;
+    let suffix_count = u64::try_from(suffix.len())
+        .map_err(|_| RichRecoveryError::Overflow("bad-credit Payment suffix count"))?;
+    if suffix_count > committed_updates || (committed_updates > 0 && suffix.is_empty()) {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "bad-credit Payment suffix count is inconsistent with committed updates",
+        ));
+    }
+    let suffix_bytes = bad_credit_suffix_bytes(warehouses, customer, suffix)?;
+    if suffix.len() > 1
+        && bad_credit_suffix_bytes(warehouses, customer, &suffix[1..])? >= MAX_CUSTOMER_DATA_BYTES
+    {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "bad-credit Payment suffix is not minimally sufficient",
+        ));
+    }
+    let rooted = committed_updates == suffix_count;
+    if !rooted && suffix_bytes < MAX_CUSTOMER_DATA_BYTES {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "truncated bad-credit Payment suffix does not overwrite the setup root",
+        ));
+    }
+    let mut replayed = if rooted {
+        initial_data.to_vec()
+    } else {
+        Vec::new()
+    };
+    for prefix in suffix {
+        let bytes = validate_bad_credit_payment_prefix(warehouses, customer, *prefix)?;
+        replayed = prepend_bad_credit_data(&bytes, &replayed);
+    }
+    if replayed != final_data {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "bad-credit final data differs from its trusted Payment suffix replay",
+        ));
+    }
+    Ok(())
 }
 
 fn prepend_bad_credit_data(prefix: &[u8], before: &[u8]) -> Vec<u8> {
@@ -2552,7 +4011,10 @@ fn sealed_raw_size(
         }
     }
     for customer in customers {
-        size = checked_size_add(size, 48 + customer.data.len())?;
+        size = checked_size_add(
+            size,
+            48 + customer.data.len() + customer.payment_suffix.len() * (2 + 1 + 4),
+        )?;
     }
     for group in histories {
         size = checked_size_add(size, 16)?;
@@ -2588,7 +4050,8 @@ const MAX_DELIVERY_BYTES: usize = 64
     + 4
     + MAX_DELIVERY_TIMESTAMP_BYTES
     + MAX_ORDER_LINES as usize * (12 + MAX_DELIVERY_TIMESTAMP_BYTES);
-const MAX_BAD_CUSTOMER_BYTES: usize = 48 + MAX_CUSTOMER_DATA_BYTES;
+const MAX_BAD_CUSTOMER_BYTES: usize =
+    48 + MAX_CUSTOMER_DATA_BYTES + MAX_BAD_CREDIT_SUFFIX_ENTRIES * (2 + 1 + 4);
 const MAX_HISTORY_BYTES: usize = 16 + 48 + MAX_HISTORY_TIMESTAMP_BYTES + MAX_HISTORY_DATA_BYTES;
 const MAX_WITNESS_BYTES: usize =
     (16 + 7) + (16 + 7) + (16 + 12) + (16 + 10 + 4 + MAX_HISTORY_TIMESTAMP_BYTES + 4 + 24);
@@ -2882,8 +4345,18 @@ mod tests {
         collector
     }
 
-    fn unrooted_customer_state(start: i32) -> CustomerDataState {
-        let mut state = CustomerDataState::new(b"old-data".to_vec());
+    fn unrooted_customer_state(key: CustomerKey, start: i32) -> CustomerDataState {
+        let prefix = SealedBadCreditPaymentPrefix {
+            home_warehouse_id: 1,
+            home_district_id: 1,
+            amount_cents: MIN_PAYMENT_CENTS,
+        };
+        let before_data = b"before".to_vec();
+        let after_data = prepend_bad_credit_data(
+            &validate_bad_credit_payment_prefix(OFFICIAL_WAREHOUSES, key, prefix).unwrap(),
+            &before_data,
+        );
+        let mut state = CustomerDataState::new(OFFICIAL_WAREHOUSES, key, b"old-data".to_vec());
         state.update_count = 1;
         state.pending.insert(
             start,
@@ -2896,14 +4369,29 @@ mod tests {
                     payment_count: start + 1,
                     delivery_count: 0,
                 },
-                before_data: b"before".to_vec(),
-                after_data: b"after".to_vec(),
+                before_data,
+                after_data,
+                prefix,
             },
         );
         state
     }
 
     fn prepared_bad_customer(key: CustomerKey, before_count: i32) -> PreparedBadCustomer {
+        let prefix = SealedBadCreditPaymentPrefix {
+            home_warehouse_id: 1,
+            home_district_id: 1,
+            amount_cents: MIN_PAYMENT_CENTS,
+        };
+        let data_before = if before_count == CUSTOMER_INITIAL_PAYMENT_COUNT {
+            b"old-data".to_vec()
+        } else {
+            b"before".to_vec()
+        };
+        let data_after = prepend_bad_credit_data(
+            &validate_bad_credit_payment_prefix(OFFICIAL_WAREHOUSES, key, prefix).unwrap(),
+            &data_before,
+        );
         PreparedBadCustomer {
             key,
             setup_data: b"old-data".to_vec(),
@@ -2915,12 +4403,9 @@ mod tests {
                 payment_count: before_count + 1,
                 delivery_count: 0,
             },
-            data_before: if before_count == CUSTOMER_INITIAL_PAYMENT_COUNT {
-                b"old-data".to_vec()
-            } else {
-                b"before".to_vec()
-            },
-            data_after: b"after".to_vec(),
+            data_before,
+            data_after,
+            prefix,
         }
     }
 
@@ -2952,6 +4437,498 @@ mod tests {
             delivery_timestamp: timestamp.to_vec(),
             line_amount_bits,
         }
+    }
+
+    #[derive(Clone)]
+    struct CanonicalSnapshot {
+        header: CanonicalRichRecoveryHeader,
+        orders: Vec<CanonicalRichNewOrder>,
+        deliveries: Vec<CanonicalRichDelivery>,
+        customers: Vec<CanonicalRichBadCreditCustomer>,
+        histories: Vec<CanonicalRichHistoryTuple>,
+        order_rejected: Option<CanonicalRichOrderWitness>,
+        delivery_rejected: Option<CanonicalRichOrderWitness>,
+        customer_rejected: Option<CanonicalRichCustomerWitness>,
+        history_rejected: Option<CanonicalRichHistoryWitness>,
+    }
+
+    struct LyingExact<I> {
+        inner: I,
+        declared: usize,
+    }
+
+    impl<I: Iterator> Iterator for LyingExact<I> {
+        type Item = I::Item;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.inner.next()
+        }
+    }
+
+    impl<I: Iterator> ExactSizeIterator for LyingExact<I> {
+        fn len(&self) -> usize {
+            self.declared
+        }
+    }
+
+    fn canonical_snapshot(sealed: &SealedRichRecoverySamples) -> CanonicalSnapshot {
+        let orders = sealed
+            .new_orders()
+            .iter()
+            .map(|order| {
+                CanonicalRichNewOrder::new(
+                    order.score(),
+                    order.key(),
+                    order.customer_id(),
+                    order.entry_timestamp().to_vec(),
+                    order.carrier_id(),
+                    order.line_count(),
+                    order.all_local(),
+                    order.queue_present(),
+                    order.lines().iter().map(|line| {
+                        CanonicalRichOrderLine::new(
+                            line.number(),
+                            line.item_id(),
+                            line.supply_warehouse(),
+                            line.delivery_timestamp().to_vec(),
+                            line.quantity(),
+                            line.amount_bits(),
+                            line.district_info().to_vec(),
+                        )
+                    }),
+                )
+                .unwrap()
+            })
+            .collect();
+        let deliveries = sealed
+            .deliveries()
+            .iter()
+            .map(|delivery| {
+                CanonicalRichDelivery::new(
+                    delivery.score(),
+                    delivery.key(),
+                    delivery.customer_id(),
+                    delivery.carrier_id(),
+                    delivery.queue_present(),
+                    delivery.delivery_timestamp().to_vec(),
+                    delivery.lines().iter().map(|line| {
+                        CanonicalRichDeliveryLine::new(
+                            line.number(),
+                            line.delivery_timestamp().to_vec(),
+                            line.amount_bits(),
+                        )
+                    }),
+                )
+                .unwrap()
+            })
+            .collect();
+        let customers = sealed
+            .bad_credit_customers()
+            .iter()
+            .map(|customer| {
+                CanonicalRichBadCreditCustomer::new(
+                    customer.score(),
+                    customer.customer_key(),
+                    customer.final_payment_count(),
+                    *customer.expected_credit(),
+                    customer.final_data().to_vec(),
+                    customer.committed_payment_updates(),
+                    customer.payment_suffix().iter().map(|prefix| {
+                        CanonicalRichBadCreditPrefix::new(
+                            prefix.home_warehouse_id(),
+                            prefix.home_district_id(),
+                            prefix.amount_cents(),
+                        )
+                    }),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut histories = sealed
+            .history_tuples()
+            .map(|(group, tuple)| {
+                CanonicalRichHistoryTuple::new(
+                    tuple.score(),
+                    group,
+                    tuple.timestamp().to_vec(),
+                    tuple.amount_bits(),
+                    tuple.data().to_vec(),
+                    tuple.committed_multiplicity(),
+                    tuple.setup_collision_multiplicity(),
+                )
+            })
+            .collect::<Vec<_>>();
+        histories.sort_by(|left, right| {
+            RankedKey {
+                score: left.score,
+                key: HistoryTupleKey {
+                    group: left.group,
+                    timestamp: left.timestamp.clone(),
+                    amount_bits: left.amount_bits,
+                    data: left.data.clone(),
+                },
+            }
+            .cmp(&RankedKey {
+                score: right.score,
+                key: HistoryTupleKey {
+                    group: right.group,
+                    timestamp: right.timestamp.clone(),
+                    amount_bits: right.amount_bits,
+                    data: right.data.clone(),
+                },
+            })
+        });
+        CanonicalSnapshot {
+            header: CanonicalRichRecoveryHeader::new(
+                sealed.warehouses(),
+                sealed.run_seed(),
+                sealed.policy_version(),
+                sealed.raw_size_bytes(),
+                sealed.new_order_commit_count(),
+                sealed.delivered_order_count(),
+                sealed.committed_history_row_count(),
+                sealed.bad_credit_payment_count(),
+            ),
+            orders,
+            deliveries,
+            customers,
+            histories,
+            order_rejected: sealed
+                .order_rejected_witness()
+                .map(|witness| CanonicalRichOrderWitness::new(witness.score(), witness.key())),
+            delivery_rejected: sealed
+                .delivery_rejected_witness()
+                .map(|witness| CanonicalRichOrderWitness::new(witness.score(), witness.key())),
+            customer_rejected: sealed
+                .bad_customer_rejected_witness()
+                .map(|witness| CanonicalRichCustomerWitness::new(witness.score(), witness.key())),
+            history_rejected: sealed.history_rejected_witness().map(|witness| {
+                CanonicalRichHistoryWitness::new(
+                    witness.score(),
+                    witness.group(),
+                    witness.timestamp().to_vec(),
+                    witness.amount_bits(),
+                    witness.data().to_vec(),
+                )
+            }),
+        }
+    }
+
+    fn reconstruct(
+        snapshot: CanonicalSnapshot,
+    ) -> Result<SealedRichRecoverySamples, RichRecoveryError> {
+        SealedRichRecoverySamples::from_canonical_parts(
+            snapshot.header,
+            snapshot.orders.into_iter(),
+            snapshot.deliveries.into_iter(),
+            snapshot.customers.into_iter(),
+            snapshot.histories.into_iter(),
+            snapshot.order_rejected,
+            snapshot.delivery_rejected,
+            snapshot.customer_rejected,
+            snapshot.history_rejected,
+            &empty_intervals(),
+            &no_setup_collision,
+            &bad_credit_setup,
+        )
+    }
+
+    fn all_domain_sealed() -> SealedRichRecoverySamples {
+        let new_order_ticket = normal_new_order_ticket();
+        let new_order = new_order_evidence(&new_order_ticket, 3_001);
+        let key = OrderKey::from_parts(
+            new_order.warehouse_id,
+            new_order.district_id,
+            new_order.order_id,
+        );
+        let customer_id = match new_order_ticket.parameters() {
+            TransactionParameters::NewOrder(input) => i32::from(input.customer_id()),
+            _ => unreachable!(),
+        };
+        let delivery_ticket = delivery_ticket(Some(key.warehouse_id()));
+        let delivery = delivery_evidence(
+            key,
+            customer_id,
+            TEST_TIMESTAMP,
+            new_order.line_amount_bits.clone(),
+        );
+        let payment_ticket = local_payment_ticket();
+        let payment = payment_evidence(
+            &payment_ticket,
+            true,
+            CustomerVersion {
+                payment_count: 1,
+                delivery_count: 0,
+            },
+            TEST_TIMESTAMP,
+            b"ROUNDTRIP-HISTORY",
+            b"old-data".to_vec(),
+        );
+
+        let mut collector = collector();
+        collector
+            .offer_terminal(
+                &new_order_ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::NewOrder(new_order)),
+            )
+            .unwrap();
+        collector
+            .offer_terminal(
+                &delivery_ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::Delivery(vec![delivery])),
+            )
+            .unwrap();
+        collector
+            .offer_terminal(
+                &payment_ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::Payment(payment)),
+            )
+            .unwrap();
+        collector.seal(&empty_intervals()).unwrap()
+    }
+
+    #[test]
+    fn canonical_reconstruction_roundtrips_all_rich_domains() {
+        let live = all_domain_sealed();
+        let restored = reconstruct(canonical_snapshot(&live)).unwrap();
+        assert_eq!(restored.warehouses, live.warehouses);
+        assert_eq!(restored.run_seed, live.run_seed);
+        assert_eq!(restored.raw_size_bytes, live.raw_size_bytes);
+        assert_eq!(restored.new_order_commits, live.new_order_commits);
+        assert_eq!(restored.delivered_orders, live.delivered_orders);
+        assert_eq!(restored.history_rows, live.history_rows);
+        assert_eq!(restored.bad_credit_payments, live.bad_credit_payments);
+        assert_eq!(restored.new_orders, live.new_orders);
+        assert_eq!(restored.deliveries, live.deliveries);
+        assert_eq!(restored.bad_credit_customers, live.bad_credit_customers);
+        assert_eq!(restored.history_groups, live.history_groups);
+    }
+
+    #[test]
+    fn canonical_reconstruction_rejects_rank_order_cutoff_and_raw_size_forgery() {
+        let live = all_domain_sealed();
+
+        let mut forged_score = canonical_snapshot(&live);
+        forged_score.orders[0].score.high ^= 1;
+        assert!(matches!(
+            reconstruct(forged_score),
+            Err(RichRecoveryError::ForgedCanonicalScore { .. })
+        ));
+
+        let mut duplicate_order = canonical_snapshot(&live);
+        duplicate_order
+            .orders
+            .push(duplicate_order.orders[0].clone());
+        duplicate_order.header.new_order_commits += 1;
+        assert!(matches!(
+            reconstruct(duplicate_order),
+            Err(RichRecoveryError::NonCanonicalOrder { .. })
+        ));
+
+        let mut invalid_cutoff = canonical_snapshot(&live);
+        let selected = RankedKey {
+            score: invalid_cutoff.orders[0].score,
+            key: invalid_cutoff.orders[0].key,
+        };
+        let rejected = (3_002..)
+            .map(|order_id| OrderKey::from_parts(1, 1, order_id))
+            .map(|key| RankedKey {
+                score: order_score(TEST_SEED, key),
+                key,
+            })
+            .find(|candidate| candidate > &selected)
+            .unwrap();
+        invalid_cutoff.order_rejected =
+            Some(CanonicalRichOrderWitness::new(rejected.score, rejected.key));
+        invalid_cutoff.header.new_order_commits += 1;
+        assert!(matches!(
+            reconstruct(invalid_cutoff),
+            Err(RichRecoveryError::InvalidWeightedSelection { .. })
+        ));
+
+        let mut wrong_size = canonical_snapshot(&live);
+        wrong_size.header.raw_size_bytes += 1;
+        assert!(matches!(
+            reconstruct(wrong_size),
+            Err(RichRecoveryError::RawSizeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn canonical_reconstruction_rechecks_providers_overlap_and_iterator_caps() {
+        let live = all_domain_sealed();
+
+        let mut collision = canonical_snapshot(&live);
+        collision.histories[0].setup_collision_multiplicity ^= 1;
+        assert!(matches!(
+            reconstruct(collision),
+            Err(RichRecoveryError::SetupCollisionMismatch { .. })
+        ));
+
+        let bad_provider = canonical_snapshot(&live);
+        let result = SealedRichRecoverySamples::from_canonical_parts(
+            bad_provider.header,
+            bad_provider.orders.into_iter(),
+            bad_provider.deliveries.into_iter(),
+            bad_provider.customers.into_iter(),
+            bad_provider.histories.into_iter(),
+            bad_provider.order_rejected,
+            bad_provider.delivery_rejected,
+            bad_provider.customer_rejected,
+            bad_provider.history_rejected,
+            &empty_intervals(),
+            &no_setup_collision,
+            &|_| Some(InitialCustomerData::new(*b"GC", Vec::new()).unwrap()),
+        );
+        assert!(matches!(
+            result,
+            Err(RichRecoveryError::CustomerCreditFlagMismatch { .. })
+        ));
+
+        let mut overlap = canonical_snapshot(&live);
+        overlap.deliveries[0].customer_id = if overlap.deliveries[0].customer_id == 1 {
+            2
+        } else {
+            1
+        };
+        assert!(matches!(
+            reconstruct(overlap),
+            Err(RichRecoveryError::InvalidEvidence(
+                "canonical NewOrder and Delivery samples disagree for one retained order"
+            ))
+        ));
+
+        let mut bad_count = canonical_snapshot(&live);
+        bad_count.customers[0].final_payment_count += 1;
+        assert!(matches!(
+            reconstruct(bad_count),
+            Err(RichRecoveryError::InvalidEvidence(
+                "canonical bad-credit final Payment count is not setup-rooted"
+            ))
+        ));
+
+        let mut bad_suffix = canonical_snapshot(&live);
+        bad_suffix.customers[0].payment_suffix[0].amount_cents += 1;
+        assert!(matches!(
+            reconstruct(bad_suffix),
+            Err(RichRecoveryError::InvalidEvidence(
+                "bad-credit final data differs from its trusted Payment suffix replay"
+            ))
+        ));
+
+        let one = canonical_snapshot(&live).orders[0].clone();
+        let oversized = std::iter::repeat_n(one, RICH_RECOVERY_SAMPLE_CAPACITY + 1);
+        assert!(matches!(
+            SealedRichRecoverySamples::from_canonical_parts(
+                CanonicalRichRecoveryHeader::new(
+                    OFFICIAL_WAREHOUSES,
+                    TEST_SEED,
+                    RICH_RECOVERY_POLICY_VERSION,
+                    64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ),
+                oversized,
+                Vec::new().into_iter(),
+                Vec::new().into_iter(),
+                Vec::new().into_iter(),
+                None,
+                None,
+                None,
+                None,
+                &empty_intervals(),
+                &no_setup_collision,
+                &bad_credit_setup,
+            ),
+            Err(RichRecoveryError::CanonicalCount { .. })
+        ));
+    }
+
+    #[test]
+    fn canonical_nested_iterators_cannot_lie_about_their_bounds() {
+        let order_key = OrderKey::from_parts(1, 1, 3_001);
+        let order_line = CanonicalRichOrderLine::new(
+            1,
+            1,
+            1,
+            Vec::new(),
+            MIN_ITEM_QUANTITY,
+            1.0_f32.to_bits(),
+            vec![b'D'; DISTRICT_INFO_BYTES],
+        );
+        assert!(matches!(
+            CanonicalRichNewOrder::new(
+                order_score(TEST_SEED, order_key),
+                order_key,
+                1,
+                TEST_TIMESTAMP.to_vec(),
+                0,
+                MIN_ORDER_LINES,
+                true,
+                true,
+                LyingExact {
+                    inner: std::iter::repeat(order_line),
+                    declared: usize::from(MIN_ORDER_LINES),
+                },
+            ),
+            Err(RichRecoveryError::CanonicalCount { .. })
+        ));
+
+        let delivery_line =
+            CanonicalRichDeliveryLine::new(1, TEST_TIMESTAMP.to_vec(), 1.0_f32.to_bits());
+        assert!(matches!(
+            CanonicalRichDelivery::new(
+                delivery_score(TEST_SEED, order_key),
+                order_key,
+                1,
+                MIN_CARRIER_ID,
+                false,
+                TEST_TIMESTAMP.to_vec(),
+                LyingExact {
+                    inner: vec![delivery_line; usize::from(MIN_ORDER_LINES) - 1].into_iter(),
+                    declared: usize::from(MIN_ORDER_LINES),
+                },
+            ),
+            Err(RichRecoveryError::CanonicalCount { .. })
+        ));
+
+        let prefix = CanonicalRichBadCreditPrefix::new(1, 1, MIN_PAYMENT_CENTS);
+        assert!(matches!(
+            CanonicalRichBadCreditCustomer::new(
+                SampleScore { high: 0, low: 0 },
+                CustomerKey {
+                    warehouse_id: 1,
+                    district_id: 1,
+                    customer_id: 1,
+                },
+                2,
+                *b"BC",
+                Vec::new(),
+                1,
+                LyingExact {
+                    inner: std::iter::repeat(prefix),
+                    declared: 1,
+                },
+            ),
+            Err(RichRecoveryError::CanonicalCount { .. })
+        ));
+
+        let live = all_domain_sealed();
+        let mut invalid_order = canonical_snapshot(&live);
+        invalid_order.orders[0].lines.clear();
+        invalid_order.orders[0].line_count = 0;
+        assert!(matches!(
+            reconstruct(invalid_order),
+            Err(RichRecoveryError::CanonicalCount { .. })
+        ));
+        let mut invalid_delivery = canonical_snapshot(&live);
+        invalid_delivery.deliveries[0].lines.clear();
+        assert!(matches!(
+            reconstruct(invalid_delivery),
+            Err(RichRecoveryError::CanonicalCount { .. })
+        ));
     }
 
     #[test]
@@ -3174,6 +5151,14 @@ mod tests {
         assert_eq!(
             reverse.bad_credit_customers()[0].final_payment_count(),
             final_count
+        );
+        assert!(
+            reverse.bad_credit_customers()[0].payment_suffix().len()
+                <= MAX_BAD_CREDIT_SUFFIX_ENTRIES
+        );
+        assert!(
+            reverse.bad_credit_customers()[0].payment_suffix().len()
+                < reverse.bad_credit_customers()[0].committed_payment_updates() as usize
         );
 
         // The composite ACK contract allows at most one unrooted receipt per
@@ -3683,7 +5668,14 @@ mod tests {
                     district_id: 1,
                     customer_id,
                 },
-                unrooted_customer_state(2),
+                unrooted_customer_state(
+                    CustomerKey {
+                        warehouse_id: 1,
+                        district_id: 1,
+                        customer_id,
+                    },
+                    2,
+                ),
             );
         }
         for customer_id in 1..=RICH_RECOVERY_SAMPLE_CAPACITY as i32 {
@@ -3693,9 +5685,9 @@ mod tests {
                 customer_id,
             };
             let state = if customer_id == RICH_RECOVERY_SAMPLE_CAPACITY as i32 {
-                unrooted_customer_state(2)
+                unrooted_customer_state(key, 2)
             } else {
-                CustomerDataState::new(b"old-data".to_vec())
+                CustomerDataState::new(OFFICIAL_WAREHOUSES, key, b"old-data".to_vec())
             };
             collector.customers.ensure(
                 SampleScore {
@@ -3747,7 +5739,7 @@ mod tests {
         };
         collector
             .retired_customers
-            .insert(retired_key, unrooted_customer_state(2));
+            .insert(retired_key, unrooted_customer_state(retired_key, 2));
         collector.pending_customer_edges = 1;
         for customer_id in 1..=RICH_RECOVERY_SAMPLE_CAPACITY as i32 {
             let key = CustomerKey {
@@ -3761,7 +5753,7 @@ mod tests {
                     low: customer_id as u64,
                 },
                 key,
-                || CustomerDataState::new(b"old-data".to_vec()),
+                || CustomerDataState::new(OFFICIAL_WAREHOUSES, key, b"old-data".to_vec()),
             );
         }
         let candidate = prepared_bad_customer(
@@ -3864,6 +5856,14 @@ mod tests {
                 credit: *b"BC",
                 data: vec![b'C'; MAX_CUSTOMER_DATA_BYTES],
                 committed_payment_updates: 1,
+                payment_suffix: vec![
+                    SealedBadCreditPaymentPrefix {
+                        home_warehouse_id: OFFICIAL_WAREHOUSES,
+                        home_district_id: DISTRICTS_PER_WAREHOUSE,
+                        amount_cents: MAX_PAYMENT_CENTS,
+                    };
+                    MAX_BAD_CREDIT_SUFFIX_ENTRIES
+                ],
             })
             .collect::<Vec<_>>();
         let histories = (0..RICH_HISTORY_SAMPLE_CAPACITY)
