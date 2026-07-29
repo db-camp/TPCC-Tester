@@ -8,6 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 DEFAULT_RMDB_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd -P)"
 DEFAULT_TPCC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+DIAGNOSTIC_METRICS_HELPER="${SCRIPT_DIR}/diagnostic_metrics.py"
 
 MODE="all"
 LABEL="final2026"
@@ -39,6 +40,7 @@ STATE_DIR_OVERRIDE=""
 SERVER_PID=""
 PROBE_PID=""
 TRACE_PID=""
+TRACE_EXIT_STATUS=""
 STOPPING_SERVER=0
 SERVER_LOG=""
 RESULT_DIR=""
@@ -553,6 +555,43 @@ import sys
     diagnostic_observation,
 ) = sys.argv[1:]
 
+artifact_names = {
+    "proc_before": "diagnostic_proc_before.json",
+    "proc_after": "diagnostic_proc_after.json",
+    "proc_delta": "diagnostic_proc_delta.json",
+    "strace_summary": "diagnostic_strace_summary.txt",
+    "strace_metrics": "diagnostic_strace_metrics.json",
+}
+
+
+def describe_artifact(name):
+    path = Path(result_dir) / name
+    descriptor = {"path": name, "status": "missing"}
+    if path.is_symlink():
+        descriptor["status"] = "unsafe"
+        return descriptor
+    if not path.is_file():
+        return descriptor
+    if path.stat().st_size == 0:
+        descriptor["status"] = "empty"
+        return descriptor
+    if path.suffix == ".json":
+        try:
+            with path.open("r", encoding="utf-8") as stream:
+                artifact = json.load(stream)
+            artifact_status = artifact.get("status")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            artifact_status = "invalid"
+        descriptor["status"] = (
+            artifact_status
+            if isinstance(artifact_status, str)
+            else "present"
+        )
+    else:
+        descriptor["status"] = "present"
+    return descriptor
+
+
 payload = {
     "schema_version": 1,
     "conformance": (
@@ -619,6 +658,10 @@ payload = {
         "public_observation_seconds": int(diagnostic_observation),
         "native_single_observation_supported": True,
         "status": phase_diagnostics,
+        "artifacts": {
+            key: describe_artifact(name)
+            for key, name in artifact_names.items()
+        },
     },
 }
 
@@ -748,19 +791,38 @@ stop_probe() {
 stop_trace() {
   local pid="${TRACE_PID}"
   local attempts=0
+  local trace_rc=0
+  local forced_kill=0
   [[ -n "${pid}" ]] || return 0
   if kill -0 "${pid}" 2>/dev/null; then
     kill -INT "${pid}" 2>/dev/null || true
-    while kill -0 "${pid}" 2>/dev/null && (( attempts < 20 )); do
+    while kill -0 "${pid}" 2>/dev/null && (( attempts < 40 )); do
       sleep 0.05
       attempts=$((attempts + 1))
     done
   fi
   if kill -0 "${pid}" 2>/dev/null; then
     kill -TERM "${pid}" 2>/dev/null || true
+    attempts=0
+    while kill -0 "${pid}" 2>/dev/null && (( attempts < 20 )); do
+      sleep 0.05
+      attempts=$((attempts + 1))
+    done
   fi
-  wait "${pid}" 2>/dev/null || true
+  if kill -0 "${pid}" 2>/dev/null; then
+    forced_kill=1
+    kill -KILL "${pid}" 2>/dev/null || true
+  fi
+  wait "${pid}" 2>/dev/null || trace_rc=$?
+  if [[ "${forced_kill}" == "1" && "${trace_rc}" == "0" ]]; then
+    trace_rc=137
+  fi
+  TRACE_EXIT_STATUS="${trace_rc}"
   TRACE_PID=""
+  case "${trace_rc}" in
+    0|130|143) return 0 ;;
+    *) return "${trace_rc}" ;;
+  esac
 }
 
 crash_server() {
@@ -1058,6 +1120,12 @@ run_final_diagnostics() {
     set_phase_status diagnostics unavailable
     return 0
   fi
+  if [[ ! -f "${DIAGNOSTIC_METRICS_HELPER}" \
+    || -L "${DIAGNOSTIC_METRICS_HELPER}" ]]; then
+    warn "diagnostic metrics helper is missing or unsafe; ranked result remains valid"
+    set_phase_status diagnostics failed
+    return 0
+  fi
 
   log "running ${DIAGNOSTIC_WARMUP_SECONDS}s non-ranked diagnostic warmup"
   if ! run_tester "${RESULT_DIR}/diagnostic_warmup.log" \
@@ -1070,8 +1138,8 @@ run_final_diagnostics() {
   fi
 
   log "attaching strace to registered RMDB pid ${SERVER_PID}"
-  strace -f -tt -T -p "${SERVER_PID}" \
-    -o "${RESULT_DIR}/strace.log" \
+  LC_ALL=C strace -c -f -p "${SERVER_PID}" \
+    -o "${RESULT_DIR}/diagnostic_strace_summary.txt" \
     >"${RESULT_DIR}/strace_attach.log" 2>&1 &
   TRACE_PID=$!
   sleep 0.20
@@ -1083,18 +1151,78 @@ run_final_diagnostics() {
     return 0
   fi
 
+  local diagnostics_failed=0
+  local tracer_survived_observation=1
+  if ! python3 "${DIAGNOSTIC_METRICS_HELPER}" capture \
+      --pid "${SERVER_PID}" \
+      --output "${RESULT_DIR}/diagnostic_proc_before.json" \
+      --require-available; then
+    warn "could not capture the pre-observation process counters"
+    diagnostics_failed=1
+  fi
+
   log "running ${DIAGNOSTIC_OBSERVATION_SECONDS}s non-ranked diagnostic observation"
   if ! run_tester "${RESULT_DIR}/diagnostic_observation.log" \
       --diagnostic-workload-seconds "${DIAGNOSTIC_OBSERVATION_SECONDS}" \
       --profile "${PROFILE}" --seed "${SEED}" --state-dir "${STATE_DIR}" \
       --host "${HOST}" --port "${PORT}"; then
-    stop_trace
     warn "diagnostic observation failed; ranked result remains valid"
-    set_phase_status diagnostics failed
-    return 0
+    diagnostics_failed=1
   fi
-  stop_trace
-  set_phase_status diagnostics passed
+
+  if ! python3 "${DIAGNOSTIC_METRICS_HELPER}" capture \
+      --pid "${SERVER_PID}" \
+      --output "${RESULT_DIR}/diagnostic_proc_after.json" \
+      --require-available; then
+    warn "could not capture the post-observation process counters"
+    diagnostics_failed=1
+  fi
+
+  if ! kill -0 "${TRACE_PID}" 2>/dev/null; then
+    tracer_survived_observation=0
+    wait "${TRACE_PID}" 2>/dev/null || TRACE_EXIT_STATUS=$?
+    TRACE_PID=""
+    warn "strace exited before the diagnostic observation completed"
+    diagnostics_failed=1
+  elif ! stop_trace; then
+    warn "strace exited abnormally with status ${TRACE_EXIT_STATUS}"
+    diagnostics_failed=1
+  fi
+
+  if [[ -f "${RESULT_DIR}/diagnostic_proc_before.json" \
+    && -f "${RESULT_DIR}/diagnostic_proc_after.json" ]]; then
+    if ! python3 "${DIAGNOSTIC_METRICS_HELPER}" delta \
+        --before "${RESULT_DIR}/diagnostic_proc_before.json" \
+        --after "${RESULT_DIR}/diagnostic_proc_after.json" \
+        --output "${RESULT_DIR}/diagnostic_proc_delta.json" \
+        --require-available; then
+      warn "could not calculate process-counter deltas"
+      diagnostics_failed=1
+    fi
+  else
+    diagnostics_failed=1
+  fi
+
+  if [[ "${tracer_survived_observation}" == "1" \
+    && -s "${RESULT_DIR}/diagnostic_strace_summary.txt" ]]; then
+    if ! python3 "${DIAGNOSTIC_METRICS_HELPER}" strace \
+        --input "${RESULT_DIR}/diagnostic_strace_summary.txt" \
+        --output "${RESULT_DIR}/diagnostic_strace_metrics.json"; then
+      warn "could not parse the strace -c summary"
+      diagnostics_failed=1
+    fi
+  else
+    warn "strace did not produce a non-empty summary"
+    diagnostics_failed=1
+  fi
+
+  if [[ "${diagnostics_failed}" == "1" ]]; then
+    warn "one or more diagnostic observations failed; ranked result remains valid"
+    set_phase_status diagnostics failed
+  else
+    set_phase_status diagnostics passed
+  fi
+  return 0
 }
 
 write_summary() {
