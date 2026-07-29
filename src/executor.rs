@@ -19,6 +19,7 @@ use crate::phases::{
     SystemMonotonicClock, TransactionIdentity, WorkerId,
 };
 use crate::ranking::dispatch::{self, FrozenTransaction};
+use crate::ranking::ledger::{LedgerError, RunLedger};
 use crate::ranking::runner::RankedTransactionOutcome;
 use crate::ranking::session::open_ranked_session;
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
@@ -135,9 +136,29 @@ impl BenchmarkExecutor {
         );
 
         let mut first_error = None;
+        let mut worker_ledgers: Vec<Option<RunLedger>> = std::iter::repeat_with(|| None)
+            .take(usize::from(profile.clients))
+            .collect();
         while let Some(joined) = workers.join_next().await {
             match joined {
-                Ok(Ok(())) => {}
+                Ok(Ok((worker, ledger))) => {
+                    let index = usize::from(worker);
+                    if index >= worker_ledgers.len() {
+                        cancelled.store(true, Ordering::Release);
+                        if first_error.is_none() {
+                            first_error = Some(TpccError::Protocol(format!(
+                                "ranked worker returned out-of-range id {worker}"
+                            )));
+                        }
+                    } else if worker_ledgers[index].replace(ledger).is_some() {
+                        cancelled.store(true, Ordering::Release);
+                        if first_error.is_none() {
+                            first_error = Some(TpccError::Protocol(format!(
+                                "ranked worker returned duplicate ledger for id {worker}"
+                            )));
+                        }
+                    }
+                }
                 Ok(Err(error)) => {
                     cancelled.store(true, Ordering::Release);
                     if first_error.is_none() {
@@ -157,6 +178,18 @@ impl BenchmarkExecutor {
         if let Some(error) = first_error {
             return Err(error);
         }
+        let worker_ledgers = worker_ledgers
+            .into_iter()
+            .enumerate()
+            .map(|(worker, ledger)| {
+                ledger.ok_or_else(|| {
+                    TpccError::Protocol(format!(
+                        "ranked worker {worker} did not return its physical commit ledger"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ledger = RunLedger::merge_all(worker_ledgers).map_err(ledger_error)?;
 
         let (windows, summary) = {
             let mut state = lock_scheduler(&scheduler)?;
@@ -177,6 +210,7 @@ impl BenchmarkExecutor {
             median_new_order_per_minute,
             response_timeout,
             phase_tail_grace: limits.phase_tail_grace,
+            ledger,
         };
 
         if result.ranked && !result.summary.passed() {
@@ -272,24 +306,25 @@ async fn run_worker(
     ready_barrier: Arc<Barrier>,
     start_barrier: Arc<Barrier>,
     monotonic_clock: SystemMonotonicClock,
-) -> Result<(), TpccError> {
+) -> Result<(u16, RunLedger), TpccError> {
     let worker = WorkerId::new(worker_value).map_err(scheduler_error)?;
     wait_for_timing_release(&ready_barrier, &start_barrier).await;
 
+    let mut ledger = RunLedger::default();
     let mut sequence_phase = None;
     let mut sequence = ClientSequence::new(worker_value)
         .map_err(|error| TpccError::Protocol(error.to_string()))?;
 
     loop {
         if cancelled.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok((worker_value, ledger));
         }
 
         let reservation = {
             let mut state = lock_scheduler(&scheduler)?;
             match state.reserve_transaction(worker) {
                 Ok(reservation) => reservation,
-                Err(SchedulerError::TimelineEnded) => return Ok(()),
+                Err(SchedulerError::TimelineEnded) => return Ok((worker_value, ledger)),
                 Err(error) => return Err(scheduler_error(error)),
             }
         };
@@ -341,7 +376,7 @@ async fn run_worker(
 
         loop {
             if cancelled.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok((worker_value, ledger));
             }
             let deadline = tokio::time::Instant::from_std(
                 monotonic_clock
@@ -380,10 +415,31 @@ async fn run_worker(
                             .finish_attempt_at(phase_ticket, attempt, completed_at)
                             .map_err(scheduler_error)?
                     };
-                    debug_assert!(matches!(
-                        disposition,
-                        AttemptDisposition::Finished | AttemptDisposition::GraceTail
-                    ));
+                    let record_result = match disposition {
+                        AttemptDisposition::Finished => ledger.record(frozen.ticket(), &outcome),
+                        AttemptDisposition::GraceTail => {
+                            ledger.record_grace_tail(frozen.ticket(), &outcome)
+                        }
+                        other => {
+                            return fail_worker(
+                                &scheduler,
+                                &cancelled,
+                                worker,
+                                format!(
+                                    "terminal transaction received invalid scheduler disposition \
+                                     {other:?}"
+                                ),
+                            );
+                        }
+                    };
+                    if let Err(error) = record_result {
+                        return fail_worker(
+                            &scheduler,
+                            &cancelled,
+                            worker,
+                            format!("physical commit ledger rejected terminal: {error}"),
+                        );
+                    }
                     break;
                 }
                 Ok(Err(error)) if error.is_retryable_abort() => {
@@ -456,6 +512,10 @@ fn scheduler_error(error: SchedulerError) -> TpccError {
     TpccError::Protocol(format!("ranked scheduler: {error}"))
 }
 
+fn ledger_error(error: LedgerError) -> TpccError {
+    TpccError::Protocol(format!("ranked physical commit ledger: {error}"))
+}
+
 fn median_of_three(mut values: [f64; FORMAL_WINDOW_COUNT]) -> f64 {
     values.sort_by(f64::total_cmp);
     values[1]
@@ -469,9 +529,14 @@ pub struct Final2026RunResult {
     median_new_order_per_minute: f64,
     response_timeout: Duration,
     phase_tail_grace: Duration,
+    ledger: RunLedger,
 }
 
 impl Final2026RunResult {
+    pub fn ledger(&self) -> &RunLedger {
+        &self.ledger
+    }
+
     pub fn print_report(&self) {
         println!("=== TPCC final2026 public-spec measurement ===");
         println!(
