@@ -2261,7 +2261,7 @@ required_attestations = [
         "name": "formal_state_chain",
         "required_for_ranking": True,
         "status": formal_attestation_status,
-        "validator": "tpcc_tester_read_only_state_attestation_v1",
+        "validator": "tpcc_tester_terminal_evidence_attestation_v2",
     },
 ]
 ranking_eligible = workflow_status == "success" and all(

@@ -14,6 +14,11 @@ from typing import Any
 
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_TERMINAL_EVIDENCE_STATE_BYTES = (
+    16 * 1024 * 1024 + 128 + 4 * 1024
+)
+TERMINAL_EVIDENCE_FILE = "terminal_evidence.state"
+LEGACY_RUN_LEDGER_FILE = "run_ledger.state"
 CORE_RANKING_ATTESTATIONS = {
     "public_configuration",
     "trusted_tester_binary",
@@ -26,7 +31,7 @@ CORE_ATTESTATION_VALIDATORS = {
     "trusted_tester_binary": "fresh_workflow_source_binary_sha256_v1",
     "opaque_sealed_database": "database_identity_v2",
     "formal_workflow_phases": "shell_phase_receipts_v1",
-    "formal_state_chain": "tpcc_tester_read_only_state_attestation_v1",
+    "formal_state_chain": "tpcc_tester_terminal_evidence_attestation_v2",
 }
 PUBLIC_EFFECTIVE_CONFIGURATION = {
     "warehouses": 50,
@@ -428,6 +433,264 @@ def validate_rank_result(manifest: dict[str, Any]) -> dict[str, Any]:
     return rank_result
 
 
+def inspect_terminal_evidence(
+    state_dir: pathlib.Path,
+) -> tuple[int, str]:
+    if not state_dir.is_absolute():
+        raise ManifestError("manifest.json state path is not absolute")
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise ManifestError("platform cannot safely inspect terminal evidence")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    try:
+        state_descriptor = os.open(state_dir, directory_flags)
+    except OSError as error:
+        raise ManifestError(
+            "manifest.json state directory is missing or unsafe"
+        ) from error
+    try:
+        try:
+            os.stat(
+                LEGACY_RUN_LEDGER_FILE,
+                dir_fd=state_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise ManifestError(
+                "could not inspect forbidden run_ledger.state"
+            ) from error
+        else:
+            raise ManifestError(
+                "forbidden run_ledger.state is present"
+            )
+
+        try:
+            before = os.stat(
+                TERMINAL_EVIDENCE_FILE,
+                dir_fd=state_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise ManifestError(
+                "terminal_evidence.state is missing or unsafe"
+            ) from error
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > MAX_TERMINAL_EVIDENCE_STATE_BYTES
+        ):
+            raise ManifestError(
+                "terminal_evidence.state is empty, oversized, or unsafe"
+            )
+
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            file_flags |= os.O_CLOEXEC
+        try:
+            descriptor = os.open(
+                TERMINAL_EVIDENCE_FILE,
+                file_flags,
+                dir_fd=state_descriptor,
+            )
+        except OSError as error:
+            raise ManifestError(
+                "terminal_evidence.state could not be opened safely"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+                or opened.st_size != before.st_size
+                or opened.st_mtime_ns != before.st_mtime_ns
+            ):
+                raise ManifestError(
+                    "terminal_evidence.state changed while opening"
+                )
+            digest = hashlib.sha256()
+            remaining = opened.st_size
+            while remaining:
+                chunk = os.read(
+                    descriptor,
+                    min(1024 * 1024, remaining),
+                )
+                if not chunk:
+                    break
+                digest.update(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            try:
+                current = os.stat(
+                    TERMINAL_EVIDENCE_FILE,
+                    dir_fd=state_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise ManifestError(
+                    "terminal_evidence.state changed while hashing"
+                ) from error
+            if (
+                remaining != 0
+                or after.st_dev != opened.st_dev
+                or after.st_ino != opened.st_ino
+                or after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or current.st_dev != opened.st_dev
+                or current.st_ino != opened.st_ino
+                or current.st_size != opened.st_size
+                or current.st_mtime_ns != opened.st_mtime_ns
+            ):
+                raise ManifestError(
+                    "terminal_evidence.state changed while hashing"
+                )
+            return opened.st_size, digest.hexdigest()
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(state_descriptor)
+
+
+def validate_formal_state(
+    manifest: dict[str, Any],
+    attestation_status: str,
+) -> bool:
+    formal = manifest.get("formal_state")
+    if (
+        not isinstance(formal, dict)
+        or set(formal)
+        != {"status", "terminal_evidence", "legacy_run_ledger"}
+    ):
+        raise ManifestError("manifest.json has invalid formal-state metadata")
+    terminal = formal.get("terminal_evidence")
+    legacy = formal.get("legacy_run_ledger")
+    if (
+        not isinstance(terminal, dict)
+        or set(terminal)
+        != {
+            "path",
+            "status",
+            "file_type",
+            "open_policy",
+            "size_bytes",
+            "max_size_bytes",
+            "sha256",
+        }
+        or not isinstance(legacy, dict)
+        or set(legacy)
+        != {"path", "status", "inspection_policy"}
+    ):
+        raise ManifestError(
+            "manifest.json has invalid terminal evidence descriptors"
+        )
+    paths = manifest.get("paths")
+    if not isinstance(paths, dict) or not isinstance(paths.get("state"), str):
+        raise ManifestError("manifest.json has no formal-state directory")
+    state_dir = pathlib.Path(paths["state"])
+    if terminal.get("path") != str(state_dir / TERMINAL_EVIDENCE_FILE):
+        raise ManifestError(
+            "manifest.json terminal evidence path is not exact"
+        )
+    if legacy.get("path") != str(state_dir / LEGACY_RUN_LEDGER_FILE):
+        raise ManifestError(
+            "manifest.json legacy ledger path is not exact"
+        )
+    if (
+        terminal.get("open_policy")
+        != "state_dir_fd_o_nofollow_sha256_v1"
+        or terminal.get("max_size_bytes")
+        != MAX_TERMINAL_EVIDENCE_STATE_BYTES
+        or legacy.get("inspection_policy")
+        != "state_dir_fd_lstat_only_v1"
+    ):
+        raise ManifestError(
+            "manifest.json has an invalid formal-state inspection policy"
+        )
+    valid_terminal_statuses = {
+        "pending",
+        "verified",
+        "missing",
+        "unsafe",
+        "empty",
+        "oversized",
+        "changed",
+        "inspection_failed",
+        "legacy_present",
+        "not_applicable",
+    }
+    valid_legacy_statuses = {
+        "pending",
+        "absent",
+        "present",
+        "inspection_failed",
+        "not_applicable",
+    }
+    if (
+        formal.get("status") != attestation_status
+        or terminal.get("status") not in valid_terminal_statuses
+        or legacy.get("status") not in valid_legacy_statuses
+    ):
+        raise ManifestError(
+            "manifest.json formal-state status contradicts its attestation"
+        )
+
+    mode = manifest.get("mode")
+    if mode != "all":
+        if (
+            formal["status"] != "not_applicable"
+            or terminal["status"] != "not_applicable"
+            or legacy["status"] != "not_applicable"
+            or terminal.get("file_type") is not None
+            or terminal.get("size_bytes") is not None
+            or terminal.get("sha256") is not None
+        ):
+            raise ManifestError(
+                "manifest.json split mode claims terminal evidence"
+            )
+        return False
+
+    if terminal["status"] != "verified":
+        if (
+            terminal.get("file_type") is not None
+            or terminal.get("size_bytes") is not None
+            or terminal.get("sha256") is not None
+        ):
+            raise ManifestError(
+                "manifest.json binds unavailable terminal evidence"
+            )
+        if formal["status"] == "verified":
+            raise ManifestError(
+                "manifest.json verifies an unavailable terminal artifact"
+            )
+        return False
+
+    size = terminal.get("size_bytes")
+    digest = terminal.get("sha256")
+    if (
+        terminal.get("file_type") != "regular"
+        or not is_int(size)
+        or size <= 0
+        or size > MAX_TERMINAL_EVIDENCE_STATE_BYTES
+        or not isinstance(digest, str)
+        or HEX_64.fullmatch(digest) is None
+        or legacy.get("status") != "absent"
+    ):
+        raise ManifestError(
+            "manifest.json has an invalid terminal evidence binding"
+        )
+    actual_size, actual_digest = inspect_terminal_evidence(state_dir)
+    if size != actual_size or digest != actual_digest:
+        raise ManifestError(
+            "terminal_evidence.state does not match its manifest binding"
+        )
+    if formal["status"] != "verified":
+        return False
+    return True
+
+
 def load_authoritative_manifest(
     result_dir: pathlib.Path,
 ) -> tuple[dict[str, Any], str]:
@@ -568,6 +831,10 @@ def load_authoritative_manifest(
         phases[name] == "passed" for name in formal_phase_names
     )
     by_name = {item["name"]: item for item in required}
+    formal_state_verified = validate_formal_state(
+        manifest,
+        by_name["formal_state_chain"]["status"],
+    )
     expected_configuration_status = (
         "not_applicable"
         if mode != "all"
@@ -640,6 +907,7 @@ def load_authoritative_manifest(
         and mode == "all"
         and ranked_configuration
         and all_required_verified
+        and formal_state_verified
     )
     if ranking_eligible != eligible_shape:
         raise ManifestError("manifest.json ranking eligibility contradicts attestations")
@@ -780,6 +1048,29 @@ def render_manifest(summary: list[str], manifest: dict[str, Any]) -> None:
     )
     for item in manifest["attestations"]["required"]:
         summary.append(f"- attestation.{item['name']}: {item['status']}")
+    formal = manifest["formal_state"]
+    terminal = formal["terminal_evidence"]
+    legacy = formal["legacy_run_ledger"]
+    summary.extend(
+        [
+            f"- terminal_evidence.path: `{terminal['path']}`",
+            f"- terminal_evidence.status: {terminal['status']}",
+            f"- terminal_evidence.file_type: {terminal['file_type']}",
+            f"- terminal_evidence.open_policy: {terminal['open_policy']}",
+            f"- terminal_evidence.size_bytes: {terminal['size_bytes']}",
+            (
+                "- terminal_evidence.max_size_bytes: "
+                f"{terminal['max_size_bytes']}"
+            ),
+            f"- terminal_evidence.sha256: {terminal['sha256']}",
+            f"- legacy_run_ledger.path: `{legacy['path']}`",
+            f"- legacy_run_ledger.status: {legacy['status']}",
+            (
+                "- legacy_run_ledger.inspection_policy: "
+                f"{legacy['inspection_policy']}"
+            ),
+        ]
+    )
     for warning in manifest.get("warnings", []):
         if isinstance(warning, dict):
             summary.append(

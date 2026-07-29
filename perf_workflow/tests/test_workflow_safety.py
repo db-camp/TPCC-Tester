@@ -55,6 +55,34 @@ class WorkflowSafetyTests(unittest.TestCase):
                 "size_bytes": len(rank_bytes),
                 "sha256": hashlib.sha256(rank_bytes).hexdigest(),
             }
+        state_dir = result_dir / "state"
+        state_dir.mkdir(exist_ok=True)
+        terminal_path = state_dir / "terminal_evidence.state"
+        terminal_descriptor = {
+            "path": str(terminal_path),
+            "status": "missing",
+            "file_type": None,
+            "open_policy": "state_dir_fd_o_nofollow_sha256_v1",
+            "size_bytes": None,
+            "max_size_bytes": (
+                16 * 1024 * 1024 + 128 + 4 * 1024
+            ),
+            "sha256": None,
+        }
+        if attestation_status == "verified":
+            terminal_bytes = b"summary terminal evidence fixture\n"
+            terminal_path.write_bytes(terminal_bytes)
+            terminal_descriptor.update(
+                status="verified",
+                file_type="regular",
+                size_bytes=len(terminal_bytes),
+                sha256=hashlib.sha256(terminal_bytes).hexdigest(),
+            )
+        else:
+            try:
+                terminal_path.unlink()
+            except FileNotFoundError:
+                pass
         required = [
             {
                 "name": name,
@@ -84,7 +112,7 @@ class WorkflowSafetyTests(unittest.TestCase):
                 ("formal_workflow_phases", "shell_phase_receipts_v1"),
                 (
                     "formal_state_chain",
-                    "tpcc_tester_read_only_state_attestation_v1",
+                    "tpcc_tester_terminal_evidence_attestation_v2",
                 ),
             )
         ]
@@ -153,7 +181,7 @@ class WorkflowSafetyTests(unittest.TestCase):
             "paths": {
                 "database": str(database_path),
                 "result": str(result_dir.resolve()),
-                "state": str(result_dir / "state"),
+                "state": str(state_dir),
                 "tpcc_tester": str(tester_source),
             },
             "database_identity": {
@@ -190,6 +218,15 @@ class WorkflowSafetyTests(unittest.TestCase):
                 "diagnostics": "not_requested",
             },
             "rank_result": rank_result,
+            "formal_state": {
+                "status": attestation_status,
+                "terminal_evidence": terminal_descriptor,
+                "legacy_run_ledger": {
+                    "path": str(state_dir / "run_ledger.state"),
+                    "status": "absent",
+                    "inspection_policy": "state_dir_fd_lstat_only_v1",
+                },
+            },
             "diagnostics": {
                 "requested": False,
                 "ranked": False,
@@ -262,6 +299,152 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.assertIn("Ranked Metrics", result.stdout)
             self.assertIn("Throughput: 12345 txn/s", result.stdout)
             self.assertIn("tpmC: 67890", result.stdout)
+            terminal_path = (
+                result_dir / "state" / "terminal_evidence.state"
+            )
+            self.assertIn(
+                f"terminal_evidence.path: `{terminal_path}`",
+                result.stdout,
+            )
+            self.assertIn(
+                "terminal_evidence.file_type: regular",
+                result.stdout,
+            )
+            self.assertIn(
+                "terminal_evidence.open_policy: "
+                "state_dir_fd_o_nofollow_sha256_v1",
+                result.stdout,
+            )
+            self.assertIn(
+                "legacy_run_ledger.status: absent",
+                result.stdout,
+            )
+
+    def test_summary_revalidates_terminal_evidence_bytes_and_file_shape(self):
+        def remove_terminal(path):
+            path.unlink()
+
+        def tamper_terminal(path):
+            with path.open("ab") as output:
+                output.write(b"tampered after manifest publication\n")
+
+        def symlink_terminal(path):
+            target = path.with_name("terminal-evidence-target")
+            target.write_bytes(b"unsafe symlink target\n")
+            path.unlink()
+            path.symlink_to(target)
+
+        def oversize_terminal(path):
+            with path.open("wb") as output:
+                output.truncate(
+                    16 * 1024 * 1024 + 128 + 4 * 1024 + 1
+                )
+
+        for label, mutate in (
+            ("missing", remove_terminal),
+            ("tampered", tamper_terminal),
+            ("symlink", symlink_terminal),
+            ("oversized", oversize_terminal),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                result_dir = Path(temp)
+                self.write_summary_manifest(
+                    result_dir,
+                    status="success",
+                    ranking_eligible=True,
+                    conformance="public_spec_aligned",
+                    attestation_status="verified",
+                    rank_text="Throughput: 12345 txn/s\n",
+                )
+                mutate(
+                    result_dir / "state" / "terminal_evidence.state"
+                )
+                result = self.run_summary(result_dir)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn(
+                    "metrics: suppressed",
+                    result.stdout.lower(),
+                )
+                self.assertNotIn("12345", result.stdout)
+
+    def test_summary_rejects_every_legacy_run_ledger_shape_without_reading_it(self):
+        def create_legacy(state_dir, mode):
+            legacy = state_dir / "run_ledger.state"
+            if mode == "file":
+                legacy.write_bytes(b"legacy bytes must remain unread\n")
+            elif mode == "directory":
+                legacy.mkdir()
+            elif mode == "symlink":
+                target = state_dir / "run-ledger-target"
+                target.write_bytes(b"legacy target\n")
+                legacy.symlink_to(target)
+            else:
+                legacy.symlink_to(state_dir / "missing-ledger-target")
+            return legacy
+
+        for mode in ("file", "directory", "symlink", "dangling_symlink"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                result_dir = Path(temp)
+                self.write_summary_manifest(
+                    result_dir,
+                    status="success",
+                    ranking_eligible=True,
+                    conformance="public_spec_aligned",
+                    attestation_status="verified",
+                    rank_text="Throughput: 12345 txn/s\n",
+                )
+                legacy = create_legacy(result_dir / "state", mode)
+                result = self.run_summary(result_dir)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertNotIn("12345", result.stdout)
+                self.assertTrue(os.path.lexists(legacy))
+
+    def test_summary_rejects_terminal_descriptor_inconsistency(self):
+        mutations = {
+            "path": lambda descriptor: descriptor.update(
+                path="/tmp/not-terminal-evidence.state"
+            ),
+            "size": lambda descriptor: descriptor.update(
+                size_bytes=descriptor["size_bytes"] + 1
+            ),
+            "digest": lambda descriptor: descriptor.update(
+                sha256="0" * 64
+            ),
+            "maximum": lambda descriptor: descriptor.update(
+                max_size_bytes=32 * 1024 * 1024
+            ),
+            "file type": lambda descriptor: descriptor.update(
+                file_type="symlink"
+            ),
+            "open policy": lambda descriptor: descriptor.update(
+                open_policy="path_open_v0"
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                result_dir = Path(temp)
+                self.write_summary_manifest(
+                    result_dir,
+                    status="success",
+                    ranking_eligible=True,
+                    conformance="public_spec_aligned",
+                    attestation_status="verified",
+                    rank_text="Throughput: 12345 txn/s\n",
+                )
+                manifest_path = result_dir / "manifest.json"
+                manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                mutate(
+                    manifest["formal_state"]["terminal_evidence"]
+                )
+                manifest_path.write_text(
+                    json.dumps(manifest),
+                    encoding="utf-8",
+                )
+                result = self.run_summary(result_dir)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertNotIn("12345", result.stdout)
 
     def test_summary_rejects_corrupt_or_symlinked_authority(self):
         with tempfile.TemporaryDirectory() as temp:
