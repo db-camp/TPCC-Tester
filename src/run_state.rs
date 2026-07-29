@@ -400,6 +400,11 @@ impl DatasetState {
                 "dataset partition totals do not match global totals".to_owned(),
             ));
         }
+        self.validate_setup_evidence_binding()?;
+        Ok(())
+    }
+
+    pub fn validate_setup_evidence_binding(&self) -> Result<(), StateError> {
         self.setup_evidence
             .validate_binding(
                 self.warehouses,
@@ -407,8 +412,7 @@ impl DatasetState {
                 self.runtime_schema.fingerprint(),
                 &self.generated_csv_sha256,
             )
-            .map_err(|error| StateError::Invalid(format!("invalid setup evidence: {error}")))?;
-        Ok(())
+            .map_err(|error| StateError::Invalid(format!("invalid setup evidence: {error}")))
     }
 
     fn encode(&self) -> String {

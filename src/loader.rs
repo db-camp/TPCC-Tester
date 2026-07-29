@@ -67,10 +67,6 @@ impl MaterializedLoad {
     pub fn assets(&self) -> impl Iterator<Item = &CsvAsset> {
         self.assets.values()
     }
-
-    pub const fn dataset_checksum(&self) -> [u8; 32] {
-        self.dataset_checksum
-    }
 }
 
 impl<'a> Loader<'a> {

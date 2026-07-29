@@ -30,6 +30,9 @@ pub type FloatBaseline = BTreeMap<FloatAggregateId, u32>;
 const PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT: usize = 64;
 
 pub async fn run_setup(client: &mut RmdbClient, dataset: &DatasetState) -> Result<(), TpccError> {
+    dataset
+        .validate_setup_evidence_binding()
+        .map_err(|error| protocol_error("invalid persisted setup evidence", error))?;
     let plan = scheduled_setup_plan(dataset)?;
     run_plan(client, &plan, &dataset.runtime_schema).await?;
     run_setup_sample_checks(client, dataset.setup_evidence(), &dataset.runtime_schema).await
@@ -1528,8 +1531,11 @@ fn terminated_sql(sql: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::loader::{LoadSummary, PartitionLoadSummary};
+    use crate::runtime_schema::LogicalTable;
     use crate::sample_evidence::setup_evidence_fixture;
 
     fn smoke_dataset(warehouses: i32) -> DatasetState {
@@ -1822,6 +1828,51 @@ mod tests {
             evidence.anchors.len(),
             "history is checked in one bounded scan, not one full scan per anchor"
         );
+    }
+
+    #[test]
+    fn every_setup_sample_query_renders_only_opaque_runtime_identifiers() {
+        let evidence = setup_evidence_fixture(50, 2026);
+        let schema = RuntimeSchema::opaque(2026).unwrap();
+        let canonical_identifiers = LogicalTable::ALL
+            .iter()
+            .flat_map(|table| {
+                std::iter::once(table.canonical()).chain(table.columns().iter().copied())
+            })
+            .collect::<BTreeSet<_>>();
+
+        for query in setup_sample_queries(&evidence).unwrap() {
+            let rendered = schema.render_sql(&query.sql);
+            assert_ne!(rendered, query.sql, "{} was not rendered", query.id);
+            let rendered_tokens = rendered
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .filter(|token| !token.is_empty())
+                .collect::<BTreeSet<_>>();
+            assert!(
+                canonical_identifiers.is_disjoint(&rendered_tokens),
+                "{} leaked a canonical identifier after rendering",
+                query.id
+            );
+        }
+    }
+
+    #[test]
+    fn setup_order_sum_is_derived_once_from_persisted_raw_float_bits() {
+        let evidence = setup_evidence_fixture(50, 2026);
+        let first = &evidence.anchors[0];
+        let expected_bits =
+            sum_f32_as_f64_once(first.lines.iter().map(|line| line.amount_bits)).unwrap();
+        let query = setup_sample_queries(&evidence)
+            .unwrap()
+            .into_iter()
+            .find(|query| query.id == "setup.sample.undelivered_order_sum")
+            .unwrap();
+        assert!(query.expected_rows.contains(&vec![
+            TypedValue::Int32(first.order.warehouse_id),
+            TypedValue::Int32(first.order.district_id),
+            TypedValue::Int32(first.order.id),
+            TypedValue::Float32(expected_bits),
+        ]));
     }
 
     #[test]
