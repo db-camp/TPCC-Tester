@@ -154,6 +154,12 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --tpcc-bin /absolute/path/to/tpcc-tester
 ```
 
+`--tpcc-bin`、`--skip-build` 或外部 TPCC-Tester 源码根只适合本地诊断。
+任意已有 tester 都可能伪造 formal attestation 的退出状态，因此这三种路径不会
+获得 `trusted_tester_binary` 必需证明，也绝不会产生排名资格。正式路径必须由
+当前工作流源码根在本次调用中 fresh build tester；工作流会密封其
+device/inode/size/SHA-256，并在每次执行前复核。
+
 ## 安全边界
 
 - 默认 RMDB 根目录是 `perf_workflow/` 向上三级；可用 `--target-dir` 显式覆盖。
@@ -190,12 +196,15 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 - 成功后的 `summary.md`。
 
 `manifest.json` 使用通用 required-attestations 列表。只有公开配置精确匹配、
-数据库身份为 opaque + sealed、五个正式阶段均通过，并且 Rust 对完整正式状态链
-的只读验证成功，且工作流最终状态为 `success` 时，才同时给出
+本次 fresh build 的可信 tester 二进制通过 provenance 密封、数据库身份为
+opaque + sealed、五个正式阶段均通过，并且 Rust 对完整正式状态链的只读验证
+成功，且工作流最终状态为 `success` 时，才同时给出
 `conformance=public_spec_aligned` 和 `ranking_eligible=true`。缺失、损坏或
 符号链接状态工件会使正式 attestation 失败；显式偏差、`init`/`rank`/`recovery`
 拆分模式和 `tools` 始终非排名。`summary.md` 只从 `manifest.json` 生成，不读取
-旧式文本 manifest；manifest 缺失、损坏、自相矛盾或状态非成功时不会抽取吞吐。
+旧式文本 manifest；只有 size/SHA-256 与 manifest 绑定一致的 `rank.log` 可以
+提供吞吐，profiling 日志始终只是 observation。manifest 缺失、损坏、自相矛盾
+或状态非成功时不会抽取吞吐。
 
 资源工件始终标记 `ranked=false`、`score_effect=none`。RSS 是登记 RMDB
 进程树在固定周期采样时的总和峰值；磁盘占用使用 `lstat`/allocated blocks，

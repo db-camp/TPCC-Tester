@@ -63,9 +63,10 @@ class WorkflowSafetyTests(unittest.TestCase):
                     "verified"
                     if name
                     in {
-                        "public_configuration",
-                        "opaque_sealed_database",
-                    }
+                    "public_configuration",
+                    "opaque_sealed_database",
+                    "trusted_tester_binary",
+                }
                     else attestation_status
                 ),
                 "validator": validator,
@@ -74,6 +75,10 @@ class WorkflowSafetyTests(unittest.TestCase):
                 (
                     "public_configuration",
                     "workflow_exact_public_profile_and_mode",
+                ),
+                (
+                    "trusted_tester_binary",
+                    "fresh_workflow_source_binary_sha256_v1",
                 ),
                 ("opaque_sealed_database", "database_identity_v2"),
                 ("formal_workflow_phases", "shell_phase_receipts_v1"),
@@ -101,6 +106,20 @@ class WorkflowSafetyTests(unittest.TestCase):
             "conformance": conformance,
             "ranking_eligible": ranking_eligible,
             "ranked_configuration": True,
+            "tester_binary": {
+                "status": "verified_fresh_build",
+                "path": str(result_dir / "tpcc-tester"),
+                "sha256": "5" * 64,
+                "filesystem": {
+                    "device": 1,
+                    "inode": 3,
+                    "size_bytes": 4096,
+                },
+                "source_matches_workflow": True,
+                "built_this_invocation": True,
+                "binary_override": False,
+                "skip_build": False,
+            },
             "attestations": {
                 "policy": "all_required_must_be_verified",
                 "required": required,
@@ -306,6 +325,13 @@ class WorkflowSafetyTests(unittest.TestCase):
             ),
             "active deviation": lambda manifest: manifest["effective"].update(
                 deviation_active=True,
+            ),
+            "untrusted tester": lambda manifest: manifest[
+                "tester_binary"
+            ].update(
+                status="untrusted_binary_override",
+                built_this_invocation=False,
+                binary_override=True,
             ),
             "unfinished phase": lambda manifest: manifest["phases"].update(
                 recovery="failed",
@@ -3767,12 +3793,15 @@ while :; do sleep 0.05; done
                 if proc_delta["status"] == "available"
                 else "failed"
             )
-            self.assertEqual(manifest["conformance"], "public_spec_aligned")
+            self.assertEqual(
+                manifest["conformance"],
+                "not_public_spec_aligned",
+            )
             self.assertEqual(manifest["schema_version"], 3)
             self.assertEqual(manifest["authority"], "manifest.json")
             self.assertFalse(manifest["embeds_unpublished_official_values"])
             self.assertEqual(manifest["status"], "success")
-            self.assertTrue(manifest["ranking_eligible"])
+            self.assertFalse(manifest["ranking_eligible"])
             self.assertEqual(
                 {
                     item["name"]: item["status"]
@@ -3780,6 +3809,7 @@ while :; do sleep 0.05; done
                 },
                 {
                     "public_configuration": "verified",
+                    "trusted_tester_binary": "failed",
                     "opaque_sealed_database": "verified",
                     "formal_workflow_phases": "verified",
                     "formal_state_chain": "verified",
@@ -3843,6 +3873,20 @@ while :; do sleep 0.05; done
                 ]
             )
             self.assertTrue(manifest["ranked_configuration"])
+            self.assertEqual(
+                manifest["tester_binary"]["status"],
+                "untrusted_binary_override",
+            )
+            self.assertTrue(
+                manifest["tester_binary"]["binary_override"],
+            )
+            self.assertFalse(
+                manifest["tester_binary"]["built_this_invocation"],
+            )
+            self.assertRegex(
+                manifest["tester_binary"]["sha256"],
+                r"^[0-9a-f]{64}$",
+            )
             self.assertEqual(
                 manifest["seed"],
                 {
@@ -4082,9 +4126,9 @@ while :; do sleep 0.05; done
                     )
                     self.assertEqual(
                         diagnostic_failure_manifest["conformance"],
-                        "public_spec_aligned",
+                        "not_public_spec_aligned",
                     )
-                    self.assertTrue(
+                    self.assertFalse(
                         diagnostic_failure_manifest["ranking_eligible"]
                     )
                     self.assertEqual(

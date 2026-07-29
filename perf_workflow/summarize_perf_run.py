@@ -16,12 +16,14 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024
 CORE_RANKING_ATTESTATIONS = {
     "public_configuration",
+    "trusted_tester_binary",
     "opaque_sealed_database",
     "formal_workflow_phases",
     "formal_state_chain",
 }
 CORE_ATTESTATION_VALIDATORS = {
     "public_configuration": "workflow_exact_public_profile_and_mode",
+    "trusted_tester_binary": "fresh_workflow_source_binary_sha256_v1",
     "opaque_sealed_database": "database_identity_v2",
     "formal_workflow_phases": "shell_phase_receipts_v1",
     "formal_state_chain": "tpcc_tester_read_only_state_attestation_v1",
@@ -317,6 +319,73 @@ def validate_observation_metadata(manifest: dict[str, Any]) -> None:
             raise ManifestError("manifest.json has a ranked warning")
 
 
+def validate_tester_binary(manifest: dict[str, Any]) -> bool:
+    tester = manifest.get("tester_binary")
+    if not isinstance(tester, dict):
+        raise ManifestError("manifest.json is missing tester binary provenance")
+    status = tester.get("status")
+    if status not in {
+        "pending_fresh_build",
+        "verified_fresh_build",
+        "untrusted_binary_override",
+        "unverified_prebuilt_binary",
+        "external_source_root",
+    }:
+        raise ManifestError("manifest.json has invalid tester binary provenance")
+    if not isinstance(tester.get("path"), str) or not tester["path"]:
+        raise ManifestError("manifest.json has an invalid tester binary path")
+    for name in (
+        "source_matches_workflow",
+        "built_this_invocation",
+        "binary_override",
+        "skip_build",
+    ):
+        if not isinstance(tester.get(name), bool):
+            raise ManifestError(
+                f"manifest.json has an invalid tester binary {name}"
+            )
+    filesystem = tester.get("filesystem")
+    if not isinstance(filesystem, dict):
+        raise ManifestError("manifest.json has incomplete tester binary identity")
+    digest = tester.get("sha256")
+    has_identity = (
+        isinstance(digest, str)
+        and HEX_64.fullmatch(digest) is not None
+        and is_int(filesystem.get("device"))
+        and filesystem["device"] > 0
+        and is_int(filesystem.get("inode"))
+        and filesystem["inode"] > 0
+        and is_int(filesystem.get("size_bytes"))
+        and filesystem["size_bytes"] > 0
+    )
+    trusted = (
+        status == "verified_fresh_build"
+        and has_identity
+        and tester["source_matches_workflow"] is True
+        and tester["built_this_invocation"] is True
+        and tester["binary_override"] is False
+        and tester["skip_build"] is False
+    )
+    if status == "verified_fresh_build" and not trusted:
+        raise ManifestError("manifest.json has invalid trusted tester provenance")
+    if status == "pending_fresh_build":
+        if (
+            digest is not None
+            or any(
+                filesystem.get(name) is not None
+                for name in ("device", "inode", "size_bytes")
+            )
+            or tester["source_matches_workflow"] is not True
+            or tester["built_this_invocation"] is not False
+            or tester["binary_override"] is not False
+            or tester["skip_build"] is not False
+        ):
+            raise ManifestError("manifest.json has invalid pending tester provenance")
+    elif not has_identity:
+        raise ManifestError("manifest.json has unbound tester binary provenance")
+    return trusted
+
+
 def validate_rank_result(manifest: dict[str, Any]) -> dict[str, Any]:
     rank_result = manifest.get("rank_result")
     if not isinstance(rank_result, dict):
@@ -477,6 +546,7 @@ def load_authoritative_manifest(
 
     exact_public_configuration = validate_effective_configuration(manifest)
     identity_verified = validate_database_identity(manifest, result_dir)
+    tester_binary_verified = validate_tester_binary(manifest)
     validate_observation_metadata(manifest)
     rank_result = validate_rank_result(manifest)
 
@@ -512,6 +582,18 @@ def load_authoritative_manifest(
         )
         else "failed"
     )
+    expected_tester_status = (
+        "not_applicable"
+        if mode != "all"
+        else "verified"
+        if tester_binary_verified
+        else "pending"
+        if (
+            status == "running"
+            and manifest["tester_binary"]["status"] == "pending_fresh_build"
+        )
+        else "failed"
+    )
     expected_phase_status = (
         "not_applicable"
         if mode != "all"
@@ -529,6 +611,7 @@ def load_authoritative_manifest(
     )
     for name, expected in (
         ("public_configuration", expected_configuration_status),
+        ("trusted_tester_binary", expected_tester_status),
         ("opaque_sealed_database", expected_identity_status),
         ("formal_workflow_phases", expected_phase_status),
     ):

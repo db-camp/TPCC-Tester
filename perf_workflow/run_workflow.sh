@@ -50,6 +50,14 @@ WINDOW_SECONDS=""
 SERVER_BIN_OVERRIDE=""
 TPCC_BIN_OVERRIDE=""
 STATE_DIR_OVERRIDE=""
+TESTER_TRUSTED_BUILD_REQUESTED=0
+TESTER_BINARY_PROVENANCE_STATUS="uninitialized"
+TESTER_BINARY_SHA256=""
+TESTER_BINARY_DEVICE=""
+TESTER_BINARY_INODE=""
+TESTER_BINARY_SIZE=""
+TESTER_SOURCE_MATCHES_WORKFLOW=0
+TESTER_BINARY_OVERRIDE_ACTIVE=0
 
 SERVER_PID=""
 SERVER_PGID=""
@@ -1439,6 +1447,9 @@ RMDB_DIR="$(canonical_existing_dir "${RMDB_DIR}")" \
 TPCC_DIR="$(canonical_existing_dir "${TPCC_DIR}")" \
   || die "TPCC-Tester root does not exist: ${TPCC_DIR}"
 [[ "${RMDB_DIR}" != "/" ]] || die "refusing to use filesystem root as RMDB root"
+if [[ "${TPCC_DIR}" == "${DEFAULT_TPCC_DIR}" ]]; then
+  TESTER_SOURCE_MATCHES_WORKFLOW=1
+fi
 if [[ -n "${SERVER_BIN_OVERRIDE}" ]]; then
   SERVER_BIN_OVERRIDE="$(canonical_existing_file "${SERVER_BIN_OVERRIDE}")" \
     || die "--server-bin does not name an existing regular file"
@@ -1446,6 +1457,17 @@ fi
 if [[ -n "${TPCC_BIN_OVERRIDE}" ]]; then
   TPCC_BIN_OVERRIDE="$(canonical_existing_file "${TPCC_BIN_OVERRIDE}")" \
     || die "--tpcc-bin does not name an existing regular file"
+fi
+if [[ -n "${TPCC_BIN_OVERRIDE}" ]]; then
+  TESTER_BINARY_OVERRIDE_ACTIVE=1
+  TESTER_BINARY_PROVENANCE_STATUS="untrusted_binary_override"
+elif [[ "${SKIP_BUILD}" == "1" ]]; then
+  TESTER_BINARY_PROVENANCE_STATUS="unverified_prebuilt_binary"
+elif [[ "${TESTER_SOURCE_MATCHES_WORKFLOW}" != "1" ]]; then
+  TESTER_BINARY_PROVENANCE_STATUS="external_source_root"
+else
+  TESTER_TRUSTED_BUILD_REQUESTED=1
+  TESTER_BINARY_PROVENANCE_STATUS="pending_fresh_build"
 fi
 if [[ -n "${STATE_DIR_OVERRIDE}" ]]; then
   STATE_DIR_OVERRIDE="$(canonical_existing_dir "${STATE_DIR_OVERRIDE}")" \
@@ -1615,6 +1637,8 @@ rmdb_dir=${RMDB_DIR}
 tpcc_dir=${TPCC_DIR}
 rmdb_sha=${RMDB_SHA}
 tpcc_tester_sha=${TPCC_SHA}
+tester_binary_provenance=${TESTER_BINARY_PROVENANCE_STATUS}
+tester_binary_trusted_build_requested=${TESTER_TRUSTED_BUILD_REQUESTED}
 build_dir=${RMDB_DIR}/${BUILD_DIR}
 server_bin=${SERVER_BIN}
 tpcc_bin=${TPCC_BIN}
@@ -1707,7 +1731,13 @@ write_manifest() {
     "${DIAGNOSTICS_REQUESTED}" "${DIAGNOSTIC_WARMUP_SECONDS}" \
     "${DIAGNOSTIC_OBSERVATION_SECONDS}" "${RESOURCE_STATUS}" \
     "${RESOURCE_INTERVAL_MS}" "${RESOURCE_METRICS}" \
-    "${FORMAL_STATE_ATTESTATION_STATUS}" <<'PY'
+    "${FORMAL_STATE_ATTESTATION_STATUS}" \
+    "${TESTER_BINARY_PROVENANCE_STATUS}" "${TPCC_BIN}" \
+    "${TESTER_BINARY_SHA256}" "${TESTER_BINARY_DEVICE}" \
+    "${TESTER_BINARY_INODE}" "${TESTER_BINARY_SIZE}" \
+    "${TESTER_SOURCE_MATCHES_WORKFLOW}" \
+    "${TESTER_BINARY_OVERRIDE_ACTIVE}" \
+    "${SKIP_BUILD}" <<'PY'
 import json
 import hashlib
 import os
@@ -1764,6 +1794,15 @@ import sys
     resource_interval_ms,
     resource_metrics_path,
     formal_state_attestation_status,
+    tester_binary_provenance_status,
+    tester_binary_path,
+    tester_binary_sha256,
+    tester_binary_device,
+    tester_binary_inode,
+    tester_binary_size,
+    tester_source_matches_workflow,
+    tester_binary_override,
+    skip_build,
 ) = sys.argv[1:]
 
 artifact_names = {
@@ -2023,6 +2062,34 @@ database_identity = {
 }
 
 rank_result = describe_rank_result()
+tester_binary_verified = (
+    tester_binary_provenance_status == "verified_fresh_build"
+    and tester_source_matches_workflow == "1"
+    and tester_binary_override != "1"
+    and skip_build != "1"
+    and len(tester_binary_sha256) == 64
+    and bool(tester_binary_device)
+    and bool(tester_binary_inode)
+    and bool(tester_binary_size)
+)
+tester_binary = {
+    "status": tester_binary_provenance_status,
+    "path": tester_binary_path,
+    "sha256": tester_binary_sha256 or None,
+    "filesystem": {
+        "device": (
+            int(tester_binary_device) if tester_binary_device else None
+        ),
+        "inode": int(tester_binary_inode) if tester_binary_inode else None,
+        "size_bytes": int(tester_binary_size) if tester_binary_size else None,
+    },
+    "source_matches_workflow": tester_source_matches_workflow == "1",
+    "built_this_invocation": (
+        tester_binary_provenance_status == "verified_fresh_build"
+    ),
+    "binary_override": tester_binary_override == "1",
+    "skip_build": skip_build == "1",
+}
 formal_phases = {
     "setup": phase_setup,
     "rank": phase_rank,
@@ -2080,6 +2147,10 @@ formal_attestation_status = (
 )
 if mode != "all":
     formal_attestation_status = "not_applicable"
+tester_attestation_status = required_status(
+    tester_binary_verified,
+    tester_binary_provenance_status == "pending_fresh_build",
+)
 
 required_attestations = [
     {
@@ -2087,6 +2158,12 @@ required_attestations = [
         "required_for_ranking": True,
         "status": configuration_status,
         "validator": "workflow_exact_public_profile_and_mode",
+    },
+    {
+        "name": "trusted_tester_binary",
+        "required_for_ranking": True,
+        "status": tester_attestation_status,
+        "validator": "fresh_workflow_source_binary_sha256_v1",
     },
     {
         "name": "opaque_sealed_database",
@@ -2153,6 +2230,7 @@ payload = {
     "dataset_run_id": dataset_run_id,
     "profile": profile,
     "ranked_configuration": ranked_configuration == "1",
+    "tester_binary": tester_binary,
     "ranking_eligible": ranking_eligible,
     "attestations": {
         "policy": "all_required_must_be_verified",
@@ -3972,6 +4050,81 @@ portable_jobs() {
   printf '%s\n' "${jobs}"
 }
 
+tester_binary_identity() {
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+metadata = path.lstat()
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("tester binary is not a real regular file")
+flags = os.O_RDONLY
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = os.open(path, flags)
+try:
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_dev != metadata.st_dev
+        or opened.st_ino != metadata.st_ino
+        or opened.st_size != metadata.st_size
+    ):
+        raise SystemExit("tester binary changed while opening")
+    digest = hashlib.sha256()
+    remaining = opened.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        digest.update(chunk)
+        remaining -= len(chunk)
+    final = os.fstat(descriptor)
+    if (
+        remaining != 0
+        or final.st_dev != opened.st_dev
+        or final.st_ino != opened.st_ino
+        or final.st_size != opened.st_size
+        or final.st_mtime_ns != opened.st_mtime_ns
+    ):
+        raise SystemExit("tester binary changed while hashing")
+    print(
+        f"{opened.st_dev}\t{opened.st_ino}\t"
+        f"{opened.st_size}\t{digest.hexdigest()}"
+    )
+finally:
+    os.close(descriptor)
+PY
+}
+
+capture_tester_binary_provenance() {
+  local identity=""
+  identity="$(tester_binary_identity "${TPCC_BIN}")" \
+    || die "could not bind the tpcc-tester binary"
+  IFS=$'\t' read -r TESTER_BINARY_DEVICE TESTER_BINARY_INODE \
+    TESTER_BINARY_SIZE TESTER_BINARY_SHA256 <<<"${identity}"
+  if [[ "${TESTER_TRUSTED_BUILD_REQUESTED}" == "1" ]]; then
+    TESTER_BINARY_PROVENANCE_STATUS="verified_fresh_build"
+  fi
+}
+
+assert_tester_binary_unchanged() {
+  local identity=""
+  local expected=""
+  [[ "${TESTER_BINARY_PROVENANCE_STATUS}" == "verified_fresh_build" ]] \
+    || return 0
+  identity="$(tester_binary_identity "${TPCC_BIN}")" \
+    || die "trusted tpcc-tester binary became unsafe"
+  expected="${TESTER_BINARY_DEVICE}"$'\t'"${TESTER_BINARY_INODE}"$'\t'
+  expected+="${TESTER_BINARY_SIZE}"$'\t'"${TESTER_BINARY_SHA256}"
+  [[ "${identity}" == "${expected}" ]] \
+    || die "trusted tpcc-tester binary changed after its provenance seal"
+}
+
 ensure_binaries() {
   if [[ "${SKIP_BUILD}" != "1" ]]; then
     if [[ -z "${TPCC_BIN_OVERRIDE}" ]]; then
@@ -3994,6 +4147,8 @@ ensure_binaries() {
   fi
   [[ -x "${TPCC_BIN}" ]] || die "tpcc-tester is not executable: ${TPCC_BIN}"
   [[ -x "${SERVER_BIN}" ]] || die "RMDB server is not executable: ${SERVER_BIN}"
+  capture_tester_binary_provenance
+  write_manifest
 }
 
 ensure_port_available() {
@@ -4004,6 +4159,7 @@ ensure_port_available() {
 
 probe_ready() {
   local absolute_deadline_nanos="$1"
+  assert_tester_binary_unchanged
   python3 - "${absolute_deadline_nanos}" "${TPCC_DIR}" "${TPCC_BIN}" \
     "${HOST}" "${PORT}" <<'PY' >>"${RESULT_DIR}/ready_probe.log" 2>&1 &
 import os
@@ -4414,6 +4570,7 @@ run_tester() {
   local log_path="$1"
   local -a tester_environment
   shift
+  assert_tester_binary_unchanged
   tester_environment=(
     "RMDB_TPCC_CSV_DIR=${CSV_DIR}"
     "RMDB_TPCC_LOAD_DIR=${LOAD_DIR}"
