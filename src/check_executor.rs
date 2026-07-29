@@ -532,6 +532,11 @@ pub async fn run_final_recovery_from_terminal_evidence(
     validate_terminal_evidence(evidence).map_err(|_| {
         TpccError::Protocol("recovery terminal evidence failed validation".to_owned())
     })?;
+    validate_terminal_dataset_binding(
+        dataset,
+        evidence.intervals().warehouses(),
+        evidence.intervals().sample_seed(),
+    )?;
     let expectations =
         bounded_recovery_expectations(dataset, evidence.stats(), initial_order_line_amounts)?;
     // Construct every bounded oracle before issuing the first query so a
@@ -670,6 +675,22 @@ fn validate_consistency_warehouse_count(warehouses: i32) -> Result<usize, TpccEr
         )));
     }
     Ok((warehouses * DISTRICTS_PER_WAREHOUSE) as usize)
+}
+
+fn validate_terminal_dataset_binding(
+    dataset: &DatasetState,
+    evidence_warehouses: u16,
+    evidence_seed: u64,
+) -> Result<(), TpccError> {
+    validate_consistency_warehouse_count(dataset.warehouses)?;
+    let dataset_warehouses = u16::try_from(dataset.warehouses)
+        .map_err(|_| TpccError::Protocol("recovery warehouse count exceeds UINT16".to_owned()))?;
+    if evidence_warehouses != dataset_warehouses || evidence_seed != dataset.seed {
+        return Err(TpccError::Protocol(
+            "terminal evidence is bound to a different recovery dataset".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -1822,6 +1843,14 @@ mod tests {
                 .len(),
             DISTRICTS_PER_WAREHOUSE as usize
         );
+    }
+
+    #[test]
+    fn terminal_recovery_binding_rejects_wrong_seed_or_scale() {
+        let dataset = smoke_dataset(1);
+        assert!(validate_terminal_dataset_binding(&dataset, 1, dataset.seed).is_ok());
+        assert!(validate_terminal_dataset_binding(&dataset, 1, dataset.seed ^ 1).is_err());
+        assert!(validate_terminal_dataset_binding(&dataset, 2, dataset.seed).is_err());
     }
 
     #[test]
