@@ -93,6 +93,15 @@ impl SystemMonotonicClock {
             epoch: Instant::now(),
         }
     }
+
+    /// Converts a scheduler-relative timestamp into the matching process
+    /// monotonic instant.  Executors use this to enforce one absolute timeout
+    /// around a complete multi-batch physical attempt.
+    pub fn instant_at(&self, timestamp: Duration) -> Result<Instant, SchedulerError> {
+        self.epoch
+            .checked_add(timestamp)
+            .ok_or(SchedulerError::ClockOverflow)
+    }
 }
 
 impl Default for SystemMonotonicClock {
@@ -431,6 +440,13 @@ pub enum SchedulerError {
     InvalidRuntimeLimit(&'static str),
     #[error("the retry's phase deadline has passed")]
     RetryDeadlinePassed,
+    #[error(
+        "terminal completion timestamp {completed_at:?} precedes attempt start {attempt_started_at:?}"
+    )]
+    CompletionBeforeAttempt {
+        completed_at: Duration,
+        attempt_started_at: Duration,
+    },
     #[error("the timeline has not reached its final absolute deadline")]
     TimelineIncomplete,
     #[error("at least one worker still has an in-flight transaction")]
@@ -744,35 +760,63 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         Ok(ticket)
     }
 
+    /// Returns the one absolute local deadline for the active physical attempt.
+    ///
+    /// The per-attempt response limit covers all of a transaction's batches,
+    /// while the phase-tail limit bounds how long an attempt selected before a
+    /// phase boundary may continue draining after that boundary.
+    pub fn attempt_deadline(&self, ticket: TransactionTicket) -> Result<Duration, SchedulerError> {
+        self.ensure_not_failed()?;
+        let worker_index = self.worker_index(ticket.worker())?;
+        let attempt_started_at = match self.workers[worker_index].selection {
+            Some(SelectionState::InFlight {
+                ticket: current,
+                attempt_started_at,
+            }) if current == ticket => attempt_started_at,
+            _ => return Err(SchedulerError::TicketMismatch(ticket.worker())),
+        };
+        let response_deadline = checked_add(attempt_started_at, self.limits.response_timeout)?;
+        let grace_deadline = checked_add(ticket.phase_deadline(), self.limits.phase_tail_grace)?;
+        Ok(response_deadline.min(grace_deadline))
+    }
+
     /// Handles a complete terminal response frame for one physical attempt.
     pub fn finish_attempt(
         &mut self,
         ticket: TransactionTicket,
         outcome: AttemptOutcome,
     ) -> Result<AttemptDisposition, SchedulerError> {
+        let completed_at = self.observe_now()?;
+        self.finish_attempt_at(ticket, outcome, completed_at)
+    }
+
+    /// Handles a terminal frame using the time sampled when that frame arrived.
+    ///
+    /// Executors must take this sample before waiting for the shared scheduler
+    /// mutex, otherwise lock contention can incorrectly turn an on-time
+    /// terminal into a grace-tail completion.
+    pub fn finish_attempt_at(
+        &mut self,
+        ticket: TransactionTicket,
+        outcome: AttemptOutcome,
+        completed_at: Duration,
+    ) -> Result<AttemptDisposition, SchedulerError> {
         let worker_index = self.worker_index(ticket.worker())?;
-        let now = self.observe_now()?;
-        self.sync_to(now)?;
+        self.sync_to(completed_at)?;
         self.ensure_not_failed()?;
 
-        match self.workers[worker_index].selection {
+        let attempt_started_at = match self.workers[worker_index].selection {
             Some(SelectionState::InFlight {
-                ticket: current, ..
-            }) if current == ticket => {}
+                ticket: current,
+                attempt_started_at,
+            }) if current == ticket => attempt_started_at,
             _ => return Err(SchedulerError::TicketMismatch(ticket.worker())),
-        }
-
-        if now >= ticket.phase_deadline() {
-            self.workers[worker_index].selection = None;
-            if let Some(index) = ticket.phase().formal_index() {
-                self.windows[index].record_grace_tail();
-            }
-            self.recorder.record(SchedulerEvent::TransactionFinished {
-                ticket,
-                class: CompletionClass::GraceTail,
-                at: now,
+        };
+        if completed_at < attempt_started_at {
+            return Err(SchedulerError::CompletionBeforeAttempt {
+                completed_at,
+                attempt_started_at,
             });
-            return Ok(AttemptDisposition::GraceTail);
         }
 
         let outcome_matches_identity = match outcome {
@@ -788,7 +832,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
                     "terminal outcome contradicts immutable transaction {} identity",
                     ticket.id()
                 ),
-                now,
+                completed_at,
             );
             return Err(SchedulerError::RunFailed(
                 self.failure
@@ -797,7 +841,20 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             ));
         }
 
-        let latency = now.saturating_sub(ticket.selected_at());
+        if completed_at >= ticket.phase_deadline() {
+            self.workers[worker_index].selection = None;
+            if let Some(index) = ticket.phase().formal_index() {
+                self.windows[index].record_grace_tail();
+            }
+            self.recorder.record(SchedulerEvent::TransactionFinished {
+                ticket,
+                class: CompletionClass::GraceTail,
+                at: completed_at,
+            });
+            return Ok(AttemptDisposition::GraceTail);
+        }
+
+        let latency = completed_at.saturating_sub(ticket.selected_at());
         let worker_state = &mut self.workers[worker_index];
         let (class, disposition) = match outcome {
             AttemptOutcome::Commit { delivery_processed } => {
@@ -836,7 +893,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         self.recorder.record(SchedulerEvent::TransactionFinished {
             ticket,
             class,
-            at: now,
+            at: completed_at,
         });
         Ok(disposition)
     }
@@ -1200,6 +1257,17 @@ mod tests {
         scheduler.start_transaction(reservation, identity).unwrap()
     }
 
+    fn start_expected_rollback(
+        scheduler: &mut TestScheduler,
+        worker: WorkerId,
+        fingerprint: u64,
+    ) -> TransactionTicket {
+        let reservation = scheduler.reserve_transaction(worker).unwrap();
+        let identity =
+            TransactionIdentity::new(TransactionType::NewOrder, 1, fingerprint, true).unwrap();
+        scheduler.start_transaction(reservation, identity).unwrap()
+    }
+
     #[test]
     fn barrier_requires_all_32_prepared_sessions_once() {
         let clock = FakeClock::default();
@@ -1487,6 +1555,44 @@ mod tests {
     }
 
     #[test]
+    fn physical_attempt_deadline_covers_all_batches_once() {
+        let (clock, mut scheduler) = ready_scheduler_with_limits(
+            LocalRuntimeLimits::new(Duration::from_secs(2), Duration::from_secs(10)).unwrap(),
+        );
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(30));
+        let ticket = start_payment(&mut scheduler, WorkerId::new(3).unwrap(), 0xabc);
+        assert_eq!(
+            scheduler.attempt_deadline(ticket).unwrap(),
+            Duration::from_secs(32)
+        );
+
+        scheduler
+            .finish_attempt(ticket, AttemptOutcome::RetryableAbort)
+            .unwrap();
+        clock.set(Duration::from_secs(179));
+        scheduler.start_retry(ticket).unwrap();
+        assert_eq!(
+            scheduler.attempt_deadline(ticket).unwrap(),
+            Duration::from_secs(181)
+        );
+    }
+
+    #[test]
+    fn phase_tail_grace_caps_a_long_response_timeout() {
+        let (clock, mut scheduler) = ready_scheduler_with_limits(
+            LocalRuntimeLimits::new(Duration::from_secs(300), Duration::from_secs(5)).unwrap(),
+        );
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(179));
+        let ticket = start_payment(&mut scheduler, WorkerId::new(3).unwrap(), 0xdef);
+        assert_eq!(
+            scheduler.attempt_deadline(ticket).unwrap(),
+            Duration::from_secs(185)
+        );
+    }
+
+    #[test]
     fn immutable_identity_rejects_false_business_rollback_accounting() {
         assert_eq!(
             TransactionIdentity::new(TransactionType::Payment, 1, 9, true),
@@ -1563,6 +1669,62 @@ mod tests {
 
         let next = start_payment(&mut scheduler, worker, 6);
         assert_eq!((next.phase(), next.txn_no()), (PhaseId::FormalWindow(1), 0));
+    }
+
+    #[test]
+    fn terminal_arrival_sample_prevents_mutex_wait_misclassification() {
+        let (clock, mut scheduler) = ready_scheduler(Duration::from_secs(10));
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(30));
+        let ticket = start_payment(&mut scheduler, WorkerId::new(5).unwrap(), 0x51);
+
+        let completed_at = Duration::from_secs(179);
+        clock.set(Duration::from_secs(181));
+        assert_eq!(
+            scheduler
+                .finish_attempt_at(
+                    ticket,
+                    AttemptOutcome::Commit {
+                        delivery_processed: 0,
+                    },
+                    completed_at,
+                )
+                .unwrap(),
+            AttemptDisposition::Finished
+        );
+        assert_eq!(scheduler.windows()[0].committed, 1);
+        assert_eq!(scheduler.windows()[0].grace_tail, 0);
+        assert!(scheduler.recorder().iter().any(|event| {
+            matches!(
+                event,
+                SchedulerEvent::TransactionFinished {
+                    ticket: completed,
+                    class: CompletionClass::Committed,
+                    at,
+                } if *completed == ticket && *at == completed_at
+            )
+        }));
+    }
+
+    #[test]
+    fn grace_tail_still_rejects_terminal_identity_mismatch() {
+        let (clock, mut scheduler) = ready_scheduler(Duration::from_secs(10));
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(30));
+        let ticket = start_expected_rollback(&mut scheduler, WorkerId::new(5).unwrap(), 0x52);
+
+        let error = scheduler
+            .finish_attempt_at(
+                ticket,
+                AttemptOutcome::Commit {
+                    delivery_processed: 0,
+                },
+                Duration::from_secs(181),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SchedulerError::RunFailed(_)));
+        assert_eq!(scheduler.windows()[0].grace_tail, 0);
+        assert_eq!(scheduler.windows()[0].abandoned, 1);
     }
 
     #[test]
