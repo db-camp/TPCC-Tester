@@ -159,6 +159,10 @@ pub struct Config {
     #[arg(long = "lifecycle-event", value_enum)]
     pub lifecycle_event: Option<LifecycleEvent>,
 
+    /// Read-only validation of every required formal-run state artifact
+    #[arg(long = "attest-formal-state")]
+    pub attest_formal_state: bool,
+
     /// 并发客户端数 (`--threads` is retained as a compatibility alias)
     #[arg(long = "clients", visible_alias = "threads", default_value_t = 32)]
     pub threads: usize,
@@ -240,14 +244,14 @@ pub enum ConfigError {
 
     #[error(
         "--seed is required for --create-schema, --init, --benchmark, \
-         --diagnostic-workload-seconds, and --lifecycle-event \
+         --diagnostic-workload-seconds, --lifecycle-event, and --attest-formal-state \
          (no grader seed is embedded)"
     )]
     MissingSeed,
 
     #[error(
         "--state-dir is required for init, benchmark, diagnostic workload, online check, \
-         recovery check, and lifecycle events"
+         recovery check, lifecycle events, and formal-state attestation"
     )]
     MissingStateDir,
 
@@ -259,6 +263,9 @@ pub enum ConfigError {
 
     #[error("--lifecycle-event must be used by itself")]
     LifecycleEventMustBeExclusive,
+
+    #[error("--attest-formal-state must be used by itself")]
+    FormalStateAttestationMustBeExclusive,
 
     #[error("--init --check may only use --check-scope setup")]
     InitCheckScopeMustBeSetup,
@@ -316,6 +323,7 @@ impl Config {
                 || diagnostic_workload
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
+                || self.attest_formal_state
                 || self.allow_deviation
                 || self.seed.is_some()
                 || self.canonical_schema
@@ -336,6 +344,7 @@ impl Config {
                 || self.benchmark
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
+                || self.attest_formal_state
                 || self.diagnose
                 || self.canonical_schema
                 || self.expected_new_orders.is_some()
@@ -367,6 +376,22 @@ impl Config {
         {
             return Err(ConfigError::LifecycleEventMustBeExclusive);
         }
+        if self.attest_formal_state
+            && (self.create_schema
+                || self.init
+                || self.check
+                || self.stats
+                || self.benchmark
+                || diagnostic_workload
+                || self.probe_ready
+                || self.lifecycle_event.is_some()
+                || self.diagnose
+                || self.expected_new_orders.is_some()
+                || self.diagnostic_segment.is_some()
+                || self.check_scope != CheckScope::Setup)
+        {
+            return Err(ConfigError::FormalStateAttestationMustBeExclusive);
+        }
         if self.init && self.check && self.check_scope != CheckScope::Setup {
             return Err(ConfigError::InitCheckScopeMustBeSetup);
         }
@@ -375,7 +400,8 @@ impl Config {
             || self.init
             || self.benchmark
             || diagnostic_workload
-            || self.lifecycle_event.is_some())
+            || self.lifecycle_event.is_some()
+            || self.attest_formal_state)
             && self.seed.is_none()
         {
             return Err(ConfigError::MissingSeed);
@@ -384,7 +410,8 @@ impl Config {
             || self.benchmark
             || self.check
             || diagnostic_workload
-            || self.lifecycle_event.is_some())
+            || self.lifecycle_event.is_some()
+            || self.attest_formal_state)
             && self.state_dir.is_none()
         {
             return Err(ConfigError::MissingStateDir);
@@ -399,6 +426,7 @@ impl Config {
                 || self.benchmark
                 || diagnostic_workload
                 || self.lifecycle_event.is_some()
+                || self.attest_formal_state
                 || self.diagnose)
         {
             return Err(ConfigError::ProbeReadyMustBeExclusive);
@@ -800,6 +828,55 @@ mod tests {
         assert!(matches!(
             combined.validate(),
             Err(ConfigError::LifecycleEventMustBeExclusive)
+        ));
+    }
+
+    #[test]
+    fn formal_state_attestation_is_exclusive_seeded_and_state_bound() {
+        let missing_seed = Config::try_parse_from([
+            "tpcc-tester",
+            "--attest-formal-state",
+            "--state-dir",
+            "/tmp/tpcc-final2026-attestation-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            missing_seed.validate(),
+            Err(ConfigError::MissingSeed)
+        ));
+
+        let missing_state =
+            Config::try_parse_from(["tpcc-tester", "--attest-formal-state", "--seed", "11"])
+                .unwrap();
+        assert!(matches!(
+            missing_state.validate(),
+            Err(ConfigError::MissingStateDir)
+        ));
+
+        let valid = Config::try_parse_from([
+            "tpcc-tester",
+            "--attest-formal-state",
+            "--seed",
+            "11",
+            "--state-dir",
+            "/tmp/tpcc-final2026-attestation-state",
+        ])
+        .unwrap();
+        valid.validate().unwrap();
+
+        let combined = Config::try_parse_from([
+            "tpcc-tester",
+            "--attest-formal-state",
+            "--check",
+            "--seed",
+            "11",
+            "--state-dir",
+            "/tmp/tpcc-final2026-attestation-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            combined.validate(),
+            Err(ConfigError::FormalStateAttestationMustBeExclusive)
         ));
     }
 
