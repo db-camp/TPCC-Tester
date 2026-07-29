@@ -13,9 +13,10 @@ use crate::data_gen::TpccDataGen;
 use crate::error::TpccError;
 use crate::ranking::evidence_collector::SealedIntervalEvidence;
 use crate::ranking::rich_recovery_samples::{
-    SealedBadCreditCustomerSample, SealedDeliverySample, SealedNewOrderSample,
-    SealedRichRecoverySamples,
+    HistoryGroupKey, SealedBadCreditCustomerSample, SealedDeliverySample, SealedHistoryGroup,
+    SealedNewOrderSample, SealedRichRecoverySamples,
 };
+use crate::ranking::terminal_evidence::{validate_terminal_evidence, TerminalEvidenceView};
 use crate::runtime_schema::RuntimeSchema;
 
 const MAX_EXACT_POINT_ROWS: usize = 15;
@@ -748,6 +749,264 @@ fn bad_credit_point_query(
     )
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct HistoryTupleExpected {
+    timestamp: Vec<u8>,
+    amount_bits: u32,
+    data: Vec<u8>,
+    multiplicity: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HistoryPointKey {
+    customer_id: i32,
+    customer_district_id: i32,
+    customer_warehouse_id: i32,
+    home_district_id: i32,
+    home_warehouse_id: i32,
+}
+
+impl From<HistoryGroupKey> for HistoryPointKey {
+    fn from(key: HistoryGroupKey) -> Self {
+        Self {
+            customer_id: key.customer_id(),
+            customer_district_id: i32::from(key.customer_district_id()),
+            customer_warehouse_id: i32::from(key.customer_warehouse_id()),
+            home_district_id: i32::from(key.home_district_id()),
+            home_warehouse_id: i32::from(key.home_warehouse_id()),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct HistoryGroupExpected {
+    key: HistoryPointKey,
+    tuples: Vec<HistoryTupleExpected>,
+}
+
+impl HistoryGroupExpected {
+    fn from_sealed(group: &SealedHistoryGroup, ordinal: usize) -> Result<Self, TpccError> {
+        let scope = QueryScope::new(SampleDomain::History, ordinal);
+        if group.tuples().is_empty() || group.tuples().len() > 2 {
+            return Err(TpccError::Protocol(
+                scope.message("has invalid sealed evidence"),
+            ));
+        }
+        let mut tuples = Vec::with_capacity(group.tuples().len());
+        for tuple in group.tuples() {
+            let expected = HistoryTupleExpected {
+                timestamp: tuple.timestamp().to_vec(),
+                amount_bits: tuple.amount_bits(),
+                data: tuple.data().to_vec(),
+                multiplicity: tuple.expected_total_multiplicity().map_err(|_| {
+                    TpccError::Protocol(scope.message("has invalid sealed evidence"))
+                })?,
+            };
+            if expected.multiplicity == 0
+                || tuples.iter().any(|retained: &HistoryTupleExpected| {
+                    retained.timestamp == expected.timestamp
+                        && retained.amount_bits == expected.amount_bits
+                        && retained.data == expected.data
+                })
+            {
+                return Err(TpccError::Protocol(
+                    scope.message("has invalid sealed evidence"),
+                ));
+            }
+            tuples.push(expected);
+        }
+        Ok(Self {
+            key: group.key().into(),
+            tuples,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct HistoryGroupFold {
+    key: HistoryPointKey,
+    retained: Vec<HistoryTupleExpected>,
+    saw_meta: bool,
+}
+
+impl HistoryGroupFold {
+    fn new(group: HistoryGroupExpected) -> Self {
+        Self {
+            key: group.key,
+            retained: group.tuples,
+            saw_meta: false,
+        }
+    }
+
+    fn accept_meta(&mut self, columns: &[Column]) -> WireResult<()> {
+        const EXPECTED_TYPES: [SqlType; 8] = [
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Char,
+            SqlType::Float32,
+            SqlType::Char,
+        ];
+        if columns.len() != EXPECTED_TYPES.len()
+            || columns
+                .iter()
+                .zip(EXPECTED_TYPES)
+                .any(|(column, expected)| column.sql_type != expected)
+        {
+            return Err(WireError::Protocol(
+                "recovery history metadata mismatch".to_owned(),
+            ));
+        }
+        self.saw_meta = true;
+        Ok(())
+    }
+
+    fn accept_row(&mut self, row: Vec<WireValue>) -> WireResult<()> {
+        if !self.saw_meta || row.len() != 8 {
+            return Err(WireError::Protocol(
+                "recovery history row type mismatch".to_owned(),
+            ));
+        }
+        let [WireValue::Int32(customer_id), WireValue::Int32(customer_district_id), WireValue::Int32(customer_warehouse_id), WireValue::Int32(home_district_id), WireValue::Int32(home_warehouse_id), WireValue::Char(timestamp), WireValue::Float32(amount_bits), WireValue::Char(data)] =
+            row.as_slice()
+        else {
+            return Err(WireError::Protocol(
+                "recovery history row type mismatch".to_owned(),
+            ));
+        };
+        if *customer_id != self.key.customer_id
+            || *customer_district_id != self.key.customer_district_id
+            || *customer_warehouse_id != self.key.customer_warehouse_id
+            || *home_district_id != self.key.home_district_id
+            || *home_warehouse_id != self.key.home_warehouse_id
+        {
+            return Err(WireError::Protocol(
+                "recovery history group mismatch".to_owned(),
+            ));
+        }
+        if let Some(retained) = self.retained.iter_mut().find(|retained| {
+            retained.timestamp.as_slice() == timestamp.as_slice()
+                && retained.amount_bits == *amount_bits
+                && retained.data.as_slice() == data.as_slice()
+        }) {
+            retained.multiplicity = retained.multiplicity.checked_sub(1).ok_or_else(|| {
+                WireError::Protocol("recovery history tuple multiplicity mismatch".to_owned())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> WireResult<()> {
+        if !self.saw_meta
+            || self
+                .retained
+                .iter()
+                .any(|retained| retained.multiplicity != 0)
+        {
+            return Err(WireError::Protocol(
+                "recovery history tuple multiplicity mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn check_history_samples(
+    client: &mut RmdbClient,
+    schema: &RuntimeSchema,
+    rich: &SealedRichRecoverySamples,
+) -> Result<(), TpccError> {
+    require_nonempty_samples(
+        SampleDomain::History,
+        rich.committed_history_row_count(),
+        rich.history_groups().len(),
+    )?;
+    let mut prior_key = None;
+    for (sample_index, group) in rich.history_groups().iter().enumerate() {
+        let ordinal = checked_query_ordinal(SampleDomain::History, sample_index, 1)?;
+        if prior_key.is_some_and(|key| key >= group.key()) {
+            return Err(TpccError::Protocol(
+                QueryScope::new(SampleDomain::History, ordinal)
+                    .message("has invalid sealed evidence"),
+            ));
+        }
+        prior_key = Some(group.key());
+        let expected = HistoryGroupExpected::from_sealed(group, ordinal)?;
+        execute_history_group_query(client, schema, expected, ordinal).await?;
+    }
+    Ok(())
+}
+
+async fn execute_history_group_query(
+    client: &mut RmdbClient,
+    schema: &RuntimeSchema,
+    expected: HistoryGroupExpected,
+    ordinal: usize,
+) -> Result<(), TpccError> {
+    let scope = QueryScope::new(SampleDomain::History, ordinal);
+    let logical_sql = history_group_sql(expected.key);
+    let rendered = render_and_only_point_sql(schema, scope, &logical_sql)?;
+    let response = client
+        .exec_stream_fold(
+            &rendered,
+            HistoryGroupFold::new(expected),
+            |columns, state| state.accept_meta(columns),
+            |_, row, state| state.accept_row(row),
+        )
+        .await
+        .map_err(|error| sanitize_exec_error(scope, error))?;
+    finish_history_response(scope, response)
+}
+
+fn finish_history_response(
+    scope: QueryScope,
+    response: FoldStreamResponse<HistoryGroupFold>,
+) -> Result<(), TpccError> {
+    match response {
+        FoldStreamResponse::Query { state, .. } => state
+            .finish()
+            .map_err(|_| TpccError::Protocol(scope.message("result mismatch"))),
+        FoldStreamResponse::CommandOk => Err(TpccError::Protocol(
+            scope.message("returned a non-query terminal"),
+        )),
+        FoldStreamResponse::TransactionAbort { diagnostic: _ } => {
+            Err(TpccError::Abort(scope.message("aborted")))
+        }
+        FoldStreamResponse::Error { diagnostic: _ } => {
+            Err(TpccError::QueryError(scope.message("failed")))
+        }
+    }
+}
+
+fn history_group_sql(key: HistoryPointKey) -> String {
+    format!(
+        "SELECT history.h_c_id, history.h_c_d_id, history.h_c_w_id, history.h_d_id, history.h_w_id, history.h_date, history.h_amount, history.h_data FROM history WHERE history.h_c_id = {} AND history.h_c_d_id = {} AND history.h_c_w_id = {} AND history.h_d_id = {} AND history.h_w_id = {}",
+        key.customer_id,
+        key.customer_district_id,
+        key.customer_warehouse_id,
+        key.home_district_id,
+        key.home_warehouse_id
+    )
+}
+
+pub(crate) async fn check_recovery_samples(
+    client: &mut RmdbClient,
+    schema: &RuntimeSchema,
+    evidence: &dyn TerminalEvidenceView,
+) -> Result<(), TpccError> {
+    validate_terminal_evidence(evidence).map_err(|_| {
+        TpccError::Protocol("recovery terminal evidence failed validation".to_owned())
+    })?;
+    check_new_order_samples(client, schema, evidence.rich()).await?;
+    check_delivery_samples(client, schema, evidence.rich()).await?;
+    check_stock_samples(client, schema, evidence.intervals()).await?;
+    check_customer_samples(client, schema, evidence.intervals()).await?;
+    check_bad_credit_samples(client, schema, evidence.rich()).await?;
+    check_history_samples(client, schema, evidence.rich()).await
+}
+
 async fn execute_exact_point_query(
     client: &mut RmdbClient,
     schema: &RuntimeSchema,
@@ -777,7 +1036,7 @@ fn finish_exact_response(
             row_count, state, ..
         } => state
             .finish(row_count)
-            .map_err(|error| sanitize_exec_error(scope, TpccError::Protocol(error.to_string()))),
+            .map_err(|_| TpccError::Protocol(scope.message("result mismatch"))),
         FoldStreamResponse::CommandOk => Err(TpccError::Protocol(
             scope.message("returned a non-query terminal"),
         )),
@@ -997,6 +1256,54 @@ mod tests {
             payment_count: 6,
             data: b"512 4 3 4 3 1.00 | setup-data".to_vec(),
         }
+    }
+
+    fn history_key() -> HistoryPointKey {
+        HistoryPointKey {
+            customer_id: 713,
+            customer_district_id: 6,
+            customer_warehouse_id: 4,
+            home_district_id: 8,
+            home_warehouse_id: 2,
+        }
+    }
+
+    fn history_expected() -> HistoryGroupExpected {
+        HistoryGroupExpected {
+            key: history_key(),
+            tuples: vec![
+                HistoryTupleExpected {
+                    timestamp: b"2026-07-29 14:15:16".to_vec(),
+                    amount_bits: 0x3f80_0001,
+                    data: b"setup-collision".to_vec(),
+                    multiplicity: 2,
+                },
+                HistoryTupleExpected {
+                    timestamp: b"2026-07-29 14:15:17".to_vec(),
+                    amount_bits: (-0.0_f32).to_bits(),
+                    data: b"runtime-only".to_vec(),
+                    multiplicity: 1,
+                },
+            ],
+        }
+    }
+
+    fn history_row(
+        key: HistoryPointKey,
+        timestamp: &[u8],
+        amount_bits: u32,
+        data: &[u8],
+    ) -> Vec<WireValue> {
+        vec![
+            WireValue::Int32(key.customer_id),
+            WireValue::Int32(key.customer_district_id),
+            WireValue::Int32(key.customer_warehouse_id),
+            WireValue::Int32(key.home_district_id),
+            WireValue::Int32(key.home_warehouse_id),
+            WireValue::Char(timestamp.to_vec()),
+            WireValue::Float32(amount_bits),
+            WireValue::Char(data.to_vec()),
+        ]
     }
 
     #[test]
@@ -1407,5 +1714,187 @@ mod tests {
         assert!(require_nonempty_samples(SampleDomain::Stock, 1, 0).is_err());
         assert!(require_nonempty_samples(SampleDomain::Customer, 0, 1).is_err());
         assert!(require_nonempty_samples(SampleDomain::BadCredit, 0, 0).is_err());
+    }
+
+    #[test]
+    fn history_fold_counts_retained_tuples_and_ignores_other_group_rows() {
+        let key = history_key();
+        let mut state = HistoryGroupFold::new(history_expected());
+        state
+            .accept_meta(&columns(&[
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Char,
+                SqlType::Float32,
+                SqlType::Char,
+            ]))
+            .unwrap();
+        state
+            .accept_row(history_row(
+                key,
+                b"2026-07-29 14:15:18",
+                0x4120_0000,
+                b"unretained-but-same-group",
+            ))
+            .unwrap();
+        state
+            .accept_row(history_row(
+                key,
+                b"2026-07-29 14:15:16",
+                0x3f80_0001,
+                b"setup-collision",
+            ))
+            .unwrap();
+        state
+            .accept_row(history_row(
+                key,
+                b"2026-07-29 14:15:17",
+                (-0.0_f32).to_bits(),
+                b"runtime-only",
+            ))
+            .unwrap();
+        state
+            .accept_row(history_row(
+                key,
+                b"2026-07-29 14:15:16",
+                0x3f80_0001,
+                b"setup-collision",
+            ))
+            .unwrap();
+        assert_eq!(state.retained.len(), 2);
+        state.finish().unwrap();
+    }
+
+    #[test]
+    fn history_fold_rejects_missing_extra_identical_wrong_key_type_and_null() {
+        let key = history_key();
+        let mut missing = HistoryGroupFold::new(history_expected());
+        missing
+            .accept_meta(&columns(&[
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Char,
+                SqlType::Float32,
+                SqlType::Char,
+            ]))
+            .unwrap();
+        assert!(missing.finish().is_err());
+
+        let one_tuple = || HistoryGroupExpected {
+            key,
+            tuples: vec![HistoryTupleExpected {
+                timestamp: b"2026-07-29 14:15:16".to_vec(),
+                amount_bits: 0x3f80_0001,
+                data: b"selected".to_vec(),
+                multiplicity: 1,
+            }],
+        };
+        let expected_row = history_row(key, b"2026-07-29 14:15:16", 0x3f80_0001, b"selected");
+        let expected_types = [
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Char,
+            SqlType::Float32,
+            SqlType::Char,
+        ];
+
+        let mut extra = HistoryGroupFold::new(one_tuple());
+        extra.accept_meta(&columns(&expected_types)).unwrap();
+        extra.accept_row(expected_row.clone()).unwrap();
+        assert!(extra.accept_row(expected_row.clone()).is_err());
+
+        let mut wrong_key = HistoryGroupFold::new(one_tuple());
+        wrong_key.accept_meta(&columns(&expected_types)).unwrap();
+        let mut wrong_key_row = expected_row.clone();
+        wrong_key_row[0] = WireValue::Int32(714);
+        assert!(wrong_key.accept_row(wrong_key_row).is_err());
+
+        let mut wrong_type = HistoryGroupFold::new(one_tuple());
+        wrong_type.accept_meta(&columns(&expected_types)).unwrap();
+        let mut wrong_type_row = expected_row.clone();
+        wrong_type_row[6] = WireValue::Int32(1);
+        assert!(wrong_type.accept_row(wrong_type_row).is_err());
+
+        let mut null = HistoryGroupFold::new(one_tuple());
+        null.accept_meta(&columns(&expected_types)).unwrap();
+        let mut null_row = expected_row;
+        null_row[7] = WireValue::Null;
+        assert!(null.accept_row(null_row).is_err());
+    }
+
+    #[test]
+    fn history_query_selects_all_columns_with_one_five_key_and_group() {
+        let logical = history_group_sql(history_key());
+        for column in [
+            "h_c_id", "h_c_d_id", "h_c_w_id", "h_d_id", "h_w_id", "h_date", "h_amount", "h_data",
+        ] {
+            assert!(logical.contains(column), "{column}");
+        }
+        let tokens = logical
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .filter(|token| !token.is_empty())
+            .map(str::to_ascii_uppercase)
+            .collect::<Vec<_>>();
+        assert_eq!(tokens.iter().filter(|token| *token == "WHERE").count(), 1);
+        assert_eq!(tokens.iter().filter(|token| *token == "AND").count(), 4);
+        assert!(!tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "OR" | "UNION" | "LIMIT")));
+
+        let schema = RuntimeSchema::opaque(0x8877).unwrap();
+        let rendered =
+            render_and_only_point_sql(&schema, QueryScope::new(SampleDomain::History, 1), &logical)
+                .unwrap();
+        for identifier in ["history", "h_c_id", "h_date", "h_amount", "h_data"] {
+            assert!(!rendered
+                .split(|character: char| {
+                    !(character.is_ascii_alphanumeric() || character == '_')
+                })
+                .any(|token| token == identifier));
+        }
+        assert_eq!(
+            checked_query_ordinal(SampleDomain::History, 1, 1).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn history_terminal_errors_are_static_and_entry_uses_terminal_evidence_view() {
+        let scope = QueryScope::new(SampleDomain::History, 9);
+        let secret = "history key=713 expected=2 actual=3 runtime_table";
+        for error in [
+            finish_history_response(
+                scope,
+                FoldStreamResponse::TransactionAbort {
+                    diagnostic: secret.to_owned(),
+                },
+            )
+            .unwrap_err(),
+            finish_history_response(
+                scope,
+                FoldStreamResponse::Error {
+                    diagnostic: secret.to_owned(),
+                },
+            )
+            .unwrap_err(),
+        ] {
+            let rendered = error.to_string();
+            assert!(rendered.contains("history"));
+            assert!(rendered.contains('9'));
+            assert!(!rendered.contains(secret));
+            assert!(!rendered.contains("713"));
+        }
+        let _entry = check_recovery_samples;
+        assert!(require_nonempty_samples(SampleDomain::History, 1, 1).is_ok());
+        assert!(require_nonempty_samples(SampleDomain::History, 1, 0).is_err());
     }
 }
