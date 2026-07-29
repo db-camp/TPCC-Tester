@@ -34,8 +34,8 @@ const STAGE_TWO_CUSTOMER_AFTER: usize = 2;
 
 const WAREHOUSE_COLUMNS: usize = 7;
 const DISTRICT_COLUMNS: usize = 7;
-const CUSTOMER_COLUMNS: usize = 18;
-const CUSTOMER_AFTER_COLUMNS: usize = 4;
+const CUSTOMER_COLUMNS: usize = 19;
+const CUSTOMER_AFTER_COLUMNS: usize = 5;
 const MAX_NAME_BYTES: usize = 10;
 const MAX_HISTORY_DATA_BYTES: usize = 24;
 const MAX_CUSTOMER_DATA_BYTES: usize = 50;
@@ -265,6 +265,7 @@ struct CustomerSnapshot {
     balance_bits: u32,
     ytd_payment_bits: u32,
     payment_count: i32,
+    delivery_count: i32,
     data: Vec<u8>,
 }
 
@@ -415,7 +416,14 @@ fn parse_customer(row: &[WireValue]) -> SemanticResult<CustomerSnapshot> {
             )));
         }
     };
-    let data = row_char(row, 17, "Payment customer")?.to_vec();
+    let payment_count = row_int32(row, 16, "Payment customer")?;
+    let delivery_count = row_int32(row, 17, "Payment customer")?;
+    if payment_count < 0 || delivery_count < 0 {
+        return Err(SemanticViolation::new(format!(
+            "Payment customer {id} has negative logical version ({payment_count},{delivery_count})"
+        )));
+    }
+    let data = row_char(row, 18, "Payment customer")?.to_vec();
     if data.len() > MAX_CUSTOMER_DATA_BYTES {
         return Err(SemanticViolation::new(format!(
             "Payment customer {id} c_data has {} bytes; maximum is {MAX_CUSTOMER_DATA_BYTES}",
@@ -430,7 +438,8 @@ fn parse_customer(row: &[WireValue]) -> SemanticResult<CustomerSnapshot> {
         credit,
         balance_bits: row_f32_bits(row, 14, "Payment customer")?,
         ytd_payment_bits: row_f32_bits(row, 15, "Payment customer")?,
-        payment_count: row_int32(row, 16, "Payment customer")?,
+        payment_count,
+        delivery_count,
         data,
     })
 }
@@ -570,6 +579,7 @@ struct CustomerAfter {
     balance_bits: u32,
     ytd_payment_bits: u32,
     payment_count: i32,
+    delivery_count: i32,
 }
 
 fn validate_stage_two(
@@ -606,7 +616,14 @@ fn validate_stage_two(
              {actual_count}"
         )));
     }
-    let actual_data = row_char(row, 3, "Payment customer after")?;
+    let actual_delivery_count = row_int32(row, 3, "Payment customer after")?;
+    if actual_delivery_count != snapshot.customer.delivery_count {
+        return Err(SemanticViolation::new(format!(
+            "Payment customer.c_delivery_cnt changed from {} to {actual_delivery_count}",
+            snapshot.customer.delivery_count
+        )));
+    }
+    let actual_data = row_char(row, 4, "Payment customer after")?;
     if actual_data != expected_customer_data {
         return Err(SemanticViolation::new(format!(
             "Payment customer.c_data mismatch: expected {} bytes, got {} bytes",
@@ -618,6 +635,7 @@ fn validate_stage_two(
         balance_bits,
         ytd_payment_bits,
         payment_count: actual_count,
+        delivery_count: actual_delivery_count,
     })
 }
 
@@ -681,6 +699,7 @@ mod tests {
         balance_bits: u32,
         ytd_bits: u32,
         payment_count: i32,
+        delivery_count: i32,
         data: &[u8],
     ) -> Vec<WireValue> {
         vec![
@@ -701,6 +720,7 @@ mod tests {
             WireValue::Float32(balance_bits),
             WireValue::Float32(ytd_bits),
             WireValue::Int32(payment_count),
+            WireValue::Int32(delivery_count),
             WireValue::Char(data.to_vec()),
         ]
     }
@@ -721,6 +741,7 @@ mod tests {
                 balance_bits: (-10.0_f32).to_bits(),
                 ytd_payment_bits: 10.0_f32.to_bits(),
                 payment_count: 1,
+                delivery_count: 0,
                 data: b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx".to_vec(),
             },
         }
@@ -788,6 +809,7 @@ mod tests {
                 0.0_f32.to_bits(),
                 10.0_f32.to_bits(),
                 1,
+                0,
                 b"a",
             ),
             customer_row(
@@ -798,6 +820,7 @@ mod tests {
                 0.0_f32.to_bits(),
                 10.0_f32.to_bits(),
                 1,
+                0,
                 b"b",
             ),
             customer_row(
@@ -808,6 +831,7 @@ mod tests {
                 0.0_f32.to_bits(),
                 10.0_f32.to_bits(),
                 1,
+                0,
                 b"c",
             ),
             customer_row(
@@ -818,6 +842,7 @@ mod tests {
                 0.0_f32.to_bits(),
                 10.0_f32.to_bits(),
                 1,
+                0,
                 b"d",
             ),
         ];
@@ -845,6 +870,7 @@ mod tests {
             (-10.0_f32).to_bits(),
             10.0_f32.to_bits(),
             1,
+            0,
             b"data",
         );
         let good = result(
@@ -962,6 +988,7 @@ mod tests {
                     WireValue::Float32((-11.0_f32).to_bits()),
                     WireValue::Float32(11.0_f32.to_bits()),
                     WireValue::Int32(2),
+                    WireValue::Int32(0),
                     WireValue::Char(stage.expected_customer_data.clone()),
                 ]],
             )],
@@ -982,6 +1009,7 @@ mod tests {
                     WireValue::Float32((-11.0_f32).to_bits().wrapping_add(1)),
                     WireValue::Float32(11.0_f32.to_bits()),
                     WireValue::Int32(2),
+                    WireValue::Int32(0),
                     WireValue::Char(stage.expected_customer_data.clone()),
                 ]],
             )],
@@ -994,5 +1022,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(!error.requires_explicit_abort());
+
+        let changed_delivery_count = result(
+            &stage.operations,
+            [(
+                2,
+                vec![vec![
+                    WireValue::Float32((-11.0_f32).to_bits()),
+                    WireValue::Float32(11.0_f32.to_bits()),
+                    WireValue::Int32(2),
+                    WireValue::Int32(1),
+                    WireValue::Char(stage.expected_customer_data.clone()),
+                ]],
+            )],
+        );
+        assert!(validate_stage_two(
+            &changed_delivery_count,
+            amount_bits,
+            &snapshot,
+            &stage.expected_customer_data,
+        )
+        .is_err());
     }
 }

@@ -45,6 +45,7 @@ struct LockedOrder {
     claim: DistrictClaim,
     customer_id: i32,
     customer_balance_bits: u32,
+    customer_payment_count: i32,
     customer_delivery_count: i32,
     line_count: u8,
     amount_bits: u32,
@@ -58,6 +59,7 @@ struct StageThreeIndex {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CustomerAfter {
     balance_bits: u32,
+    payment_count: i32,
     delivery_count: i32,
 }
 
@@ -262,9 +264,9 @@ fn parse_stage_two(
         }
 
         let customer = results.single_row(index.customer)?;
-        if customer.len() != 3 {
+        if customer.len() != 4 {
             return Err(SemanticViolation::new(format!(
-                "{context} customer lookup returned {} columns; expected three",
+                "{context} customer lookup returned {} columns; expected four",
                 customer.len()
             )));
         }
@@ -276,10 +278,12 @@ fn parse_stage_two(
             )));
         }
         let customer_balance_bits = row_f32_bits(customer, 1, &format!("{context} customer"))?;
-        let customer_delivery_count = row_int32(customer, 2, &format!("{context} customer"))?;
-        if customer_delivery_count < 0 {
+        let customer_payment_count = row_int32(customer, 2, &format!("{context} customer"))?;
+        let customer_delivery_count = row_int32(customer, 3, &format!("{context} customer"))?;
+        if customer_payment_count < 0 || customer_delivery_count < 0 {
             return Err(SemanticViolation::new(format!(
-                "{context} customer has negative delivery count {customer_delivery_count}"
+                "{context} customer has negative logical version \
+                 ({customer_payment_count},{customer_delivery_count})"
             )));
         }
 
@@ -327,6 +331,7 @@ fn parse_stage_two(
             claim: *claim,
             customer_id,
             customer_balance_bits,
+            customer_payment_count,
             customer_delivery_count,
             line_count: line_rows.len() as u8,
             amount_bits,
@@ -412,24 +417,28 @@ fn validate_stage_three(
             order.claim.district_id, order.claim.order_id
         );
         let row = results.single_row(index.customer_after)?;
-        if row.len() != 2 {
+        if row.len() != 3 {
             return Err(SemanticViolation::new(format!(
-                "{context} returned {} columns; expected two",
+                "{context} returned {} columns; expected three",
                 row.len()
             )));
         }
         let actual_balance_bits = row_f32_bits(row, 0, &context)?;
-        let actual_delivery_count = row_int32(row, 1, &context)?;
+        let actual_payment_count = row_int32(row, 1, &context)?;
+        let actual_delivery_count = row_int32(row, 2, &context)?;
         validate_customer_after(
             order.customer_balance_bits,
+            order.customer_payment_count,
             order.customer_delivery_count,
             order.amount_bits,
             actual_balance_bits,
+            actual_payment_count,
             actual_delivery_count,
             &context,
         )?;
         after.push(CustomerAfter {
             balance_bits: actual_balance_bits,
+            payment_count: actual_payment_count,
             delivery_count: actual_delivery_count,
         });
     }
@@ -438,9 +447,11 @@ fn validate_stage_three(
 
 fn validate_customer_after(
     before_balance_bits: u32,
+    before_payment_count: i32,
     before_delivery_count: i32,
     amount_bits: u32,
     actual_balance_bits: u32,
+    actual_payment_count: i32,
     actual_delivery_count: i32,
     context: &str,
 ) -> SemanticResult<()> {
@@ -461,6 +472,12 @@ fn validate_customer_after(
         )));
     }
 
+    if actual_payment_count != before_payment_count {
+        return Err(SemanticViolation::new(format!(
+            "{context} payment count changed from {before_payment_count} to \
+             {actual_payment_count}"
+        )));
+    }
     let expected_delivery_count = before_delivery_count.checked_add(1).ok_or_else(|| {
         SemanticViolation::new(format!("{context} delivery count overflowed INT32"))
     })?;
@@ -619,19 +636,24 @@ mod tests {
         let before = 16_777_216.0_f32.to_bits();
         let amount = 1.0_f32.to_bits();
         let expected = (f32::from_bits(before) + f32::from_bits(amount)).to_bits();
-        validate_customer_after(before, 9, amount, expected, 10, "customer").unwrap();
+        validate_customer_after(before, 4, 9, amount, expected, 4, 10, "customer").unwrap();
 
         assert!(validate_customer_after(
             before,
+            4,
             9,
             amount,
             expected.wrapping_add(1),
+            4,
             10,
             "customer"
         )
         .unwrap_err()
         .message()
         .contains("expected bits"));
-        assert!(validate_customer_after(before, 9, amount, expected, 9, "customer").is_err());
+        assert!(validate_customer_after(before, 4, 9, amount, expected, 4, 9, "customer").is_err());
+        assert!(
+            validate_customer_after(before, 4, 9, amount, expected, 5, 10, "customer").is_err()
+        );
     }
 }

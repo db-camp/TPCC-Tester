@@ -632,12 +632,14 @@ pub fn final2026_catalog() -> Vec<Statement> {
             StatementId::PaymentCustomerAfter,
             &[Int32, Int32, Int32],
             "SELECT c_balance AS c_balance, c_ytd_payment AS c_ytd_payment, \
-             c_payment_cnt AS c_payment_cnt, c_data AS c_data \
+             c_payment_cnt AS c_payment_cnt, c_delivery_cnt AS c_delivery_cnt, \
+             c_data AS c_data \
              FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3;",
             &[
                 ("c_balance", Float32),
                 ("c_ytd_payment", Float32),
                 ("c_payment_cnt", Int32),
+                ("c_delivery_cnt", Int32),
                 ("c_data", Char),
             ],
         ),
@@ -712,6 +714,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
             StatementId::DeliveryCustomer,
             &[Int32, Int32, Int32],
             "SELECT customer.c_id AS c_id, customer.c_balance AS c_balance, \
+             customer.c_payment_cnt AS c_payment_cnt, \
              customer.c_delivery_cnt AS c_delivery_cnt \
              FROM customer, orders \
              WHERE orders.o_w_id = $1 AND orders.o_d_id = $2 AND orders.o_id = $3 \
@@ -721,6 +724,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
             &[
                 ("c_id", Int32),
                 ("c_balance", Float32),
+                ("c_payment_cnt", Int32),
                 ("c_delivery_cnt", Int32),
             ],
         ),
@@ -769,9 +773,14 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::DeliveryCustomerAfter,
             &[Int32, Int32, Int32],
-            "SELECT c_balance AS c_balance, c_delivery_cnt AS c_delivery_cnt \
+            "SELECT c_balance AS c_balance, c_payment_cnt AS c_payment_cnt, \
+             c_delivery_cnt AS c_delivery_cnt \
              FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3;",
-            &[("c_balance", Float32), ("c_delivery_cnt", Int32)],
+            &[
+                ("c_balance", Float32),
+                ("c_payment_cnt", Int32),
+                ("c_delivery_cnt", Int32),
+            ],
         ),
         query(
             StatementId::StockLevelNextOrder,
@@ -815,7 +824,7 @@ fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement 
              c_credit AS c_credit, c_credit_lim AS c_credit_lim, \
              c_discount AS c_discount, c_balance AS c_balance, \
              c_ytd_payment AS c_ytd_payment, c_payment_cnt AS c_payment_cnt, \
-             c_data AS c_data FROM customer \
+             c_delivery_cnt AS c_delivery_cnt, c_data AS c_data FROM customer \
              WHERE customer.c_w_id = $1 AND customer.c_d_id = $2 AND {predicate};"
         ),
         &[
@@ -836,6 +845,7 @@ fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement 
             ("c_balance", Float32),
             ("c_ytd_payment", Float32),
             ("c_payment_cnt", Int32),
+            ("c_delivery_cnt", Int32),
             ("c_data", Char),
         ],
     )
