@@ -1149,7 +1149,7 @@ impl StateStore {
         atomic_publish_new(&self.root, DATASET_FILE, encoded.as_bytes())
     }
 
-    fn load_dataset(&self) -> Result<DatasetState, StateError> {
+    pub fn load_dataset(&self) -> Result<DatasetState, StateError> {
         let input = read_limited(
             &self.root.join(DATASET_FILE),
             MAX_DATASET_STATE_BYTES as u64,

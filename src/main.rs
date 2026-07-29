@@ -402,7 +402,7 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         }
 
         if config.stats {
-            let (_, dataset) = load_bound_state(&config, &effective)?;
+            let (_, dataset, _) = load_bound_state(&config, &effective)?;
             let mut chk = checker::ConsistencyChecker::new(
                 &mut cursor,
                 &dataset.runtime_schema,
