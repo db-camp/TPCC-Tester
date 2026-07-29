@@ -14,6 +14,8 @@ mod profile;
 mod ranking;
 #[path = "../src/routing.rs"]
 mod routing;
+#[path = "../src/runtime_schema.rs"]
+mod runtime_schema;
 #[path = "../src/transaction/mod.rs"]
 mod transaction;
 #[path = "../src/workload.rs"]

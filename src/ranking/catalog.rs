@@ -10,6 +10,7 @@ use std::fmt;
 
 use crate::connection::prepared::{Statement, StatementKind};
 use crate::connection::wire::{Column, SqlType};
+use crate::runtime_schema::RuntimeSchema;
 
 pub const UNDELIVERED_CARRIER_ID: i32 = 0;
 pub const UNDELIVERED_DATE: &str = "";
@@ -67,8 +68,100 @@ pub enum StatementId {
 }
 
 impl StatementId {
+    pub const ALL: [Self; 42] = [
+        Self::Begin,
+        Self::Commit,
+        Self::Abort,
+        Self::NewOrderHome,
+        Self::NewOrderLockStock,
+        Self::NewOrderItem,
+        Self::NewOrderStock,
+        Self::NewOrderAdvanceDistrict,
+        Self::NewOrderInsertOrder,
+        Self::NewOrderInsertQueue,
+        Self::NewOrderUpdateStockNormal,
+        Self::NewOrderUpdateStockWrapped,
+        Self::NewOrderInsertLine,
+        Self::PaymentWarehouse,
+        Self::PaymentUpdateWarehouse,
+        Self::PaymentDistrict,
+        Self::PaymentUpdateDistrict,
+        Self::PaymentCustomerById,
+        Self::PaymentCustomerByLast,
+        Self::PaymentUpdateGoodCustomer,
+        Self::PaymentUpdateBadCustomer,
+        Self::PaymentInsertHistory,
+        Self::PaymentCustomerAfter,
+        Self::OrderStatusCustomerById,
+        Self::OrderStatusCustomerByLast,
+        Self::OrderStatusLatestOrder,
+        Self::OrderStatusOrder,
+        Self::OrderStatusLines,
+        Self::DeliveryOldestOrder,
+        Self::DeliveryLockQueue,
+        Self::DeliveryConfirmQueue,
+        Self::DeliveryOrder,
+        Self::DeliveryCustomer,
+        Self::DeliveryLineRows,
+        Self::DeliveryLineSum,
+        Self::DeliveryDeleteQueue,
+        Self::DeliveryUpdateOrder,
+        Self::DeliveryUpdateLines,
+        Self::DeliveryUpdateCustomer,
+        Self::DeliveryCustomerAfter,
+        Self::StockLevelNextOrder,
+        Self::StockLevelCount,
+    ];
+
     pub const fn wire_id(self) -> u16 {
         self as u16
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Commit => "commit",
+            Self::Abort => "abort",
+            Self::NewOrderHome => "new_order.home",
+            Self::NewOrderLockStock => "new_order.lock_stock",
+            Self::NewOrderItem => "new_order.item",
+            Self::NewOrderStock => "new_order.stock",
+            Self::NewOrderAdvanceDistrict => "new_order.advance_district",
+            Self::NewOrderInsertOrder => "new_order.insert_order",
+            Self::NewOrderInsertQueue => "new_order.insert_queue",
+            Self::NewOrderUpdateStockNormal => "new_order.update_stock_normal",
+            Self::NewOrderUpdateStockWrapped => "new_order.update_stock_wrapped",
+            Self::NewOrderInsertLine => "new_order.insert_line",
+            Self::PaymentWarehouse => "payment.warehouse",
+            Self::PaymentUpdateWarehouse => "payment.update_warehouse",
+            Self::PaymentDistrict => "payment.district",
+            Self::PaymentUpdateDistrict => "payment.update_district",
+            Self::PaymentCustomerById => "payment.customer_by_id",
+            Self::PaymentCustomerByLast => "payment.customer_by_last",
+            Self::PaymentUpdateGoodCustomer => "payment.update_good_customer",
+            Self::PaymentUpdateBadCustomer => "payment.update_bad_customer",
+            Self::PaymentInsertHistory => "payment.insert_history",
+            Self::PaymentCustomerAfter => "payment.customer_after",
+            Self::OrderStatusCustomerById => "order_status.customer_by_id",
+            Self::OrderStatusCustomerByLast => "order_status.customer_by_last",
+            Self::OrderStatusLatestOrder => "order_status.latest_order",
+            Self::OrderStatusOrder => "order_status.order",
+            Self::OrderStatusLines => "order_status.lines",
+            Self::DeliveryOldestOrder => "delivery.oldest_order",
+            Self::DeliveryLockQueue => "delivery.lock_queue",
+            Self::DeliveryConfirmQueue => "delivery.confirm_queue",
+            Self::DeliveryOrder => "delivery.order",
+            Self::DeliveryCustomer => "delivery.customer",
+            Self::DeliveryLineRows => "delivery.line_rows",
+            Self::DeliveryLineSum => "delivery.line_sum",
+            Self::DeliveryDeleteQueue => "delivery.delete_queue",
+            Self::DeliveryUpdateOrder => "delivery.update_order",
+            Self::DeliveryUpdateLines => "delivery.update_lines",
+            Self::DeliveryUpdateCustomer => "delivery.update_customer",
+            Self::DeliveryCustomerAfter => "delivery.customer_after",
+            Self::StockLevelNextOrder => "stock_level.next_order",
+            Self::StockLevelCount => "stock_level.count",
+        }
     }
 }
 
@@ -810,6 +903,45 @@ pub fn final2026_catalog() -> Vec<Statement> {
     ]
 }
 
+/// Render one complete per-run catalogue from the persisted opaque layout.
+///
+/// The canonical builder remains the logical source of relational semantics;
+/// this transformation replaces every statement id, SQL identifier, and
+/// declared result alias from the same immutable runtime schema.
+pub fn runtime_catalog(schema: &RuntimeSchema) -> Result<Vec<Statement>, CatalogError> {
+    schema
+        .validate()
+        .map_err(|error| CatalogError::new(format!("invalid runtime schema: {error}")))?;
+    let mut catalog = final2026_catalog();
+    if catalog.len() != StatementId::ALL.len() {
+        return Err(CatalogError::new(format!(
+            "logical catalogue has {} statements, expected {}",
+            catalog.len(),
+            StatementId::ALL.len()
+        )));
+    }
+    for (statement, logical_id) in catalog.iter_mut().zip(StatementId::ALL) {
+        if statement.id != logical_id.wire_id() {
+            return Err(CatalogError::new(format!(
+                "logical catalogue order mismatch at {:?}: found canonical id {}",
+                logical_id, statement.id
+            )));
+        }
+        statement.id = schema
+            .statements()
+            .id(logical_id.key())
+            .map_err(|error| CatalogError::new(error.to_string()))?;
+        statement.sql = schema.render_sql(&statement.sql);
+        if let StatementKind::Query { columns } = &mut statement.kind {
+            for column in columns {
+                column.name = schema.render_sql(&column.name);
+            }
+        }
+    }
+    validate_runtime_catalog(&catalog, schema)?;
+    Ok(catalog)
+}
+
 fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement {
     use SqlType::{Char, Float32, Int32};
 
@@ -930,6 +1062,25 @@ impl fmt::Display for CatalogError {
 impl Error for CatalogError {}
 
 pub fn validate_catalog(catalog: &[Statement]) -> Result<(), CatalogError> {
+    validate_catalog_with(catalog, |id| Ok(id.wire_id()))
+}
+
+pub fn validate_runtime_catalog(
+    catalog: &[Statement],
+    schema: &RuntimeSchema,
+) -> Result<(), CatalogError> {
+    validate_catalog_with(catalog, |id| {
+        schema
+            .statements()
+            .id(id.key())
+            .map_err(|error| CatalogError::new(error.to_string()))
+    })
+}
+
+fn validate_catalog_with(
+    catalog: &[Statement],
+    resolve_id: impl Fn(StatementId) -> Result<u16, CatalogError>,
+) -> Result<(), CatalogError> {
     if catalog.is_empty() || catalog.len() > 256 {
         return Err(CatalogError::new(
             "catalogue must contain between 1 and 256 statements",
@@ -938,9 +1089,9 @@ pub fn validate_catalog(catalog: &[Statement]) -> Result<(), CatalogError> {
 
     let mut ids = BTreeSet::new();
     for statement in catalog {
-        if !(1..=256).contains(&statement.id) {
+        if statement.id == 0 {
             return Err(CatalogError::new(format!(
-                "statement id {} is outside 1..=256",
+                "statement id {} is reserved",
                 statement.id
             )));
         }
@@ -992,7 +1143,7 @@ pub fn validate_catalog(catalog: &[Statement]) -> Result<(), CatalogError> {
         }
     }
 
-    validate_stage_templates(catalog)
+    validate_stage_templates(catalog, resolve_id)
 }
 
 fn parameter_ordinals(sql: &str) -> Result<BTreeSet<usize>, CatalogError> {
@@ -1027,7 +1178,10 @@ fn parameter_ordinals(sql: &str) -> Result<BTreeSet<usize>, CatalogError> {
     Ok(ordinals)
 }
 
-fn validate_stage_templates(catalog: &[Statement]) -> Result<(), CatalogError> {
+fn validate_stage_templates(
+    catalog: &[Statement],
+    resolve_id: impl Fn(StatementId) -> Result<u16, CatalogError>,
+) -> Result<(), CatalogError> {
     let ids: BTreeSet<u16> = catalog.iter().map(|statement| statement.id).collect();
     let groups: &[&[StageTemplate]] = &[
         NEW_ORDER_STAGES,
@@ -1054,10 +1208,11 @@ fn validate_stage_templates(catalog: &[Statement]) -> Result<(), CatalogError> {
                     ));
                 }
                 for statement_id in step.alternatives {
-                    if !ids.contains(&statement_id.wire_id()) {
+                    let runtime_id = resolve_id(*statement_id)?;
+                    if !ids.contains(&runtime_id) {
                         return Err(CatalogError::new(format!(
                             "stage references absent statement {}",
-                            statement_id.wire_id()
+                            runtime_id
                         )));
                     }
                 }
@@ -1065,4 +1220,66 @@ fn validate_stage_templates(catalog: &[Statement]) -> Result<(), CatalogError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn opaque_catalog_is_seed_specific_and_stable_across_32_sessions() {
+        let first = RuntimeSchema::opaque(73).unwrap();
+        let second = RuntimeSchema::opaque(74).unwrap();
+        let first_catalog = runtime_catalog(&first).unwrap();
+        let second_catalog = runtime_catalog(&second).unwrap();
+        assert_ne!(
+            first_catalog
+                .iter()
+                .map(|statement| statement.id)
+                .collect::<Vec<_>>(),
+            second_catalog
+                .iter()
+                .map(|statement| statement.id)
+                .collect::<Vec<_>>()
+        );
+
+        for schema in [&first, &second] {
+            let expected = runtime_catalog(schema).unwrap();
+            let ids = expected
+                .iter()
+                .map(|statement| statement.id)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(ids.len(), StatementId::ALL.len());
+            assert!(!ids.contains(&0));
+            for session in 0..32 {
+                assert_eq!(
+                    runtime_catalog(schema).unwrap(),
+                    expected,
+                    "session {session} diverged from its run catalogue"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opaque_catalog_renders_sql_and_declared_aliases_together() {
+        let schema = RuntimeSchema::opaque(2026).unwrap();
+        let catalog = runtime_catalog(&schema).unwrap();
+        let payment_id = schema
+            .statements()
+            .id(StatementId::PaymentWarehouse.key())
+            .unwrap();
+        let payment = catalog
+            .iter()
+            .find(|statement| statement.id == payment_id)
+            .unwrap();
+        assert_eq!(payment.id, payment_id);
+        assert!(payment
+            .sql
+            .contains(schema.table(crate::runtime_schema::LogicalTable::Warehouse)));
+        assert!(!payment.sql.contains(" FROM warehouse "));
+        validate_runtime_catalog(&catalog, &schema).unwrap();
+    }
 }

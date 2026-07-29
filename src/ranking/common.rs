@@ -6,13 +6,42 @@
 //! classification, operation-indexed query lookup, and typed semantic reads.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use thiserror::Error;
 
 use crate::connection::prepared::{BatchResponse, Operation};
 use crate::connection::wire::WireValue;
+use crate::runtime_schema::StatementLayout;
 
 use super::catalog::StatementId;
+
+static ACTIVE_STATEMENT_LAYOUT: OnceLock<StatementLayout> = OnceLock::new();
+
+/// Install the one immutable prepared-statement layout used by every runner.
+///
+/// Reinstalling the identical layout is harmless; attempting to mix layouts
+/// in one process fails closed before sessions or workers are released.
+pub fn install_statement_layout(layout: &StatementLayout) -> Result<(), String> {
+    match ACTIVE_STATEMENT_LAYOUT.set(layout.clone()) {
+        Ok(()) => Ok(()),
+        Err(candidate) if ACTIVE_STATEMENT_LAYOUT.get() == Some(&candidate) => Ok(()),
+        Err(_) => Err("attempted to install a different statement-id layout".to_owned()),
+    }
+}
+
+pub fn operation_with_layout(
+    layout: &StatementLayout,
+    statement_id: StatementId,
+    parameters: impl IntoIterator<Item = WireValue>,
+) -> Operation {
+    Operation {
+        statement_id: layout
+            .id(statement_id.key())
+            .expect("validated statement layout lost a logical key"),
+        parameters: parameters.into_iter().collect(),
+    }
+}
 
 /// Build one typed prepared operation without exposing numeric statement ids
 /// throughout the transaction runners.
@@ -20,10 +49,19 @@ pub fn operation(
     statement_id: StatementId,
     parameters: impl IntoIterator<Item = WireValue>,
 ) -> Operation {
-    Operation {
-        statement_id: statement_id.wire_id(),
-        parameters: parameters.into_iter().collect(),
+    if let Some(layout) = ACTIVE_STATEMENT_LAYOUT.get() {
+        return operation_with_layout(layout, statement_id, parameters);
     }
+
+    #[cfg(test)]
+    {
+        return Operation {
+            statement_id: statement_id.wire_id(),
+            parameters: parameters.into_iter().collect(),
+        };
+    }
+    #[cfg(not(test))]
+    panic!("statement-id layout must be installed before transaction dispatch");
 }
 
 /// The only local-semantic-failure cleanup operation.
@@ -439,6 +477,7 @@ pub fn customer_lower_median<T>(ordered_rows: &[T]) -> SemanticResult<&T> {
 #[cfg(test)]
 mod tests {
     use crate::connection::prepared::BatchQueryResult;
+    use crate::runtime_schema::RuntimeSchema;
 
     use super::*;
 
@@ -448,6 +487,19 @@ mod tests {
 
     fn operations(count: usize) -> Vec<Operation> {
         (0..count).map(|_| op(StatementId::Begin)).collect()
+    }
+
+    #[test]
+    fn runner_operations_resolve_the_same_seed_layout_as_the_catalog() {
+        for seed in [73, 74] {
+            let schema = RuntimeSchema::opaque(seed).unwrap();
+            for statement in StatementId::ALL {
+                assert_eq!(
+                    operation_with_layout(schema.statements(), statement, []).statement_id,
+                    schema.statements().id(statement.key()).unwrap()
+                );
+            }
+        }
     }
 
     fn successful(executed_operations: u16, results: Vec<BatchQueryResult>) -> BatchResponse {
