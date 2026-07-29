@@ -20,6 +20,10 @@ use super::evidence_collector::{
     CanonicalCustomerChain, CanonicalRejectedSample, CanonicalStockChain, CollectorError,
     CustomerKey, SealedIntervalEvidence, StockKey,
 };
+use super::payment_endpoints::{
+    PaymentEndpointError, PaymentEndpointView, PersistedPaymentEndpoints,
+    DISTRICTS_PER_WAREHOUSE as PAYMENT_DISTRICTS_PER_WAREHOUSE, MAX_PAYMENT_WAREHOUSES,
+};
 use super::runner::StockVersion;
 
 const SECTION_MAGIC: [u8; 4] = *b"TCS1";
@@ -30,6 +34,7 @@ pub(crate) const MAX_CORE_SECTION_HEX_CHARS: usize = MAX_CORE_SECTION_BYTES * 2;
 pub(crate) const MAX_PHYSICAL_STATS_SECTION_BYTES: usize = MAX_CORE_SECTION_BYTES;
 pub(crate) const MAX_CUSTOMER_INTERVAL_SECTION_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_STOCK_INTERVAL_SECTION_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_PAYMENT_ENDPOINT_SECTION_BYTES: usize = 8 * 1024;
 const MAX_ACCUMULATOR_WORDS: u32 = 6;
 const MAX_INTERVAL_SAMPLES: u32 = 64;
 
@@ -97,6 +102,16 @@ pub(crate) enum CoreCodecError {
     MismatchedIntervalMetadata(&'static str),
     #[error("canonical {field} presence flag has invalid value {actual}")]
     InvalidPresenceFlag { field: &'static str, actual: u8 },
+    #[error("invalid canonical Payment endpoint evidence: {0}")]
+    InvalidPaymentEndpoints(#[source] PaymentEndpointError),
+    #[error(
+        "canonical Payment endpoint view is missing {domain} key ({warehouse_id}, {district_id:?})"
+    )]
+    MissingPaymentEndpoint {
+        domain: &'static str,
+        warehouse_id: u16,
+        district_id: Option<u8>,
+    },
 }
 
 /// A limit-aware writer for fixed-width little-endian canonical values.
@@ -770,6 +785,183 @@ fn decode_stock_version(reader: &mut CanonicalReader<'_>) -> Result<StockVersion
     })
 }
 
+/// Encode the endpoint-only Payment section in fixed Warehouse/District key
+/// order.
+///
+/// The decoder deliberately returns [`PersistedPaymentEndpoints`], never live
+/// sealed Payment evidence: this compact section cannot recreate the paired
+/// amounts or their common live serial order.
+pub(crate) fn encode_payment_endpoint_section(
+    endpoints: &dyn PaymentEndpointView,
+) -> Result<Vec<u8>, CoreCodecError> {
+    let canonical = canonicalize_payment_view(endpoints)?;
+    let mut writer = section_writer(
+        SectionKind::PaymentEndpoints,
+        MAX_PAYMENT_ENDPOINT_SECTION_BYTES,
+    )?;
+    writer.put_u16(canonical.warehouses())?;
+    writer.put_u64(canonical.terminal_count())?;
+    writer.put_u64(canonical.warehouse_edge_count())?;
+    writer.put_u64(canonical.district_edge_count())?;
+    for warehouse_id in 1..=canonical.warehouses() {
+        encode_payment_endpoint(
+            &mut writer,
+            canonical.warehouse_endpoint_bits(warehouse_id).ok_or(
+                CoreCodecError::MissingPaymentEndpoint {
+                    domain: "Warehouse",
+                    warehouse_id,
+                    district_id: None,
+                },
+            )?,
+            canonical.warehouse_update_count(warehouse_id).ok_or(
+                CoreCodecError::MissingPaymentEndpoint {
+                    domain: "Warehouse",
+                    warehouse_id,
+                    district_id: None,
+                },
+            )?,
+        )?;
+    }
+    for warehouse_id in 1..=canonical.warehouses() {
+        for district_id in 1..=PAYMENT_DISTRICTS_PER_WAREHOUSE {
+            encode_payment_endpoint(
+                &mut writer,
+                canonical
+                    .district_endpoint_bits(warehouse_id, district_id)
+                    .ok_or(CoreCodecError::MissingPaymentEndpoint {
+                        domain: "District",
+                        warehouse_id,
+                        district_id: Some(district_id),
+                    })?,
+                canonical
+                    .district_update_count(warehouse_id, district_id)
+                    .ok_or(CoreCodecError::MissingPaymentEndpoint {
+                        domain: "District",
+                        warehouse_id,
+                        district_id: Some(district_id),
+                    })?,
+            )?;
+        }
+    }
+    Ok(writer.finish())
+}
+
+pub(crate) fn decode_payment_endpoint_section(
+    bytes: &[u8],
+) -> Result<PersistedPaymentEndpoints, CoreCodecError> {
+    let mut reader = section_reader(
+        bytes,
+        SectionKind::PaymentEndpoints,
+        MAX_PAYMENT_ENDPOINT_SECTION_BYTES,
+    )?;
+    let warehouses = reader.get_u16()?;
+    if warehouses > MAX_PAYMENT_WAREHOUSES {
+        return Err(CoreCodecError::OversizedCount {
+            field: "Payment warehouses",
+            actual: u64::from(warehouses),
+            maximum: u64::from(MAX_PAYMENT_WAREHOUSES),
+        });
+    }
+    let terminal_count = reader.get_u64()?;
+    let warehouse_edge_count = reader.get_u64()?;
+    let district_edge_count = reader.get_u64()?;
+    let mut warehouse_endpoints = Vec::with_capacity(usize::from(warehouses));
+    for _ in 0..warehouses {
+        warehouse_endpoints.push(decode_payment_endpoint(&mut reader)?);
+    }
+    let district_count = usize::from(warehouses) * usize::from(PAYMENT_DISTRICTS_PER_WAREHOUSE);
+    let mut district_endpoints = Vec::with_capacity(district_count);
+    for _ in 0..district_count {
+        district_endpoints.push(decode_payment_endpoint(&mut reader)?);
+    }
+    reader.finish()?;
+    PersistedPaymentEndpoints::from_canonical_endpoints(
+        warehouses,
+        terminal_count,
+        warehouse_edge_count,
+        district_edge_count,
+        warehouse_endpoints,
+        district_endpoints,
+    )
+    .map_err(CoreCodecError::InvalidPaymentEndpoints)
+}
+
+fn canonicalize_payment_view(
+    endpoints: &dyn PaymentEndpointView,
+) -> Result<PersistedPaymentEndpoints, CoreCodecError> {
+    let warehouses = endpoints.warehouses();
+    if warehouses > MAX_PAYMENT_WAREHOUSES {
+        return Err(CoreCodecError::OversizedCount {
+            field: "Payment warehouses",
+            actual: u64::from(warehouses),
+            maximum: u64::from(MAX_PAYMENT_WAREHOUSES),
+        });
+    }
+    let mut warehouse_endpoints = Vec::with_capacity(usize::from(warehouses));
+    for warehouse_id in 1..=warehouses {
+        warehouse_endpoints.push((
+            endpoints.warehouse_endpoint_bits(warehouse_id).ok_or(
+                CoreCodecError::MissingPaymentEndpoint {
+                    domain: "Warehouse",
+                    warehouse_id,
+                    district_id: None,
+                },
+            )?,
+            endpoints.warehouse_update_count(warehouse_id).ok_or(
+                CoreCodecError::MissingPaymentEndpoint {
+                    domain: "Warehouse",
+                    warehouse_id,
+                    district_id: None,
+                },
+            )?,
+        ));
+    }
+    let district_count = usize::from(warehouses) * usize::from(PAYMENT_DISTRICTS_PER_WAREHOUSE);
+    let mut district_endpoints = Vec::with_capacity(district_count);
+    for warehouse_id in 1..=warehouses {
+        for district_id in 1..=PAYMENT_DISTRICTS_PER_WAREHOUSE {
+            district_endpoints.push((
+                endpoints
+                    .district_endpoint_bits(warehouse_id, district_id)
+                    .ok_or(CoreCodecError::MissingPaymentEndpoint {
+                        domain: "District",
+                        warehouse_id,
+                        district_id: Some(district_id),
+                    })?,
+                endpoints
+                    .district_update_count(warehouse_id, district_id)
+                    .ok_or(CoreCodecError::MissingPaymentEndpoint {
+                        domain: "District",
+                        warehouse_id,
+                        district_id: Some(district_id),
+                    })?,
+            ));
+        }
+    }
+    PersistedPaymentEndpoints::from_canonical_endpoints(
+        warehouses,
+        endpoints.terminal_count(),
+        endpoints.warehouse_edge_count(),
+        endpoints.district_edge_count(),
+        warehouse_endpoints,
+        district_endpoints,
+    )
+    .map_err(CoreCodecError::InvalidPaymentEndpoints)
+}
+
+fn encode_payment_endpoint(
+    writer: &mut CanonicalWriter,
+    endpoint_bits: u32,
+    update_count: u64,
+) -> Result<(), CoreCodecError> {
+    writer.put_u32(endpoint_bits)?;
+    writer.put_u64(update_count)
+}
+
+fn decode_payment_endpoint(reader: &mut CanonicalReader<'_>) -> Result<(u32, u64), CoreCodecError> {
+    Ok((reader.get_u32()?, reader.get_u64()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1053,8 +1245,69 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn payment_endpoint_section_round_trips_as_distinct_persisted_view() {
+        let endpoints = sample_payment_endpoints();
+        let encoded = encode_payment_endpoint_section(&endpoints).unwrap();
+        let restored = decode_payment_endpoint_section(&encoded).unwrap();
+        assert_eq!(restored, endpoints);
+        assert_eq!(encode_payment_endpoint_section(&restored).unwrap(), encoded);
+    }
+
+    #[test]
+    fn payment_decoder_rejects_unknown_truncated_trailing_and_oversized_sections() {
+        let encoded = encode_payment_endpoint_section(&sample_payment_endpoints()).unwrap();
+        for end in [0, 1, 6, encoded.len() / 2, encoded.len() - 1] {
+            assert!(decode_payment_endpoint_section(&encoded[..end]).is_err());
+        }
+
+        let mut unknown = encoded.clone();
+        unknown[4] = 0xff;
+        assert!(matches!(
+            decode_payment_endpoint_section(&unknown),
+            Err(CoreCodecError::UnexpectedSection { actual: 0xff, .. })
+        ));
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(matches!(
+            decode_payment_endpoint_section(&trailing),
+            Err(CoreCodecError::TrailingBytes { remaining: 1 })
+        ));
+        assert!(matches!(
+            decode_payment_endpoint_section(&vec![0; MAX_PAYMENT_ENDPOINT_SECTION_BYTES + 1]),
+            Err(CoreCodecError::OversizedSection { .. })
+        ));
+    }
+
+    #[test]
+    fn payment_decoder_caps_warehouse_allocation_and_revalidates_totals() {
+        let encoded = encode_payment_endpoint_section(&sample_payment_endpoints()).unwrap();
+        let mut oversized_count = encoded.clone();
+        oversized_count[7..9].copy_from_slice(&(MAX_PAYMENT_WAREHOUSES + 1).to_le_bytes());
+        assert!(matches!(
+            decode_payment_endpoint_section(&oversized_count),
+            Err(CoreCodecError::OversizedCount {
+                field: "Payment warehouses",
+                ..
+            })
+        ));
+
+        let mut wrong_total = encoded;
+        // Header (7), warehouses (2), terminal total (8), then Warehouse
+        // edge total.
+        wrong_total[17..25].copy_from_slice(&0_u64.to_le_bytes());
+        assert!(matches!(
+            decode_payment_endpoint_section(&wrong_total),
+            Err(CoreCodecError::InvalidPaymentEndpoints(
+                PaymentEndpointError::InvalidInvariant(
+                    "persisted edge totals differ from terminal total"
+                )
+            ))
+        ));
+    }
+
     fn sample_intervals() -> SealedIntervalEvidence {
-        let generator = TpccDataGen::with_seed(1, TEST_LOAD_SEED);
         let roots = move |key: StockKey| {
             let generator = TpccDataGen::with_seed(1, TEST_LOAD_SEED);
             Some(StockVersion {
@@ -1129,5 +1382,26 @@ mod tests {
             .record_terminal(TerminalEvidence::stocks(&stocks))
             .unwrap();
         collector.seal().unwrap()
+    }
+
+    fn sample_payment_endpoints() -> PersistedPaymentEndpoints {
+        use crate::ranking::payment_endpoints::{DISTRICT_YTD_ROOT_BITS, WAREHOUSE_YTD_ROOT_BITS};
+
+        let warehouse_endpoints = vec![
+            ((f32::from_bits(WAREHOUSE_YTD_ROOT_BITS) + 1.0).to_bits(), 1),
+            (WAREHOUSE_YTD_ROOT_BITS, 0),
+        ];
+        let mut district_endpoints =
+            vec![(DISTRICT_YTD_ROOT_BITS, 0); 2 * usize::from(PAYMENT_DISTRICTS_PER_WAREHOUSE)];
+        district_endpoints[0] = ((f32::from_bits(DISTRICT_YTD_ROOT_BITS) + 1.0).to_bits(), 1);
+        PersistedPaymentEndpoints::from_canonical_endpoints(
+            2,
+            1,
+            1,
+            1,
+            warehouse_endpoints,
+            district_endpoints,
+        )
+        .unwrap()
     }
 }
