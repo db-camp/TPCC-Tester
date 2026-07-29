@@ -214,6 +214,37 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
             process.terminate()
             process.wait(timeout=2)
 
+    def test_cleanup_identity_proof_brackets_owner_and_group_checks(self):
+        script_text = SCRIPT.read_text(encoding="utf-8")
+        function_start = script_text.index("establish_cleanup_identity() {")
+        function_end = script_text.index(
+            "\n}\n\nserver_process_helper() {",
+            function_start,
+        )
+        function_text = script_text[function_start:function_end]
+        first_identity = function_text.index(
+            'cleanup_identity_before="$(\n'
+            '    process_identity "${pid}" "${cleanup_deadline}"'
+        )
+        owner_proof = function_text.index(
+            'process_owner_matches "${pid}" "${cleanup_deadline}"'
+        )
+        group_proof = function_text.index(
+            'cleanup_pgid="$(python3 - "${pid}"'
+        )
+        second_identity = function_text.index(
+            'cleanup_identity_after="$(\n'
+            '    process_identity "${pid}" "${cleanup_deadline}"'
+        )
+        equality_proof = function_text.index(
+            '[[ "${cleanup_identity_before}" == '
+            '"${cleanup_identity_after}" ]]'
+        )
+        self.assertLess(first_identity, owner_proof)
+        self.assertLess(owner_proof, group_proof)
+        self.assertLess(group_proof, second_identity)
+        self.assertLess(second_identity, equality_proof)
+
     def test_diagnostic_metrics_collect_delta_and_parse_strace(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)

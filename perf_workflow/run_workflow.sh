@@ -940,12 +940,14 @@ PY
 establish_cleanup_identity() {
   local pid="$1"
   local cleanup_deadline=""
-  local cleanup_identity=""
+  local cleanup_identity_before=""
+  local cleanup_identity_after=""
   local cleanup_pgid=""
   cleanup_deadline=$(( $(monotonic_millis) + 1000 ))
+  cleanup_identity_before="$(
+    process_identity "${pid}" "${cleanup_deadline}"
+  )" || return 1
   process_owner_matches "${pid}" "${cleanup_deadline}" || return 1
-  cleanup_identity="$(process_identity "${pid}" "${cleanup_deadline}")" \
-    || return 1
   cleanup_pgid="$(python3 - "${pid}" <<'PY'
 import os
 import sys
@@ -957,7 +959,12 @@ except ProcessLookupError:
 PY
 )" || return 1
   [[ "${cleanup_pgid}" == "${pid}" ]] || return 1
-  SERVER_IDENTITY="${cleanup_identity}"
+  cleanup_identity_after="$(
+    process_identity "${pid}" "${cleanup_deadline}"
+  )" || return 1
+  [[ "${cleanup_identity_before}" == "${cleanup_identity_after}" ]] \
+    || return 1
+  SERVER_IDENTITY="${cleanup_identity_after}"
   SERVER_PGID="${cleanup_pgid}"
 }
 
