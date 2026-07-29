@@ -23,6 +23,7 @@ const CUSTOMERS_PER_DISTRICT: usize = 3_000;
 const DISTRICTS_PER_WAREHOUSE: usize = 10;
 const MAX_EDGES_PER_TERMINAL: usize = 15;
 const SAMPLE_LIMIT: usize = 64;
+pub const INTERVAL_SAMPLE_POLICY_VERSION: u32 = 1;
 const CUSTOMER_INITIAL_BALANCE_BITS: u32 = (-10.0_f32).to_bits();
 const CUSTOMER_INITIAL_YTD_BITS: u32 = 10.0_f32.to_bits();
 const CUSTOMER_INITIAL_PAYMENT_COUNT: i32 = 1;
@@ -662,6 +663,7 @@ impl IntervalCollector {
         Ok(SealedIntervalEvidence {
             warehouses: self.warehouses,
             sample_seed: self.sample_seed,
+            policy_version: INTERVAL_SAMPLE_POLICY_VERSION,
             customers: self.customers,
             stocks: self.stocks,
             customer_updates: self.customer_updates,
@@ -832,12 +834,84 @@ impl CollectorStorage {
     }
 }
 
+/// Canonical persisted form of one selected Customer chain endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CanonicalCustomerChain {
+    key: CustomerKey,
+    sample_rank: u64,
+    endpoint: CustomerUpdateEndpoint,
+}
+
+impl CanonicalCustomerChain {
+    pub fn new(key: CustomerKey, sample_rank: u64, endpoint: CustomerUpdateEndpoint) -> Self {
+        Self {
+            key,
+            sample_rank,
+            endpoint,
+        }
+    }
+
+    pub fn key(&self) -> CustomerKey {
+        self.key
+    }
+
+    pub fn sample_rank(&self) -> u64 {
+        self.sample_rank
+    }
+
+    pub fn endpoint(&self) -> CustomerUpdateEndpoint {
+        self.endpoint
+    }
+}
+
+/// Canonical persisted form of one selected Stock chain endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalStockChain {
+    key: StockKey,
+    sample_rank: u64,
+    initial: StockVersion,
+    endpoint: StockVersion,
+}
+
+impl CanonicalStockChain {
+    pub fn new(
+        key: StockKey,
+        sample_rank: u64,
+        initial: StockVersion,
+        endpoint: StockVersion,
+    ) -> Self {
+        Self {
+            key,
+            sample_rank,
+            initial,
+            endpoint,
+        }
+    }
+
+    pub fn key(&self) -> StockKey {
+        self.key
+    }
+
+    pub fn sample_rank(&self) -> u64 {
+        self.sample_rank
+    }
+
+    pub fn initial(&self) -> &StockVersion {
+        &self.initial
+    }
+
+    pub fn endpoint(&self) -> &StockVersion {
+        &self.endpoint
+    }
+}
+
 /// Validated, bounded samples produced only by consuming `seal`.
 ///
 /// All fields are private, and the type has neither `Default` nor `Clone`.
 pub struct SealedIntervalEvidence {
     warehouses: u16,
     sample_seed: u64,
+    policy_version: u32,
     customers: Vec<CustomerSample>,
     stocks: Vec<StockSample>,
     customer_updates: u64,
@@ -845,8 +919,16 @@ pub struct SealedIntervalEvidence {
 }
 
 impl SealedIntervalEvidence {
+    pub fn warehouses(&self) -> u16 {
+        self.warehouses
+    }
+
     pub fn sample_seed(&self) -> u64 {
         self.sample_seed
+    }
+
+    pub fn policy_version(&self) -> u32 {
+        self.policy_version
     }
 
     pub fn customer_update_count(&self) -> u64 {
@@ -855,6 +937,159 @@ impl SealedIntervalEvidence {
 
     pub fn stock_update_count(&self) -> u64 {
         self.stock_updates
+    }
+
+    /// Rebuild a sealed artifact only after validating its canonical form.
+    ///
+    /// Binary/text codecs must reject oversized section counts before
+    /// allocating their input vectors. This constructor then rechecks the
+    /// semantic capacity, seed-derived ranks, strict order, setup roots,
+    /// endpoints, and global edge-count bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_canonical_entries(
+        warehouses: u16,
+        sample_seed: u64,
+        policy_version: u32,
+        customer_updates: u64,
+        stock_updates: u64,
+        customers: Vec<CanonicalCustomerChain>,
+        stocks: Vec<CanonicalStockChain>,
+        stock_roots: &dyn StockRootProvider,
+    ) -> Result<Self, CollectorError> {
+        validate_configuration(warehouses, 1)?;
+        if policy_version != INTERVAL_SAMPLE_POLICY_VERSION {
+            return Err(CollectorError::UnsupportedSamplePolicy {
+                actual: policy_version,
+                expected: INTERVAL_SAMPLE_POLICY_VERSION,
+            });
+        }
+        validate_sealed_presence("customer", customer_updates, customers.len())?;
+        validate_sealed_presence("stock", stock_updates, stocks.len())?;
+
+        let mut customer_samples = Vec::with_capacity(customers.len());
+        let mut previous_customer = None;
+        let mut selected_customer_updates = 0_u64;
+        for entry in customers {
+            let key_index = customer_index(warehouses, entry.key)?;
+            let expected_rank = sample_rank(sample_seed, CUSTOMER_SAMPLE_DOMAIN, key_index);
+            validate_canonical_rank(
+                "customer",
+                key_index,
+                entry.sample_rank,
+                expected_rank,
+                &mut previous_customer,
+            )?;
+            let endpoint = entry.endpoint;
+            require_finite("sealed customer balance", endpoint.balance_bits)?;
+            let ytd = require_finite("sealed customer YTD", endpoint.ytd_payment_bits)?;
+            if endpoint.version.payment_count < CUSTOMER_INITIAL_PAYMENT_COUNT
+                || endpoint.version.delivery_count < CUSTOMER_INITIAL_DELIVERY_COUNT
+                || ytd < f32::from_bits(CUSTOMER_INITIAL_YTD_BITS)
+            {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "customer endpoint precedes its setup root",
+                ));
+            }
+            let payment_updates =
+                u64::try_from(endpoint.version.payment_count - CUSTOMER_INITIAL_PAYMENT_COUNT)
+                    .map_err(|_| {
+                        CollectorError::InvalidSealedEvidence(
+                            "customer payment update count is negative",
+                        )
+                    })?;
+            let delivery_updates =
+                u64::try_from(endpoint.version.delivery_count - CUSTOMER_INITIAL_DELIVERY_COUNT)
+                    .map_err(|_| {
+                        CollectorError::InvalidSealedEvidence(
+                            "customer delivery update count is negative",
+                        )
+                    })?;
+            let updates = payment_updates
+                .checked_add(delivery_updates)
+                .ok_or(CollectorError::Overflow("sealed selected customer updates"))?;
+            if updates == 0 {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "selected customer has no update",
+                ));
+            }
+            selected_customer_updates = selected_customer_updates
+                .checked_add(updates)
+                .ok_or(CollectorError::Overflow("sealed selected customer updates"))?;
+            customer_samples.push(CustomerSample {
+                rank: expected_rank,
+                key_index,
+                slot: CustomerSlot {
+                    payment_count: endpoint.version.payment_count,
+                    delivery_count: endpoint.version.delivery_count,
+                    balance_bits: endpoint.balance_bits,
+                    ytd_payment_bits: endpoint.ytd_payment_bits,
+                },
+            });
+        }
+        if selected_customer_updates > customer_updates {
+            return Err(CollectorError::InvalidSealedEvidence(
+                "selected customer updates exceed the global edge count",
+            ));
+        }
+
+        let mut stock_samples = Vec::with_capacity(stocks.len());
+        let mut previous_stock = None;
+        let mut selected_stock_updates = 0_u64;
+        for entry in stocks {
+            let key_index = stock_index(warehouses, entry.key)?;
+            let expected_rank = sample_rank(sample_seed, STOCK_SAMPLE_DOMAIN, key_index);
+            validate_canonical_rank(
+                "stock",
+                key_index,
+                entry.sample_rank,
+                expected_rank,
+                &mut previous_stock,
+            )?;
+
+            let initial = StockState::from_version(&entry.initial);
+            validate_stock_root(stock_roots, entry.key, initial)?;
+            let endpoint = StockState::from_version(&entry.endpoint);
+            validate_stock_state("after", endpoint)?;
+            if endpoint.order_count <= 0
+                || f32::from_bits(endpoint.ytd_bits) <= f32::from_bits(STOCK_INITIAL_YTD_BITS)
+            {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "selected Stock endpoint has no committed update",
+                ));
+            }
+            let updates = u64::try_from(endpoint.order_count).map_err(|_| {
+                CollectorError::InvalidSealedEvidence("Stock update count is negative")
+            })?;
+            selected_stock_updates = selected_stock_updates
+                .checked_add(updates)
+                .ok_or(CollectorError::Overflow("sealed selected Stock updates"))?;
+            stock_samples.push(StockSample {
+                rank: expected_rank,
+                key_index,
+                slot: StockSlot {
+                    quantity: endpoint.quantity,
+                    ytd_bits: endpoint.ytd_bits,
+                    order_count: endpoint.order_count,
+                    remote_count: endpoint.remote_count,
+                    initial_quantity: initial.quantity,
+                },
+            });
+        }
+        if selected_stock_updates > stock_updates {
+            return Err(CollectorError::InvalidSealedEvidence(
+                "selected Stock updates exceed the global edge count",
+            ));
+        }
+
+        Ok(Self {
+            warehouses,
+            sample_seed,
+            policy_version,
+            customers: customer_samples,
+            stocks: stock_samples,
+            customer_updates,
+            stock_updates,
+        })
     }
 
     pub fn customer_sample_count(&self) -> usize {
@@ -1445,6 +1680,56 @@ fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+fn validate_sealed_presence(
+    domain: &'static str,
+    global_updates: u64,
+    sample_count: usize,
+) -> Result<(), CollectorError> {
+    if sample_count > SAMPLE_LIMIT {
+        return Err(CollectorError::TooManySealedSamples {
+            domain,
+            actual: sample_count,
+            limit: SAMPLE_LIMIT,
+        });
+    }
+    if (global_updates == 0) != (sample_count == 0) {
+        return Err(CollectorError::InvalidSealedEvidence(match domain {
+            "customer" => "customer sample presence differs from its global edge count",
+            _ => "Stock sample presence differs from its global edge count",
+        }));
+    }
+    if u64::try_from(sample_count).map_or(true, |count| count > global_updates) {
+        return Err(CollectorError::InvalidSealedEvidence(match domain {
+            "customer" => "customer sample count exceeds its global edge count",
+            _ => "Stock sample count exceeds its global edge count",
+        }));
+    }
+    Ok(())
+}
+
+fn validate_canonical_rank(
+    domain: &'static str,
+    key_index: u32,
+    actual_rank: u64,
+    expected_rank: u64,
+    previous: &mut Option<(u64, u32)>,
+) -> Result<(), CollectorError> {
+    if actual_rank != expected_rank {
+        return Err(CollectorError::ForgedSampleRank {
+            domain,
+            key_index,
+            actual: actual_rank,
+            expected: expected_rank,
+        });
+    }
+    let current = (actual_rank, key_index);
+    if previous.is_some_and(|prior| prior >= current) {
+        return Err(CollectorError::NonCanonicalSampleOrder { domain });
+    }
+    *previous = Some(current);
+    Ok(())
+}
+
 fn validate_configuration(warehouses: u16, clients: u16) -> Result<(), CollectorError> {
     if warehouses == 0 {
         return Err(CollectorError::InvalidConfiguration(
@@ -1565,6 +1850,27 @@ pub enum CollectorError {
     Disconnected { pending: usize },
     #[error("pending interval safety limit exceeded: {actual} > {limit}")]
     PendingLimit { actual: usize, limit: usize },
+    #[error("unsupported interval sample policy {actual}; expected {expected}")]
+    UnsupportedSamplePolicy { actual: u32, expected: u32 },
+    #[error("{domain} sealed sample count {actual} exceeds limit {limit}")]
+    TooManySealedSamples {
+        domain: &'static str,
+        actual: usize,
+        limit: usize,
+    },
+    #[error(
+        "{domain} sample key index {key_index} has forged rank {actual:#018x}; expected {expected:#018x}"
+    )]
+    ForgedSampleRank {
+        domain: &'static str,
+        key_index: u32,
+        actual: u64,
+        expected: u64,
+    },
+    #[error("{domain} sealed samples are duplicated or not in canonical rank order")]
+    NonCanonicalSampleOrder { domain: &'static str },
+    #[error("invalid sealed interval evidence: {0}")]
+    InvalidSealedEvidence(&'static str),
     #[error("collector counter overflow: {0}")]
     Overflow(&'static str),
     #[error("collector is poisoned by an earlier terminal: {cause}")]
@@ -2202,5 +2508,214 @@ mod tests {
         let chain = sealed.stock(key).unwrap().unwrap();
         assert_eq!(chain.initial(), root.version());
         assert_eq!(chain.endpoint(), after.version());
+    }
+
+    #[test]
+    fn sealed_reconstruction_revalidates_policy_rank_order_roots_and_counts() {
+        let customer_key = CustomerKey {
+            warehouse_id: 1,
+            district_id: 1,
+            customer_id: 42,
+        };
+        let stock_key = StockKey {
+            warehouse_id: 1,
+            item_id: 42,
+        };
+        let customer = [CustomerMutation::new(
+            customer_key,
+            payment_edge(customer_version(1, 0), -10.0, 10.0, 1.0),
+        )];
+        let root = stock_root(stock_key);
+        let stock = [stock_mutation(
+            stock_key,
+            3,
+            1,
+            root,
+            stock_after(root, 3, 1),
+        )];
+        let mut collector = collector(32);
+        collector
+            .record_terminal(TerminalEvidence::customers(&customer))
+            .unwrap();
+        collector
+            .record_terminal(TerminalEvidence::stocks(&stock))
+            .unwrap();
+        let sealed = collector.seal().unwrap();
+        let customers = sealed
+            .customers()
+            .map(|chain| {
+                CanonicalCustomerChain::new(chain.key(), chain.sample_rank(), chain.endpoint())
+            })
+            .collect::<Vec<_>>();
+        let stocks = sealed
+            .stocks()
+            .map(|chain| {
+                CanonicalStockChain::new(
+                    chain.key(),
+                    chain.sample_rank(),
+                    chain.initial(),
+                    chain.endpoint(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let rebuilt = SealedIntervalEvidence::from_canonical_entries(
+            50,
+            TEST_SEED,
+            INTERVAL_SAMPLE_POLICY_VERSION,
+            1,
+            1,
+            customers.clone(),
+            stocks.clone(),
+            &root_for,
+        )
+        .unwrap();
+        assert_eq!(rebuilt.warehouses(), 50);
+        assert_eq!(rebuilt.sample_seed(), TEST_SEED);
+        assert_eq!(rebuilt.policy_version(), INTERVAL_SAMPLE_POLICY_VERSION);
+        assert_eq!(
+            rebuilt.customer(customer_key).unwrap().unwrap().endpoint(),
+            sealed.customer(customer_key).unwrap().unwrap().endpoint()
+        );
+        assert_eq!(
+            rebuilt.stock(stock_key).unwrap().unwrap().endpoint(),
+            sealed.stock(stock_key).unwrap().unwrap().endpoint()
+        );
+
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION + 1,
+                1,
+                1,
+                customers.clone(),
+                stocks.clone(),
+                &root_for,
+            ),
+            Err(CollectorError::UnsupportedSamplePolicy { .. })
+        ));
+
+        let mut forged_rank = customers.clone();
+        forged_rank[0].sample_rank ^= 1;
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                1,
+                1,
+                forged_rank,
+                stocks.clone(),
+                &root_for,
+            ),
+            Err(CollectorError::ForgedSampleRank {
+                domain: "customer",
+                ..
+            })
+        ));
+
+        let duplicate = vec![customers[0], customers[0]];
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                2,
+                1,
+                duplicate,
+                stocks.clone(),
+                &root_for,
+            ),
+            Err(CollectorError::NonCanonicalSampleOrder { domain: "customer" })
+        ));
+
+        let mut forged_root = stocks;
+        forged_root[0].initial.ytd_bits = (-0.0_f32).to_bits();
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                1,
+                1,
+                customers,
+                forged_root,
+                &root_for,
+            ),
+            Err(CollectorError::StockRootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn sealed_reconstruction_rejects_oversized_or_impossible_samples() {
+        let endpoint = CustomerUpdateEndpoint {
+            version: customer_version(2, 0),
+            balance_bits: (-11.0_f32).to_bits(),
+            ytd_payment_bits: 11.0_f32.to_bits(),
+        };
+        let mut customers = (1..=SAMPLE_LIMIT as i32 + 1)
+            .map(|customer_id| {
+                let key = CustomerKey {
+                    warehouse_id: 1,
+                    district_id: 1,
+                    customer_id,
+                };
+                let key_index = customer_index(50, key).unwrap();
+                CanonicalCustomerChain::new(
+                    key,
+                    sample_rank(TEST_SEED, CUSTOMER_SAMPLE_DOMAIN, key_index),
+                    endpoint,
+                )
+            })
+            .collect::<Vec<_>>();
+        customers.sort_unstable_by_key(|sample| (sample.sample_rank, sample.key));
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                customers.len() as u64,
+                0,
+                customers,
+                Vec::new(),
+                &root_for,
+            ),
+            Err(CollectorError::TooManySealedSamples {
+                domain: "customer",
+                ..
+            })
+        ));
+
+        let key = CustomerKey {
+            warehouse_id: 1,
+            district_id: 1,
+            customer_id: 1,
+        };
+        let key_index = customer_index(50, key).unwrap();
+        let two_updates = CanonicalCustomerChain::new(
+            key,
+            sample_rank(TEST_SEED, CUSTOMER_SAMPLE_DOMAIN, key_index),
+            CustomerUpdateEndpoint {
+                version: customer_version(3, 0),
+                balance_bits: (-12.0_f32).to_bits(),
+                ytd_payment_bits: 12.0_f32.to_bits(),
+            },
+        );
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                1,
+                0,
+                vec![two_updates],
+                Vec::new(),
+                &root_for,
+            ),
+            Err(CollectorError::InvalidSealedEvidence(
+                "selected customer updates exceed the global edge count"
+            ))
+        ));
     }
 }
