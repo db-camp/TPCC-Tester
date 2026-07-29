@@ -640,7 +640,7 @@ def sample_segment(arguments):
             offset_second = unix_after_ns - monotonic_after_ns
             offset_lower_ns = min(offset_first, offset_second)
             offset_upper_ns = max(offset_first, offset_second)
-            if offset_second < offset_first:
+            if offset_first - offset_second > CLOCK_OFFSET_TOLERANCE_NS:
                 append_warning(
                     payload["warnings"],
                     "wall_clock_regressed_during_sample",

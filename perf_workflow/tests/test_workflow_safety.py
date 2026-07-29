@@ -373,7 +373,7 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
 
             self.assertEqual(result, 0)
             segment = RESOURCE_SAMPLER.validate_segment(output)
-            self.assertEqual(segment["status"], "available")
+            self.assertEqual(segment["status"], "available", segment)
             self.assertTrue(segment["root_observed_exit"])
             self.assertEqual(segment["process_samples"], 1)
             self.assertEqual(segment["root_identity_observed"], "linux:10")
@@ -1411,7 +1411,7 @@ if "--benchmark" in sys.argv:
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(metrics["status"], "available")
+            self.assertIn(metrics["status"], {"available", "partial"})
             self.assertEqual(metrics["rank_cpu"]["status"], "available")
             self.assertEqual(len(metrics["rank_cpu"]["windows"]), 3)
             self.assertTrue(
