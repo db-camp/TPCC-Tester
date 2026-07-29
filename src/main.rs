@@ -158,38 +158,42 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 
         if config.check {
             info!("运行 {} 阶段一致性检查", config.check_scope.as_str());
-            if config.check_scope == config::CheckScope::Setup {
-                let store = run_state::StateStore::open(
-                    config
-                        .state_dir
-                        .as_deref()
-                        .ok_or("validated setup check lost its state directory")?,
-                )?;
-                let dataset = store.load_dataset()?;
-                if dataset.warehouses != config.scale_factor
-                    || effective.seed.is_some_and(|seed| dataset.seed != seed)
-                {
-                    return Err(format!(
-                        "setup state mismatch: state seed/SF={}/{}, CLI seed/SF={:?}/{}",
-                        dataset.seed, dataset.warehouses, effective.seed, config.scale_factor
+            let (store, dataset) = load_bound_state(&config, &effective)?;
+            match config.check_scope {
+                config::CheckScope::Setup => {
+                    setup_step(
+                        setup_deadline,
+                        "run public setup integrity checks",
+                        check_executor::run_setup(cursor.client_mut(), &dataset),
                     )
-                    .into());
+                    .await?;
                 }
-                setup_step(
-                    setup_deadline,
-                    "run public setup integrity checks",
-                    check_executor::run_setup(cursor.client_mut(), &dataset),
-                )
-                .await?;
-            } else {
-                let mut chk = checker::ConsistencyChecker::new(
-                    &mut cursor,
-                    config.scale_factor,
-                    config.expected_new_orders,
-                );
-                let all_passed = chk.run_all_checks().await?;
-                if !all_passed {
-                    return Err("一致性检查未全部通过".into());
+                config::CheckScope::Online => {
+                    let ledger = store.load_ledger(&dataset)?;
+                    let baseline = check_executor::run_final_online(
+                        cursor.client_mut(),
+                        &dataset,
+                        &ledger,
+                        dataset.initial_order_line_amounts(),
+                    )
+                    .await?;
+                    store.save_float_baseline(&dataset, &baseline)?;
+                    info!(
+                        "已原子保存 online FLOAT baseline: {}",
+                        store.root().join("float_baseline.state").display()
+                    );
+                }
+                config::CheckScope::Recovery => {
+                    let ledger = store.load_ledger(&dataset)?;
+                    let baseline = store.load_float_baseline(&dataset)?;
+                    check_executor::run_final_recovery(
+                        cursor.client_mut(),
+                        &dataset,
+                        &ledger,
+                        dataset.initial_order_line_amounts(),
+                        &baseline,
+                    )
+                    .await?;
                 }
             }
         }
@@ -202,12 +206,48 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 
     if config.benchmark {
         info!("启动原生 final2026 连续三窗口基准测试...");
+        let (store, dataset) = load_bound_state(&config, &effective)?;
         let exec = executor::BenchmarkExecutor::new(config, effective);
         let result = exec.run().await?;
+        store.save_ledger(&dataset, result.ledger())?;
+        info!(
+            "已原子保存完整 physical commit ledger: {}",
+            store.root().join("run_ledger.state").display()
+        );
         result.print_report();
     }
 
     Ok(())
+}
+
+fn load_bound_state(
+    config: &Config,
+    effective: &ResolvedProfile,
+) -> Result<(run_state::StateStore, run_state::DatasetState), Box<dyn std::error::Error>> {
+    let store = run_state::StateStore::open(
+        config
+            .state_dir
+            .as_deref()
+            .ok_or("validated stateful phase lost its state directory")?,
+    )?;
+    let dataset = store.load_dataset()?;
+    let seed_mismatch = effective.seed.is_some_and(|seed| dataset.seed != seed);
+    let run_id_mismatch = std::env::var("RMDB_TPCC_RUN_ID")
+        .ok()
+        .is_some_and(|run_id| dataset.run_id != run_id);
+    if dataset.warehouses != config.scale_factor || seed_mismatch || run_id_mismatch {
+        return Err(format!(
+            "run state mismatch: state run/seed/SF={}/{}/{}, CLI run/seed/SF={:?}/{:?}/{}",
+            dataset.run_id,
+            dataset.seed,
+            dataset.warehouses,
+            std::env::var("RMDB_TPCC_RUN_ID").ok(),
+            effective.seed,
+            config.scale_factor
+        )
+        .into());
+    }
+    Ok((store, dataset))
 }
 
 async fn setup_step<T, F>(
