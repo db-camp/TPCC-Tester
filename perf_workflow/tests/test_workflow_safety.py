@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -337,6 +338,36 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
             self.assertIn("conformance=non_ranked_deviation", accepted.stdout)
             self.assertIn("ranked_configuration=0", accepted.stdout)
+            self.assertIn(
+                "recovery_ready_budget_seconds=5\n",
+                accepted.stdout,
+            )
+
+    def test_non_ranked_all_does_not_run_fixed_final_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            result = self.run_script(
+                "--plan-only",
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--allow-deviation",
+                "--scale",
+                "1",
+                "--clients",
+                "1",
+                "--warmup-seconds",
+                "0",
+                "--window-seconds",
+                "1",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("diagnostics_requested=0\n", result.stdout)
+            self.assertIn(
+                "diagnostics_phase=not_applicable_non_ranked\n",
+                result.stdout,
+            )
 
     def test_existing_database_modes_reuse_dataset_run_identity(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -459,6 +490,184 @@ class WorkflowSafetyTests(unittest.TestCase):
             finally:
                 listener.close()
 
+    def test_readiness_probe_is_bounded_by_monotonic_absolute_deadline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            server = self.make_python_executable(
+                Path(temp) / "fake-rmdb",
+                """
+import os
+import signal
+import socket
+import sys
+import time
+
+os.makedirs(sys.argv[1], exist_ok=True)
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", int(os.environ["RMDB_PORT"])))
+listener.listen(4)
+running = True
+def stop(_signum, _frame):
+    global running
+    running = False
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+while running:
+    time.sleep(0.02)
+listener.close()
+""",
+            )
+            tester = self.make_executable(
+                Path(temp) / "slow-tpcc",
+                """
+if [[ " $* " == *" --probe-ready "* ]]; then
+  sleep 5
+fi
+exit 0
+""",
+            )
+            reservation = socket.socket()
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+            reservation.close()
+
+            started = time.monotonic()
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                Path(temp) / "records",
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                "--allow-deviation",
+                "--ready-timeout-seconds",
+                "1",
+            )
+            elapsed = time.monotonic() - started
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("within 1s", result.stderr)
+            self.assertLess(
+                elapsed,
+                3.0,
+                "a single readiness probe exceeded the remaining deadline",
+            )
+
+    def test_foreign_racing_listener_is_rejected_and_not_killed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            start_marker = temp_path / "server-started"
+            listener_ready = temp_path / "foreign-listener-ready"
+            server = self.make_python_executable(
+                temp_path / "fake-rmdb",
+                """
+import os
+import signal
+import sys
+import time
+
+os.makedirs(sys.argv[1], exist_ok=True)
+open(os.environ["FAKE_START_MARKER"], "w", encoding="utf-8").close()
+running = True
+def stop(_signum, _frame):
+    global running
+    running = False
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+while running:
+    time.sleep(0.02)
+""",
+            )
+            tester = self.make_executable(
+                temp_path / "fake-tpcc",
+                "exit 0\n",
+            )
+            reservation = socket.socket()
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+            reservation.close()
+            foreign = subprocess.Popen(
+                [
+                    "python3",
+                    "-c",
+                    """
+import os
+from pathlib import Path
+import signal
+import socket
+import sys
+import time
+
+marker, ready, port = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+while not marker.exists():
+    time.sleep(0.01)
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", port))
+listener.listen(4)
+ready.write_text(str(os.getpid()), encoding="utf-8")
+running = True
+def stop(_signum, _frame):
+    global running
+    running = False
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+while running:
+    time.sleep(0.02)
+listener.close()
+""",
+                    str(start_marker),
+                    str(listener_ready),
+                    str(port),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            env = os.environ.copy()
+            env["FAKE_START_MARKER"] = str(start_marker)
+            try:
+                result = self.run_script(
+                    "--mode",
+                    "init",
+                    "--target-dir",
+                    root,
+                    "--record-root",
+                    temp_path / "records",
+                    "--skip-build",
+                    "--server-bin",
+                    server,
+                    "--tpcc-bin",
+                    tester,
+                    "--port",
+                    port,
+                    "--allow-deviation",
+                    "--ready-timeout-seconds",
+                    "1",
+                    env=env,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(listener_ready.exists(), result.stderr)
+                self.assertIn(
+                    "outside the registered RMDB process tree",
+                    result.stderr,
+                )
+                self.assertIsNone(
+                    foreign.poll(),
+                    "workflow killed a listener outside its registered tree",
+                )
+            finally:
+                if foreign.poll() is None:
+                    foreign.terminate()
+                foreign.wait(timeout=3)
+
     def test_stale_cmake_cache_fails_without_deleting_it(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)
@@ -505,23 +714,45 @@ class WorkflowSafetyTests(unittest.TestCase):
             source_csv.parent.mkdir(parents=True)
             source_csv.write_text("tracked csv", encoding="utf-8")
             calls = Path(temp) / "tester-calls"
+            server_children = Path(temp) / "server-children"
             server = self.make_python_executable(
                 Path(temp) / "fake-rmdb",
                 """
 import os
 import signal
+import socket
+import subprocess
 import sys
 import time
 
 os.makedirs(sys.argv[1], exist_ok=True)
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", int(os.environ["RMDB_PORT"])))
+listener.listen(8)
+worker = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import time\\nwhile True: time.sleep(0.05)",
+    ]
+)
+with open(os.environ["FAKE_SERVER_CHILDREN"], "a", encoding="utf-8") as output:
+    output.write(f"{worker.pid}\\n")
 running = True
 def stop(_signum, _frame):
     global running
     running = False
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
-while running:
-    time.sleep(0.02)
+try:
+    while running:
+        time.sleep(0.02)
+finally:
+    listener.close()
+    if worker.poll() is None:
+        worker.terminate()
+    worker.wait()
 """,
             )
             tester = self.make_python_executable(
@@ -577,6 +808,7 @@ while :; do sleep 0.05; done
             env = os.environ.copy()
             env["FAKE_TPCC_CALLS"] = str(calls)
             env["FAKE_DB_PATH"] = str(root / "tpcc_final2026")
+            env["FAKE_SERVER_CHILDREN"] = str(server_children)
             env["PATH"] = f"{fake_tools}{os.pathsep}{env['PATH']}"
 
             result = self.run_script(
@@ -616,6 +848,13 @@ while :; do sleep 0.05; done
                 ],
                 ["10", "60"],
             )
+            self.assertEqual(
+                [
+                    args[args.index("--diagnostic-segment") + 1]
+                    for args in diagnostic_runs
+                ],
+                ["warmup", "observation"],
+            )
             self.assertIn("--profile", ranks[0])
             self.assertIn("final2026", ranks[0])
             for forbidden in (
@@ -653,6 +892,18 @@ while :; do sleep 0.05; done
                         "8765",
                     ]
                     for args in probes
+                )
+            )
+            stateful_invocations = [
+                args for args in invocations if "--probe-ready" not in args
+            ]
+            self.assertTrue(
+                all(
+                    args[
+                        args.index("--recovery-ready-budget-seconds") + 1
+                    ]
+                    == "90"
+                    for args in stateful_invocations
                 )
             )
             result_dirs = list((Path(temp) / "records").iterdir())
@@ -798,6 +1049,35 @@ while :; do sleep 0.05; done
             self.assertIn("[server start: existing database]", server_log)
             self.assertFalse((root / "tpcc_final2026").exists())
             self.assertEqual(source_csv.read_text(encoding="utf-8"), "tracked csv")
+            child_pids = [
+                int(pid)
+                for pid in server_children.read_text(encoding="utf-8").splitlines()
+            ]
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if all(
+                    subprocess.run(
+                        ["ps", "-p", str(pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    ).returncode
+                    != 0
+                    for pid in child_pids
+                ):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(
+                all(
+                    subprocess.run(
+                        ["ps", "-p", str(pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    ).returncode
+                    != 0
+                    for pid in child_pids
+                ),
+                f"registered RMDB descendants survived cleanup: {child_pids}",
+            )
 
             for failure_variable, diagnostic_status in (
                 ("FAKE_STRACE_EMPTY", "failed"),

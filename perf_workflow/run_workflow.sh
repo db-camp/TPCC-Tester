@@ -38,6 +38,8 @@ TPCC_BIN_OVERRIDE=""
 STATE_DIR_OVERRIDE=""
 
 SERVER_PID=""
+SERVER_PGID=""
+SERVER_IDENTITY=""
 PROBE_PID=""
 TRACE_PID=""
 TRACE_EXIT_STATUS=""
@@ -275,10 +277,6 @@ esac
 if [[ "${DIAGNOSTICS_REQUESTED}" == "1" && "${MODE}" != "all" ]]; then
   die "--diagnostics requires --mode all so rank, online, and recovery gates complete first"
 fi
-if [[ "${MODE}" == "all" ]]; then
-  DIAGNOSTICS_REQUESTED=1
-fi
-
 validate_component "--db-name" "${DB_NAME}"
 validate_component "--label" "${LABEL}"
 validate_component "--build-dir" "${BUILD_DIR}"
@@ -412,6 +410,12 @@ case "${MODE}" in
   tools)
     ;;
 esac
+if [[ "${MODE}" == "all" && "${RANKED_CONFIGURATION}" == "1" ]]; then
+  DIAGNOSTICS_REQUESTED=1
+elif [[ "${MODE}" == "all" ]]; then
+  DIAGNOSTICS_REQUESTED=0
+  PHASE_DIAGNOSTICS="not_applicable_non_ranked"
+fi
 if [[ "${DIAGNOSTICS_REQUESTED}" == "1" ]]; then
   PHASE_DIAGNOSTICS="pending"
 fi
@@ -452,12 +456,15 @@ state_dir=${STATE_DIR}
 host=${HOST}
 port=${PORT}
 ready_probe=tpcc-tester --probe-ready --host ${HOST} --port ${PORT}
+recovery_ready_budget_seconds=${READY_TIMEOUT_SECONDS}
 schedule_owner=rust
 effective_scale=${EFFECTIVE_SCALE}
 effective_clients=${EFFECTIVE_CLIENTS}
 effective_warmup_seconds=${EFFECTIVE_WARMUP_SECONDS}
 effective_windows=${PUBLIC_WINDOWS}
 effective_window_seconds=${EFFECTIVE_WINDOW_SECONDS}
+diagnostics_requested=${DIAGNOSTICS_REQUESTED}
+diagnostics_phase=${PHASE_DIAGNOSTICS}
 EOF
 }
 
@@ -736,42 +743,450 @@ owned_marker_matches() {
   [[ "$(sed -n '1p' "${marker}")" == "${OWNER_TOKEN}" ]]
 }
 
+monotonic_millis() {
+  python3 - <<'PY'
+import time
+
+print(time.monotonic_ns() // 1_000_000)
+PY
+}
+
+process_identity() {
+  local pid="$1"
+  python3 - "${pid}" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+pid = int(sys.argv[1])
+stat_path = Path("/proc") / str(pid) / "stat"
+if stat_path.is_file():
+    try:
+        text = stat_path.read_text(encoding="ascii")
+        fields = text[text.rfind(")") + 2 :].split()
+        print(f"linux:{fields[19]}")
+    except (OSError, IndexError, ValueError):
+        raise SystemExit(1)
+else:
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    identity = result.stdout.strip()
+    if result.returncode != 0 or not identity:
+        raise SystemExit(1)
+    print(f"ps:{identity}")
+PY
+}
+
+server_process_helper() {
+  local action="$1"
+  local signal_name="${2-}"
+  python3 - "${action}" "${SERVER_PID}" "${SERVER_IDENTITY}" \
+    "${SERVER_PGID}" "${PORT}" "${signal_name}" <<'PY'
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+action, root_text, expected_identity, pgid_text, port_text, signal_name = (
+    sys.argv[1:]
+)
+root_pid = int(root_text)
+registered_pgid = int(pgid_text)
+port = int(port_text)
+
+
+def linux_stat(pid):
+    try:
+        text = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+        fields = text[text.rfind(")") + 2 :].split()
+        return {
+            "pid": pid,
+            "state": fields[0],
+            "ppid": int(fields[1]),
+            "pgrp": int(fields[2]),
+            "identity": f"linux:{fields[19]}",
+        }
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def process_table():
+    table = {}
+    proc = Path("/proc")
+    if (proc / "self" / "stat").is_file():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            item = linux_stat(int(entry.name))
+            if item is not None:
+                table[item["pid"]] = item
+        return table
+
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,pgid=,state="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("cannot inspect the process table")
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        try:
+            pid, ppid, pgrp = map(int, fields[:3])
+        except ValueError:
+            continue
+        table[pid] = {
+            "pid": pid,
+            "ppid": ppid,
+            "pgrp": pgrp,
+            "state": fields[3],
+            "identity": None,
+        }
+    return table
+
+
+def current_identity(pid):
+    item = linux_stat(pid)
+    if item is not None:
+        return item["identity"]
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    identity = result.stdout.strip()
+    if result.returncode != 0 or not identity:
+        return None
+    return f"ps:{identity}"
+
+
+def descendants(table):
+    owned = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, item in table.items():
+            if pid not in owned and item["ppid"] in owned:
+                owned.add(pid)
+                changed = True
+    return owned
+
+
+def root_status(table):
+    item = table.get(root_pid)
+    if item is None:
+        return "absent"
+    if current_identity(root_pid) != expected_identity:
+        return "reused"
+    return "owned"
+
+
+def listener_owners_linux():
+    inodes = set()
+    for name in ("tcp", "tcp6"):
+        path = Path("/proc/net") / name
+        try:
+            lines = path.read_text(encoding="ascii").splitlines()[1:]
+        except OSError:
+            raise RuntimeError(f"cannot inspect {path}")
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":
+                continue
+            try:
+                local_port = int(fields[1].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError):
+                continue
+            if local_port == port:
+                inodes.add(fields[9])
+    if not inodes:
+        return set(), False
+
+    owners = set()
+    mapped = set()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            descriptors = (entry / "fd").iterdir()
+            for descriptor in descriptors:
+                try:
+                    target = os.readlink(descriptor)
+                except OSError:
+                    continue
+                if target.startswith("socket:[") and target.endswith("]"):
+                    inode = target[8:-1]
+                    if inode in inodes:
+                        owners.add(int(entry.name))
+                        mapped.add(inode)
+        except (OSError, PermissionError):
+            continue
+    if mapped != inodes:
+        raise RuntimeError("cannot identify every listening socket owner")
+    return owners, True
+
+
+def listener_owners_lsof():
+    try:
+        result = subprocess.run(
+            [
+                "lsof",
+                "-nP",
+                "-a",
+                f"-iTCP:{port}",
+                "-sTCP:LISTEN",
+                "-Fp",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("lsof is required to validate listener ownership")
+    owners = set()
+    for line in result.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            owners.add(int(line[1:]))
+    if result.returncode == 1 and not owners:
+        return set(), False
+    if result.returncode != 0 or not owners:
+        raise RuntimeError("lsof could not identify the listening socket owner")
+    return owners, True
+
+
+try:
+    table = process_table()
+except RuntimeError as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(2)
+status = root_status(table)
+
+if action == "root-alive":
+    raise SystemExit(0 if status == "owned" else (1 if status == "absent" else 2))
+
+if action == "group-running":
+    if status == "reused":
+        print("registered RMDB pid was reused", file=sys.stderr)
+        raise SystemExit(2)
+    running = any(
+        item["pgrp"] == registered_pgid
+        and not item["state"].upper().startswith("Z")
+        for item in table.values()
+    )
+    raise SystemExit(0 if running else 1)
+
+if action == "listener":
+    if status != "owned":
+        print("registered RMDB process identity is not live", file=sys.stderr)
+        raise SystemExit(2)
+    owned = descendants(table)
+    try:
+        if (Path("/proc") / "self" / "stat").is_file():
+            owners, present = listener_owners_linux()
+        else:
+            owners, present = listener_owners_lsof()
+    except RuntimeError as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(2)
+    if not present:
+        raise SystemExit(1)
+    if not owners.issubset(owned):
+        print(
+            "listening socket is owned outside the registered RMDB process tree",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    raise SystemExit(0)
+
+if action == "signal":
+    group_members = {
+        pid
+        for pid, item in table.items()
+        if item["pgrp"] == registered_pgid
+        and not item["state"].upper().startswith("Z")
+    }
+    if status == "reused":
+        print("refusing to signal a reused RMDB pid", file=sys.stderr)
+        raise SystemExit(2)
+    if status == "owned":
+        root = table[root_pid]
+        if root["pgrp"] != registered_pgid or registered_pgid != root_pid:
+            print("registered RMDB process group identity changed", file=sys.stderr)
+            raise SystemExit(2)
+        owned = descendants(table)
+        live_owned = {
+            pid
+            for pid in owned
+            if pid in table and not table[pid]["state"].upper().startswith("Z")
+        }
+        if not group_members.issubset(owned) or any(
+            table[pid]["pgrp"] != registered_pgid for pid in live_owned
+        ):
+            print(
+                "RMDB process tree escaped or was joined by another process group",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    elif not group_members:
+        raise SystemExit(0)
+
+    signals = {
+        "INT": signal.SIGINT,
+        "TERM": signal.SIGTERM,
+        "KILL": signal.SIGKILL,
+    }
+    try:
+        requested = signals[signal_name]
+    except KeyError:
+        raise SystemExit(2)
+    try:
+        os.killpg(registered_pgid, requested)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        print("permission denied while signaling RMDB process group", file=sys.stderr)
+        raise SystemExit(2)
+    raise SystemExit(0)
+
+print(f"unknown process-helper action: {action}", file=sys.stderr)
+raise SystemExit(2)
+PY
+}
+
+port_is_available() {
+  python3 - "${HOST}" "${PORT}" <<'PY'
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+addresses = {
+    (family, socktype, proto, address)
+    for family, socktype, proto, _, address in socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM)
+}
+if not addresses:
+    raise SystemExit(1)
+for family, socktype, proto, address in addresses:
+    sock = socket.socket(family, socktype, proto)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(address)
+    except OSError:
+        sock.close()
+        raise SystemExit(1)
+    sock.close()
+raise SystemExit(0)
+PY
+}
+
+wait_for_server_group_exit() {
+  local timeout_millis="$1"
+  local started=""
+  local deadline=""
+  local now=""
+  started="$(monotonic_millis)"
+  deadline=$(( started + timeout_millis ))
+  while true; do
+    if server_process_helper group-running; then
+      :
+    else
+      local status=$?
+      [[ "${status}" == "1" ]] && return 0
+      return "${status}"
+    fi
+    now="$(monotonic_millis)"
+    (( now < deadline )) || return 1
+    sleep 0.05
+  done
+}
+
+wait_for_listener_gone() {
+  local timeout_millis="$1"
+  local started=""
+  local deadline=""
+  local now=""
+  started="$(monotonic_millis)"
+  deadline=$(( started + timeout_millis ))
+  while true; do
+    port_is_available && return 0
+    now="$(monotonic_millis)"
+    (( now < deadline )) || return 1
+    sleep 0.05
+  done
+}
+
+clear_server_registration() {
+  SERVER_PID=""
+  SERVER_PGID=""
+  SERVER_IDENTITY=""
+  STOPPING_SERVER=0
+}
+
 stop_server() {
   local pid="${SERVER_PID}"
-  local attempts=0
+  local wait_status=0
   [[ -n "${pid}" ]] || return 0
   if [[ "${STOPPING_SERVER}" == "1" ]]; then
-    kill -KILL "${pid}" 2>/dev/null || true
-    wait "${pid}" 2>/dev/null || true
-    SERVER_PID=""
-    return 0
+    warn "server shutdown is already in progress"
+    return 1
   fi
   STOPPING_SERVER=1
-  if ! kill -0 "${pid}" 2>/dev/null; then
-    wait "${pid}" 2>/dev/null || true
-    SERVER_PID=""
+
+  if ! server_process_helper signal INT; then
+    warn "refusing unsafe RMDB shutdown for registered pid ${pid}"
     STOPPING_SERVER=0
-    return 0
+    return 1
   fi
-  kill -INT "${pid}" 2>/dev/null || true
-  while kill -0 "${pid}" 2>/dev/null && (( attempts < 40 )); do
-    sleep 0.25
-    attempts=$((attempts + 1))
-  done
-  if kill -0 "${pid}" 2>/dev/null; then
-    kill -TERM "${pid}" 2>/dev/null || true
-    attempts=0
-    while kill -0 "${pid}" 2>/dev/null && (( attempts < 20 )); do
-      sleep 0.25
-      attempts=$((attempts + 1))
-    done
+  wait_for_server_group_exit 10000 || wait_status=$?
+  if (( wait_status > 1 )); then
+    warn "could not safely inspect registered RMDB process group ${SERVER_PGID}"
+    STOPPING_SERVER=0
+    return 1
   fi
-  if kill -0 "${pid}" 2>/dev/null; then
-    kill -KILL "${pid}" 2>/dev/null || true
+  if [[ "${wait_status}" == "1" ]]; then
+    if ! server_process_helper signal TERM; then
+      warn "refusing unsafe RMDB TERM escalation for registered pid ${pid}"
+      STOPPING_SERVER=0
+      return 1
+    fi
+  fi
+  wait_status=0
+  wait_for_server_group_exit 5000 || wait_status=$?
+  if (( wait_status > 1 )); then
+    warn "could not safely inspect registered RMDB process group ${SERVER_PGID}"
+    STOPPING_SERVER=0
+    return 1
+  fi
+  if [[ "${wait_status}" == "1" ]]; then
+    if ! server_process_helper signal KILL; then
+      warn "refusing unsafe RMDB KILL escalation for registered pid ${pid}"
+      STOPPING_SERVER=0
+      return 1
+    fi
+  fi
+  wait_status=0
+  wait_for_server_group_exit 5000 || wait_status=$?
+  if [[ "${wait_status}" != "0" ]]; then
+    warn "registered RMDB process group ${SERVER_PGID} did not terminate"
+    STOPPING_SERVER=0
+    return 1
   fi
   wait "${pid}" 2>/dev/null || true
-  SERVER_PID=""
-  STOPPING_SERVER=0
+  if ! wait_for_listener_gone 5000; then
+    warn "listener ${HOST}:${PORT} remained after registered RMDB shutdown"
+    clear_server_registration
+    return 1
+  fi
+  clear_server_registration
 }
 
 stop_probe() {
@@ -828,11 +1243,27 @@ stop_trace() {
 crash_server() {
   local pid="${SERVER_PID}"
   [[ -n "${pid}" ]] || die "cannot crash an unregistered server"
-  kill -0 "${pid}" 2>/dev/null || die "registered server ${pid} is not running"
-  log "SIGKILL registered RMDB pid ${pid}"
-  kill -KILL "${pid}"
+  server_process_helper root-alive \
+    || die "registered server ${pid} is not the live RMDB process"
+  log "SIGKILL registered RMDB process group ${SERVER_PGID}"
+  force_stop_server 5000 \
+    || die "registered RMDB process group did not terminate safely"
+}
+
+force_stop_server() {
+  local listener_timeout_millis="$1"
+  local pid="${SERVER_PID}"
+  [[ -n "${pid}" ]] || return 0
+  server_process_helper signal KILL \
+    || return 1
+  wait_for_server_group_exit 5000 \
+    || return 1
   wait "${pid}" 2>/dev/null || true
-  SERVER_PID=""
+  if ! wait_for_listener_gone "${listener_timeout_millis}"; then
+    clear_server_registration
+    return 1
+  fi
+  clear_server_registration
 }
 
 remove_current_owned_database() {
@@ -923,68 +1354,133 @@ ensure_binaries() {
 }
 
 ensure_port_available() {
-  if ! python3 - "${HOST}" "${PORT}" <<'PY'
-import socket
-import sys
-
-host, port = sys.argv[1], int(sys.argv[2])
-addresses = {
-    (family, socktype, proto, address)
-    for family, socktype, proto, _, address in socket.getaddrinfo(
-        host, port, type=socket.SOCK_STREAM)
-}
-if not addresses:
-    raise SystemExit(1)
-for family, socktype, proto, address in addresses:
-    sock = socket.socket(family, socktype, proto)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(address)
-    except OSError:
-        sock.close()
-        raise SystemExit(1)
-    sock.close()
-raise SystemExit(0)
-PY
-  then
+  if ! port_is_available; then
     die "port ${HOST}:${PORT} is already in use; the workflow will not kill its owner"
   fi
 }
 
 probe_ready() {
-  (
-    cd "${TPCC_DIR}"
-    exec "${TPCC_BIN}" --probe-ready --host "${HOST}" --port "${PORT}"
-  ) >>"${RESULT_DIR}/ready_probe.log" 2>&1 &
-  PROBE_PID=$!
+  local absolute_deadline_millis="$1"
+  python3 - "${absolute_deadline_millis}" "${TPCC_DIR}" "${TPCC_BIN}" \
+    "${HOST}" "${PORT}" <<'PY' >>"${RESULT_DIR}/ready_probe.log" 2>&1
+import os
+import signal
+import subprocess
+import sys
+import time
 
-  local attempts=0
-  local probe_rc=0
-  while kill -0 "${PROBE_PID}" 2>/dev/null && (( attempts < 40 )); do
-    sleep 0.05
-    attempts=$((attempts + 1))
-  done
-  if kill -0 "${PROBE_PID}" 2>/dev/null; then
-    stop_probe
-    return 1
-  fi
-  wait "${PROBE_PID}" || probe_rc=$?
-  PROBE_PID=""
-  return "${probe_rc}"
+deadline_millis = int(sys.argv[1])
+working_directory, executable, host, port = sys.argv[2:]
+remaining_seconds = (
+    deadline_millis - (time.monotonic_ns() // 1_000_000)
+) / 1000.0
+if remaining_seconds <= 0:
+    raise SystemExit(124)
+
+process = subprocess.Popen(
+    [executable, "--probe-ready", "--host", host, "--port", port],
+    cwd=working_directory,
+    start_new_session=True,
+)
+
+
+def terminate_probe(signum, _frame):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGINT, terminate_probe)
+signal.signal(signal.SIGTERM, terminate_probe)
+try:
+    raise SystemExit(process.wait(timeout=remaining_seconds))
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+    raise SystemExit(124)
+PY
 }
 
 wait_for_ready() {
-  local deadline=$(( $(date +%s) + 10#${READY_TIMEOUT_SECONDS} ))
-  while (( $(date +%s) <= deadline )); do
-    if [[ -z "${SERVER_PID}" ]] || ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+  local started_millis=""
+  local deadline_millis=""
+  local now_millis=""
+  local listener_status=0
+  started_millis="$(monotonic_millis)"
+  deadline_millis=$(( (10#${READY_TIMEOUT_SECONDS} * 1000) + started_millis ))
+  while true; do
+    now_millis="$(monotonic_millis)"
+    (( now_millis < deadline_millis )) || return 1
+    if [[ -z "${SERVER_PID}" ]] \
+      || ! server_process_helper root-alive; then
       return 1
     fi
-    if probe_ready; then
+
+    if server_process_helper listener; then
+      if probe_ready "${deadline_millis}"; then
+        now_millis="$(monotonic_millis)"
+        (( now_millis <= deadline_millis )) || return 1
+        server_process_helper listener || return 1
+        now_millis="$(monotonic_millis)"
+        (( now_millis <= deadline_millis )) || return 1
+        return 0
+      fi
+    else
+      listener_status=$?
+      if [[ "${listener_status}" != "1" ]]; then
+        return 1
+      fi
+    fi
+    now_millis="$(monotonic_millis)"
+    (( now_millis < deadline_millis )) || return 1
+    python3 - "${deadline_millis}" <<'PY'
+import sys
+import time
+
+remaining = (int(sys.argv[1]) - time.monotonic_ns() // 1_000_000) / 1000.0
+if remaining > 0:
+    time.sleep(min(0.25, remaining))
+PY
+  done
+}
+
+register_server_process() {
+  local pid="$1"
+  local started_millis=""
+  local deadline_millis=""
+  local current_pgid=""
+  SERVER_IDENTITY="$(process_identity "${pid}")" \
+    || die "could not capture registered RMDB process identity"
+  started_millis="$(monotonic_millis)"
+  deadline_millis=$(( started_millis + 2000 ))
+  while true; do
+    if ! server_process_helper root-alive; then
+      die "RMDB exited before its process group could be registered"
+    fi
+    current_pgid="$(python3 - "${pid}" <<'PY'
+import os
+import sys
+
+try:
+    print(os.getpgid(int(sys.argv[1])))
+except ProcessLookupError:
+    raise SystemExit(1)
+PY
+)" || die "could not inspect registered RMDB process group"
+    if [[ "${current_pgid}" == "${pid}" ]]; then
+      SERVER_PGID="${current_pgid}"
       return 0
     fi
-    sleep 0.25
+    (( $(monotonic_millis) < deadline_millis )) \
+      || die "RMDB did not enter its dedicated process group"
+    sleep 0.02
   done
-  return 1
 }
 
 start_server() {
@@ -994,12 +1490,19 @@ start_server() {
   log "starting RMDB for ${purpose}"
   (
     cd "${RMDB_DIR}"
-    exec env RMDB_PORT="${PORT}" "${SERVER_BIN}" "${DB_NAME}"
+    exec env RMDB_PORT="${PORT}" python3 -c \
+      'import os, sys
+if os.getpgrp() != os.getpid():
+    os.setpgid(0, 0)
+os.execv(sys.argv[1], sys.argv[1:])' \
+      "${SERVER_BIN}" "${DB_NAME}"
   ) >>"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
+  SERVER_PGID="${SERVER_PID}"
+  register_server_process "${SERVER_PID}"
   printf '%s\n' "${SERVER_PID}" >"${RESULT_DIR}/server.pid"
   if ! wait_for_ready; then
-    stop_server
+    force_stop_server 1000 || true
     die "RMDB did not pass the exact show-tables readiness probe within ${READY_TIMEOUT_SECONDS}s; see ${SERVER_LOG}"
   fi
 }
@@ -1035,7 +1538,8 @@ run_tester() {
     RMDB_TPCC_CSV_DIR="${CSV_DIR}" \
     RMDB_TPCC_LOAD_DIR="${LOAD_DIR}" \
     RMDB_TPCC_RUN_ID="${DATASET_RUN_ID}" \
-      "${TPCC_BIN}" "$@"
+      "${TPCC_BIN}" "$@" \
+      --recovery-ready-budget-seconds "${READY_TIMEOUT_SECONDS}"
   ) >"${log_path}" 2>&1
 }
 
@@ -1130,6 +1634,7 @@ run_final_diagnostics() {
   log "running ${DIAGNOSTIC_WARMUP_SECONDS}s non-ranked diagnostic warmup"
   if ! run_tester "${RESULT_DIR}/diagnostic_warmup.log" \
       --diagnostic-workload-seconds "${DIAGNOSTIC_WARMUP_SECONDS}" \
+      --diagnostic-segment warmup \
       --profile "${PROFILE}" --seed "${SEED}" --state-dir "${STATE_DIR}" \
       --host "${HOST}" --port "${PORT}"; then
     warn "diagnostic warmup failed; ranked result remains valid"
@@ -1164,6 +1669,7 @@ run_final_diagnostics() {
   log "running ${DIAGNOSTIC_OBSERVATION_SECONDS}s non-ranked diagnostic observation"
   if ! run_tester "${RESULT_DIR}/diagnostic_observation.log" \
       --diagnostic-workload-seconds "${DIAGNOSTIC_OBSERVATION_SECONDS}" \
+      --diagnostic-segment observation \
       --profile "${PROFILE}" --seed "${SEED}" --state-dir "${STATE_DIR}" \
       --host "${HOST}" --port "${PORT}"; then
     warn "diagnostic observation failed; ranked result remains valid"
