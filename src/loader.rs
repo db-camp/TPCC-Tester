@@ -1,6 +1,7 @@
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fs::{create_dir_all, rename, File, OpenOptions};
+use std::fs::{create_dir_all, rename, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -48,6 +49,7 @@ pub struct CsvAsset {
 pub struct MaterializedLoad {
     scale_factor: i32,
     schema_fingerprint: u64,
+    dataset_checksum: [u8; 32],
     assets: BTreeMap<LogicalTable, CsvAsset>,
     summary: LoadSummary,
 }
@@ -64,6 +66,10 @@ impl MaterializedLoad {
 
     pub fn assets(&self) -> impl Iterator<Item = &CsvAsset> {
         self.assets.values()
+    }
+
+    pub const fn dataset_checksum(&self) -> [u8; 32] {
+        self.dataset_checksum
     }
 }
 
@@ -172,6 +178,7 @@ pub struct CsvMaterializer<'a> {
     schema: &'a RuntimeSchema,
     csv_dir: PathBuf,
     load_dir: String,
+    dataset_hasher: Sha256,
     assets: BTreeMap<LogicalTable, CsvAsset>,
 }
 
@@ -198,6 +205,7 @@ impl<'a> CsvMaterializer<'a> {
             schema,
             csv_dir,
             load_dir,
+            dataset_hasher: Self::initial_dataset_hasher(scale_factor, schema),
             assets: BTreeMap::new(),
         })
     }
@@ -460,11 +468,13 @@ impl<'a> CsvMaterializer<'a> {
             ));
         }
         let setup_evidence = setup_evidence.finish()?;
+        let dataset_checksum: [u8; 32] = self.dataset_hasher.clone().finalize().into();
 
         info!("[数据物化] 9 个 CSV 已全部完成");
         Ok(MaterializedLoad {
             scale_factor: self.scale_factor,
             schema_fingerprint: self.schema.fingerprint(),
+            dataset_checksum,
             assets: self.assets,
             summary: LoadSummary {
                 order_line_rows: expected_order_line_count,
@@ -529,7 +539,17 @@ impl<'a> CsvMaterializer<'a> {
             .schema
             .columns(table)
             .map_err(|error| TpccError::Protocol(error.to_string()))?;
-        writeln!(writer, "{}", runtime_columns.join(","))?;
+        let ordinal = LogicalTable::ALL
+            .iter()
+            .position(|candidate| *candidate == table)
+            .expect("logical table disappeared from the complete set");
+        self.dataset_hasher.update([0xff, ordinal as u8]);
+        self.dataset_hasher
+            .update((basename.len() as u32).to_be_bytes());
+        self.dataset_hasher.update(basename.as_bytes());
+        let header = format!("{}\n", runtime_columns.join(","));
+        self.dataset_hasher.update(header.as_bytes());
+        writer.write_all(header.as_bytes())?;
         let mut total = 0_u64;
         for row in rows {
             if row.len() != columns.len() {
@@ -541,7 +561,9 @@ impl<'a> CsvMaterializer<'a> {
                 )));
             }
             observe(&row)?;
-            Self::write_csv_row(&mut writer, &row)?;
+            let encoded = Self::csv_row(&row);
+            self.dataset_hasher.update(encoded.as_bytes());
+            writer.write_all(encoded.as_bytes())?;
             total += 1;
             if total >= 10000 && total % 10000 == 0 {
                 let elapsed = start.elapsed().as_secs_f64();
@@ -551,6 +573,8 @@ impl<'a> CsvMaterializer<'a> {
                 );
             }
         }
+        self.dataset_hasher.update([0xfe, ordinal as u8]);
+        self.dataset_hasher.update(total.to_be_bytes());
         writer.flush()?;
         drop(writer);
         rename(&partial_file, &csv_file)?;
@@ -576,15 +600,16 @@ impl<'a> CsvMaterializer<'a> {
         Ok(total)
     }
 
-    fn write_csv_row(writer: &mut BufWriter<File>, row: &[SqlParam]) -> Result<(), TpccError> {
+    fn csv_row(row: &[SqlParam]) -> String {
+        let mut output = String::new();
         for (idx, param) in row.iter().enumerate() {
             if idx > 0 {
-                write!(writer, ",")?;
+                output.push(',');
             }
-            write!(writer, "{}", Self::csv_value(param))?;
+            output.push_str(&Self::csv_value(param));
         }
-        writeln!(writer)?;
-        Ok(())
+        output.push('\n');
+        output
     }
 
     fn csv_value(param: &SqlParam) -> String {
@@ -602,6 +627,15 @@ impl<'a> CsvMaterializer<'a> {
             }
             SqlParam::Null => String::new(),
         }
+    }
+
+    fn initial_dataset_hasher(scale_factor: i32, schema: &RuntimeSchema) -> Sha256 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"rmdb-tpcc-generated-csv-v1\0");
+        hasher.update(scale_factor.to_be_bytes());
+        hasher.update(schema.seed().to_be_bytes());
+        hasher.update(schema.fingerprint().to_be_bytes());
+        hasher
     }
 }
 
@@ -719,6 +753,7 @@ mod tests {
             schema: &schema,
             csv_dir: directory.clone(),
             load_dir: directory.to_string_lossy().into_owned(),
+            dataset_hasher: CsvMaterializer::initial_dataset_hasher(1, &schema),
             assets: BTreeMap::new(),
         };
         let row = vec![
@@ -741,6 +776,11 @@ mod tests {
                 [row],
             )
             .unwrap();
+        let empty_checksum: [u8; 32] = CsvMaterializer::initial_dataset_hasher(1, &schema)
+            .finalize()
+            .into();
+        let streamed_checksum: [u8; 32] = materializer.dataset_hasher.clone().finalize().into();
+        assert_ne!(streamed_checksum, empty_checksum);
 
         let asset = materializer.assets.get(&LogicalTable::Warehouse).unwrap();
         assert_eq!(

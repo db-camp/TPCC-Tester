@@ -12,6 +12,7 @@ rand = "0.9"
 chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+sha2 = "0.10"
 
 [profile.release]
 strip = false
