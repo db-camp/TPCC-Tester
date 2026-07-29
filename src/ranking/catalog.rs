@@ -498,7 +498,9 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::NewOrderStock,
             &[Int32, Int32],
-            "SELECT s_quantity AS s_quantity, s_data AS s_data, \
+            "SELECT s_quantity AS s_quantity, s_ytd AS s_ytd, \
+             s_order_cnt AS s_order_cnt, s_remote_cnt AS s_remote_cnt, \
+             s_data AS s_data, \
              s_dist_01 AS s_dist_01, s_dist_02 AS s_dist_02, \
              s_dist_03 AS s_dist_03, s_dist_04 AS s_dist_04, \
              s_dist_05 AS s_dist_05, s_dist_06 AS s_dist_06, \
@@ -507,6 +509,9 @@ pub fn final2026_catalog() -> Vec<Statement> {
              FROM stock WHERE s_w_id = $1 AND s_i_id = $2;",
             &[
                 ("s_quantity", Int32),
+                ("s_ytd", Float32),
+                ("s_order_cnt", Int32),
+                ("s_remote_cnt", Int32),
                 ("s_data", Char),
                 ("s_dist_01", Char),
                 ("s_dist_02", Char),

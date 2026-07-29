@@ -24,7 +24,7 @@ use super::common::{
 };
 use super::runner::{
     execute_batch, semantic_or_abort, NewOrderEvidence, RankedCommit, RankedTransactionError,
-    RankedTransactionOutcome,
+    RankedTransactionOutcome, RecoveryNewOrderLineEvidence, StockVersion,
 };
 
 const MIN_STOCK_QUANTITY: i32 = 10;
@@ -78,6 +78,8 @@ pub async fn execute(
                 .iter()
                 .map(|line| line.amount_bits)
                 .collect(),
+            entry_timestamp: validated.timestamp,
+            recovery_lines: stage_two.recovery_lines,
         },
     )))
 }
@@ -301,7 +303,7 @@ fn build_stage_one(input: &ValidatedInput) -> StageOnePlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MaterializedLine {
     plan: LinePlan,
-    initial_stock_quantity: i32,
+    initial_stock: StockVersion,
     amount_bits: u32,
     district_info: Vec<u8>,
 }
@@ -352,7 +354,7 @@ fn parse_stage_one(
     require_f32_range(district_tax_bits, 0.0, 0.2, "district.d_tax")?;
 
     let mut item_prices = BTreeMap::<i32, u32>::new();
-    let mut stock_snapshots = BTreeMap::<(i32, i32), (i32, Vec<u8>)>::new();
+    let mut stock_snapshots = BTreeMap::<(i32, i32), (StockVersion, Vec<u8>)>::new();
     let mut lines = Vec::with_capacity(input.lines.len());
 
     for (line, indices) in input.lines.iter().zip(&plan.line_results) {
@@ -407,7 +409,7 @@ fn parse_stage_one(
         )?;
         require_columns(
             stock,
-            12,
+            15,
             &format!(
                 "New-Order stock ({}, {})",
                 line.supply_warehouse, line.item_id
@@ -428,10 +430,54 @@ fn parse_stage_one(
                 line.supply_warehouse, line.item_id
             )));
         }
+        let stock_ytd_bits = row_f32_bits(
+            stock,
+            1,
+            &format!(
+                "New-Order stock ({}, {})",
+                line.supply_warehouse, line.item_id
+            ),
+        )?;
+        let stock_ytd = f32::from_bits(stock_ytd_bits);
+        if !stock_ytd.is_finite() || stock_ytd < 0.0 {
+            return Err(SemanticViolation::new(format!(
+                "stock ({}, {}) s_ytd must be finite and non-negative",
+                line.supply_warehouse, line.item_id
+            )));
+        }
+        let stock_order_count = row_int32(
+            stock,
+            2,
+            &format!(
+                "New-Order stock ({}, {})",
+                line.supply_warehouse, line.item_id
+            ),
+        )?;
+        let stock_remote_count = row_int32(
+            stock,
+            3,
+            &format!(
+                "New-Order stock ({}, {})",
+                line.supply_warehouse, line.item_id
+            ),
+        )?;
+        if stock_order_count < 0 || stock_remote_count < 0 || stock_remote_count > stock_order_count
+        {
+            return Err(SemanticViolation::new(format!(
+                "stock ({}, {}) has invalid counters ({stock_order_count},{stock_remote_count})",
+                line.supply_warehouse, line.item_id
+            )));
+        }
+        let stock_version = StockVersion {
+            quantity: stock_quantity,
+            ytd_bits: stock_ytd_bits,
+            order_count: stock_order_count,
+            remote_count: stock_remote_count,
+        };
         require_char_range(
             row_char(
                 stock,
-                1,
+                4,
                 &format!(
                     "New-Order stock ({}, {})",
                     line.supply_warehouse, line.item_id
@@ -441,7 +487,7 @@ fn parse_stage_one(
             50,
             "stock.s_data",
         )?;
-        for column in 2..12 {
+        for column in 5..15 {
             require_char_range(
                 row_char(
                     stock,
@@ -453,12 +499,12 @@ fn parse_stage_one(
                 )?,
                 24,
                 24,
-                &format!("stock.s_dist_{:02}", column - 1),
+                &format!("stock.s_dist_{:02}", column - 4),
             )?;
         }
         let district_info = row_char(
             stock,
-            input.district_id as usize + 1,
+            input.district_id as usize + 4,
             &format!(
                 "New-Order stock ({}, {})",
                 line.supply_warehouse, line.item_id
@@ -468,10 +514,10 @@ fn parse_stage_one(
         require_char_range(&district_info, 24, 24, "stock district information")?;
 
         let key = line.stock_key();
-        if let Some((previous_quantity, previous_info)) =
-            stock_snapshots.insert(key, (stock_quantity, district_info.clone()))
+        if let Some((previous_version, previous_info)) =
+            stock_snapshots.insert(key, (stock_version.clone(), district_info.clone()))
         {
-            if previous_quantity != stock_quantity || previous_info != district_info {
+            if previous_version != stock_version || previous_info != district_info {
                 return Err(SemanticViolation::new(format!(
                     "stock ({}, {}) returned inconsistent rows inside one snapshot",
                     line.supply_warehouse, line.item_id
@@ -481,7 +527,7 @@ fn parse_stage_one(
 
         lines.push(MaterializedLine {
             plan: *line,
-            initial_stock_quantity: stock_quantity,
+            initial_stock: stock_version,
             amount_bits: multiply_f32_bits(price_bits, line.quantity)?,
             district_info,
         });
@@ -573,6 +619,7 @@ struct StageTwoPlan {
     operations: Vec<Operation>,
     remote_line_count: u8,
     stock_ytd_delta: u32,
+    recovery_lines: Vec<RecoveryNewOrderLineEvidence>,
 }
 
 fn build_stage_two(
@@ -612,28 +659,41 @@ fn build_stage_two(
         ),
     ];
 
-    let mut current_quantities = BTreeMap::<(i32, i32), i32>::new();
+    let mut current_stocks = BTreeMap::<(i32, i32), StockVersion>::new();
     let mut remote_line_count = 0_u8;
     let mut stock_ytd_delta = 0_u32;
+    let mut recovery_lines = Vec::with_capacity(materialized.lines.len());
     for line in &materialized.lines {
         let key = line.plan.stock_key();
-        let current = current_quantities
+        let current = current_stocks
             .entry(key)
-            .or_insert(line.initial_stock_quantity);
-        let normal_update = *current >= line.plan.quantity + 10;
-        *current = if normal_update {
-            *current - line.plan.quantity
+            .or_insert_with(|| line.initial_stock.clone());
+        let stock_before = current.clone();
+        let normal_update = current.quantity >= line.plan.quantity + 10;
+        current.quantity = if normal_update {
+            current.quantity - line.plan.quantity
         } else {
-            *current + 91 - line.plan.quantity
+            current.quantity + 91 - line.plan.quantity
         };
-        if !(MIN_STOCK_QUANTITY..=MAX_STOCK_QUANTITY).contains(current) {
+        if !(MIN_STOCK_QUANTITY..=MAX_STOCK_QUANTITY).contains(&current.quantity) {
             return Err(SemanticViolation::new(format!(
                 "stock ({}, {}) relative update produced out-of-range quantity {}",
-                line.plan.supply_warehouse, line.plan.item_id, current
+                line.plan.supply_warehouse, line.plan.item_id, current.quantity
             )));
         }
 
         let remote = i32::from(line.plan.supply_warehouse != input.warehouse_id);
+        let stock_ytd = f32::from_bits(current.ytd_bits);
+        current.ytd_bits = (stock_ytd + line.plan.quantity as f32).to_bits();
+        current.order_count = current
+            .order_count
+            .checked_add(1)
+            .ok_or_else(|| SemanticViolation::new("New-Order stock order count overflow"))?;
+        current.remote_count = current
+            .remote_count
+            .checked_add(remote)
+            .ok_or_else(|| SemanticViolation::new("New-Order stock remote count overflow"))?;
+        let stock_after = current.clone();
         remote_line_count = remote_line_count
             .checked_add(remote as u8)
             .ok_or_else(|| SemanticViolation::new("New-Order remote line count overflow"))?;
@@ -670,6 +730,20 @@ fn build_stage_two(
                 WireValue::Char(line.district_info.clone()),
             ],
         ));
+        recovery_lines.push(RecoveryNewOrderLineEvidence {
+            number: line.plan.number,
+            item_id: u32::try_from(line.plan.item_id)
+                .map_err(|_| SemanticViolation::new("New-Order item id does not fit UINT32"))?,
+            supply_warehouse: u16::try_from(line.plan.supply_warehouse).map_err(|_| {
+                SemanticViolation::new("New-Order supply warehouse does not fit UINT16")
+            })?,
+            quantity: u8::try_from(line.plan.quantity)
+                .map_err(|_| SemanticViolation::new("New-Order quantity does not fit UINT8"))?,
+            amount_bits: line.amount_bits,
+            district_info: line.district_info.clone(),
+            stock_before,
+            stock_after,
+        });
     }
 
     operations.push(operation(
@@ -685,6 +759,7 @@ fn build_stage_two(
         operations,
         remote_line_count,
         stock_ytd_delta,
+        recovery_lines,
     })
 }
 
@@ -723,7 +798,12 @@ mod tests {
     fn materialized(plan: LinePlan, stock: i32, amount: f32) -> MaterializedLine {
         MaterializedLine {
             plan,
-            initial_stock_quantity: stock,
+            initial_stock: StockVersion {
+                quantity: stock,
+                ytd_bits: 0.0_f32.to_bits(),
+                order_count: 0,
+                remote_count: 0,
+            },
             amount_bits: amount.to_bits(),
             district_info: b"district".to_vec(),
         }
@@ -859,6 +939,21 @@ mod tests {
             stage.operations[5].statement_id,
             StatementId::NewOrderUpdateStockWrapped.wire_id()
         );
+        assert_eq!(stage.recovery_lines.len(), 2);
+        assert_eq!(stage.recovery_lines[0].stock_before.quantity, 25);
+        assert_eq!(stage.recovery_lines[0].stock_after.quantity, 17);
+        assert_eq!(
+            stage.recovery_lines[0].stock_after.ytd_bits,
+            8.0_f32.to_bits()
+        );
+        assert_eq!(stage.recovery_lines[0].stock_after.order_count, 1);
+        assert_eq!(stage.recovery_lines[1].stock_before.quantity, 17);
+        assert_eq!(stage.recovery_lines[1].stock_after.quantity, 100);
+        assert_eq!(
+            stage.recovery_lines[1].stock_after.ytd_bits,
+            16.0_f32.to_bits()
+        );
+        assert_eq!(stage.recovery_lines[1].stock_after.order_count, 2);
     }
 
     #[test]

@@ -344,6 +344,8 @@ impl LedgerEvent {
                         remote_line_count,
                         stock_ytd_delta,
                         line_amount_bits: delta.lines.iter().map(|line| line.amount_bits).collect(),
+                        entry_timestamp: Vec::new(),
+                        recovery_lines: Vec::new(),
                     },
                 ))
             }
@@ -2425,6 +2427,8 @@ mod tests {
                 .map(|line| u32::from(line.quantity()))
                 .sum(),
             line_amount_bits: amount_bits,
+            entry_timestamp: b"2026-07-29 10:20:30".to_vec(),
+            recovery_lines: Vec::new(),
         }))
     }
 

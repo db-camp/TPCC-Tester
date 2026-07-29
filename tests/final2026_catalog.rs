@@ -86,9 +86,13 @@ fn query_schemas_use_fixed_aliases_and_exact_wire_types() {
     let StatementKind::Query { columns } = &stock.kind else {
         panic!("stock lookup must be a query");
     };
-    assert_eq!(columns.len(), 12);
+    assert_eq!(columns.len(), 15);
     assert_eq!(columns[0].sql_type, SqlType::Int32);
-    assert!(columns[1..]
+    assert_eq!(columns[1].sql_type, SqlType::Float32);
+    assert!(columns[2..4]
+        .iter()
+        .all(|column| column.sql_type == SqlType::Int32));
+    assert!(columns[4..]
         .iter()
         .all(|column| column.sql_type == SqlType::Char));
 

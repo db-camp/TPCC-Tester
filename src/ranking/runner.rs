@@ -12,6 +12,26 @@ use super::common::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StockVersion {
+    pub quantity: i32,
+    pub ytd_bits: u32,
+    pub order_count: i32,
+    pub remote_count: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryNewOrderLineEvidence {
+    pub number: u8,
+    pub item_id: u32,
+    pub supply_warehouse: u16,
+    pub quantity: u8,
+    pub amount_bits: u32,
+    pub district_info: Vec<u8>,
+    pub stock_before: StockVersion,
+    pub stock_after: StockVersion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewOrderEvidence {
     pub warehouse_id: u16,
     pub district_id: u8,
@@ -20,6 +40,8 @@ pub struct NewOrderEvidence {
     pub remote_line_count: u8,
     pub stock_ytd_delta: u32,
     pub line_amount_bits: Vec<u32>,
+    pub entry_timestamp: Vec<u8>,
+    pub recovery_lines: Vec<RecoveryNewOrderLineEvidence>,
 }
 
 /// The two counters jointly identify one logical customer-row predecessor.
