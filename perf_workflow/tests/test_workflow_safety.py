@@ -755,7 +755,7 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 "--port",
                 port,
                 "--allow-deviation",
-                "--ready-timeout-seconds",
+                "--startup-ready-timeout-seconds",
                 "1",
                 env=env,
             )
@@ -1069,6 +1069,28 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             self.assertIn(
                 "recovery_ready_budget_seconds=5\n",
                 accepted.stdout,
+            )
+
+    def test_local_startup_budget_is_not_the_public_recovery_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            result = self.run_script(
+                "--plan-only",
+                "--target-dir",
+                root,
+                "--startup-ready-timeout-seconds",
+                "5",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("conformance=public_spec_aligned\n", result.stdout)
+            self.assertIn("ranked_configuration=1\n", result.stdout)
+            self.assertIn(
+                "startup_ready_budget_seconds=5\n",
+                result.stdout,
+            )
+            self.assertIn(
+                "recovery_ready_budget_seconds=90\n",
+                result.stdout,
             )
 
     def test_non_ranked_all_does_not_run_fixed_final_diagnostics(self):
@@ -1556,7 +1578,7 @@ if "--probe-ready" in sys.argv:
                 "--port",
                 port,
                 "--allow-deviation",
-                "--ready-timeout-seconds",
+                "--startup-ready-timeout-seconds",
                 "8",
                 env=env,
             )
@@ -1624,7 +1646,7 @@ exit 0
                 "--port",
                 port,
                 "--allow-deviation",
-                "--ready-timeout-seconds",
+                "--startup-ready-timeout-seconds",
                 "1",
             )
             elapsed = time.monotonic() - started
@@ -1681,7 +1703,7 @@ if "--probe-ready" in sys.argv:
                 "--port",
                 port,
                 "--allow-deviation",
-                "--ready-timeout-seconds",
+                "--startup-ready-timeout-seconds",
                 "5",
                 env=env,
             )
@@ -1753,7 +1775,7 @@ time.sleep(60)
                 "--port",
                 port,
                 "--allow-deviation",
-                "--ready-timeout-seconds",
+                "--startup-ready-timeout-seconds",
                 "3",
                 env=env,
             )
@@ -1808,7 +1830,7 @@ time.sleep(60)
                 "--port",
                 port,
                 "--allow-deviation",
-                "--ready-timeout-seconds",
+                "--startup-ready-timeout-seconds",
                 "1",
                 env=env,
             )
@@ -1984,7 +2006,7 @@ listener.close()
                     "--port",
                     port,
                     "--allow-deviation",
-                    "--ready-timeout-seconds",
+                    "--startup-ready-timeout-seconds",
                     "1",
                     env=env,
                 )

@@ -23,7 +23,8 @@ PORT="8765"
 PROFILE="final2026"
 SEED="2026"
 SEED_CALLER_SUPPLIED=0
-READY_TIMEOUT_SECONDS="90"
+STARTUP_READY_TIMEOUT_SECONDS="90"
+RECOVERY_READY_TIMEOUT_SECONDS="90"
 SKIP_BUILD=0
 PLAN_ONLY=0
 INIT_BEFORE_RUN=0
@@ -120,7 +121,10 @@ Paths/build:
 
 Lifecycle:
   --init-db                    Initialize before --mode rank
-  --ready-timeout-seconds <n>  Public default: 90; other values are deviations
+  --ready-timeout-seconds <n>  Public recovery default: 90; deviations require
+                               --allow-deviation
+  --startup-ready-timeout-seconds <n>
+                               Local first-start safety budget (default: 90)
   --diagnostics                Compatibility flag; --mode all automatically
                                runs non-ranked diagnostics after every gate
   --keep-db-artifacts
@@ -254,8 +258,10 @@ while [[ $# -gt 0 ]]; do
       need_value "$1" "${2-}"; PROFILE="$2"; shift 2 ;;
     --seed)
       need_value "$1" "${2-}"; SEED="$2"; SEED_CALLER_SUPPLIED=1; shift 2 ;;
-    --ready-timeout-seconds|--server-start-timeout-seconds)
-      need_value "$1" "${2-}"; READY_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --ready-timeout-seconds)
+      need_value "$1" "${2-}"; RECOVERY_READY_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --startup-ready-timeout-seconds|--server-start-timeout-seconds)
+      need_value "$1" "${2-}"; STARTUP_READY_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --server-bin)
       need_value "$1" "${2-}"; SERVER_BIN_OVERRIDE="$2"; shift 2 ;;
     --tpcc-bin)
@@ -309,13 +315,16 @@ validate_component "--build-dir" "${BUILD_DIR}"
 validate_nonnegative_integer "--seed" "${SEED}"
 validate_positive_integer "--port" "${PORT}"
 (( 10#${PORT} <= 65535 )) || die "--port must be at most 65535"
-validate_positive_integer "--ready-timeout-seconds" "${READY_TIMEOUT_SECONDS}"
+validate_positive_integer \
+  "--startup-ready-timeout-seconds" "${STARTUP_READY_TIMEOUT_SECONDS}"
+validate_positive_integer \
+  "--ready-timeout-seconds" "${RECOVERY_READY_TIMEOUT_SECONDS}"
 HOST_INFO="$(normalize_numeric_host "${HOST}")" \
   || die "--host must be a numeric IPv4 or IPv6 address"
 IFS=$'\t' read -r HOST_VERSION HOST <<<"${HOST_INFO}"
 
 if [[ -n "${SCALE}${CLIENTS}${WARMUP_SECONDS}${WINDOW_SECONDS}" \
-  || "${READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]] \
+  || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]] \
   && [[ "${ALLOW_DEVIATION}" != "1" ]]; then
   die "local sizing/timing/readiness overrides require --allow-deviation"
 fi
@@ -337,7 +346,7 @@ if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_CLIENTS}" != "${PUBLIC_CLIENTS}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
   || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
-  || "${READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
+  || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
 if [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
@@ -485,7 +494,8 @@ state_dir=${STATE_DIR}
 host=${HOST}
 port=${PORT}
 ready_probe=tpcc-tester --probe-ready --host ${HOST} --port ${PORT}
-recovery_ready_budget_seconds=${READY_TIMEOUT_SECONDS}
+startup_ready_budget_seconds=${STARTUP_READY_TIMEOUT_SECONDS}
+recovery_ready_budget_seconds=${RECOVERY_READY_TIMEOUT_SECONDS}
 schedule_owner=rust
 effective_scale=${EFFECTIVE_SCALE}
 effective_clients=${EFFECTIVE_CLIENTS}
@@ -2765,13 +2775,15 @@ PY
 
 start_server() {
   local purpose="$1"
+  local readiness_budget_seconds="$2"
+  local readiness_budget_kind="$3"
   local readiness_started_millis=""
   local readiness_deadline_millis=""
   ensure_port_available
   printf '\n[server start: %s]\n' "${purpose}" >>"${SERVER_LOG}"
-  log "starting RMDB for ${purpose}"
+  log "starting RMDB for ${purpose} (${readiness_budget_kind} readiness budget)"
   readiness_started_millis="$(monotonic_millis)"
-  readiness_deadline_millis=$(( (10#${READY_TIMEOUT_SECONDS} * 1000) \
+  readiness_deadline_millis=$(( (10#${readiness_budget_seconds} * 1000) \
     + readiness_started_millis ))
   (
     cd "${RMDB_DIR}"
@@ -2797,7 +2809,7 @@ os.execv(sys.argv[1], sys.argv[1:])' \
   printf '%s\n' "${SERVER_PID}" >"${RESULT_DIR}/server.pid"
   if ! wait_for_ready "${readiness_deadline_millis}"; then
     force_stop_server 1000 || true
-    die "RMDB did not pass the exact show-tables readiness probe within ${READY_TIMEOUT_SECONDS}s; see ${SERVER_LOG}"
+    die "RMDB did not pass the exact show-tables readiness probe within ${readiness_budget_seconds}s (${readiness_budget_kind} budget); see ${SERVER_LOG}"
   fi
 }
 
@@ -2814,16 +2826,34 @@ start_new_database() {
   if [[ -e "${DB_PATH}" || -L "${DB_PATH}" ]]; then
     die "database path already exists: ${DB_PATH}; choose another --db-name or remove it explicitly"
   fi
-  start_server "new database setup"
+  start_server "new database setup" \
+    "${STARTUP_READY_TIMEOUT_SECONDS}" "local startup"
   claim_new_database
   capture_resource_database_identity || true
 }
 
 start_existing_database() {
+  local readiness_scope="$1"
+  local readiness_budget_seconds=""
+  local readiness_budget_kind=""
   [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] \
     || die "existing database directory is missing or unsafe: ${DB_PATH}"
   capture_resource_database_identity || true
-  start_server "existing database"
+  case "${readiness_scope}" in
+    startup)
+      readiness_budget_seconds="${STARTUP_READY_TIMEOUT_SECONDS}"
+      readiness_budget_kind="local startup"
+      ;;
+    recovery)
+      readiness_budget_seconds="${RECOVERY_READY_TIMEOUT_SECONDS}"
+      readiness_budget_kind="public recovery"
+      ;;
+    *)
+      die "internal unknown readiness scope: ${readiness_scope}"
+      ;;
+  esac
+  start_server "existing database" \
+    "${readiness_budget_seconds}" "${readiness_budget_kind}"
 }
 
 run_tester() {
@@ -2843,7 +2873,7 @@ run_tester() {
   (
     cd "${TPCC_DIR}"
     env "${tester_environment[@]}" "${TPCC_BIN}" "$@" \
-      --recovery-ready-budget-seconds "${READY_TIMEOUT_SECONDS}"
+      --recovery-ready-budget-seconds "${RECOVERY_READY_TIMEOUT_SECONDS}"
   ) >"${log_path}" 2>&1
 }
 
@@ -2928,7 +2958,7 @@ run_crash_restart() {
   crash_server
   record_lifecycle_event crash-killed
   record_lifecycle_event restart-started
-  start_existing_database
+  start_existing_database recovery
   record_lifecycle_event restart-ready
   set_phase_status crash_restart passed
 }
@@ -3095,14 +3125,14 @@ case "${MODE}" in
       start_new_database
       run_setup
     else
-      start_existing_database
+      start_existing_database startup
     fi
     run_rank
     run_check online
     stop_server
     ;;
   recovery)
-    start_existing_database
+    start_existing_database recovery
     run_check recovery
     stop_server
     ;;
