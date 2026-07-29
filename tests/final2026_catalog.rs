@@ -190,6 +190,25 @@ fn delivery_reads_rows_and_sum_with_the_full_partition_key() {
 }
 
 #[test]
+fn delivery_reads_customer_after_its_relative_update() {
+    let catalogue = final2026_catalog();
+    let after = find(&catalogue, StatementId::DeliveryCustomerAfter);
+    assert_eq!(
+        after.param_types,
+        vec![SqlType::Int32, SqlType::Int32, SqlType::Int32]
+    );
+    assert!(after.sql.contains("c_w_id = $1"));
+    assert!(after.sql.contains("c_d_id = $2"));
+    assert!(after.sql.contains("c_id = $3"));
+
+    let final_stage = DELIVERY_STAGES.last().unwrap();
+    assert!(final_stage.steps.iter().any(|step| {
+        step.alternatives == [StatementId::DeliveryCustomerAfter]
+            && step.multiplicity == Multiplicity::PerClaimedDistrict
+    }));
+}
+
+#[test]
 fn stage_templates_preserve_the_ranked_round_trip_shapes() {
     assert_eq!(
         NEW_ORDER_STAGES

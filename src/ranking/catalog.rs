@@ -60,6 +60,7 @@ pub enum StatementId {
     DeliveryUpdateOrder = 78,
     DeliveryUpdateLines = 79,
     DeliveryUpdateCustomer = 80,
+    DeliveryCustomerAfter = 81,
 
     StockLevelNextOrder = 89,
     StockLevelCount = 90,
@@ -144,6 +145,7 @@ const DELIVERY_DELETE_QUEUE: &[StatementId] = &[StatementId::DeliveryDeleteQueue
 const DELIVERY_UPDATE_ORDER: &[StatementId] = &[StatementId::DeliveryUpdateOrder];
 const DELIVERY_UPDATE_LINES: &[StatementId] = &[StatementId::DeliveryUpdateLines];
 const DELIVERY_UPDATE_CUSTOMER: &[StatementId] = &[StatementId::DeliveryUpdateCustomer];
+const DELIVERY_CUSTOMER_AFTER: &[StatementId] = &[StatementId::DeliveryCustomerAfter];
 
 const STOCK_LEVEL_NEXT_ORDER: &[StatementId] = &[StatementId::StockLevelNextOrder];
 const STOCK_LEVEL_COUNT: &[StatementId] = &[StatementId::StockLevelCount];
@@ -383,6 +385,10 @@ const DELIVERY_STAGE_THREE_STEPS: &[PlanStep] = &[
     },
     PlanStep {
         alternatives: DELIVERY_UPDATE_CUSTOMER,
+        multiplicity: Multiplicity::PerClaimedDistrict,
+    },
+    PlanStep {
+        alternatives: DELIVERY_CUSTOMER_AFTER,
         multiplicity: Multiplicity::PerClaimedDistrict,
     },
     PlanStep {
@@ -759,6 +765,13 @@ pub fn final2026_catalog() -> Vec<Statement> {
              SET c_balance = c_balance + $1, \
              c_delivery_cnt = c_delivery_cnt + 1 \
              WHERE c_w_id = $2 AND c_d_id = $3 AND c_id = $4;",
+        ),
+        query(
+            StatementId::DeliveryCustomerAfter,
+            &[Int32, Int32, Int32],
+            "SELECT c_balance AS c_balance, c_delivery_cnt AS c_delivery_cnt \
+             FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3;",
+            &[("c_balance", Float32), ("c_delivery_cnt", Int32)],
         ),
         query(
             StatementId::StockLevelNextOrder,
