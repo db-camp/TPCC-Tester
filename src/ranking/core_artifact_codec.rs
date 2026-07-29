@@ -104,6 +104,12 @@ pub(crate) enum CoreCodecError {
     InvalidIntervals(#[source] CollectorError),
     #[error("customer and Stock interval sections disagree on {0}")]
     MismatchedIntervalMetadata(&'static str),
+    #[error("canonical interval {field} {actual} does not match trusted outer value {expected}")]
+    IntervalBindingMismatch {
+        field: &'static str,
+        expected: u64,
+        actual: u64,
+    },
     #[error("canonical {field} presence flag has invalid value {actual}")]
     InvalidPresenceFlag { field: &'static str, actual: u8 },
     #[error("invalid canonical Payment endpoint evidence: {0}")]
@@ -586,6 +592,28 @@ struct IntervalMetadata {
     policy_version: u32,
 }
 
+/// Trusted outer metadata required to restore persisted interval sections.
+///
+/// Keeping these values out of the section payload prevents two mutually
+/// consistent but foreign sections from silently rebinding a terminal
+/// artifact to another run or dataset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IntervalSectionBinding {
+    warehouses: u16,
+    sample_seed: u64,
+    load_seed: u64,
+}
+
+impl IntervalSectionBinding {
+    pub(crate) const fn new(warehouses: u16, sample_seed: u64, load_seed: u64) -> Self {
+        Self {
+            warehouses,
+            sample_seed,
+            load_seed,
+        }
+    }
+}
+
 pub(crate) struct DecodedCustomerIntervals {
     metadata: IntervalMetadata,
     update_count: u64,
@@ -732,17 +760,17 @@ pub(crate) fn decode_stock_interval_section(
 pub(crate) fn decode_interval_sections(
     customer_bytes: &[u8],
     stock_bytes: &[u8],
-    load_seed: u64,
+    binding: IntervalSectionBinding,
 ) -> Result<SealedIntervalEvidence, CoreCodecError> {
     let customers = decode_customer_interval_section(customer_bytes)?;
     let stocks = decode_stock_interval_section(stock_bytes)?;
-    restore_interval_evidence(customers, stocks, load_seed)
+    restore_interval_evidence(customers, stocks, binding)
 }
 
 pub(crate) fn restore_interval_evidence(
     customers: DecodedCustomerIntervals,
     stocks: DecodedStockIntervals,
-    load_seed: u64,
+    binding: IntervalSectionBinding,
 ) -> Result<SealedIntervalEvidence, CoreCodecError> {
     if customers.metadata.warehouses != stocks.metadata.warehouses {
         return Err(CoreCodecError::MismatchedIntervalMetadata("warehouses"));
@@ -756,7 +784,21 @@ pub(crate) fn restore_interval_evidence(
         ));
     }
     let metadata = customers.metadata;
-    let generator = TpccDataGen::with_seed(i32::from(metadata.warehouses), load_seed);
+    if metadata.warehouses != binding.warehouses {
+        return Err(CoreCodecError::IntervalBindingMismatch {
+            field: "warehouse count",
+            expected: u64::from(binding.warehouses),
+            actual: u64::from(metadata.warehouses),
+        });
+    }
+    if metadata.sample_seed != binding.sample_seed {
+        return Err(CoreCodecError::IntervalBindingMismatch {
+            field: "sample seed",
+            expected: binding.sample_seed,
+            actual: metadata.sample_seed,
+        });
+    }
+    let generator = TpccDataGen::with_seed(i32::from(metadata.warehouses), binding.load_seed);
     let roots = |key: StockKey| {
         Some(StockVersion {
             quantity: generator.initial_stock_quantity(key.warehouse_id, key.item_id),
@@ -1231,7 +1273,7 @@ mod tests {
         let intervals = sample_intervals();
         let customers = encode_customer_interval_section(&intervals).unwrap();
         let stocks = encode_stock_interval_section(&intervals).unwrap();
-        let restored = decode_interval_sections(&customers, &stocks, TEST_LOAD_SEED).unwrap();
+        let restored = decode_interval_sections(&customers, &stocks, interval_binding()).unwrap();
         assert_eq!(
             encode_customer_interval_section(&restored).unwrap(),
             customers
@@ -1310,7 +1352,7 @@ mod tests {
         // Header (7), warehouses (2), then sample_seed.
         stocks[9] ^= 1;
         assert!(matches!(
-            decode_interval_sections(&customers, &stocks, TEST_LOAD_SEED),
+            decode_interval_sections(&customers, &stocks, interval_binding()),
             Err(CoreCodecError::MismatchedIntervalMetadata("sample seed"))
         ));
 
@@ -1323,10 +1365,45 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(
-            decode_interval_sections(&customers, &stocks, wrong_seed),
+            decode_interval_sections(
+                &customers,
+                &stocks,
+                IntervalSectionBinding::new(1, TEST_SAMPLE_SEED, wrong_seed)
+            ),
             Err(CoreCodecError::InvalidIntervals(
                 CollectorError::StockRootMismatch { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn interval_restore_rejects_consistently_rebound_outer_metadata() {
+        let intervals = sample_intervals();
+        let mut customers = encode_customer_interval_section(&intervals).unwrap();
+        let mut stocks = encode_stock_interval_section(&intervals).unwrap();
+        // Header (7), warehouses (2), then sample_seed.
+        customers[9] ^= 1;
+        stocks[9] ^= 1;
+        assert!(matches!(
+            decode_interval_sections(&customers, &stocks, interval_binding()),
+            Err(CoreCodecError::IntervalBindingMismatch {
+                field: "sample seed",
+                expected: TEST_SAMPLE_SEED,
+                ..
+            })
+        ));
+
+        let mut customers = encode_customer_interval_section(&intervals).unwrap();
+        let mut stocks = encode_stock_interval_section(&intervals).unwrap();
+        customers[7..9].copy_from_slice(&2_u16.to_le_bytes());
+        stocks[7..9].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(matches!(
+            decode_interval_sections(&customers, &stocks, interval_binding()),
+            Err(CoreCodecError::IntervalBindingMismatch {
+                field: "warehouse count",
+                expected: 1,
+                actual: 2,
+            })
         ));
     }
 
@@ -1343,7 +1420,7 @@ mod tests {
         reordered[34..70].copy_from_slice(&second);
         reordered[70..106].copy_from_slice(&first);
         assert!(matches!(
-            decode_interval_sections(&reordered, &stocks, TEST_LOAD_SEED),
+            decode_interval_sections(&reordered, &stocks, interval_binding()),
             Err(CoreCodecError::InvalidIntervals(
                 CollectorError::NonCanonicalSampleOrder { domain: "customer" }
             ))
@@ -1353,7 +1430,7 @@ mod tests {
         let first = duplicate[34..70].to_vec();
         duplicate[70..106].copy_from_slice(&first);
         assert!(matches!(
-            decode_interval_sections(&duplicate, &stocks, TEST_LOAD_SEED),
+            decode_interval_sections(&duplicate, &stocks, interval_binding()),
             Err(CoreCodecError::InvalidIntervals(
                 CollectorError::NonCanonicalSampleOrder { domain: "customer" }
             ))
@@ -1420,6 +1497,10 @@ mod tests {
                 )
             ))
         ));
+    }
+
+    fn interval_binding() -> IntervalSectionBinding {
+        IntervalSectionBinding::new(1, TEST_SAMPLE_SEED, TEST_LOAD_SEED)
     }
 
     fn sample_intervals() -> SealedIntervalEvidence {
