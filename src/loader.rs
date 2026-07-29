@@ -8,9 +8,6 @@ use crate::connection::cursor::{RmdbCursor, SqlParam};
 use crate::data_gen::*;
 use crate::error::TpccError;
 
-const TABLE_DATA_DIR_FROM_TESTER: &str = "../../src/test/performance_test/table_data";
-const TABLE_DATA_DIR_FROM_DATABASE: &str = "../src/test/performance_test/table_data";
-
 pub struct Loader<'a> {
     cursor: &'a mut RmdbCursor,
     scale_factor: i32,
@@ -65,7 +62,8 @@ impl<'a> Loader<'a> {
             match self.cursor.execute_update(stmt, &[]).await {
                 Ok(_) => {}
                 Err(e) => {
-                    warn!("[建索引] 语句 {} 执行失败 (继续): {e}", i + 1);
+                    error!("[建索引] 语句 {} 执行失败: {e}", i + 1);
+                    return Err(e);
                 }
             }
         }
@@ -79,11 +77,24 @@ impl<'a> Loader<'a> {
             self.scale_factor
         );
         let gen = TpccDataGen::new(self.scale_factor);
+        info!(
+            "[数据加载] 使用公开可配置本地 seed={} (RMDB_TPCC_SEED；非官方隐藏 seed)",
+            gen.load_seed()
+        );
+        let default_csv_dir = std::env::temp_dir().join(format!(
+            "rmdb-tpcc-sf{}-seed{}-pid{}",
+            self.scale_factor,
+            gen.load_seed(),
+            std::process::id()
+        ));
         let csv_dir_path = std::env::var("RMDB_TPCC_CSV_DIR")
-            .unwrap_or_else(|_| TABLE_DATA_DIR_FROM_TESTER.to_string());
+            .map(std::path::PathBuf::from)
+            .unwrap_or(default_csv_dir);
+        // An absolute host path remains valid after rmdb changes into its database
+        // directory. Split overrides still support container or mounted setups.
         let load_dir_path = std::env::var("RMDB_TPCC_LOAD_DIR")
-            .unwrap_or_else(|_| TABLE_DATA_DIR_FROM_DATABASE.to_string());
-        let csv_dir = Path::new(&csv_dir_path);
+            .unwrap_or_else(|_| csv_dir_path.to_string_lossy().into_owned());
+        let csv_dir = csv_dir_path.as_path();
         // RMDB switches its working directory to the database directory after open_db().
         let load_dir = load_dir_path.as_str();
         create_dir_all(csv_dir)?;
@@ -236,30 +247,37 @@ impl<'a> Loader<'a> {
                 .map(|h| h.to_sql_params()),
         )
         .await?;
-        self.write_and_load_table(
-            csv_dir,
-            load_dir,
-            "order_line",
-            &[
-                "ol_o_id",
-                "ol_d_id",
-                "ol_w_id",
-                "ol_number",
-                "ol_i_id",
-                "ol_supply_w_id",
-                "ol_delivery_d",
-                "ol_quantity",
-                "ol_amount",
-                "ol_dist_info",
-            ],
-            gen.generate_order_lines()
-                .into_iter()
-                .map(|ol| ol.to_sql_params()),
-        )
-        .await?;
+        let generated_order_line_count = self
+            .write_and_load_table(
+                csv_dir,
+                load_dir,
+                "order_line",
+                &[
+                    "ol_o_id",
+                    "ol_d_id",
+                    "ol_w_id",
+                    "ol_number",
+                    "ol_i_id",
+                    "ol_supply_w_id",
+                    "ol_delivery_d",
+                    "ol_quantity",
+                    "ol_amount",
+                    "ol_dist_info",
+                ],
+                gen.generate_order_lines()
+                    .into_iter()
+                    .map(|ol| ol.to_sql_params()),
+            )
+            .await?;
+        let expected_order_line_count = gen.expected_order_line_count() as u64;
+        if generated_order_line_count != expected_order_line_count {
+            return Err(TpccError::QueryError(format!(
+                "order_line 生成计数不一致: generated={generated_order_line_count}, expected={expected_order_line_count}"
+            )));
+        }
 
         info!("[数据加载] 全部数据加载完成");
-        self.verify_counts().await?;
+        self.verify_counts(expected_order_line_count as i64).await?;
         Ok(())
     }
 
@@ -270,7 +288,7 @@ impl<'a> Loader<'a> {
         table_name: &str,
         columns: &[&str],
         rows: I,
-    ) -> Result<(), TpccError>
+    ) -> Result<u64, TpccError>
     where
         I: IntoIterator<Item = Vec<SqlParam>>,
     {
@@ -280,7 +298,7 @@ impl<'a> Loader<'a> {
         let mut writer = BufWriter::new(file);
 
         writeln!(writer, "{}", columns.join(","))?;
-        let mut total = 0usize;
+        let mut total = 0_u64;
         for row in rows {
             Self::write_csv_row(&mut writer, &row)?;
             total += 1;
@@ -300,7 +318,7 @@ impl<'a> Loader<'a> {
         let elapsed = start.elapsed().as_secs_f64();
         info!("[表加载] {table_name}: load 完成 ({elapsed:.2}s)");
 
-        Ok(())
+        Ok(total)
     }
 
     fn write_csv_row(writer: &mut BufWriter<File>, row: &[SqlParam]) -> Result<(), TpccError> {
@@ -317,7 +335,9 @@ impl<'a> Loader<'a> {
     fn csv_value(param: &SqlParam) -> String {
         match param {
             SqlParam::Int(v) => v.to_string(),
-            SqlParam::Float(v) => format!("{v}"),
+            // SQL FLOAT is binary32. Formatting the narrowed value gives a shortest
+            // decimal representation that round-trips to the exact generated bits.
+            SqlParam::Float(v) => format!("{}", *v as f32),
             SqlParam::Str(v) => {
                 if v.contains(',') || v.contains('"') || v.contains('\n') || v.contains('\r') {
                     format!("\"{}\"", v.replace('"', "\"\""))
@@ -329,7 +349,7 @@ impl<'a> Loader<'a> {
         }
     }
 
-    async fn verify_counts(&mut self) -> Result<(), TpccError> {
+    async fn verify_counts(&mut self, expected_order_line_count: i64) -> Result<(), TpccError> {
         info!("[数据验证] 检查各表行数...");
         let sf = self.scale_factor as i64;
         let expected: Vec<(&str, i64)> = vec![
@@ -341,31 +361,37 @@ impl<'a> Loader<'a> {
             ("orders", sf * 10 * 3000),
             ("new_orders", sf * 10 * 900),
             ("history", sf * 10 * 3000),
-            ("order_line", sf * 10 * 3000 * 10),
+            ("order_line", expected_order_line_count),
         ];
 
         let mut all_ok = true;
         for (table, exp) in &expected {
             let sql = format!("SELECT COUNT(*) FROM {table}");
             match self.cursor.execute(&sql, &[]).await {
-                Ok(result) => {
-                    if let Some(row) = result.rows.first() {
-                        if let Some(val) = row.first() {
-                            let actual: i64 = val.parse().unwrap_or(0);
-                            if actual == *exp {
-                                debug!("[数据验证] {table}: {actual}/{exp} OK");
-                            } else {
-                                warn!(
-                                    "[数据验证] {table}: 实际 {actual} / 期望 {exp} - 差异 {}",
-                                    actual - exp
-                                );
-                                all_ok = false;
-                            }
+                Ok(result) => match result.rows.first().and_then(|row| row.first()) {
+                    Some(value) => match value.parse::<i64>() {
+                        Ok(actual) if actual == *exp => {
+                            debug!("[数据验证] {table}: {actual}/{exp} OK");
                         }
+                        Ok(actual) => {
+                            error!(
+                                "[数据验证] {table}: 实际 {actual} / 期望 {exp} - 差异 {}",
+                                actual - exp
+                            );
+                            all_ok = false;
+                        }
+                        Err(e) => {
+                            error!("[数据验证] {table}: COUNT 结果无法解析 ({value}): {e}");
+                            all_ok = false;
+                        }
+                    },
+                    None => {
+                        error!("[数据验证] {table}: COUNT 查询没有返回值");
+                        all_ok = false;
                     }
-                }
+                },
                 Err(e) => {
-                    warn!("[数据验证] {table} COUNT 查询失败: {e}");
+                    error!("[数据验证] {table} COUNT 查询失败: {e}");
                     all_ok = false;
                 }
             }
@@ -373,9 +399,57 @@ impl<'a> Loader<'a> {
 
         if all_ok {
             info!("[数据验证] 所有表行数正确");
+            Ok(())
         } else {
-            warn!("[数据验证] 部分表行数不匹配，请检查加载过程中的错误");
+            Err(TpccError::QueryError(
+                "初始数据精确行数校验失败".to_string(),
+            ))
         }
-        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float_csv_serialization_round_trips_binary32_bits() {
+        for cents in [1, 2, 3, 99, 100, 101, 16_777, 500_001, 999_998, 999_999] {
+            let value = cents as f32 / 100.0_f32;
+            let encoded = Loader::csv_value(&SqlParam::Float(f64::from(value)));
+            let decoded: f32 = encoded.parse().unwrap();
+            assert_eq!(decoded.to_bits(), value.to_bits(), "cents={cents}");
+        }
+    }
+
+    #[test]
+    fn final_2026_schema_has_ten_logical_indexes() {
+        let statements: Vec<_> = include_str!("../sql/create_index.sql")
+            .split(';')
+            .filter(|statement| !statement.trim().is_empty())
+            .collect();
+        assert_eq!(statements.len(), 10);
+        assert!(statements
+            .iter()
+            .any(|sql| sql.contains("customer(c_w_id, c_d_id, c_last, c_id)")));
+        assert!(statements
+            .iter()
+            .any(|sql| sql.contains("orders(o_w_id, o_d_id, o_c_id, o_id)")));
+    }
+
+    #[test]
+    fn final_2026_schema_uses_public_column_types() {
+        let ddl = include_str!("../sql/create_tables.sql");
+        for expected in [
+            "s_ytd        float",
+            "c_since        char(30)",
+            "c_credit_lim   int",
+            "c_data         char(50)",
+            "h_date     char(30)",
+            "o_entry_d    char(30)",
+            "ol_delivery_d  char(30)",
+        ] {
+            assert!(ddl.contains(expected), "missing DDL fragment: {expected}");
+        }
     }
 }

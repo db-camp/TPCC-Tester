@@ -33,7 +33,7 @@ CREATE TABLE stock
     s_dist_08    char(24),
     s_dist_09    char(24),
     s_dist_10    char(24),
-    s_ytd        int,
+    s_ytd        float,
     s_order_cnt  int,
     s_remote_cnt int,
     s_data       char(50)
@@ -66,15 +66,15 @@ CREATE TABLE customer
     c_state        char(2),
     c_zip          char(9),
     c_phone        char(16),
-    c_since        datetime,
+    c_since        char(30),
     c_credit       char(2),
-    c_credit_lim   float,
+    c_credit_lim   int,
     c_discount     float,
     c_balance      float,
     c_ytd_payment  float,
     c_payment_cnt  int,
     c_delivery_cnt int,
-    c_data         char(300)
+    c_data         char(50)
 );
 CREATE TABLE history
 (
@@ -83,7 +83,7 @@ CREATE TABLE history
     h_c_w_id   int,
     h_d_id     int,
     h_w_id     int,
-    h_datetime datetime,
+    h_date     char(30),
     h_amount   float,
     h_data     char(24)
 );
@@ -93,7 +93,7 @@ CREATE TABLE orders
     o_d_id       int,
     o_w_id       int,
     o_c_id       int,
-    o_entry_d    datetime,
+    o_entry_d    char(30),
     o_carrier_id int,
     o_ol_cnt     int,
     o_all_local  int
@@ -112,7 +112,7 @@ CREATE TABLE order_line
     ol_number      int,
     ol_i_id        int,
     ol_supply_w_id int,
-    ol_delivery_d  datetime,
+    ol_delivery_d  char(30),
     ol_quantity    int,
     ol_amount      float,
     ol_dist_info   char(24)
