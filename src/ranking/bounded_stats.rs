@@ -8,8 +8,8 @@
 use thiserror::Error;
 
 use crate::consistency::{
-    sum_f32_as_f64_once, FloatError, NonNegativeF32Accumulator, CUSTOMERS_PER_DISTRICT,
-    DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES,
+    sum_f32_as_f64_once, CommittedLedger, FloatError, NonNegativeF32Accumulator,
+    CUSTOMERS_PER_DISTRICT, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES,
 };
 use crate::profile::{ITEM_COUNT, OFFICIAL_CLIENTS};
 use crate::workload::{
@@ -280,6 +280,28 @@ impl BoundedPhysicalStats {
             total = total.checked_add(class)?;
         }
         Ok(total)
+    }
+
+    /// Project the fixed-domain physical totals into the public recovery
+    /// accounting shape without rebuilding the unbounded terminal ledger.
+    pub fn to_committed_ledger(&self) -> Result<CommittedLedger, BoundedStatsError> {
+        self.validate()?;
+        let total = self.totals()?;
+        Ok(CommittedLedger {
+            new_orders: checked_i64(total.new_orders, "new_orders")?,
+            new_order_lines: checked_i64(total.new_order_lines, "new_order_lines")?,
+            remote_new_order_lines: checked_i64(
+                total.remote_new_order_lines,
+                "remote_new_order_lines",
+            )?,
+            stock_ytd_delta: checked_i64(total.stock_quantity_delta, "stock_ytd_delta")?,
+            payments: checked_i64(total.payment_commits, "payment_commits")?,
+            delivered_orders: checked_i64(total.delivered_orders, "delivered_orders")?,
+            delivered_order_lines: checked_i64(
+                total.delivered_order_lines,
+                "delivered_order_lines",
+            )?,
+        })
     }
 
     pub fn partition_totals(
@@ -1125,6 +1147,10 @@ fn checked_mul(left: u64, right: u64, field: &'static str) -> Result<u64, Bounde
         .ok_or(BoundedStatsError::Overflow(field))
 }
 
+fn checked_i64(value: u64, field: &'static str) -> Result<i64, BoundedStatsError> {
+    i64::try_from(value).map_err(|_| BoundedStatsError::Overflow(field))
+}
+
 fn merge_accumulator_group(
     group: &[NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
     field: &'static str,
@@ -1471,6 +1497,10 @@ mod tests {
         );
         assert_eq!(total.stock_level_commits, old.stock_level_commits() as u64);
         assert_eq!(total.expected_rollbacks, old.expected_rollbacks() as u64);
+        assert_eq!(
+            bounded.to_committed_ledger().unwrap(),
+            old.to_committed_ledger()
+        );
 
         for ((warehouse_id, district_id), actual) in bounded.partition_totals_iter() {
             let expected = old.partition_delta(warehouse_id, district_id).unwrap();
