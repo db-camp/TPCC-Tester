@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod common;
 pub mod delivery;
 pub mod dispatch;
+pub mod ledger;
 pub mod new_order;
 pub mod order_status;
 pub mod payment;

@@ -1,5 +1,7 @@
 #[path = "../src/connection/mod.rs"]
 mod connection;
+#[path = "../src/consistency.rs"]
+mod consistency;
 #[path = "../src/data_gen.rs"]
 mod data_gen;
 #[path = "../src/error.rs"]
