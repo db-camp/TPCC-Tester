@@ -167,6 +167,10 @@ pub struct Config {
     #[arg(long = "attest-formal-state")]
     pub attest_formal_state: bool,
 
+    /// Non-scoring replay of the public 37+7 post-crash response surface
+    #[arg(long = "post-crash-response-probe")]
+    pub post_crash_response_probe: bool,
+
     /// 并发客户端数 (`--threads` is retained as a compatibility alias)
     #[arg(long = "clients", visible_alias = "threads", default_value_t = 32)]
     pub threads: usize,
@@ -274,6 +278,9 @@ pub enum ConfigError {
     #[error("--attest-formal-state must be used by itself")]
     FormalStateAttestationMustBeExclusive,
 
+    #[error("--post-crash-response-probe must be used by itself")]
+    PostCrashResponseProbeMustBeExclusive,
+
     #[error("--init --check may only use --check-scope setup")]
     InitCheckScopeMustBeSetup,
 
@@ -331,6 +338,7 @@ impl Config {
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
                 || self.attest_formal_state
+                || self.post_crash_response_probe
                 || self.allow_deviation
                 || self.seed.is_some()
                 || self.canonical_schema
@@ -352,6 +360,7 @@ impl Config {
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
                 || self.attest_formal_state
+                || self.post_crash_response_probe
                 || self.diagnose
                 || self.canonical_schema
                 || self.expected_new_orders.is_some()
@@ -376,6 +385,7 @@ impl Config {
                 || self.benchmark
                 || diagnostic_workload
                 || self.probe_ready
+                || self.post_crash_response_probe
                 || self.diagnose
                 || self.expected_new_orders.is_some()
                 || self.diagnostic_segment.is_some()
@@ -392,12 +402,30 @@ impl Config {
                 || diagnostic_workload
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
+                || self.post_crash_response_probe
                 || self.diagnose
                 || self.expected_new_orders.is_some()
                 || self.diagnostic_segment.is_some()
                 || self.check_scope != CheckScope::Setup)
         {
             return Err(ConfigError::FormalStateAttestationMustBeExclusive);
+        }
+        if self.post_crash_response_probe
+            && (self.create_schema
+                || self.init
+                || self.check
+                || self.stats
+                || self.benchmark
+                || diagnostic_workload
+                || self.probe_ready
+                || self.lifecycle_event.is_some()
+                || self.attest_formal_state
+                || self.diagnose
+                || self.expected_new_orders.is_some()
+                || self.diagnostic_segment.is_some()
+                || self.check_scope != CheckScope::Setup)
+        {
+            return Err(ConfigError::PostCrashResponseProbeMustBeExclusive);
         }
         if self.init && self.check && self.check_scope != CheckScope::Setup {
             return Err(ConfigError::InitCheckScopeMustBeSetup);
@@ -408,7 +436,8 @@ impl Config {
             || self.benchmark
             || diagnostic_workload
             || self.lifecycle_event.is_some()
-            || self.attest_formal_state)
+            || self.attest_formal_state
+            || self.post_crash_response_probe)
             && self.seed.is_none()
         {
             return Err(ConfigError::MissingSeed);
@@ -418,7 +447,8 @@ impl Config {
             || self.check
             || diagnostic_workload
             || self.lifecycle_event.is_some()
-            || self.attest_formal_state)
+            || self.attest_formal_state
+            || self.post_crash_response_probe)
             && self.state_dir.is_none()
         {
             return Err(ConfigError::MissingStateDir);
@@ -434,6 +464,7 @@ impl Config {
                 || diagnostic_workload
                 || self.lifecycle_event.is_some()
                 || self.attest_formal_state
+                || self.post_crash_response_probe
                 || self.diagnose)
         {
             return Err(ConfigError::ProbeReadyMustBeExclusive);
@@ -590,6 +621,43 @@ mod tests {
         assert_eq!(resolved.final2026.conformance(), Conformance::Official);
         assert_eq!(resolved.seed, Some(73));
         assert!(resolved.is_ranked_configuration());
+    }
+
+    #[test]
+    fn post_crash_response_probe_requires_bound_state_and_is_exclusive() {
+        let valid = Config::try_parse_from([
+            "tpcc-tester",
+            "--post-crash-response-probe",
+            "--seed",
+            "73",
+            "--state-dir",
+            "/tmp/tpcc-final2026-post-crash-probe",
+        ])
+        .unwrap();
+        valid.validate().unwrap();
+
+        let missing_state =
+            Config::try_parse_from(["tpcc-tester", "--post-crash-response-probe", "--seed", "73"])
+                .unwrap();
+        assert!(matches!(
+            missing_state.validate(),
+            Err(ConfigError::MissingStateDir)
+        ));
+
+        let combined = Config::try_parse_from([
+            "tpcc-tester",
+            "--post-crash-response-probe",
+            "--stats",
+            "--seed",
+            "73",
+            "--state-dir",
+            "/tmp/tpcc-final2026-post-crash-probe",
+        ])
+        .unwrap();
+        assert!(matches!(
+            combined.validate(),
+            Err(ConfigError::PostCrashResponseProbeMustBeExclusive)
+        ));
     }
 
     #[test]

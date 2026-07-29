@@ -580,6 +580,50 @@ pub async fn run_plan(
     Ok(())
 }
 
+/// Execute the public 37 integer and 7 FLOAT32 recovery query shapes without
+/// comparing values or publishing any formal-state receipt.
+///
+/// This deliberately non-scoring probe exists only to reproduce response
+/// framing/deadline failures after a local crash when ranking may have ended
+/// before terminal evidence could be sealed. The official SQL and answers are
+/// unpublished; this is the same public-spec approximation used elsewhere.
+pub async fn probe_public_post_crash_responses(
+    client: &mut RmdbClient,
+    dataset: &DatasetState,
+) -> Result<(), TpccError> {
+    warn!(
+        "running non-scoring public post-crash response probe; values are not compared and no \
+         recovery receipt will be written"
+    );
+    let plan = recovery_plan(RecoveryExpectations {
+        setup: SetupExpectations {
+            warehouses: dataset.warehouses,
+            order_line_rows: dataset.order_line_rows,
+            undelivered_order_line_rows: dataset.undelivered_order_line_rows,
+        },
+        committed: Default::default(),
+    })
+    .map_err(|error| protocol_error("invalid local recovery response plan", error))?;
+    for query in &plan.queries {
+        let result = execute_query(client, &dataset.runtime_schema, query).await?;
+        info!(
+            "post-crash response terminal PASS: {} ({} row(s))",
+            query.id,
+            result.rows.len()
+        );
+    }
+    for query in &float_aggregate_plan(CheckScope::Recovery).queries {
+        let result = execute_query(client, &dataset.runtime_schema, query).await?;
+        info!(
+            "post-crash response terminal PASS: {} ({} row(s))",
+            query.id,
+            result.rows.len()
+        );
+    }
+    info!("non-scoring public post-crash response probe completed all 37+7 requests");
+    Ok(())
+}
+
 pub async fn read_float_aggregates(
     client: &mut RmdbClient,
     scope: CheckScope,

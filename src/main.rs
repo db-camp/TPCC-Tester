@@ -192,8 +192,12 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         return Ok(());
     }
 
-    let needs_connection =
-        config.create_schema || config.init || config.check || config.stats || config.benchmark;
+    let needs_connection = config.create_schema
+        || config.init
+        || config.check
+        || config.stats
+        || config.benchmark
+        || config.post_crash_response_probe;
 
     if !needs_connection {
         info!("用法: tpcc-tester --create-schema | --init | --check | --stats | --benchmark | --diagnostic-workload-seconds N --diagnostic-segment warmup|observation | --diagnose");
@@ -208,8 +212,11 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         return Ok(());
     }
 
-    let needs_control_connection =
-        config.create_schema || config.init || config.check || config.stats;
+    let needs_control_connection = config.create_schema
+        || config.init
+        || config.check
+        || config.stats
+        || config.post_crash_response_probe;
     if needs_control_connection {
         let mut setup_run = if config.init {
             let seed = effective
@@ -429,6 +436,12 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                 None,
             );
             chk.show_stats().await?;
+        }
+
+        if config.post_crash_response_probe {
+            let (_, dataset, _) = load_bound_state(&config, &effective)?;
+            check_executor::probe_public_post_crash_responses(cursor.client_mut(), &dataset)
+                .await?;
         }
     }
 

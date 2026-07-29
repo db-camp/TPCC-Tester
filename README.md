@@ -146,3 +146,8 @@ smoke 仍走同一三窗口状态机、Wire 路径与语义检查，但会明确
 永久阻塞。决赛说明没有公布官方对应 deadline；150 秒只是本地报告复现值，不得描述为
 官方参数。恢复一致性请求若在完整发送后超时，会明确报告“请求已发送，但未收到完整
 response frame 与 terminal”，且不会把本地生成的 SQL 写入超时诊断。
+
+若正式排名在本机先于崩溃阶段失败，可在对同一 SF50 数据库执行真实 `SIGKILL`、重启并
+通过 `show tables;` 测活后，使用 `--post-crash-response-probe --seed <setup-seed>
+--state-dir <setup-state>` 做只读的本地 37+7 响应面探测。该模式不比较数值、不写
+recovery receipt，也不推断未公开 SQL/答案，结果始终不构成排名或正式恢复通过证明。
