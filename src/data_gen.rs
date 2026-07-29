@@ -313,6 +313,32 @@ impl TpccDataGen {
         (item_id, dist_info)
     }
 
+    fn initial_stock_prefix(&self, w_id: i32, i_id: i32) -> (StableRng, String, i32) {
+        let mut rng = self.row_rng(DOMAIN_STOCK, &[w_id, i_id]);
+        // The public population stream consumes S_DATA before S_QUANTITY. Keep
+        // both the row generator and the O(1) root helper on this one path.
+        let data = Self::gen_data(&mut rng, 26, 50);
+        let quantity = Self::rng_int(&mut rng, 10, 100);
+        (rng, data, quantity)
+    }
+
+    /// Return the deterministic setup quantity for one Stock row.
+    ///
+    /// This reconstructs only the fixed-size prefix of that row's independent
+    /// RNG stream; it neither scans nor materializes any other Stock row.
+    pub fn initial_stock_quantity(&self, w_id: i32, i_id: i32) -> i32 {
+        assert!(
+            (1..=self.scale_factor).contains(&w_id),
+            "stock warehouse id must be in 1..={}",
+            self.scale_factor
+        );
+        assert!(
+            (1..=ITEMS_TOTAL).contains(&i_id),
+            "stock item id must be in 1..={ITEMS_TOTAL}"
+        );
+        self.initial_stock_prefix(w_id, i_id).2
+    }
+
     /// Return the item referenced by one initial order line.
     ///
     /// The loader needs the key before item and stock streaming finishes. This
@@ -461,12 +487,11 @@ impl TpccDataGen {
     pub fn generate_stock(&self) -> impl Iterator<Item = Stock> + '_ {
         (1..=self.scale_factor).flat_map(move |w_id| {
             (1..=ITEMS_TOTAL).map(move |i_id| {
-                let mut rng = self.row_rng(DOMAIN_STOCK, &[w_id, i_id]);
-                let data = Self::gen_data(&mut rng, 26, 50);
+                let (mut rng, data, quantity) = self.initial_stock_prefix(w_id, i_id);
                 Stock {
                     s_i_id: i_id,
                     s_w_id: w_id,
-                    s_quantity: Self::rng_int(&mut rng, 10, 100),
+                    s_quantity: quantity,
                     s_dist_01: Self::gen_dist_info(&mut rng),
                     s_dist_02: Self::gen_dist_info(&mut rng),
                     s_dist_03: Self::gen_dist_info(&mut rng),
@@ -849,6 +874,70 @@ mod tests {
             assert_eq!(history.h_date, GOLDEN_POPULATION_TIMESTAMP);
             assert!(valid_a_string(&history.h_data, 12, 24));
             assert_eq!((history.h_amount as f32).to_bits(), 10.0_f32.to_bits());
+        }
+    }
+
+    #[test]
+    fn initial_stock_quantity_matches_samples_from_full_stream() {
+        let gen = TpccDataGen::with_seed(1, 0x570c_2026);
+        let sample_ids = [1, 2, 17, 997, 10_000, 99_999, ITEMS_TOTAL];
+        let generated: Vec<_> = gen
+            .generate_stock()
+            .filter(|stock| sample_ids.binary_search(&stock.s_i_id).is_ok())
+            .map(|stock| (stock.s_i_id, stock.s_quantity))
+            .collect();
+
+        assert_eq!(generated.len(), sample_ids.len());
+        for (item_id, quantity) in generated {
+            assert_eq!(quantity, gen.initial_stock_quantity(1, item_id));
+        }
+    }
+
+    #[test]
+    fn initial_stock_quantity_depends_on_seed_and_full_key() {
+        let left = TpccDataGen::with_seed(2, 0x570c_0001);
+        let same = TpccDataGen::with_seed(2, 0x570c_0001);
+        let other_seed = TpccDataGen::with_seed(2, 0x570c_0002);
+
+        let left_values: Vec<_> = (1..=128)
+            .map(|item_id| left.initial_stock_quantity(1, item_id))
+            .collect();
+        let same_values: Vec<_> = (1..=128)
+            .map(|item_id| same.initial_stock_quantity(1, item_id))
+            .collect();
+        let other_seed_values: Vec<_> = (1..=128)
+            .map(|item_id| other_seed.initial_stock_quantity(1, item_id))
+            .collect();
+        let other_warehouse_values: Vec<_> = (1..=128)
+            .map(|item_id| left.initial_stock_quantity(2, item_id))
+            .collect();
+
+        assert_eq!(left_values, same_values);
+        assert_ne!(left_values, other_seed_values);
+        assert_ne!(left_values, other_warehouse_values);
+        assert!(left_values.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn initial_stock_quantity_validates_keys_and_stays_in_range() {
+        let gen = TpccDataGen::with_seed(2, 0x570c_2026);
+        for warehouse_id in 1..=2 {
+            for item_id in (1..=ITEMS_TOTAL).step_by(997) {
+                assert!((10..=100).contains(&gen.initial_stock_quantity(warehouse_id, item_id)));
+            }
+            assert!((10..=100).contains(&gen.initial_stock_quantity(warehouse_id, ITEMS_TOTAL)));
+        }
+
+        for (warehouse_id, item_id) in [
+            (0, 1),
+            (gen.scale_factor + 1, 1),
+            (1, 0),
+            (1, ITEMS_TOTAL + 1),
+        ] {
+            assert!(std::panic::catch_unwind(|| {
+                gen.initial_stock_quantity(warehouse_id, item_id);
+            })
+            .is_err());
         }
     }
 
