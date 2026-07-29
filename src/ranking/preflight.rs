@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::connection::client::RmdbClient;
-use crate::connection::prepared::Operation;
+use crate::connection::prepared::{BatchResponse, Operation};
 use crate::connection::wire::WireValue;
 use crate::error::TpccError;
 use crate::profile::{DISTRICTS_PER_WAREHOUSE, ITEM_COUNT};
@@ -34,7 +34,8 @@ const MAX_DETAIL_BATCH_OPERATIONS: usize = 200;
 pub async fn run(client: &mut RmdbClient, seed: u64, warehouses: u16) -> Result<(), TpccError> {
     let selection = PreflightSelection::derive(seed, warehouses)?;
     verify_stock_level(client, &selection).await?;
-    verify_new_order_rollback(client, &selection).await
+    verify_new_order_rollback(client, &selection).await?;
+    verify_new_order_auto_abort(client, &selection).await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -400,6 +401,131 @@ async fn verify_new_order_rollback(
     Ok(())
 }
 
+async fn verify_new_order_auto_abort(
+    client: &mut RmdbClient,
+    selection: &PreflightSelection,
+) -> Result<(), TpccError> {
+    let prospective_order_id = read_prospective_order_id(client, selection).await?;
+    let before = read_new_order_state(client, selection, prospective_order_id).await?;
+    require_pristine_order_slot(
+        &before,
+        prospective_order_id,
+        "before NewOrder AUTO_ABORT probe",
+    )?;
+
+    let stage_one_plan = build_new_order_stage_one(selection);
+    let stage_one_results = execute_preflight_batch(
+        client,
+        "NewOrder AUTO_ABORT stage one",
+        &stage_one_plan.operations,
+    )
+    .await?;
+    let materialized =
+        match parse_new_order_stage_one(selection, &stage_one_plan, &stage_one_results) {
+            Ok(materialized) => materialized,
+            Err(error) => return semantic_abort(client, error).await,
+        };
+    if materialized.order_id != before.district_next_order_id {
+        return semantic_abort(
+            client,
+            format!(
+                "NewOrder AUTO_ABORT order id changed between untimed probes: before {}, \
+                 stage one {}",
+                before.district_next_order_id, materialized.order_id
+            ),
+        )
+        .await;
+    }
+
+    let write_prefix = build_new_order_write_stage(selection, &materialized)?;
+    execute_preflight_batch(
+        client,
+        "NewOrder AUTO_ABORT valid write prefix",
+        &write_prefix,
+    )
+    .await?;
+    let visible = read_open_new_order_state(client, selection, materialized.order_id).await?;
+    if let Err(error) = validate_visible_new_order_state(selection, &materialized, &visible) {
+        return semantic_abort(client, error).await;
+    }
+
+    // The first operation deliberately produces a query result.  A failure
+    // terminal cannot carry results in the typed BatchResponse, so accepting
+    // the exact terminal below also proves that this partial result was
+    // discarded.  The duplicate prospective PK is the final operation and
+    // AUTO_ABORT must end the transaction; no explicit ABORT follows it.
+    let failure_operations = [
+        new_order_home_operation(selection),
+        new_order_insert_order_operation(selection, &materialized),
+    ];
+    let response = client.exec_batch(&failure_operations).await?;
+    validate_expected_auto_abort_error(response, failure_operations.len() - 1)?;
+
+    // BEGIN on the very next prepared batch proves that the failed batch
+    // automatically ended the transaction and left the session reusable.
+    let after = read_new_order_state(client, selection, materialized.order_id).await?;
+    require_pristine_order_slot(
+        &after,
+        materialized.order_id,
+        "after NewOrder AUTO_ABORT probe",
+    )?;
+    if after != before {
+        return Err(preflight_semantic(format!(
+            "NewOrder AUTO_ABORT left a visible change: before {before:?}, after {after:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_expected_auto_abort_error(
+    response: BatchResponse,
+    expected_failed_operation: usize,
+) -> Result<(), TpccError> {
+    let expected_failed_operation = u16::try_from(expected_failed_operation)
+        .map_err(|_| preflight_protocol("AUTO_ABORT failed-operation index exceeds u16"))?;
+    match response {
+        BatchResponse::Error {
+            executed_operations,
+            failed_operation,
+            ..
+        } if executed_operations == expected_failed_operation
+            && failed_operation == expected_failed_operation =>
+        {
+            Ok(())
+        }
+        BatchResponse::Error {
+            executed_operations,
+            failed_operation,
+            diagnostic,
+        } => Err(preflight_semantic(format!(
+            "NewOrder AUTO_ABORT returned ERROR at ({executed_operations}, \
+             {failed_operation}), expected ({expected_failed_operation}, \
+             {expected_failed_operation}): {diagnostic}"
+        ))),
+        BatchResponse::TransactionAbort {
+            executed_operations,
+            failed_operation,
+            diagnostic,
+        } => Err(preflight_semantic(format!(
+            "NewOrder duplicate primary key returned TRANSACTION_ABORT at \
+             ({executed_operations}, {failed_operation}), expected ERROR at \
+             ({expected_failed_operation}, {expected_failed_operation}): {diagnostic}"
+        ))),
+        BatchResponse::Ok {
+            executed_operations,
+            results,
+        } => Err(preflight_semantic(format!(
+            "NewOrder duplicate primary key unexpectedly succeeded after \
+             {executed_operations} operations with {} query result(s)",
+            results.len()
+        ))),
+        BatchResponse::TopLevelError { diagnostic } => Err(preflight_semantic(format!(
+            "NewOrder duplicate primary key returned top-level ERROR instead of operation \
+             ERROR: {diagnostic}"
+        ))),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NewOrderStageOnePlan {
     operations: Vec<Operation>,
@@ -592,7 +718,6 @@ fn build_new_order_write_stage(
         )));
     }
 
-    let total_line_count = selection.invalid_line_number();
     let mut operations = vec![
         operation(
             StatementId::NewOrderAdvanceDistrict,
@@ -601,19 +726,7 @@ fn build_new_order_write_stage(
                 WireValue::Int32(selection.district_id),
             ],
         ),
-        operation(
-            StatementId::NewOrderInsertOrder,
-            [
-                WireValue::Int32(materialized.order_id),
-                WireValue::Int32(selection.district_id),
-                WireValue::Int32(selection.warehouse_id),
-                WireValue::Int32(selection.customer_id),
-                WireValue::Char(selection.timestamp.clone()),
-                WireValue::Int32(UNDELIVERED_CARRIER_ID),
-                WireValue::Int32(total_line_count),
-                WireValue::Int32(1),
-            ],
-        ),
+        new_order_insert_order_operation(selection, materialized),
         operation(
             StatementId::NewOrderInsertQueue,
             [
@@ -657,6 +770,25 @@ fn build_new_order_write_stage(
         ));
     }
     Ok(operations)
+}
+
+fn new_order_insert_order_operation(
+    selection: &PreflightSelection,
+    materialized: &MaterializedNewOrder,
+) -> Operation {
+    operation(
+        StatementId::NewOrderInsertOrder,
+        [
+            WireValue::Int32(materialized.order_id),
+            WireValue::Int32(selection.district_id),
+            WireValue::Int32(selection.warehouse_id),
+            WireValue::Int32(selection.customer_id),
+            WireValue::Char(selection.timestamp.clone()),
+            WireValue::Int32(UNDELIVERED_CARRIER_ID),
+            WireValue::Int32(selection.invalid_line_number()),
+            WireValue::Int32(1),
+        ],
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1416,6 +1548,48 @@ mod tests {
             ),
             TpccError::QueryError(_)
         ));
+    }
+
+    #[test]
+    fn auto_abort_probe_accepts_only_exact_operation_error_terminal() {
+        assert!(validate_expected_auto_abort_error(
+            BatchResponse::Error {
+                executed_operations: 1,
+                failed_operation: 1,
+                diagnostic: "duplicate key".to_owned(),
+            },
+            1,
+        )
+        .is_ok());
+        assert!(validate_expected_auto_abort_error(
+            BatchResponse::TransactionAbort {
+                executed_operations: 1,
+                failed_operation: 1,
+                diagnostic: "wrong terminal".to_owned(),
+            },
+            1,
+        )
+        .is_err());
+        assert!(validate_expected_auto_abort_error(
+            BatchResponse::Error {
+                executed_operations: 0,
+                failed_operation: 0,
+                diagnostic: "wrong index".to_owned(),
+            },
+            1,
+        )
+        .is_err());
+        assert!(validate_expected_auto_abort_error(
+            BatchResponse::Ok {
+                executed_operations: 2,
+                results: vec![BatchQueryResult {
+                    operation_index: 0,
+                    rows: Vec::new(),
+                }],
+            },
+            1,
+        )
+        .is_err());
     }
 
     #[test]
