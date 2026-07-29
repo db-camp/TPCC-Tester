@@ -293,6 +293,25 @@ impl RoutedTransaction {
         self.clone()
     }
 
+    /// Draws one transaction parameter from an independent, stateless domain.
+    ///
+    /// Workload parameter generation deliberately does not share a mutable RNG
+    /// stream with routing. Adding or reordering an unrelated parameter therefore
+    /// cannot change warehouse, hotspot, transaction-kind, or existing parameter
+    /// choices.
+    pub(crate) fn parameter_sample(&self, domain: &'static str, ordinal: u64, upper: u64) -> u64 {
+        assert!(upper > 0, "parameter sample upper bound must be positive");
+        let coordinates = [
+            self.stage.value(),
+            u64::from(self.client_id),
+            self.txn_no,
+            u64::from(self.home_warehouse),
+            u64::from(self.home_district),
+            ordinal,
+        ];
+        bounded(derive_seed(self.seed.0, domain, &coordinates), upper)
+    }
+
     pub fn item_id(&self, line_number: u8) -> u32 {
         let coordinates = self.line_coordinates(line_number);
         if chance(
