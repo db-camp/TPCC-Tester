@@ -284,6 +284,10 @@ const NEW_ORDER_STAGE_TWO_STEPS: &[PlanStep] = &[
         multiplicity: Multiplicity::PerOrderLine,
     },
     PlanStep {
+        alternatives: NEW_ORDER_STOCK,
+        multiplicity: Multiplicity::PerOrderLine,
+    },
+    PlanStep {
         alternatives: NEW_ORDER_INSERT_LINE,
         multiplicity: Multiplicity::PerOrderLine,
     },

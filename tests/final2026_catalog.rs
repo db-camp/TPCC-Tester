@@ -270,6 +270,10 @@ fn stage_templates_preserve_the_ranked_round_trip_shapes() {
         step.multiplicity == Multiplicity::SortedUniqueStock
             && step.alternatives == &[StatementId::NewOrderLockStock]
     }));
+    assert!(NEW_ORDER_STAGES[1].steps.iter().any(|step| {
+        step.multiplicity == Multiplicity::PerOrderLine
+            && step.alternatives == &[StatementId::NewOrderStock]
+    }));
     assert!(DELIVERY_STAGES[0].steps.iter().any(|step| {
         step.multiplicity == Multiplicity::TenDistricts
             && step.alternatives == &[StatementId::DeliveryOldestOrder]

@@ -59,7 +59,13 @@ pub async fn execute(
         build_stage_two(&validated, &materialized).require_explicit_abort(),
     )
     .await?;
-    execute_batch(client, &stage_two.operations).await?;
+    let stage_two_results = execute_batch(client, &stage_two.operations).await?;
+
+    // The terminal is the final operation in this batch, so a mismatch is a
+    // fatal post-terminal semantic failure. A stale writer must instead be
+    // rejected by the server as TRANSACTION_ABORT while the batch executes.
+    validate_stage_two_stock_readbacks(&stage_two_results, &stage_two)
+        .map_err(RankedTransactionError::Semantic)?;
 
     if validated.expected_rollback {
         return Ok(RankedTransactionOutcome::ExpectedRollback);
@@ -617,6 +623,7 @@ fn multiply_f32_bits(price_bits: u32, quantity: i32) -> SemanticResult<u32> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StageTwoPlan {
     operations: Vec<Operation>,
+    stock_after_results: Vec<usize>,
     remote_line_count: u8,
     stock_ytd_delta: u32,
     recovery_lines: Vec<RecoveryNewOrderLineEvidence>,
@@ -662,6 +669,7 @@ fn build_stage_two(
     let mut current_stocks = BTreeMap::<(i32, i32), StockVersion>::new();
     let mut remote_line_count = 0_u8;
     let mut stock_ytd_delta = 0_u32;
+    let mut stock_after_results = Vec::with_capacity(materialized.lines.len());
     let mut recovery_lines = Vec::with_capacity(materialized.lines.len());
     for line in &materialized.lines {
         let key = line.plan.stock_key();
@@ -715,6 +723,14 @@ fn build_stage_two(
                 WireValue::Int32(line.plan.item_id),
             ],
         ));
+        stock_after_results.push(operations.len());
+        operations.push(operation(
+            StatementId::NewOrderStock,
+            [
+                WireValue::Int32(line.plan.supply_warehouse),
+                WireValue::Int32(line.plan.item_id),
+            ],
+        ));
         operations.push(operation(
             StatementId::NewOrderInsertLine,
             [
@@ -757,15 +773,56 @@ fn build_stage_two(
 
     Ok(StageTwoPlan {
         operations,
+        stock_after_results,
         remote_line_count,
         stock_ytd_delta,
         recovery_lines,
     })
 }
 
+fn validate_stage_two_stock_readbacks(
+    results: &BatchResults,
+    plan: &StageTwoPlan,
+) -> SemanticResult<()> {
+    if plan.stock_after_results.len() != plan.recovery_lines.len() {
+        return Err(SemanticViolation::new(
+            "New-Order stock readback map differs from recovery line count",
+        ));
+    }
+
+    for (operation_index, line) in plan
+        .stock_after_results
+        .iter()
+        .copied()
+        .zip(&plan.recovery_lines)
+    {
+        let context = format!(
+            "New-Order stock readback ({}, {}) after line {}",
+            line.supply_warehouse, line.item_id, line.number
+        );
+        let row = results.single_row(operation_index)?;
+        require_columns(row, 15, &context)?;
+        let actual = StockVersion {
+            quantity: row_int32(row, 0, &context)?,
+            ytd_bits: row_f32_bits(row, 1, &context)?,
+            order_count: row_int32(row, 2, &context)?,
+            remote_count: row_int32(row, 3, &context)?,
+        };
+        if actual != line.stock_after {
+            return Err(SemanticViolation::new(format!(
+                "{context} was {actual:?}, expected exact relative-update endpoint {:?}",
+                line.stock_after
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::prepared::{BatchQueryResult, BatchResponse};
+    use crate::ranking::common::accept_batch;
 
     fn line(
         number: u8,
@@ -875,8 +932,10 @@ mod tests {
                 StatementId::NewOrderInsertOrder.wire_id(),
                 StatementId::NewOrderInsertQueue.wire_id(),
                 StatementId::NewOrderUpdateStockNormal.wire_id(),
+                StatementId::NewOrderStock.wire_id(),
                 StatementId::NewOrderInsertLine.wire_id(),
                 StatementId::NewOrderUpdateStockWrapped.wire_id(),
+                StatementId::NewOrderStock.wire_id(),
                 StatementId::NewOrderInsertLine.wire_id(),
                 StatementId::Abort.wire_id(),
             ]
@@ -936,7 +995,7 @@ mod tests {
             StatementId::NewOrderUpdateStockNormal.wire_id()
         );
         assert_eq!(
-            stage.operations[5].statement_id,
+            stage.operations[6].statement_id,
             StatementId::NewOrderUpdateStockWrapped.wire_id()
         );
         assert_eq!(stage.recovery_lines.len(), 2);
@@ -954,6 +1013,98 @@ mod tests {
             16.0_f32.to_bits()
         );
         assert_eq!(stage.recovery_lines[1].stock_after.order_count, 2);
+    }
+
+    fn readback_results(stage: &StageTwoPlan, versions: &[StockVersion]) -> BatchResults {
+        assert_eq!(stage.stock_after_results.len(), versions.len());
+        let results = stage
+            .stock_after_results
+            .iter()
+            .zip(versions)
+            .map(|(operation_index, version)| BatchQueryResult {
+                operation_index: *operation_index as u16,
+                rows: vec![vec![
+                    WireValue::Int32(version.quantity),
+                    WireValue::Float32(version.ytd_bits),
+                    WireValue::Int32(version.order_count),
+                    WireValue::Int32(version.remote_count),
+                    WireValue::Char(b"stock-data".to_vec()),
+                    WireValue::Char(vec![b'd'; 24]),
+                    WireValue::Char(vec![b'd'; 24]),
+                    WireValue::Char(vec![b'd'; 24]),
+                    WireValue::Char(vec![b'd'; 24]),
+                    WireValue::Char(vec![b'd'; 24]),
+                    WireValue::Char(vec![b'd'; 24]),
+                    WireValue::Char(vec![b'd'; 24]),
+                    WireValue::Char(vec![b'd'; 24]),
+                    WireValue::Char(vec![b'd'; 24]),
+                    WireValue::Char(vec![b'd'; 24]),
+                ]],
+            })
+            .collect();
+        accept_batch(
+            BatchResponse::Ok {
+                executed_operations: stage.operations.len() as u16,
+                results,
+            },
+            &stage.operations,
+        )
+        .unwrap()
+    }
+
+    fn one_line_stage() -> StageTwoPlan {
+        let only = line(1, 2, 10, 7, false);
+        let input = input(vec![only], false);
+        let materialized = MaterializedOrder {
+            order_id: 3001,
+            lines: vec![materialized(only, 100, 14.0)],
+        };
+        build_stage_two(&input, &materialized).unwrap()
+    }
+
+    #[test]
+    fn stock_readback_requires_all_exact_relative_endpoints() {
+        let stage = one_line_stage();
+        let exact = stage.recovery_lines[0].stock_after.clone();
+        validate_stage_two_stock_readbacks(
+            &readback_results(&stage, std::slice::from_ref(&exact)),
+            &stage,
+        )
+        .unwrap();
+
+        let mut wrong_versions = Vec::new();
+        let mut wrong = exact.clone();
+        wrong.quantity += 1;
+        wrong_versions.push(wrong);
+        let mut wrong = exact.clone();
+        wrong.ytd_bits ^= 1;
+        wrong_versions.push(wrong);
+        let mut wrong = exact.clone();
+        wrong.order_count += 1;
+        wrong_versions.push(wrong);
+        let mut wrong = exact;
+        wrong.remote_count += 1;
+        wrong_versions.push(wrong);
+
+        for wrong in wrong_versions {
+            let error =
+                validate_stage_two_stock_readbacks(&readback_results(&stage, &[wrong]), &stage)
+                    .unwrap_err();
+            assert!(error.to_string().contains("exact relative-update endpoint"));
+            assert!(
+                !error.requires_explicit_abort(),
+                "the batch terminal has already completed"
+            );
+        }
+    }
+
+    #[test]
+    fn stock_readback_rejects_a_stale_pre_update_version() {
+        let stage = one_line_stage();
+        let stale = stage.recovery_lines[0].stock_before.clone();
+        let error = validate_stage_two_stock_readbacks(&readback_results(&stage, &[stale]), &stage)
+            .unwrap_err();
+        assert!(error.to_string().contains("exact relative-update endpoint"));
     }
 
     #[test]
