@@ -339,6 +339,30 @@ impl TpccDataGen {
         self.initial_stock_prefix(w_id, i_id).2
     }
 
+    /// Reconstruct the one setup History row for a Customer in constant time.
+    ///
+    /// Recovery evidence uses this to account for a complete-tuple collision
+    /// between a committed Payment row and the deterministic setup row.
+    pub fn initial_history(&self, w_id: i32, d_id: i32, c_id: i32) -> Option<History> {
+        if !(1..=self.scale_factor).contains(&w_id)
+            || !(1..=DISTRICTS_PER_WAREHOUSE).contains(&d_id)
+            || !(1..=CUSTOMERS_PER_DISTRICT).contains(&c_id)
+        {
+            return None;
+        }
+        let mut rng = self.row_rng(DOMAIN_HISTORY, &[w_id, d_id, c_id]);
+        Some(History {
+            h_c_id: c_id,
+            h_c_d_id: d_id,
+            h_c_w_id: w_id,
+            h_d_id: d_id,
+            h_w_id: w_id,
+            h_date: self.population_timestamp(),
+            h_amount: 10.0,
+            h_data: Self::gen_data(&mut rng, 12, 24),
+        })
+    }
+
     /// Return the item referenced by one initial order line.
     ///
     /// The loader needs the key before item and stock streaming finishes. This
@@ -558,17 +582,8 @@ impl TpccDataGen {
         (1..=self.scale_factor).flat_map(move |w_id| {
             (1..=DISTRICTS_PER_WAREHOUSE).flat_map(move |d_id| {
                 (1..=CUSTOMERS_PER_DISTRICT).map(move |c_id| {
-                    let mut rng = self.row_rng(DOMAIN_HISTORY, &[w_id, d_id, c_id]);
-                    History {
-                        h_c_id: c_id,
-                        h_c_d_id: d_id,
-                        h_c_w_id: w_id,
-                        h_d_id: d_id,
-                        h_w_id: w_id,
-                        h_date: self.population_timestamp(),
-                        h_amount: 10.0,
-                        h_data: Self::gen_data(&mut rng, 12, 24),
-                    }
+                    self.initial_history(w_id, d_id, c_id)
+                        .expect("generated History keys are inside the setup domain")
                 })
             })
         })
@@ -875,6 +890,44 @@ mod tests {
             assert!(valid_a_string(&history.h_data, 12, 24));
             assert_eq!((history.h_amount as f32).to_bits(), 10.0_f32.to_bits());
         }
+    }
+
+    #[test]
+    fn initial_history_matches_rows_from_full_stream() {
+        let gen = TpccDataGen::with_seed_and_timestamp(
+            2,
+            0x4849_5354_4f52_5926,
+            "2026-07-29 12:34:56".to_owned(),
+        );
+        for (warehouse_id, district_id, customer_id) in
+            [(1, 1, 1), (1, 7, 997), (2, 3, 2_001), (2, 10, 3_000)]
+        {
+            let streamed = gen
+                .generate_history()
+                .find(|row| {
+                    row.h_c_w_id == warehouse_id
+                        && row.h_c_d_id == district_id
+                        && row.h_c_id == customer_id
+                })
+                .unwrap();
+            let direct = gen
+                .initial_history(warehouse_id, district_id, customer_id)
+                .unwrap();
+            assert_eq!(direct.h_c_id, streamed.h_c_id);
+            assert_eq!(direct.h_c_d_id, streamed.h_c_d_id);
+            assert_eq!(direct.h_c_w_id, streamed.h_c_w_id);
+            assert_eq!(direct.h_d_id, streamed.h_d_id);
+            assert_eq!(direct.h_w_id, streamed.h_w_id);
+            assert_eq!(direct.h_date, streamed.h_date);
+            assert_eq!(direct.h_amount.to_bits(), streamed.h_amount.to_bits());
+            assert_eq!(direct.h_data, streamed.h_data);
+        }
+        assert!(gen.initial_history(0, 1, 1).is_none());
+        assert!(gen.initial_history(1, 0, 1).is_none());
+        assert!(gen.initial_history(1, 1, 0).is_none());
+        assert!(gen.initial_history(3, 1, 1).is_none());
+        assert!(gen.initial_history(1, 11, 1).is_none());
+        assert!(gen.initial_history(1, 1, 3_001).is_none());
     }
 
     #[test]
