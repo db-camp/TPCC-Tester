@@ -3,6 +3,7 @@
 pub mod bounded_stats;
 pub mod catalog;
 pub mod common;
+pub(crate) mod core_artifact_codec;
 pub mod delivery;
 pub mod dispatch;
 pub mod evidence_collector;
