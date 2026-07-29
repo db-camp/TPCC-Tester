@@ -748,7 +748,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             None => return Err(SchedulerError::RetryNotPending(ticket.worker())),
         }
         if let Some(index) = ticket.phase().formal_index() {
-            self.windows[index].record_abandoned();
+            self.windows[index].record_unsent_abandoned();
         }
         self.recorder.record(SchedulerEvent::TransactionFinished {
             ticket,
@@ -875,7 +875,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         }
         for selection in abandoned {
             if let Some(index) = phase.formal_index() {
-                self.windows[index].record_abandoned();
+                self.windows[index].record_unsent_abandoned();
             }
             match selection {
                 AbandonedSelection::Reservation(reservation) => {
@@ -940,7 +940,12 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         let state = &mut self.workers[usize::from(worker.value())];
         if let Some(selection) = state.selection.take() {
             if let Some(index) = selection.formal_index() {
-                self.windows[index].record_abandoned();
+                match selection {
+                    SelectionState::InFlight { .. } => self.windows[index].record_abandoned(),
+                    SelectionState::Reserved(_) | SelectionState::RetryPending(_) => {
+                        self.windows[index].record_unsent_abandoned()
+                    }
+                }
             }
         }
         let failure = SchedulerFailure {
@@ -1282,8 +1287,26 @@ mod tests {
             Err(SchedulerError::ReservationDeadlinePassed)
         );
         assert_eq!(scheduler.windows()[0].abandoned, 1);
+        assert_eq!(scheduler.windows()[0].attempted, 0);
         let next = start_payment(&mut scheduler, worker, 61);
         assert_eq!((next.phase(), next.txn_no()), (PhaseId::FormalWindow(1), 0));
+    }
+
+    #[test]
+    fn abandoning_a_pending_retry_does_not_invent_another_attempt() {
+        let (clock, mut scheduler) = ready_scheduler(Duration::from_secs(5));
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(30));
+        let ticket = start_payment(&mut scheduler, WorkerId::new(7).unwrap(), 0x77);
+
+        scheduler
+            .finish_attempt(ticket, AttemptOutcome::RetryableAbort)
+            .unwrap();
+        scheduler.abandon_retry(ticket).unwrap();
+
+        assert_eq!(scheduler.windows()[0].retry_aborts, 1);
+        assert_eq!(scheduler.windows()[0].abandoned, 1);
+        assert_eq!(scheduler.windows()[0].attempted, 1);
     }
 
     #[test]

@@ -105,6 +105,15 @@ impl WindowStats {
         self.abandoned = self.abandoned.saturating_add(1);
     }
 
+    /// Records a selected transaction abandoned before another request was sent.
+    ///
+    /// This is used for an expired reservation and for a retry that cannot be
+    /// started before the phase deadline. The transaction still counts as
+    /// abandoned, but there is no additional physical attempt to report.
+    pub fn record_unsent_abandoned(&mut self) {
+        self.abandoned = self.abandoned.saturating_add(1);
+    }
+
     /// Records a response completed only after the formal window deadline.
     pub fn record_grace_tail(&mut self) {
         self.attempted = self.attempted.saturating_add(1);
@@ -476,9 +485,11 @@ mod tests {
         stats.record_expected_rollback(2);
         stats.record_retry_abort();
         stats.record_abandoned();
+        stats.record_unsent_abandoned();
         stats.record_grace_tail();
 
         assert_eq!(stats.attempted, 5);
+        assert_eq!(stats.abandoned, 2);
         assert_eq!(stats.completed(), 2);
         assert_eq!(stats.covered_warehouses(), 2);
         assert_eq!(stats.warehouse_completions[0], 1);
