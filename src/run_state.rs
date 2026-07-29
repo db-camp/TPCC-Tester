@@ -5,11 +5,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::consistency::{FloatAggregateId, FLOAT_AGGREGATES};
+use crate::consistency::{FloatAggregateId, NonNegativeF32Accumulator, FLOAT_AGGREGATES};
 use crate::loader::{LoadSummary, PartitionLoadSummary};
 use crate::ranking::ledger::RunLedger;
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 const DATASET_FILE: &str = "dataset.state";
 const MAX_DATASET_STATE_BYTES: usize = 256 * 1024;
 const ARTIFACT_VERSION: u32 = 1;
@@ -28,6 +28,7 @@ pub struct DatasetState {
     pub warehouses: i32,
     pub order_line_rows: i64,
     pub undelivered_order_line_rows: i64,
+    initial_order_line_amounts: NonNegativeF32Accumulator,
     pub partitions: Vec<PartitionLoadSummary>,
 }
 
@@ -57,6 +58,7 @@ impl DatasetState {
             warehouses,
             order_line_rows: load.order_line_rows,
             undelivered_order_line_rows: load.undelivered_order_line_rows,
+            initial_order_line_amounts: load.order_line_amounts,
             partitions: load.partitions,
         };
         state.validate()?;
@@ -74,6 +76,21 @@ impl DatasetState {
                 "dataset partition count does not match warehouses".to_owned(),
             ));
         }
+        if self.initial_order_line_amounts.term_count()
+            != u64::try_from(self.order_line_rows)
+                .map_err(|_| StateError::Invalid("invalid order-line row count".to_owned()))?
+        {
+            return Err(StateError::Invalid(
+                "initial order-line FLOAT term count does not match row count".to_owned(),
+            ));
+        }
+        self.initial_order_line_amounts
+            .boundary()
+            .map_err(|error| {
+                StateError::Invalid(format!(
+                    "invalid initial order-line FLOAT accumulator: {error}"
+                ))
+            })?;
         let mut expected_warehouse = 1;
         let mut expected_district = 1;
         let mut order_lines = 0_i64;
@@ -111,8 +128,14 @@ impl DatasetState {
     }
 
     fn encode(&self) -> String {
+        let (amount_terms, amount_words) = self.initial_order_line_amounts.to_words();
+        let amount_words = amount_words
+            .iter()
+            .map(|word| format!("{word:016x}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let mut output = format!(
-            "version={STATE_VERSION}\nrun_id={}\nseed={}\nwarehouses={}\norder_line_rows={}\nundelivered_order_line_rows={}\n",
+            "version={STATE_VERSION}\nrun_id={}\nseed={}\nwarehouses={}\norder_line_rows={}\nundelivered_order_line_rows={}\norder_line_amount_terms={amount_terms}\norder_line_amount_words={amount_words}\n",
             self.run_id,
             self.seed,
             self.warehouses,
@@ -142,6 +165,19 @@ impl DatasetState {
             value(&mut lines, "undelivered_order_line_rows")?,
             "undelivered_order_line_rows",
         )?;
+        let amount_terms = parse(
+            value(&mut lines, "order_line_amount_terms")?,
+            "order_line_amount_terms",
+        )?;
+        let amount_words = parse_accumulator_words(value(&mut lines, "order_line_amount_words")?)?;
+        let initial_order_line_amounts =
+            NonNegativeF32Accumulator::from_words(amount_terms, &amount_words).map_err(
+                |error| {
+                    StateError::Invalid(format!(
+                        "invalid initial order-line FLOAT accumulator: {error}"
+                    ))
+                },
+            )?;
         let mut partitions = Vec::new();
         for line in lines {
             let raw = line
@@ -166,10 +202,15 @@ impl DatasetState {
             warehouses,
             order_line_rows,
             undelivered_order_line_rows,
+            initial_order_line_amounts,
             partitions,
         };
         state.validate()?;
         Ok(state)
+    }
+
+    pub fn initial_order_line_amounts(&self) -> &NonNegativeF32Accumulator {
+        &self.initial_order_line_amounts
     }
 }
 
@@ -503,6 +544,32 @@ fn parse_checksum(value: &str) -> Result<u64, StateError> {
         .map_err(|_| StateError::Invalid("checksum is not valid hexadecimal".to_owned()))
 }
 
+fn parse_accumulator_words(value: &str) -> Result<Vec<u64>, StateError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|word| {
+            if word.len() != 16
+                || !word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(StateError::Invalid(
+                    "order-line FLOAT accumulator words must be 16 lower-case hexadecimal digits"
+                        .to_owned(),
+                ));
+            }
+            u64::from_str_radix(word, 16).map_err(|_| {
+                StateError::Invalid(
+                    "order-line FLOAT accumulator word is not valid hexadecimal".to_owned(),
+                )
+            })
+        })
+        .collect()
+}
+
 fn encode_float_baseline(
     values: &BTreeMap<FloatAggregateId, u32>,
     ledger_checksum: u64,
@@ -823,9 +890,14 @@ mod tests {
     }
 
     fn sample_dataset(run_id: &str, seed: u64) -> DatasetState {
+        let mut order_line_amounts = NonNegativeF32Accumulator::default();
+        order_line_amounts
+            .add_repeated_bits(1.0_f32.to_bits(), 7)
+            .unwrap();
         let load = LoadSummary {
             order_line_rows: 7,
             undelivered_order_line_rows: 7,
+            order_line_amounts,
             partitions: (1..=10)
                 .map(|district_id| PartitionLoadSummary {
                     warehouse_id: 1,

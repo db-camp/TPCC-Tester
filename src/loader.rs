@@ -6,6 +6,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::connection::cursor::{RmdbCursor, SqlParam};
+use crate::consistency::NonNegativeF32Accumulator;
 use crate::data_gen::*;
 use crate::error::TpccError;
 
@@ -26,6 +27,7 @@ pub struct PartitionLoadSummary {
 pub struct LoadSummary {
     pub order_line_rows: i64,
     pub undelivered_order_line_rows: i64,
+    pub order_line_amounts: NonNegativeF32Accumulator,
     pub partitions: Vec<PartitionLoadSummary>,
 }
 
@@ -287,8 +289,9 @@ impl<'a> Loader<'a> {
                 .map(|h| h.to_sql_params()),
         )
         .await?;
+        let mut order_line_amounts = NonNegativeF32Accumulator::default();
         let generated_order_line_count = self
-            .write_and_load_table(
+            .write_and_load_table_observed(
                 csv_dir,
                 load_dir,
                 "order_line",
@@ -307,6 +310,23 @@ impl<'a> Loader<'a> {
                 gen.generate_order_lines()
                     .into_iter()
                     .map(|ol| ol.to_sql_params()),
+                |row| {
+                    let amount = match row.get(8) {
+                        Some(SqlParam::Float(amount)) => *amount as f32,
+                        _ => {
+                            return Err(TpccError::Protocol(
+                                "generated order_line row lost its FLOAT ol_amount".to_owned(),
+                            ));
+                        }
+                    };
+                    order_line_amounts
+                        .add_bits(amount.to_bits())
+                        .map_err(|error| {
+                            TpccError::Protocol(format!(
+                                "initial order_line FLOAT accumulator failed: {error}"
+                            ))
+                        })
+                },
             )
             .await?;
         let partitions = partition_shapes.into_inner();
@@ -329,6 +349,7 @@ impl<'a> Loader<'a> {
         Ok(LoadSummary {
             order_line_rows: expected_order_line_count,
             undelivered_order_line_rows,
+            order_line_amounts,
             partitions,
         })
     }
@@ -344,6 +365,23 @@ impl<'a> Loader<'a> {
     where
         I: IntoIterator<Item = Vec<SqlParam>>,
     {
+        self.write_and_load_table_observed(csv_dir, load_dir, table_name, columns, rows, |_| Ok(()))
+            .await
+    }
+
+    async fn write_and_load_table_observed<I, F>(
+        &mut self,
+        csv_dir: &Path,
+        load_dir: &str,
+        table_name: &str,
+        columns: &[&str],
+        rows: I,
+        mut observe: F,
+    ) -> Result<u64, TpccError>
+    where
+        I: IntoIterator<Item = Vec<SqlParam>>,
+        F: FnMut(&[SqlParam]) -> Result<(), TpccError>,
+    {
         let start = Instant::now();
         let csv_file = csv_dir.join(format!("{table_name}.csv"));
         let file = File::create(&csv_file)?;
@@ -352,6 +390,7 @@ impl<'a> Loader<'a> {
         writeln!(writer, "{}", columns.join(","))?;
         let mut total = 0_u64;
         for row in rows {
+            observe(&row)?;
             Self::write_csv_row(&mut writer, &row)?;
             total += 1;
             if total >= 10000 && total % 10000 == 0 {
