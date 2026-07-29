@@ -4209,6 +4209,7 @@ run_tester() {
   tester_environment=(
     "RMDB_TPCC_CSV_DIR=${CSV_DIR}"
     "RMDB_TPCC_LOAD_DIR=${LOAD_DIR}"
+    "RMDB_TPCC_SERVER_CWD=${DB_PATH}"
     "RMDB_TPCC_RUN_ID=${DATASET_RUN_ID}"
   )
   if [[ -n "${TESTER_RESOURCE_TIMELINE}" ]]; then

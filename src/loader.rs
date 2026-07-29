@@ -45,6 +45,7 @@ pub struct CsvAsset {
     pub host_path: PathBuf,
     pub load_path: String,
     pub row_count: i64,
+    load_host_path: PathBuf,
     seal: CsvFileSeal,
 }
 
@@ -128,31 +129,64 @@ impl CsvAsset {
         let path_metadata = symlink_metadata(&self.host_path)?;
         self.seal
             .validate_metadata(&self.host_path, &path_metadata)?;
+        self.seal.validate_metadata(
+            &self.load_host_path,
+            &symlink_metadata(&self.load_host_path)?,
+        )?;
 
-        let mut file = File::open(&self.host_path)?;
+        let mut file = File::open(&self.load_host_path)?;
         self.seal
-            .validate_metadata(&self.host_path, &file.metadata()?)?;
+            .validate_metadata(&self.load_host_path, &file.metadata()?)?;
         let mut hasher = Sha256::new();
-        let mut buffer = vec![0_u8; 1024 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
+        let mut buffer = [0_u8; 1024 * 1024];
+        let mut remaining = self.seal.byte_len;
+        while remaining > 0 {
+            let limit = usize::try_from(remaining.min(buffer.len() as u64))
+                .expect("bounded CSV verification chunk fits usize");
+            let read = file.read(&mut buffer[..limit])?;
             if read == 0 {
-                break;
+                return Err(TpccError::Protocol(format!(
+                    "sealed CSV {} was truncated {boundary}",
+                    self.load_host_path.display()
+                )));
             }
             hasher.update(&buffer[..read]);
+            remaining -= read as u64;
+        }
+        if file.read(&mut buffer[..1])? != 0 {
+            return Err(TpccError::Protocol(format!(
+                "sealed CSV {} grew beyond {} bytes {boundary}",
+                self.load_host_path.display(),
+                self.seal.byte_len
+            )));
         }
         let actual: [u8; 32] = hasher.finalize().into();
         if actual != self.seal.content_sha256 {
             return Err(TpccError::Protocol(format!(
                 "sealed CSV {} failed SHA-256 verification {boundary}",
-                self.host_path.display()
+                self.load_host_path.display()
             )));
         }
         self.seal
-            .validate_metadata(&self.host_path, &file.metadata()?)?;
+            .validate_metadata(&self.load_host_path, &file.metadata()?)?;
         self.seal
             .validate_metadata(&self.host_path, &symlink_metadata(&self.host_path)?)?;
+        self.seal.validate_metadata(
+            &self.load_host_path,
+            &symlink_metadata(&self.load_host_path)?,
+        )?;
         Ok(())
+    }
+
+    async fn verify_sealed_async(&self, boundary: &'static str) -> Result<(), TpccError> {
+        let asset = self.clone();
+        tokio::task::spawn_blocking(move || asset.verify_sealed(boundary))
+            .await
+            .map_err(|error| {
+                TpccError::Protocol(format!(
+                    "sealed CSV verification task failed {boundary}: {error}"
+                ))
+            })?
     }
 }
 
@@ -268,9 +302,15 @@ impl<'a> Loader<'a> {
                 "materialized CSV assets do not match this setup runtime".to_owned(),
             ));
         }
+        for table in self.schema.schedule().load_tables() {
+            materialized
+                .asset(*table)?
+                .verify_sealed_async("before the first LOAD")
+                .await?;
+        }
         for (ordinal, table) in self.schema.schedule().load_tables().iter().enumerate() {
             let asset = materialized.asset(*table)?;
-            asset.verify_sealed("before LOAD")?;
+            asset.verify_sealed_async("immediately before LOAD").await?;
             info!(
                 "[表加载] ordinal={}: 通过 load 导入 {} 行",
                 ordinal + 1,
@@ -282,7 +322,7 @@ impl<'a> Loader<'a> {
                 self.schema.table(*table)
             );
             let load_result = self.cursor.execute_update(&sql, &[]).await;
-            asset.verify_sealed("after LOAD")?;
+            asset.verify_sealed_async("after LOAD").await?;
             load_result?;
         }
         self.verify_counts(&materialized).await?;
@@ -295,6 +335,7 @@ pub struct CsvMaterializer<'a> {
     schema: &'a RuntimeSchema,
     csv_dir: PathBuf,
     load_dir: String,
+    server_cwd: Option<PathBuf>,
     dataset_hasher: Sha256,
     assets: BTreeMap<LogicalTable, CsvAsset>,
 }
@@ -350,11 +391,13 @@ impl<'a> CsvMaterializer<'a> {
             .unwrap_or(default_csv_dir);
         let load_dir = std::env::var("RMDB_TPCC_LOAD_DIR")
             .unwrap_or_else(|_| csv_dir.to_string_lossy().into_owned());
+        let server_cwd = std::env::var_os("RMDB_TPCC_SERVER_CWD").map(PathBuf::from);
         Ok(Self {
             scale_factor,
             schema,
             csv_dir,
             load_dir,
+            server_cwd,
             dataset_hasher: Self::initial_dataset_hasher(scale_factor, schema),
             assets: BTreeMap::new(),
         })
@@ -735,6 +778,7 @@ impl<'a> CsvMaterializer<'a> {
         std::fs::set_permissions(&csv_file, permissions)?;
         let content_sha256 = asset_hasher.finalize().into();
         let load_path = format!("{load_dir}/{basename}");
+        let load_host_path = Self::load_host_path(&load_path, self.server_cwd.as_deref())?;
         let row_count = i64::try_from(total).map_err(|_| {
             TpccError::Protocol(format!("{} CSV row count overflow", table.canonical()))
         })?;
@@ -743,8 +787,12 @@ impl<'a> CsvMaterializer<'a> {
             host_path: csv_file,
             load_path,
             row_count,
+            load_host_path: load_host_path.clone(),
             seal: CsvFileSeal::capture(&csv_dir.join(basename), content_sha256)?,
         };
+        asset
+            .seal
+            .validate_metadata(&load_host_path, &symlink_metadata(&load_host_path)?)?;
         if self.assets.insert(table, asset).is_some() {
             return Err(TpccError::Protocol(format!(
                 "duplicate CSV asset for {}",
@@ -792,6 +840,24 @@ impl<'a> CsvMaterializer<'a> {
         hasher.update(schema.seed().to_be_bytes());
         hasher.update(schema.fingerprint().to_be_bytes());
         hasher
+    }
+
+    fn load_host_path(load_path: &str, server_cwd: Option<&Path>) -> Result<PathBuf, TpccError> {
+        let path = PathBuf::from(load_path);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        let server_cwd = server_cwd.ok_or_else(|| {
+            TpccError::Protocol(
+                "relative RMDB_TPCC_LOAD_DIR requires RMDB_TPCC_SERVER_CWD".to_owned(),
+            )
+        })?;
+        if !server_cwd.is_absolute() {
+            return Err(TpccError::Protocol(
+                "RMDB_TPCC_SERVER_CWD must be absolute".to_owned(),
+            ));
+        }
+        Ok(server_cwd.join(path))
     }
 }
 
@@ -893,6 +959,21 @@ mod tests {
     }
 
     #[test]
+    fn relative_load_paths_require_and_use_the_server_working_directory() {
+        let server_cwd = Path::new("/tmp/rmdb/database");
+        assert_eq!(
+            CsvMaterializer::load_host_path("../csv/table.csv", Some(server_cwd)).unwrap(),
+            server_cwd.join("../csv/table.csv")
+        );
+        assert!(CsvMaterializer::load_host_path("../csv/table.csv", None).is_err());
+        assert!(CsvMaterializer::load_host_path(
+            "../csv/table.csv",
+            Some(Path::new("relative/database"))
+        )
+        .is_err());
+    }
+
+    #[test]
     fn csv_asset_uses_opaque_basename_and_ddl_ordered_header() {
         let schema = RuntimeSchema::opaque(73).unwrap();
         let unique = SystemTime::now()
@@ -909,6 +990,7 @@ mod tests {
             schema: &schema,
             csv_dir: directory.clone(),
             load_dir: directory.to_string_lossy().into_owned(),
+            server_cwd: None,
             dataset_hasher: CsvMaterializer::initial_dataset_hasher(1, &schema),
             assets: BTreeMap::new(),
         };
@@ -985,6 +1067,19 @@ mod tests {
         permissions.set_readonly(true);
         fs::set_permissions(&asset.host_path, permissions).unwrap();
         asset.verify_sealed("after restoration").unwrap();
+
+        let wrong_load_path = directory.join("wrong-load.csv");
+        fs::write(&wrong_load_path, &original).unwrap();
+        let mut permissions = fs::metadata(&wrong_load_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&wrong_load_path, permissions).unwrap();
+        let mut wrong_asset = asset.clone();
+        wrong_asset.load_host_path = wrong_load_path;
+        assert!(wrong_asset
+            .verify_sealed("with mismatched LOAD path")
+            .unwrap_err()
+            .to_string()
+            .contains("file identity"));
 
         #[cfg(unix)]
         {
