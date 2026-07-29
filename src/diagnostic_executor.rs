@@ -16,15 +16,14 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::info;
 
-use crate::config::{Config, ResolvedProfile};
+use crate::config::{Config, DiagnosticSegment, ResolvedProfile};
 use crate::connection::client::RmdbClient;
 use crate::error::TpccError;
-use crate::profile::{TransactionKind, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES};
+use crate::profile::{TransactionKind, OFFICIAL_CLIENTS};
 use crate::ranking::dispatch::{self, FrozenTransaction};
 use crate::ranking::runner::RankedTransactionOutcome;
 use crate::ranking::session::open_ranked_session;
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
-use crate::run_state::StateStore;
 use crate::workload::Final2026Workload;
 
 const DIAGNOSTIC_STAGE: StageId = StageId::custom(0x6469_6167_3230_3236);
@@ -40,13 +39,13 @@ impl DiagnosticExecutor {
     }
 
     pub async fn run(&self) -> Result<DiagnosticRunResult, TpccError> {
-        let duration_seconds = self.config.diagnostic_workload_seconds.ok_or_else(|| {
-            TpccError::Protocol("diagnostic executor requires an explicit duration".to_owned())
+        let segment = self.config.diagnostic_segment.ok_or_else(|| {
+            TpccError::Protocol("diagnostic executor requires an explicit segment".to_owned())
         })?;
+        let duration_seconds = segment.duration_seconds();
         let seed = self.effective.seed.ok_or_else(|| {
             TpccError::Protocol("diagnostic workload requires an explicit seed".to_owned())
         })?;
-        self.validate_state_binding(seed)?;
 
         let response_timeout = Duration::from_secs(self.config.response_timeout_seconds);
         let phase_tail_grace = Duration::from_secs(self.config.phase_tail_grace_seconds);
@@ -81,7 +80,6 @@ impl DiagnosticExecutor {
                     ready_barrier,
                     start_barrier,
                     timeline,
-                    response_timeout,
                 )
                 .await
             });
@@ -128,51 +126,12 @@ impl DiagnosticExecutor {
         }
 
         Ok(DiagnosticRunResult {
+            segment,
             duration,
             response_timeout,
             phase_tail_grace,
             stats: aggregate,
         })
-    }
-
-    fn validate_state_binding(&self, seed: u64) -> Result<(), TpccError> {
-        let state_dir = self.config.state_dir.as_deref().ok_or_else(|| {
-            TpccError::Protocol("diagnostic workload requires a state directory".to_owned())
-        })?;
-        let metadata = std::fs::symlink_metadata(state_dir).map_err(|error| {
-            TpccError::Protocol(format!(
-                "diagnostic state directory must already exist (read-only binding): {error}"
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(TpccError::Protocol(format!(
-                "diagnostic state path is not a real directory: {}",
-                state_dir.display()
-            )));
-        }
-        let store = StateStore::open(state_dir)
-            .map_err(|error| TpccError::Protocol(format!("diagnostic state: {error}")))?;
-        let dataset = store
-            .load_dataset()
-            .map_err(|error| TpccError::Protocol(format!("diagnostic dataset state: {error}")))?;
-        if dataset.seed != seed
-            || dataset.warehouses != i32::from(OFFICIAL_WAREHOUSES)
-            || self.config.scale_factor != i32::from(OFFICIAL_WAREHOUSES)
-        {
-            return Err(TpccError::Protocol(format!(
-                "diagnostic dataset state mismatch: state seed/SF={}/{}, CLI seed/SF={}/{}",
-                dataset.seed, dataset.warehouses, seed, self.config.scale_factor
-            )));
-        }
-        if let Ok(run_id) = std::env::var("RMDB_TPCC_RUN_ID") {
-            if dataset.run_id != run_id {
-                return Err(TpccError::Protocol(format!(
-                    "diagnostic run id mismatch: state={}, environment={run_id}",
-                    dataset.run_id
-                )));
-            }
-        }
-        Ok(())
     }
 
     async fn open_sessions(
@@ -255,15 +214,8 @@ impl DiagnosticTimeline {
         now < self.stop_at
     }
 
-    fn attempt_deadline(
-        self,
-        started_at: Instant,
-        response_timeout: Duration,
-    ) -> Result<Instant, TpccError> {
-        let response_deadline = started_at.checked_add(response_timeout).ok_or_else(|| {
-            TpccError::Protocol("diagnostic response deadline overflow".to_owned())
-        })?;
-        Ok(response_deadline.min(self.drain_deadline))
+    fn attempt_deadline(self) -> Instant {
+        self.drain_deadline
     }
 }
 
@@ -275,7 +227,6 @@ async fn run_worker(
     ready_barrier: Arc<Barrier>,
     start_barrier: Arc<Barrier>,
     mut timeline: watch::Receiver<Option<DiagnosticTimeline>>,
-    response_timeout: Duration,
 ) -> Result<DiagnosticStats, TpccError> {
     ready_barrier.wait().await;
     start_barrier.wait().await;
@@ -318,7 +269,7 @@ async fn run_worker(
                 break;
             }
             stats.physical_attempts += 1;
-            let attempt_deadline = timeline.attempt_deadline(attempt_started, response_timeout)?;
+            let attempt_deadline = timeline.attempt_deadline();
             let response =
                 tokio::time::timeout_at(attempt_deadline, dispatch::execute(&mut client, &frozen))
                     .await;
@@ -328,7 +279,7 @@ async fn run_worker(
                 return Err(TpccError::Timeout {
                     context: format!(
                         "non-ranked diagnostic worker {worker} exceeded its absolute \
-                         response/grace deadline"
+                         phase drain deadline"
                     ),
                 });
             }
@@ -339,7 +290,7 @@ async fn run_worker(
                     return Err(TpccError::Timeout {
                         context: format!(
                             "non-ranked diagnostic worker {worker} exceeded its absolute \
-                             response/grace deadline"
+                             phase drain deadline"
                         ),
                     });
                 }
@@ -425,6 +376,7 @@ impl DiagnosticStats {
 }
 
 pub struct DiagnosticRunResult {
+    segment: DiagnosticSegment,
     duration: Duration,
     response_timeout: Duration,
     phase_tail_grace: Duration,
@@ -435,6 +387,7 @@ impl DiagnosticRunResult {
     pub fn print_report(&self) {
         println!("=== TPCC final2026 diagnostic workload ===");
         println!("mode=non_ranked_diagnostic");
+        println!("segment={}", self.segment.as_str());
         println!(
             "clients={},duration_seconds={},mix=45/43/4/4/4,no_think_time=true",
             OFFICIAL_CLIENTS,
@@ -463,7 +416,7 @@ impl DiagnosticRunResult {
             self.stats.abandoned,
             self.stats.grace_tail
         );
-        println!("state_artifacts_written=false");
+        println!("state_artifacts_written=append_only_phase_claim_and_receipt");
     }
 }
 
@@ -472,24 +425,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absolute_attempt_deadline_is_capped_by_phase_grace() {
+    fn absolute_attempt_deadline_is_the_phase_drain_deadline() {
         let start = Instant::now();
         let timeline =
             DiagnosticTimeline::new(start, Duration::from_secs(10), Duration::from_secs(5))
                 .unwrap();
 
-        assert_eq!(
-            timeline
-                .attempt_deadline(start, Duration::from_secs(30))
-                .unwrap(),
-            start + Duration::from_secs(15)
-        );
-        assert_eq!(
-            timeline
-                .attempt_deadline(start + Duration::from_secs(1), Duration::from_secs(2))
-                .unwrap(),
-            start + Duration::from_secs(3)
-        );
+        assert_eq!(timeline.attempt_deadline(), start + Duration::from_secs(15));
     }
 
     #[test]

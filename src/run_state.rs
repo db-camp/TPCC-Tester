@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::consistency::{FloatAggregateId, NonNegativeF32Accumulator, FLOAT_AGGREGATES};
 use crate::loader::{LoadSummary, PartitionLoadSummary};
 use crate::profile::{
-    MEASUREMENT_SECONDS, MEASUREMENT_WINDOWS, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES, WARMUP_SECONDS,
+    LOAD_BUDGET_SECONDS, MEASUREMENT_SECONDS, MEASUREMENT_WINDOWS, OFFICIAL_CLIENTS,
+    OFFICIAL_WAREHOUSES, RECOVERY_READY_BUDGET_SECONDS, WARMUP_SECONDS,
 };
 use crate::ranking::ledger::RunLedger;
 
@@ -17,16 +18,19 @@ const STATE_VERSION: u32 = 2;
 const DATASET_FILE: &str = "dataset.state";
 const MAX_DATASET_STATE_BYTES: usize = 256 * 1024;
 const ARTIFACT_VERSION: u32 = 1;
+const SETUP_INTENT_ARTIFACT: &str = "setup_claim";
+const SETUP_INTENT_FILE: &str = "setup.started";
 const RUN_CONTRACT_ARTIFACT: &str = "run_contract";
 const RUN_CONTRACT_FILE: &str = "run_contract.state";
-const SETUP_CLAIM_ARTIFACT: &str = "setup_check_claim";
-const SETUP_CLAIM_FILE: &str = "setup_check.started";
+const SETUP_CHECK_CLAIM_ARTIFACT: &str = "setup_check_claim";
+const SETUP_CHECK_CLAIM_FILE: &str = "setup_check.started";
 const SETUP_RECEIPT_ARTIFACT: &str = "setup_check_receipt";
 const SETUP_RECEIPT_FILE: &str = "setup_check.passed";
 const RANK_CLAIM_ARTIFACT: &str = "rank_claim";
 const RANK_CLAIM_FILE: &str = "rank.started";
 const RANKED_LEDGER_ARTIFACT: &str = "ranked_run_ledger";
 const NON_RANKED_LEDGER_ARTIFACT: &str = "non_ranked_run_ledger";
+#[cfg(test)]
 const LEDGER_ARTIFACT: &str = "run_ledger";
 const LEDGER_FILE: &str = "run_ledger.state";
 const ONLINE_CLAIM_ARTIFACT: &str = "online_check_claim";
@@ -50,6 +54,7 @@ const MAX_LEDGER_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FLOAT_BASELINE_PAYLOAD_BYTES: usize = 4 * 1024;
 const MAX_CONTRACT_PAYLOAD_BYTES: usize = 4 * 1024;
 const MAX_MARKER_PAYLOAD_BYTES: usize = 256;
+const MAX_SETUP_INTENT_BYTES: usize = 8 * 1024;
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,22 +89,21 @@ pub struct RunContract {
     pub warmup_seconds: u64,
     pub measurement_windows: u8,
     pub window_seconds: u64,
+    pub load_budget_seconds: u64,
+    pub recovery_ready_budget_seconds: u64,
     pub response_timeout_seconds: u64,
     pub phase_tail_grace_seconds: u64,
     pub conformance: RunConformance,
 }
 
 impl RunContract {
-    fn validate(&self, dataset: &DatasetState) -> Result<(), StateError> {
-        if i32::from(self.warehouses) != dataset.warehouses {
-            return Err(StateError::Invalid(
-                "run contract warehouses do not match dataset.state".to_owned(),
-            ));
-        }
+    fn validate_shape(&self) -> Result<(), StateError> {
         if self.warehouses == 0
             || self.clients == 0
             || self.measurement_windows == 0
             || self.window_seconds == 0
+            || self.load_budget_seconds == 0
+            || self.recovery_ready_budget_seconds == 0
             || self.response_timeout_seconds == 0
             || self.phase_tail_grace_seconds == 0
         {
@@ -111,7 +115,9 @@ impl RunContract {
             && self.clients == OFFICIAL_CLIENTS
             && self.warmup_seconds == WARMUP_SECONDS
             && self.measurement_windows == MEASUREMENT_WINDOWS
-            && self.window_seconds == MEASUREMENT_SECONDS;
+            && self.window_seconds == MEASUREMENT_SECONDS
+            && self.load_budget_seconds == LOAD_BUDGET_SECONDS
+            && self.recovery_ready_budget_seconds == RECOVERY_READY_BUDGET_SECONDS;
         if (self.conformance == RunConformance::PublicSpecAligned) != public_shape {
             return Err(StateError::Invalid(
                 "run contract conformance does not match its published profile dimensions"
@@ -121,14 +127,26 @@ impl RunContract {
         Ok(())
     }
 
+    fn validate(&self, dataset: &DatasetState) -> Result<(), StateError> {
+        self.validate_shape()?;
+        if i32::from(self.warehouses) != dataset.warehouses {
+            return Err(StateError::Invalid(
+                "run contract warehouses do not match dataset.state".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn encode(&self) -> String {
         format!(
-            "contract_version=1\nwarehouses={}\nclients={}\nwarmup_seconds={}\nmeasurement_windows={}\nwindow_seconds={}\nresponse_timeout_seconds={}\nphase_tail_grace_seconds={}\nconformance={}\n",
+            "contract_version=2\nwarehouses={}\nclients={}\nwarmup_seconds={}\nmeasurement_windows={}\nwindow_seconds={}\nload_budget_seconds={}\nrecovery_ready_budget_seconds={}\nresponse_timeout_seconds={}\nphase_tail_grace_seconds={}\nconformance={}\n",
             self.warehouses,
             self.clients,
             self.warmup_seconds,
             self.measurement_windows,
             self.window_seconds,
+            self.load_budget_seconds,
+            self.recovery_ready_budget_seconds,
             self.response_timeout_seconds,
             self.phase_tail_grace_seconds,
             self.conformance.as_str()
@@ -137,7 +155,7 @@ impl RunContract {
 
     fn decode(input: &str) -> Result<Self, StateError> {
         let mut lines = input.lines();
-        expect_exact(&mut lines, "contract_version", 1_u32)?;
+        expect_exact(&mut lines, "contract_version", 2_u32)?;
         let contract = Self {
             warehouses: parse(value(&mut lines, "warehouses")?, "contract warehouses")?,
             clients: parse(value(&mut lines, "clients")?, "contract clients")?,
@@ -152,6 +170,14 @@ impl RunContract {
             window_seconds: parse(
                 value(&mut lines, "window_seconds")?,
                 "contract window seconds",
+            )?,
+            load_budget_seconds: parse(
+                value(&mut lines, "load_budget_seconds")?,
+                "contract load budget",
+            )?,
+            recovery_ready_budget_seconds: parse(
+                value(&mut lines, "recovery_ready_budget_seconds")?,
+                "contract recovery readiness budget",
             )?,
             response_timeout_seconds: parse(
                 value(&mut lines, "response_timeout_seconds")?,
@@ -170,6 +196,11 @@ impl RunContract {
         }
         Ok(contract)
     }
+}
+
+#[derive(Debug)]
+pub struct SetupClaim {
+    checksum: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,21 +470,61 @@ impl StateStore {
         })
     }
 
+    pub fn begin_setup(
+        &self,
+        run_id: &str,
+        seed: u64,
+        contract: &RunContract,
+    ) -> Result<SetupClaim, StateError> {
+        validate_run_id(run_id)?;
+        contract.validate_shape()?;
+        self.ensure_fresh_setup_root()?;
+        let encoded = encode_setup_intent(run_id, seed, contract)?;
+        atomic_publish_new(&self.root, SETUP_INTENT_FILE, encoded.as_bytes())?;
+        let (_, checksum) = decode_setup_intent(&read_limited(
+            &self.root.join(SETUP_INTENT_FILE),
+            MAX_SETUP_INTENT_BYTES as u64,
+        )?)?;
+        Ok(SetupClaim { checksum })
+    }
+
+    pub fn complete_dataset(
+        &self,
+        dataset: &DatasetState,
+        contract: &RunContract,
+        claim: SetupClaim,
+    ) -> Result<(), StateError> {
+        dataset.validate()?;
+        contract.validate(dataset)?;
+        let (intent, checksum) = self.load_setup_intent()?;
+        if checksum != claim.checksum
+            || intent.run_id != dataset.run_id
+            || intent.seed != dataset.seed
+            || intent.contract != *contract
+        {
+            return Err(StateError::Invalid(
+                "loaded dataset does not match the pre-DDL setup claim".to_owned(),
+            ));
+        }
+        self.save_dataset(dataset)?;
+        let payload = encode_setup_bound_contract(checksum, contract);
+        let encoded = encode_artifact(
+            RUN_CONTRACT_ARTIFACT,
+            dataset,
+            &payload,
+            MAX_CONTRACT_PAYLOAD_BYTES,
+        )?;
+        atomic_publish_new(&self.root, RUN_CONTRACT_FILE, encoded.as_bytes())
+    }
+
+    #[cfg(test)]
     pub fn initialize_run(
         &self,
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<(), StateError> {
-        dataset.validate()?;
-        contract.validate(dataset)?;
-        self.save_dataset(dataset)?;
-        let encoded = encode_artifact(
-            RUN_CONTRACT_ARTIFACT,
-            dataset,
-            &contract.encode(),
-            MAX_CONTRACT_PAYLOAD_BYTES,
-        )?;
-        atomic_publish_new(&self.root, RUN_CONTRACT_FILE, encoded.as_bytes())
+        let claim = self.begin_setup(&dataset.run_id, dataset.seed, contract)?;
+        self.complete_dataset(dataset, contract, claim)
     }
 
     pub fn load_bound_dataset(&self, expected: &RunContract) -> Result<DatasetState, StateError> {
@@ -470,8 +541,8 @@ impl StateStore {
         self.ensure_no_diagnostic_drift()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let claim_checksum = self.publish_marker(
-            SETUP_CLAIM_FILE,
-            SETUP_CLAIM_ARTIFACT,
+            SETUP_CHECK_CLAIM_FILE,
+            SETUP_CHECK_CLAIM_ARTIFACT,
             dataset,
             contract_checksum,
             contract_checksum,
@@ -493,8 +564,8 @@ impl StateStore {
             dataset,
             contract,
             claim.0,
-            SETUP_CLAIM_FILE,
-            SETUP_CLAIM_ARTIFACT,
+            SETUP_CHECK_CLAIM_FILE,
+            SETUP_CHECK_CLAIM_ARTIFACT,
         )?;
         self.publish_marker(
             SETUP_RECEIPT_FILE,
@@ -514,8 +585,8 @@ impl StateStore {
         self.ensure_no_diagnostic_drift()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let setup_claim = self.load_marker(
-            SETUP_CLAIM_FILE,
-            SETUP_CLAIM_ARTIFACT,
+            SETUP_CHECK_CLAIM_FILE,
+            SETUP_CHECK_CLAIM_ARTIFACT,
             dataset,
             contract_checksum,
             contract_checksum,
@@ -644,7 +715,7 @@ impl StateStore {
         let (contract_checksum, _, ledger, ledger_checksum) =
             self.load_bound_ledger(dataset, contract)?;
         let (baseline, baseline_checksum) =
-            self.load_bound_baseline(dataset, contract, contract_checksum, ledger_checksum)?;
+            self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
         let claim_checksum = self.publish_marker(
             RECOVERY_CLAIM_FILE,
             RECOVERY_CLAIM_ARTIFACT,
@@ -682,7 +753,7 @@ impl StateStore {
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
         let (_, baseline_checksum) =
-            self.load_bound_baseline(dataset, contract, contract_checksum, ledger_checksum)?;
+            self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
         if baseline_checksum != claim.baseline_checksum {
             return Err(StateError::Invalid(
                 "recovery claim belongs to a different FLOAT baseline".to_owned(),
@@ -708,12 +779,8 @@ impl StateStore {
         let predecessor_checksum = match stage {
             DiagnosticStage::Warmup => {
                 let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
-                let (_, baseline_checksum) = self.load_bound_baseline(
-                    dataset,
-                    contract,
-                    contract_checksum,
-                    ledger_checksum,
-                )?;
+                let (_, baseline_checksum) =
+                    self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
                 let recovery_claim = self.load_marker(
                     RECOVERY_CLAIM_FILE,
                     RECOVERY_CLAIM_ARTIFACT,
@@ -777,7 +844,25 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn save_dataset(&self, state: &DatasetState) -> Result<(), StateError> {
+    fn ensure_fresh_setup_root(&self) -> Result<(), StateError> {
+        if let Some(entry) = fs::read_dir(&self.root)?.next().transpose()? {
+            return Err(StateError::Invalid(format!(
+                "setup state directory is not empty; refusing DDL/LOAD before write-once claim: {}",
+                entry.path().display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn load_setup_intent(&self) -> Result<(SetupIntent, u64), StateError> {
+        let input = read_limited(
+            &self.root.join(SETUP_INTENT_FILE),
+            MAX_SETUP_INTENT_BYTES as u64,
+        )?;
+        decode_setup_intent(&input)
+    }
+
+    fn save_dataset(&self, state: &DatasetState) -> Result<(), StateError> {
         state.validate()?;
         let encoded = state.encode();
         if encoded.len() > MAX_DATASET_STATE_BYTES {
@@ -788,7 +873,7 @@ impl StateStore {
         atomic_publish_new(&self.root, DATASET_FILE, encoded.as_bytes())
     }
 
-    pub fn load_dataset(&self) -> Result<DatasetState, StateError> {
+    fn load_dataset(&self) -> Result<DatasetState, StateError> {
         let input = read_limited(
             &self.root.join(DATASET_FILE),
             MAX_DATASET_STATE_BYTES as u64,
@@ -796,11 +881,8 @@ impl StateStore {
         DatasetState::decode(&input)
     }
 
-    pub fn save_ledger(
-        &self,
-        dataset: &DatasetState,
-        ledger: &RunLedger,
-    ) -> Result<(), StateError> {
+    #[cfg(test)]
+    fn save_ledger(&self, dataset: &DatasetState, ledger: &RunLedger) -> Result<(), StateError> {
         dataset.validate()?;
         let payload = ledger.encode();
         let encoded =
@@ -808,7 +890,8 @@ impl StateStore {
         atomic_publish_new(&self.root, LEDGER_FILE, encoded.as_bytes())
     }
 
-    pub fn load_ledger(&self, dataset: &DatasetState) -> Result<RunLedger, StateError> {
+    #[cfg(test)]
+    fn load_ledger(&self, dataset: &DatasetState) -> Result<RunLedger, StateError> {
         dataset.validate()?;
         let input = read_limited(
             &self.root.join(LEDGER_FILE),
@@ -819,7 +902,8 @@ impl StateStore {
             .map_err(|error| StateError::Invalid(format!("invalid run ledger payload: {error}")))
     }
 
-    pub fn save_float_baseline(
+    #[cfg(test)]
+    fn save_float_baseline(
         &self,
         dataset: &DatasetState,
         values: &BTreeMap<FloatAggregateId, u32>,
@@ -836,7 +920,8 @@ impl StateStore {
         atomic_publish_new(&self.root, FLOAT_BASELINE_FILE, encoded.as_bytes())
     }
 
-    pub fn load_float_baseline(
+    #[cfg(test)]
+    fn load_float_baseline(
         &self,
         dataset: &DatasetState,
     ) -> Result<BTreeMap<FloatAggregateId, u32>, StateError> {
@@ -859,6 +944,7 @@ impl StateStore {
         &self.root
     }
 
+    #[cfg(test)]
     fn read_ledger_checksum(&self, dataset: &DatasetState) -> Result<u64, StateError> {
         read_artifact_header_checksum(
             &self.root.join(LEDGER_FILE),
@@ -875,6 +961,15 @@ impl StateStore {
     ) -> Result<u64, StateError> {
         dataset.validate()?;
         expected.validate(dataset)?;
+        let (intent, setup_checksum) = self.load_setup_intent()?;
+        if intent.run_id != dataset.run_id
+            || intent.seed != dataset.seed
+            || intent.contract != *expected
+        {
+            return Err(StateError::Invalid(
+                "setup claim does not match dataset.state and requested contract".to_owned(),
+            ));
+        }
         let input = read_limited(
             &self.root.join(RUN_CONTRACT_FILE),
             MAX_CONTRACT_PAYLOAD_BYTES as u64 + MAX_ARTIFACT_HEADER_BYTES,
@@ -885,7 +980,7 @@ impl StateStore {
             dataset,
             MAX_CONTRACT_PAYLOAD_BYTES,
         )?;
-        let actual = RunContract::decode(payload)?;
+        let actual = decode_setup_bound_contract(payload, setup_checksum)?;
         actual.validate(dataset)?;
         if actual != *expected {
             return Err(StateError::Invalid(format!(
@@ -974,8 +1069,8 @@ impl StateStore {
     ) -> Result<(u64, u64), StateError> {
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let setup_claim = self.load_marker(
-            SETUP_CLAIM_FILE,
-            SETUP_CLAIM_ARTIFACT,
+            SETUP_CHECK_CLAIM_FILE,
+            SETUP_CHECK_CLAIM_ARTIFACT,
             dataset,
             contract_checksum,
             contract_checksum,
@@ -1019,7 +1114,6 @@ impl StateStore {
     fn load_bound_baseline(
         &self,
         dataset: &DatasetState,
-        contract: &RunContract,
         contract_checksum: u64,
         ledger_checksum: u64,
     ) -> Result<(BTreeMap<FloatAggregateId, u32>, u64), StateError> {
@@ -1056,7 +1150,7 @@ impl StateStore {
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let (_, _, _, ledger_checksum) = self.load_bound_ledger(dataset, contract)?;
         let (_, baseline_checksum) =
-            self.load_bound_baseline(dataset, contract, contract_checksum, ledger_checksum)?;
+            self.load_bound_baseline(dataset, contract_checksum, ledger_checksum)?;
         let recovery_claim = self.load_marker(
             RECOVERY_CLAIM_FILE,
             RECOVERY_CLAIM_ARTIFACT,
@@ -1105,6 +1199,116 @@ pub enum StateError {
     Io(#[from] std::io::Error),
     #[error("invalid final2026 state: {0}")]
     Invalid(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SetupIntent {
+    run_id: String,
+    seed: u64,
+    contract: RunContract,
+}
+
+fn encode_setup_intent(
+    run_id: &str,
+    seed: u64,
+    contract: &RunContract,
+) -> Result<String, StateError> {
+    validate_run_id(run_id)?;
+    contract.validate_shape()?;
+    let payload = contract.encode();
+    let metadata = format!(
+        "artifact={SETUP_INTENT_ARTIFACT}\nversion={ARTIFACT_VERSION}\nrun_id={run_id}\nseed={seed}\nwarehouses={}\npayload_len={}\n",
+        contract.warehouses,
+        payload.len()
+    );
+    let checksum = checksum64(metadata.as_bytes(), payload.as_bytes());
+    let encoded = format!("{metadata}checksum={checksum:016x}\n{payload}");
+    if encoded.len() > MAX_SETUP_INTENT_BYTES {
+        return Err(StateError::Invalid(format!(
+            "setup claim exceeds {MAX_SETUP_INTENT_BYTES} bytes"
+        )));
+    }
+    Ok(encoded)
+}
+
+fn decode_setup_intent(input: &str) -> Result<(SetupIntent, u64), StateError> {
+    if input.len() > MAX_SETUP_INTENT_BYTES {
+        return Err(StateError::Invalid(format!(
+            "setup claim exceeds {MAX_SETUP_INTENT_BYTES} bytes"
+        )));
+    }
+    let mut sections = input.splitn(8, '\n');
+    let artifact = value(&mut sections, "artifact")?;
+    if artifact != SETUP_INTENT_ARTIFACT {
+        return Err(StateError::Invalid(format!(
+            "expected {SETUP_INTENT_ARTIFACT} artifact, got {artifact:?}"
+        )));
+    }
+    expect_exact(&mut sections, "version", ARTIFACT_VERSION)?;
+    let run_id = value(&mut sections, "run_id")?.to_owned();
+    validate_run_id(&run_id)?;
+    let seed = parse(value(&mut sections, "seed")?, "setup seed")?;
+    let warehouses = parse(value(&mut sections, "warehouses")?, "setup warehouses")?;
+    let payload_len: usize = parse(value(&mut sections, "payload_len")?, "setup payload length")?;
+    let checksum = parse_checksum(value(&mut sections, "checksum")?)?;
+    let payload = sections
+        .next()
+        .ok_or_else(|| StateError::Invalid("setup claim is missing its contract".to_owned()))?;
+    if payload_len != payload.len() || payload_len > MAX_CONTRACT_PAYLOAD_BYTES {
+        return Err(StateError::Invalid(
+            "setup claim contract length is invalid".to_owned(),
+        ));
+    }
+    let metadata = format!(
+        "artifact={SETUP_INTENT_ARTIFACT}\nversion={ARTIFACT_VERSION}\nrun_id={run_id}\nseed={seed}\nwarehouses={warehouses}\npayload_len={payload_len}\n"
+    );
+    if checksum64(metadata.as_bytes(), payload.as_bytes()) != checksum {
+        return Err(StateError::Invalid(
+            "setup claim checksum mismatch".to_owned(),
+        ));
+    }
+    let contract = RunContract::decode(payload)?;
+    contract.validate_shape()?;
+    if contract.warehouses != warehouses {
+        return Err(StateError::Invalid(
+            "setup claim warehouse count does not match its contract".to_owned(),
+        ));
+    }
+    let intent = SetupIntent {
+        run_id,
+        seed,
+        contract,
+    };
+    if encode_setup_intent(&intent.run_id, intent.seed, &intent.contract)? != input {
+        return Err(StateError::Invalid(
+            "setup claim is not canonically encoded".to_owned(),
+        ));
+    }
+    Ok((intent, checksum))
+}
+
+fn encode_setup_bound_contract(setup_checksum: u64, contract: &RunContract) -> String {
+    format!(
+        "setup_claim_checksum={setup_checksum:016x}\n{}",
+        contract.encode()
+    )
+}
+
+fn decode_setup_bound_contract(
+    payload: &str,
+    expected_setup_checksum: u64,
+) -> Result<RunContract, StateError> {
+    let mut sections = payload.splitn(2, '\n');
+    let setup_checksum = parse_checksum(value(&mut sections, "setup_claim_checksum")?)?;
+    if setup_checksum != expected_setup_checksum {
+        return Err(StateError::Invalid(
+            "run contract belongs to a different setup claim".to_owned(),
+        ));
+    }
+    let encoded_contract = sections
+        .next()
+        .ok_or_else(|| StateError::Invalid("run contract payload is missing".to_owned()))?;
+    RunContract::decode(encoded_contract)
 }
 
 fn validate_run_id(value: &str) -> Result<(), StateError> {
@@ -1237,6 +1441,7 @@ struct ArtifactHeader<'a> {
     checksum: u64,
 }
 
+#[cfg(test)]
 fn decode_artifact<'a>(
     input: &'a str,
     expected_artifact: &str,
@@ -1802,6 +2007,8 @@ mod tests {
             } else {
                 1
             },
+            load_budget_seconds: LOAD_BUDGET_SECONDS,
+            recovery_ready_budget_seconds: RECOVERY_READY_BUDGET_SECONDS,
             response_timeout_seconds: 30,
             phase_tail_grace_seconds: 5,
             conformance: if warehouses == OFFICIAL_WAREHOUSES {
@@ -2040,6 +2247,12 @@ mod tests {
         changed.window_seconds += 1;
         mutations.push(changed);
         let mut changed = contract.clone();
+        changed.load_budget_seconds += 1;
+        mutations.push(changed);
+        let mut changed = contract.clone();
+        changed.recovery_ready_budget_seconds += 1;
+        mutations.push(changed);
+        let mut changed = contract.clone();
         changed.response_timeout_seconds += 1;
         mutations.push(changed);
         let mut changed = contract.clone();
@@ -2053,6 +2266,47 @@ mod tests {
         let mut falsely_ranked = contract;
         falsely_ranked.conformance = RunConformance::PublicSpecAligned;
         assert!(store.load_bound_dataset(&falsely_ranked).is_err());
+    }
+
+    #[test]
+    fn setup_claim_is_persisted_before_dataset_and_rejects_reuse() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset("run-setup-claim", 87);
+        let contract = sample_contract(1);
+
+        let claim = store
+            .begin_setup(&dataset.run_id, dataset.seed, &contract)
+            .unwrap();
+        assert!(directory.0.join(SETUP_INTENT_FILE).is_file());
+        assert!(!directory.0.join(DATASET_FILE).exists());
+        assert!(store
+            .begin_setup(&dataset.run_id, dataset.seed, &contract)
+            .is_err());
+
+        let mut wrong_dataset = dataset.clone();
+        wrong_dataset.seed += 1;
+        assert!(store
+            .complete_dataset(&wrong_dataset, &contract, claim)
+            .is_err());
+        assert!(!directory.0.join(DATASET_FILE).exists());
+    }
+
+    #[test]
+    fn completed_dataset_is_bound_to_pre_ddl_setup_claim() {
+        let directory = TestDirectory::new();
+        let store = StateStore::open(&directory.0).unwrap();
+        let dataset = sample_dataset("run-complete-setup", 88);
+        let contract = sample_contract(1);
+        let claim = store
+            .begin_setup(&dataset.run_id, dataset.seed, &contract)
+            .unwrap();
+        store.complete_dataset(&dataset, &contract, claim).unwrap();
+
+        assert_eq!(store.load_bound_dataset(&contract).unwrap(), dataset);
+        assert!(store
+            .begin_setup("different-run", dataset.seed, &contract)
+            .is_err());
     }
 
     #[test]

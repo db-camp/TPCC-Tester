@@ -26,10 +26,11 @@ use std::time::Duration;
 use clap::Parser;
 use tracing::{error, info, warn};
 
-use config::{Config, ResolvedProfile};
+use config::{Config, DiagnosticSegment, ResolvedProfile};
 use connection::client::RmdbClient;
 use connection::cursor::RmdbCursor;
 use error::TpccError;
+use run_state::{DiagnosticStage, RunConformance, RunContract};
 
 fn setup_tracing(verbose: u8) {
     use tracing_subscriber::EnvFilter;
@@ -100,9 +101,22 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
     }
 
     if config.diagnostic_workload_seconds.is_some() {
-        info!("启动 final2026 非排名诊断负载；不会写入排名 ledger 或 crash baseline");
+        let (store, dataset, contract) = load_bound_state(&config, &effective)?;
+        let segment = config
+            .diagnostic_segment
+            .ok_or("validated diagnostic configuration lost its segment")?;
+        let stage = match segment {
+            DiagnosticSegment::Warmup => DiagnosticStage::Warmup,
+            DiagnosticSegment::Observation => DiagnosticStage::Observation,
+        };
+        let claim = store.begin_diagnostic(&dataset, &contract, stage)?;
+        info!(
+            "启动 final2026 非排名诊断 {}；已持久化数据库漂移 claim",
+            segment.as_str()
+        );
         let exec = diagnostic_executor::DiagnosticExecutor::new(config, effective);
         let result = exec.run().await?;
+        store.complete_diagnostic(&dataset, &contract, claim)?;
         result.print_report();
         return Ok(());
     }
@@ -111,13 +125,13 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         config.create_schema || config.init || config.check || config.stats || config.benchmark;
 
     if !needs_connection {
-        info!("用法: tpcc-tester --create-schema | --init | --check | --stats | --benchmark | --diagnostic-workload-seconds N | --diagnose");
+        info!("用法: tpcc-tester --create-schema | --init | --check | --stats | --benchmark | --diagnostic-workload-seconds N --diagnostic-segment warmup|observation | --diagnose");
         info!("  --create-schema 创建 TPC-C 表和索引");
         info!("  --init          加载 TPC-C 初始数据");
         info!("  --check         运行一致性检查");
         info!("  --stats         显示各表行数统计");
         info!("  --benchmark     运行并发基准测试");
-        info!("  --diagnostic-workload-seconds N 运行 N 秒非排名诊断负载");
+        info!("  --diagnostic-workload-seconds N --diagnostic-segment warmup|observation");
         info!("  --diagnose      运行数据库兼容性诊断");
         info!("  -v / -vv        详细日志");
         return Ok(());
@@ -138,6 +152,28 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         info!("RMDB 连接正常");
         let setup_deadline = (config.create_schema || config.init)
             .then(|| tokio::time::Instant::now() + effective.final2026.load_budget);
+        let mut setup_run = if config.init {
+            let seed = effective
+                .seed
+                .ok_or("validated init configuration lost its seed")?;
+            let run_id =
+                std::env::var("RMDB_TPCC_RUN_ID").unwrap_or_else(|_| format!("local-{seed}"));
+            let store = run_state::StateStore::open(
+                config
+                    .state_dir
+                    .as_deref()
+                    .ok_or("validated init configuration lost its state directory")?,
+            )?;
+            let contract = run_contract(&config, &effective);
+            let claim = store.begin_setup(&run_id, seed, &contract)?;
+            info!(
+                "已在首个 DDL/LOAD 前持久化 write-once setup claim: {}",
+                store.root().join("setup.started").display()
+            );
+            Some((store, contract, claim, run_id, seed))
+        } else {
+            None
+        };
 
         if config.create_schema {
             info!("创建 TPC-C 表和索引");
@@ -156,20 +192,12 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                 ldr.load_all_data(),
             )
             .await?;
-            let seed = effective
-                .seed
-                .ok_or("validated init configuration lost its seed")?;
-            let run_id =
-                std::env::var("RMDB_TPCC_RUN_ID").unwrap_or_else(|_| format!("local-{seed}"));
+            let (store, contract, claim, run_id, seed) = setup_run
+                .take()
+                .ok_or("validated init configuration lost its pre-DDL setup claim")?;
             let state =
                 run_state::DatasetState::from_load(run_id, seed, config.scale_factor, load)?;
-            let store = run_state::StateStore::open(
-                config
-                    .state_dir
-                    .as_deref()
-                    .ok_or("validated init configuration lost its state directory")?,
-            )?;
-            store.save_dataset(&state)?;
+            store.complete_dataset(&state, &contract, claim)?;
             info!(
                 "已保存版本化装载状态: {}",
                 store.root().join("dataset.state").display()
@@ -179,18 +207,20 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 
         if config.check {
             info!("运行 {} 阶段一致性检查", config.check_scope.as_str());
-            let (store, dataset) = load_bound_state(&config, &effective)?;
+            let (store, dataset, contract) = load_bound_state(&config, &effective)?;
             match config.check_scope {
                 config::CheckScope::Setup => {
+                    let claim = store.begin_setup_check(&dataset, &contract)?;
                     setup_step(
                         setup_deadline,
                         "run public setup integrity checks",
                         check_executor::run_setup(cursor.client_mut(), &dataset),
                     )
                     .await?;
+                    store.complete_setup_check(&dataset, &contract, claim)?;
                 }
                 config::CheckScope::Online => {
-                    let ledger = store.load_ledger(&dataset)?;
+                    let (claim, ledger) = store.begin_online_check(&dataset, &contract)?;
                     let baseline = check_executor::run_final_online(
                         cursor.client_mut(),
                         &dataset,
@@ -198,15 +228,15 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                         dataset.initial_order_line_amounts(),
                     )
                     .await?;
-                    store.save_float_baseline(&dataset, &baseline)?;
+                    store.complete_online_check(&dataset, &contract, claim, &baseline)?;
                     info!(
                         "已原子保存 online FLOAT baseline: {}",
                         store.root().join("float_baseline.state").display()
                     );
                 }
                 config::CheckScope::Recovery => {
-                    let ledger = store.load_ledger(&dataset)?;
-                    let baseline = store.load_float_baseline(&dataset)?;
+                    let (claim, ledger, baseline) =
+                        store.begin_recovery_check(&dataset, &contract)?;
                     check_executor::run_final_recovery(
                         cursor.client_mut(),
                         &dataset,
@@ -215,6 +245,11 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                         &baseline,
                     )
                     .await?;
+                    store.complete_recovery_check(&dataset, &contract, claim)?;
+                    info!(
+                        "已原子保存 recovery pass receipt: {}",
+                        store.root().join("recovery_check.passed").display()
+                    );
                 }
             }
         }
@@ -227,10 +262,11 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 
     if config.benchmark {
         info!("启动原生 final2026 连续三窗口基准测试...");
-        let (store, dataset) = load_bound_state(&config, &effective)?;
+        let (store, dataset, contract) = load_bound_state(&config, &effective)?;
+        let claim = store.begin_rank(&dataset, &contract)?;
         let exec = executor::BenchmarkExecutor::new(config, effective);
         let result = exec.run().await?;
-        store.save_ledger(&dataset, result.ledger())?;
+        store.complete_rank(&dataset, &contract, claim, result.ledger())?;
         info!(
             "已原子保存完整 physical commit ledger: {}",
             store.root().join("run_ledger.state").display()
@@ -244,14 +280,16 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
 fn load_bound_state(
     config: &Config,
     effective: &ResolvedProfile,
-) -> Result<(run_state::StateStore, run_state::DatasetState), Box<dyn std::error::Error>> {
-    let store = run_state::StateStore::open(
+) -> Result<(run_state::StateStore, run_state::DatasetState, RunContract), Box<dyn std::error::Error>>
+{
+    let store = run_state::StateStore::open_existing(
         config
             .state_dir
             .as_deref()
             .ok_or("validated stateful phase lost its state directory")?,
     )?;
-    let dataset = store.load_dataset()?;
+    let contract = run_contract(config, effective);
+    let dataset = store.load_bound_dataset(&contract)?;
     let seed_mismatch = effective.seed.is_some_and(|seed| dataset.seed != seed);
     let run_id_mismatch = std::env::var("RMDB_TPCC_RUN_ID")
         .ok()
@@ -268,7 +306,27 @@ fn load_bound_state(
         )
         .into());
     }
-    Ok((store, dataset))
+    Ok((store, dataset, contract))
+}
+
+fn run_contract(config: &Config, effective: &ResolvedProfile) -> RunContract {
+    let profile = &effective.final2026;
+    RunContract {
+        warehouses: profile.warehouses,
+        clients: profile.clients,
+        warmup_seconds: profile.warmup.as_secs(),
+        measurement_windows: profile.measurement_windows,
+        window_seconds: profile.measurement_window.as_secs(),
+        load_budget_seconds: profile.load_budget.as_secs(),
+        recovery_ready_budget_seconds: profile.recovery_ready_budget.as_secs(),
+        response_timeout_seconds: config.response_timeout_seconds,
+        phase_tail_grace_seconds: config.phase_tail_grace_seconds,
+        conformance: if effective.is_ranked_configuration() {
+            RunConformance::PublicSpecAligned
+        } else {
+            RunConformance::NonRankedDeviation
+        },
+    }
 }
 
 async fn setup_step<T, F>(
