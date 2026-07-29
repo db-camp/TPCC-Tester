@@ -20,6 +20,7 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parents[1] / "run_workflow.sh"
 METRICS_HELPER = Path(__file__).resolve().parents[1] / "diagnostic_metrics.py"
 RESOURCE_HELPER = Path(__file__).resolve().parents[1] / "resource_sampler.py"
+SUMMARY_HELPER = Path(__file__).resolve().parents[1] / "summarize_perf_run.py"
 RESOURCE_SPEC = importlib.util.spec_from_file_location(
     "workflow_resource_sampler",
     RESOURCE_HELPER,
@@ -29,6 +30,127 @@ RESOURCE_SPEC.loader.exec_module(RESOURCE_SAMPLER)
 
 
 class WorkflowSafetyTests(unittest.TestCase):
+    def write_summary_manifest(
+        self,
+        result_dir,
+        *,
+        status,
+        ranking_eligible=False,
+        conformance="not_public_spec_aligned",
+        attestation_status="failed",
+    ):
+        required = [
+            {
+                "name": name,
+                "required_for_ranking": True,
+                "status": attestation_status,
+                "validator": "test",
+            }
+            for name in (
+                "public_configuration",
+                "opaque_sealed_database",
+                "formal_workflow_phases",
+                "formal_state_chain",
+            )
+        ]
+        manifest = {
+            "schema_version": 3,
+            "authority": "manifest.json",
+            "status": status,
+            "mode": "all",
+            "profile": "final2026",
+            "conformance": conformance,
+            "ranking_eligible": ranking_eligible,
+            "ranked_configuration": True,
+            "attestations": {
+                "policy": "all_required_must_be_verified",
+                "required": required,
+            },
+            "warnings": [],
+        }
+        (result_dir / "manifest.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+
+    def run_summary(self, result_dir):
+        return subprocess.run(
+            [sys.executable, str(SUMMARY_HELPER), str(result_dir)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+    def test_summary_uses_only_manifest_json_and_suppresses_failed_metrics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result_dir = Path(temp)
+            self.write_summary_manifest(result_dir, status="failed")
+            (result_dir / "manifest.txt").write_text(
+                "workflow_status=success\nconformance=public_spec_aligned\n",
+                encoding="utf-8",
+            )
+            (result_dir / "rank.log").write_text(
+                "Throughput: 12345 txn/s\ntpmC: 67890\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_summary(result_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("status: failed", result.stdout)
+            self.assertIn(
+                "suppressed because the authoritative workflow status",
+                result.stdout.lower(),
+            )
+            self.assertNotIn("12345", result.stdout)
+            self.assertNotIn("67890", result.stdout)
+            self.assertNotIn("workflow_status=success", result.stdout)
+
+    def test_summary_emits_metrics_only_for_a_consistent_success_manifest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result_dir = Path(temp)
+            self.write_summary_manifest(
+                result_dir,
+                status="success",
+                ranking_eligible=True,
+                conformance="public_spec_aligned",
+                attestation_status="verified",
+            )
+            (result_dir / "rank.log").write_text(
+                "Throughput: 12345 txn/s\ntpmC: 67890\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_summary(result_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("ranking_eligible: true", result.stdout)
+            self.assertIn("Ranked Metrics", result.stdout)
+            self.assertIn("Throughput: 12345 txn/s", result.stdout)
+            self.assertIn("tpmC: 67890", result.stdout)
+
+    def test_summary_rejects_corrupt_or_symlinked_authority(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result_dir = Path(temp)
+            (result_dir / "rank.log").write_text(
+                "Throughput: 12345 txn/s\n",
+                encoding="utf-8",
+            )
+            (result_dir / "manifest.json").write_text("{", encoding="utf-8")
+            corrupt = self.run_summary(result_dir)
+            self.assertEqual(corrupt.returncode, 2)
+            self.assertIn("metrics: suppressed", corrupt.stdout.lower())
+            self.assertNotIn("12345", corrupt.stdout)
+
+            if hasattr(os, "symlink"):
+                target = result_dir / "authority-target.json"
+                self.write_summary_manifest(result_dir, status="failed")
+                (result_dir / "manifest.json").replace(target)
+                os.symlink(target, result_dir / "manifest.json")
+                unsafe = self.run_summary(result_dir)
+                self.assertEqual(unsafe.returncode, 2)
+                self.assertIn("metrics: suppressed", unsafe.stdout.lower())
+                self.assertNotIn("12345", unsafe.stdout)
+
     def kill_process_session(self, session_id):
         for requested_signal in (signal.SIGTERM, signal.SIGKILL):
             result = subprocess.run(
@@ -1214,7 +1336,7 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
             self.assertIn("db_name=local_database\n", accepted.stdout)
             self.assertIn(
-                "conformance=non_ranked_deviation\n",
+                "conformance_candidate=non_ranked_deviation\n",
                 accepted.stdout,
             )
 
@@ -1256,7 +1378,10 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 "--allow-deviation",
             )
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
-            self.assertIn("conformance=non_ranked_deviation", accepted.stdout)
+            self.assertIn(
+                "conformance_candidate=non_ranked_deviation",
+                accepted.stdout,
+            )
             self.assertIn("ranked_configuration=0", accepted.stdout)
             self.assertIn(
                 "recovery_ready_budget_seconds=5\n",
@@ -1274,7 +1399,10 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 "5",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("conformance=public_spec_aligned\n", result.stdout)
+            self.assertIn(
+                "conformance_candidate=public_spec_candidate\n",
+                result.stdout,
+            )
             self.assertIn("ranked_configuration=1\n", result.stdout)
             self.assertIn(
                 "startup_ready_budget_seconds=5\n",
@@ -1356,6 +1484,11 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 manifest["phases"]["diagnostics"],
                 "not_applicable_non_ranked",
             )
+            self.assertEqual(
+                manifest["conformance"],
+                "non_ranked_deviation",
+            )
+            self.assertFalse(manifest["ranking_eligible"])
             events = server_events.read_text(encoding="utf-8").splitlines()
             starts = [line.split() for line in events if line.startswith("start ")]
             graceful = [
@@ -1989,6 +2122,17 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             self.assertIsNone(
                 manifest["database_identity"]["filesystem"]["device"]
             )
+            self.assertEqual(
+                manifest["conformance"],
+                "non_ranked_deviation",
+            )
+            self.assertFalse(manifest["ranking_eligible"])
+            self.assertTrue(
+                all(
+                    item["status"] == "not_applicable"
+                    for item in manifest["attestations"]["required"]
+                )
+            )
 
     def test_resource_helper_failure_is_warning_only(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2031,6 +2175,11 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             self.assertEqual(manifest["phases"]["setup"], "passed")
             self.assertEqual(manifest["resources"]["status"], "failed")
             self.assertFalse(manifest["resources"]["ranked"])
+            self.assertEqual(
+                manifest["conformance"],
+                "not_public_spec_aligned",
+            )
+            self.assertFalse(manifest["ranking_eligible"])
 
     def test_rank_cpu_uses_the_published_three_window_timeline(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3286,9 +3435,23 @@ while :; do sleep 0.05; done
                 else "failed"
             )
             self.assertEqual(manifest["conformance"], "public_spec_aligned")
-            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["schema_version"], 3)
+            self.assertEqual(manifest["authority"], "manifest.json")
             self.assertFalse(manifest["embeds_unpublished_official_values"])
             self.assertEqual(manifest["status"], "success")
+            self.assertTrue(manifest["ranking_eligible"])
+            self.assertEqual(
+                {
+                    item["name"]: item["status"]
+                    for item in manifest["attestations"]["required"]
+                },
+                {
+                    "public_configuration": "verified",
+                    "opaque_sealed_database": "verified",
+                    "formal_workflow_phases": "verified",
+                    "formal_state_chain": "verified",
+                },
+            )
             self.assertEqual(resource_metrics["status"], "partial")
             self.assertFalse(resource_metrics["ranked"])
             self.assertEqual(resource_metrics["score_effect"], "none")
@@ -3582,6 +3745,13 @@ while :; do sleep 0.05; done
                         "success",
                     )
                     self.assertEqual(
+                        diagnostic_failure_manifest["conformance"],
+                        "public_spec_aligned",
+                    )
+                    self.assertTrue(
+                        diagnostic_failure_manifest["ranking_eligible"]
+                    )
+                    self.assertEqual(
                         diagnostic_failure_manifest["phases"]["rank"],
                         "passed",
                     )
@@ -3620,6 +3790,11 @@ while :; do sleep 0.05; done
                 )
             )
             self.assertEqual(failed_manifest["status"], "failed")
+            self.assertEqual(
+                failed_manifest["conformance"],
+                "not_public_spec_aligned",
+            )
+            self.assertFalse(failed_manifest["ranking_eligible"])
             self.assertEqual(
                 failed_manifest["seed"],
                 {

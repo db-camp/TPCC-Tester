@@ -10,6 +10,7 @@ DEFAULT_RMDB_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd -P)"
 DEFAULT_TPCC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 DIAGNOSTIC_METRICS_HELPER="${SCRIPT_DIR}/diagnostic_metrics.py"
 RESOURCE_HELPER="${RMDB_TPCC_RESOURCE_HELPER_OVERRIDE:-${SCRIPT_DIR}/resource_sampler.py}"
+SUMMARY_HELPER="${SCRIPT_DIR}/summarize_perf_run.py"
 
 MODE="all"
 LABEL="final2026"
@@ -90,6 +91,7 @@ PHASE_ONLINE="not_applicable"
 PHASE_CRASH_RESTART="not_applicable"
 PHASE_RECOVERY="not_applicable"
 PHASE_DIAGNOSTICS="not_requested"
+FORMAL_STATE_ATTESTATION_STATUS="not_applicable"
 
 PUBLIC_SCALE=50
 PUBLIC_CLIENTS=32
@@ -1425,8 +1427,10 @@ if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
-if [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
-  CONFORMANCE="public_spec_aligned"
+if [[ "${RANKED_CONFIGURATION}" == "1" && "${MODE}" == "all" ]]; then
+  CONFORMANCE="public_spec_candidate"
+elif [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
+  CONFORMANCE="non_ranked_split_mode"
 else
   CONFORMANCE="non_ranked_deviation"
 fi
@@ -1535,8 +1539,10 @@ if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
-if [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
-  CONFORMANCE="public_spec_aligned"
+if [[ "${RANKED_CONFIGURATION}" == "1" && "${MODE}" == "all" ]]; then
+  CONFORMANCE="public_spec_candidate"
+elif [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
+  CONFORMANCE="non_ranked_split_mode"
 else
   CONFORMANCE="non_ranked_deviation"
 fi
@@ -1556,6 +1562,7 @@ case "${MODE}" in
     PHASE_ONLINE="pending"
     PHASE_CRASH_RESTART="pending"
     PHASE_RECOVERY="pending"
+    FORMAL_STATE_ATTESTATION_STATUS="pending"
     ;;
   init)
     PHASE_SETUP="pending"
@@ -1598,7 +1605,7 @@ print_plan() {
   cat <<EOF
 mode=${MODE}
 profile=${PROFILE}
-conformance=${CONFORMANCE}
+conformance_candidate=${CONFORMANCE}
 ranked_configuration=${RANKED_CONFIGURATION}
 seed=${SEED}
 seed_caller_supplied=${SEED_CALLER_SUPPLIED}
@@ -1682,24 +1689,6 @@ if [[ "${MODE}" == "tools" ]]; then
 fi
 
 write_manifest() {
-  {
-    print_plan
-    echo "workflow_status=${WORKFLOW_STATUS}"
-    echo "allow_deviation=${ALLOW_DEVIATION}"
-    echo "scale=${SCALE}"
-    echo "clients=${CLIENTS}"
-    echo "warmup_seconds=${WARMUP_SECONDS}"
-    echo "window_seconds=${WINDOW_SECONDS}"
-    echo "phase_setup=${PHASE_SETUP}"
-    echo "phase_rank=${PHASE_RANK}"
-    echo "phase_online=${PHASE_ONLINE}"
-    echo "phase_crash_restart=${PHASE_CRASH_RESTART}"
-    echo "phase_recovery=${PHASE_RECOVERY}"
-    echo "phase_diagnostics=${PHASE_DIAGNOSTICS}"
-    echo "resource_status=${RESOURCE_STATUS}"
-    echo "resource_artifact=resource_metrics.json"
-  } >"${RESULT_DIR}/manifest.txt"
-
   python3 - "${RESULT_DIR}/manifest.json" \
     "${WORKFLOW_STATUS}" "${MODE}" "${RUN_ID}" "${DATASET_RUN_ID}" "${PROFILE}" \
     "${RANKED_CONFIGURATION}" "${SEED}" "${SEED_CALLER_SUPPLIED}" \
@@ -1716,7 +1705,8 @@ write_manifest() {
     "${PHASE_CRASH_RESTART}" "${PHASE_RECOVERY}" "${PHASE_DIAGNOSTICS}" \
     "${DIAGNOSTICS_REQUESTED}" "${DIAGNOSTIC_WARMUP_SECONDS}" \
     "${DIAGNOSTIC_OBSERVATION_SECONDS}" "${RESOURCE_STATUS}" \
-    "${RESOURCE_INTERVAL_MS}" "${RESOURCE_METRICS}" <<'PY'
+    "${RESOURCE_INTERVAL_MS}" "${RESOURCE_METRICS}" \
+    "${FORMAL_STATE_ATTESTATION_STATUS}" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -1769,6 +1759,7 @@ import sys
     resource_status,
     resource_interval_ms,
     resource_metrics_path,
+    formal_state_attestation_status,
 ) = sys.argv[1:]
 
 artifact_names = {
@@ -1954,20 +1945,139 @@ database_identity = {
     "database_marker": ".tpcc-workflow-database-identity",
 }
 
+formal_phases = {
+    "setup": phase_setup,
+    "rank": phase_rank,
+    "online": phase_online,
+    "crash_restart": phase_crash_restart,
+    "recovery": phase_recovery,
+}
+configuration_verified = mode == "all" and ranked_configuration == "1"
+phases_verified = mode == "all" and all(
+    value == "passed" for value in formal_phases.values()
+)
+identity_verified = (
+    db_identity_status == "verified"
+    and db_identity_binding_status == "sealed"
+    and db_name_source == "derived_opaque"
+    and db_name_deviation_active != "1"
+    and bool(db_path_fingerprint)
+    and len(runtime_schema_fingerprint) == 16
+    and len(dataset_state_fingerprint) == 64
+    and len(db_identity_fingerprint) == 64
+    and bool(db_device)
+    and bool(db_inode)
+)
+
+
+def required_status(verified, pending):
+    if mode != "all":
+        return "not_applicable"
+    if verified:
+        return "verified"
+    return "pending" if pending and workflow_status == "running" else "failed"
+
+
+configuration_status = required_status(configuration_verified, True)
+phase_status = required_status(
+    phases_verified,
+    any(value in {"pending", "running"} for value in formal_phases.values()),
+)
+identity_status = required_status(
+    identity_verified,
+    db_identity_status in {"pending", "verified"},
+)
+valid_formal_attestation_statuses = {
+    "pending",
+    "verified",
+    "failed",
+    "not_applicable",
+}
+formal_attestation_status = (
+    formal_state_attestation_status
+    if formal_state_attestation_status in valid_formal_attestation_statuses
+    else "failed"
+)
+if mode != "all":
+    formal_attestation_status = "not_applicable"
+
+required_attestations = [
+    {
+        "name": "public_configuration",
+        "required_for_ranking": True,
+        "status": configuration_status,
+        "validator": "workflow_exact_public_profile_and_mode",
+    },
+    {
+        "name": "opaque_sealed_database",
+        "required_for_ranking": True,
+        "status": identity_status,
+        "validator": "database_identity_v2",
+    },
+    {
+        "name": "formal_workflow_phases",
+        "required_for_ranking": True,
+        "status": phase_status,
+        "validator": "shell_phase_receipts_v1",
+    },
+    {
+        "name": "formal_state_chain",
+        "required_for_ranking": True,
+        "status": formal_attestation_status,
+        "validator": "tpcc_tester_read_only_state_attestation_v1",
+    },
+]
+ranking_eligible = workflow_status == "success" and all(
+    item["status"] == "verified"
+    for item in required_attestations
+    if item["required_for_ranking"]
+)
+if ranking_eligible:
+    conformance = "public_spec_aligned"
+elif ranked_configuration != "1":
+    conformance = "non_ranked_deviation"
+else:
+    conformance = "not_public_spec_aligned"
+
+safe_workflow_status = (
+    workflow_status
+    if workflow_status in {"running", "success", "failed"}
+    else "failed"
+)
+observation_warnings = []
+if phase_diagnostics in {"failed", "unavailable"}:
+    observation_warnings.append(
+        {
+            "kind": "diagnostics",
+            "status": phase_diagnostics,
+            "ranking_effect": "none",
+        }
+    )
+if safe_resource_status in {"partial", "unavailable", "failed"}:
+    observation_warnings.append(
+        {
+            "kind": "resources",
+            "status": safe_resource_status,
+            "ranking_effect": "none",
+        }
+    )
+
 payload = {
-    "schema_version": 2,
-    "conformance": (
-        "public_spec_aligned"
-        if ranked_configuration == "1"
-        else "non_ranked_deviation"
-    ),
+    "schema_version": 3,
+    "authority": "manifest.json",
+    "conformance": conformance,
     "embeds_unpublished_official_values": False,
-    "status": workflow_status,
+    "status": safe_workflow_status,
     "mode": mode,
     "run_id": run_id,
     "dataset_run_id": dataset_run_id,
     "profile": profile,
     "ranked_configuration": ranked_configuration == "1",
+    "ranking_eligible": ranking_eligible,
+    "attestations": {
+        "policy": "all_required_must_be_verified",
+        "required": required_attestations,
+    },
     "seed": {
         "value": int(seed),
         "caller_supplied": seed_caller_supplied == "1",
@@ -2044,6 +2154,7 @@ payload = {
         "rank_cpu": resource_rank_cpu,
         "artifact": resource_descriptor,
     },
+    "warnings": observation_warnings,
 }
 
 path = Path(output)
@@ -4435,18 +4546,32 @@ run_final_diagnostics() {
   return 0
 }
 
+attest_formal_state() {
+  [[ "${MODE}" == "all" ]] || return 0
+  log "revalidating every required formal state artifact"
+  FORMAL_STATE_ATTESTATION_STATUS="pending"
+  write_manifest
+  if run_profile_tester "${RESULT_DIR}/formal_state_attestation.log" \
+      --attest-formal-state --profile "${PROFILE}" --seed "${SEED}" \
+      --state-dir "${STATE_DIR}"; then
+    FORMAL_STATE_ATTESTATION_STATUS="verified"
+    write_manifest
+  else
+    FORMAL_STATE_ATTESTATION_STATUS="failed"
+    write_manifest
+    die "formal state attestation failed; see ${RESULT_DIR}/formal_state_attestation.log"
+  fi
+}
+
 write_summary() {
-  {
-    echo "# TPCC final2026 workflow"
-    echo
-    echo "- mode: ${MODE}"
-    echo "- profile: ${PROFILE}"
-    echo "- seed: ${SEED}"
-    echo "- status: success"
-    echo "- Rust owns warmup, all three formal windows, and semantic gates."
-    echo "- final diagnostics: ${PHASE_DIAGNOSTICS} (never ranked)"
-    echo "- resource observation: ${RESOURCE_STATUS} (never ranked)"
-  } >"${RESULT_DIR}/summary.md"
+  local temporary="${RESULT_DIR}/.summary.md.$$.tmp"
+  [[ -f "${SUMMARY_HELPER}" && ! -L "${SUMMARY_HELPER}" ]] \
+    || die "summary helper is missing or unsafe"
+  if ! python3 "${SUMMARY_HELPER}" "${RESULT_DIR}" >"${temporary}"; then
+    rm -f -- "${temporary}"
+    die "could not generate summary from authoritative manifest.json"
+  fi
+  mv -f -- "${temporary}" "${RESULT_DIR}/summary.md"
 }
 
 assert_database_identity_ready_for_success() {
@@ -4514,6 +4639,7 @@ esac
 
 finalize_resource_metrics
 assert_database_identity_ready_for_success
+attest_formal_state
 WORKFLOW_STATUS="success"
 write_manifest
 write_summary
