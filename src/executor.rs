@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::Local;
+use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
@@ -92,24 +93,43 @@ impl BenchmarkExecutor {
                     )
                     .map_err(scheduler_error)?;
             }
-            state.start().map_err(scheduler_error)?;
         }
 
-        info!(
-            "timing started: one {}s warmup followed continuously by 3x{}s windows",
-            profile.warmup.as_secs(),
-            profile.measurement_window.as_secs()
-        );
         let cancelled = Arc::new(AtomicBool::new(false));
+        let ready_barrier = Arc::new(Barrier::new(usize::from(profile.clients) + 1));
+        let start_barrier = Arc::new(Barrier::new(usize::from(profile.clients) + 1));
         let mut workers = JoinSet::new();
         for (worker_index, session) in sessions.into_iter().enumerate() {
             let scheduler = Arc::clone(&scheduler);
             let routing = Arc::clone(&routing);
             let cancelled = Arc::clone(&cancelled);
+            let ready_barrier = Arc::clone(&ready_barrier);
+            let start_barrier = Arc::clone(&start_barrier);
             workers.spawn(async move {
-                run_worker(worker_index as u16, session, scheduler, routing, cancelled).await
+                run_worker(
+                    worker_index as u16,
+                    session,
+                    scheduler,
+                    routing,
+                    cancelled,
+                    ready_barrier,
+                    start_barrier,
+                )
+                .await
             });
         }
+
+        ready_barrier.wait().await;
+        {
+            let mut state = lock_scheduler(&scheduler)?;
+            state.start().map_err(scheduler_error)?;
+        }
+        start_barrier.wait().await;
+        info!(
+            "all worker tasks ready; timing started: one {}s warmup followed continuously by 3x{}s windows",
+            profile.warmup.as_secs(),
+            profile.measurement_window.as_secs()
+        );
 
         let mut first_error = None;
         while let Some(joined) = workers.join_next().await {
@@ -246,8 +266,12 @@ async fn run_worker(
     scheduler: Arc<Mutex<Scheduler>>,
     routing: Arc<RunRouting>,
     cancelled: Arc<AtomicBool>,
+    ready_barrier: Arc<Barrier>,
+    start_barrier: Arc<Barrier>,
 ) -> Result<(), TpccError> {
     let worker = WorkerId::new(worker_value).map_err(scheduler_error)?;
+    wait_for_timing_release(&ready_barrier, &start_barrier).await;
+
     let mut sequence_phase = None;
     let mut sequence = ClientSequence::new(worker_value)
         .map_err(|error| TpccError::Protocol(error.to_string()))?;
@@ -366,6 +390,11 @@ async fn run_worker(
     }
 }
 
+async fn wait_for_timing_release(ready_barrier: &Barrier, start_barrier: &Barrier) {
+    ready_barrier.wait().await;
+    start_barrier.wait().await;
+}
+
 fn fail_worker<T>(
     scheduler: &Arc<Mutex<Scheduler>>,
     cancelled: &Arc<AtomicBool>,
@@ -457,5 +486,47 @@ impl Final2026RunResult {
         if !self.ranked {
             warn!("this smoke result is deliberately non-ranked");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_tasks_wait_for_explicit_timing_release_after_ready() {
+        const WORKERS: usize = 2;
+        let ready_barrier = Arc::new(Barrier::new(WORKERS + 1));
+        let start_barrier = Arc::new(Barrier::new(WORKERS + 1));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let mut tasks = JoinSet::new();
+
+        for worker in 0..WORKERS {
+            let ready_barrier = Arc::clone(&ready_barrier);
+            let start_barrier = Arc::clone(&start_barrier);
+            let started_tx = started_tx.clone();
+            tasks.spawn(async move {
+                wait_for_timing_release(&ready_barrier, &start_barrier).await;
+                started_tx.send(worker).unwrap();
+            });
+        }
+        drop(started_tx);
+
+        ready_barrier.wait().await;
+        assert!(matches!(
+            started_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        start_barrier.wait().await;
+        let mut started = vec![
+            started_rx.recv().await.unwrap(),
+            started_rx.recv().await.unwrap(),
+        ];
+        started.sort_unstable();
+        assert_eq!(started, vec![0, 1]);
+        while tasks.join_next().await.is_some() {}
     }
 }
