@@ -9,7 +9,6 @@ use crate::connection::prepared::{BatchResponse, Operation, PrepareResponse, Sta
 use crate::connection::wire::{StreamResponse, WireConnection, WireError, WireValue};
 use crate::error::TpccError;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct RmdbClient {
@@ -64,6 +63,10 @@ impl RmdbClient {
         Self::connect_with_timeout(host, port, DEFAULT_RESPONSE_TIMEOUT).await
     }
 
+    /// Open and negotiate one session under the caller's local I/O deadline.
+    ///
+    /// The same duration is then reused independently for every complete Wire
+    /// request. It is never accumulated across a multi-batch transaction.
     pub async fn connect_with_timeout(
         host: &str,
         port: u16,
@@ -73,10 +76,10 @@ impl RmdbClient {
         debug!("正在连接 RMDB: {addr}");
 
         let connection =
-            tokio::time::timeout(CONNECT_TIMEOUT, WireConnection::connect((host, port)))
+            tokio::time::timeout(response_timeout, WireConnection::connect((host, port)))
                 .await
                 .map_err(|_| TpccError::Timeout {
-                    context: format!("连接及 Wire v3 握手 {addr} 超时 ({CONNECT_TIMEOUT:?})"),
+                    context: format!("连接及 Wire v3 握手 {addr} 超时 ({response_timeout:?})"),
                 })?
                 .map_err(map_wire_error)?;
 
@@ -268,6 +271,32 @@ mod tests {
         .to_string();
         assert!(read.contains("response read timeout"));
         assert!(read.contains("show tables;"));
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_covers_connect_and_complete_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut handshake = [0_u8; HANDSHAKE.len()];
+            socket.read_exact(&mut handshake).await.unwrap();
+            assert_eq!(handshake, HANDSHAKE);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let error = match RmdbClient::connect_with_timeout("127.0.0.1", port, timeout).await {
+            Ok(_) => panic!("stalled handshake unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, TpccError::Timeout { .. }));
+        let message = error.to_string();
+        assert!(message.contains("连接及 Wire v3 握手"), "{message}");
+        assert!(message.contains("100ms"), "{message}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.await.unwrap();
     }
 
     #[tokio::test]
