@@ -3,10 +3,12 @@
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -15,6 +17,9 @@ import time
 
 SCHEMA_VERSION = 1
 DEFAULT_INTERVAL_MS = 1000
+CLOCK_OFFSET_TOLERANCE_NS = 10_000_000
+MAX_SAMPLE_GAP_NUMERATOR = 3
+MAX_SAMPLE_GAP_DENOMINATOR = 2
 TIMELINE_KEYS = {
     "schema_version",
     "kind",
@@ -22,6 +27,68 @@ TIMELINE_KEYS = {
     "warmup_ns",
     "measurement_windows",
     "measurement_window_ns",
+}
+SEGMENT_FIELDS = {
+    "schema_version",
+    "kind",
+    "status",
+    "ranked",
+    "score_effect",
+    "run_id",
+    "generation",
+    "root_pid",
+    "root_identity_expected",
+    "root_identity_observed",
+    "root_strong_identity",
+    "root_observed_exit",
+    "process_group",
+    "database_path",
+    "database_identity_expected",
+    "database_identity_observed",
+    "sample_interval_ms",
+    "started_unix_ns",
+    "started_monotonic_ns",
+    "completed_unix_ns",
+    "completed_monotonic_ns",
+    "backend",
+    "logical_cpus",
+    "process_samples",
+    "disk_samples",
+    "missed_deadlines",
+    "max_sample_collection_span_ns",
+    "clock_offset_spread_ns",
+    "max_rss_bytes",
+    "max_disk_allocated_bytes",
+    "max_disk_apparent_bytes",
+    "final_disk",
+    "cpu_intervals",
+    "clock_correlations",
+    "warnings",
+}
+INTERVAL_FIELDS = {
+    "start_monotonic_ns",
+    "end_monotonic_ns",
+    "cpu_delta_ns",
+    "start_collection_span_ns",
+    "end_collection_span_ns",
+}
+CORRELATION_FIELDS = {
+    "monotonic_before_ns",
+    "monotonic_after_ns",
+    "monotonic_ns",
+    "unix_ns",
+    "offset_lower_ns",
+    "offset_upper_ns",
+    "collection_span_ns",
+}
+COMPLETION_FIELDS = {
+    "schema_version",
+    "kind",
+    "run_id",
+    "timeline_sha256",
+    "timeline_size_bytes",
+    "timeline_mtime_ns",
+    "completed_unix_ns",
 }
 
 
@@ -65,6 +132,64 @@ def load_json(path):
     if not isinstance(value, dict):
         raise ResourceError(f"{path} does not contain a JSON object")
     return value
+
+
+def require_exact_fields(value, fields, label):
+    actual = set(value)
+    if actual != fields:
+        missing = sorted(fields - actual)
+        unknown = sorted(actual - fields)
+        raise ResourceError(
+            f"{label} fields do not match schema version {SCHEMA_VERSION}; "
+            f"missing={missing}, unknown={unknown}"
+        )
+
+
+def parse_database_identity(value):
+    if value == "auto":
+        return None
+    device, separator, inode = value.partition(":")
+    if not separator:
+        raise argparse.ArgumentTypeError(
+            "database identity must be auto or DEVICE:INODE"
+        )
+    try:
+        parsed = (int(device), int(inode))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "database identity must contain integers"
+        ) from error
+    if parsed[0] < 0 or parsed[1] <= 0:
+        raise argparse.ArgumentTypeError(
+            "database identity requires a non-negative device and positive inode"
+        )
+    return parsed
+
+
+def encode_database_identity(identity):
+    if identity is None:
+        return None
+    return {
+        "device": identity[0],
+        "inode": identity[1],
+    }
+
+
+def decode_database_identity(value, label):
+    if not isinstance(value, dict) or set(value) != {"device", "inode"}:
+        raise ResourceError(f"{label} is not a device/inode identity")
+    device = value["device"]
+    inode = value["inode"]
+    if (
+        not isinstance(device, int)
+        or isinstance(device, bool)
+        or device < 0
+        or not isinstance(inode, int)
+        or isinstance(inode, bool)
+        or inode <= 0
+    ):
+        raise ResourceError(f"{label} has invalid device/inode values")
+    return (device, inode)
 
 
 def online_cpu_count():
@@ -269,7 +394,10 @@ class DarwinLibprocBackend:
                 "state": str(bsd.pbi_status),
                 "ppid": int(bsd.pbi_ppid),
                 "pgid": int(bsd.pbi_pgid),
-                "identity": f"darwin:{start_abstime}",
+                "identity": (
+                    f"darwin:{bsd.pbi_start_tvsec}:{bsd.pbi_start_tvusec}"
+                ),
+                "strong_identity": f"darwin-abstime:{start_abstime}",
                 "cpu_ns": user_ns + system_ns + child_user_ns + child_system_ns,
                 "rss_bytes": resident_bytes,
             }
@@ -320,13 +448,14 @@ def collect_tree_sample(backend, root_pid, expected_pgid, root_identity):
         raise ResourceError("an RMDB descendant escaped the registered process group")
     return {
         "identity": root["identity"],
+        "strong_identity": root.get("strong_identity", root["identity"]),
         "process_count": len(live_owned),
         "cpu_ns": sum(item["cpu_ns"] for item in live_owned),
         "rss_bytes": sum(item["rss_bytes"] for item in live_owned),
     }
 
 
-def directory_usage(path):
+def directory_usage(path, expected_identity=None):
     root = Path(path)
     try:
         root_stat = root.lstat()
@@ -334,8 +463,15 @@ def directory_usage(path):
         return None
     except OSError as error:
         raise ResourceError(f"cannot stat database directory {root}: {error}") from error
-    if root.is_symlink() or not root.is_dir():
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
         raise ResourceError(f"database path is not a real directory: {root}")
+    root_identity = (root_stat.st_dev, root_stat.st_ino)
+    if expected_identity is not None and root_identity != expected_identity:
+        raise ResourceError(
+            "database directory identity changed from "
+            f"{expected_identity[0]}:{expected_identity[1]} to "
+            f"{root_identity[0]}:{root_identity[1]}"
+        )
 
     allocated = 0
     apparent = 0
@@ -347,26 +483,43 @@ def directory_usage(path):
             item_stat = current.lstat()
         except OSError as error:
             raise ResourceError(f"cannot stat database entry {current}: {error}") from error
+        if stat.S_ISLNK(item_stat.st_mode):
+            raise ResourceError(
+                f"database directory contains a symbolic link: {current}"
+            )
         identity = (item_stat.st_dev, item_stat.st_ino)
         if identity in seen:
             continue
         seen.add(identity)
         allocated += max(0, item_stat.st_blocks) * 512
         apparent += max(0, item_stat.st_size)
-        if not current.is_dir() or current.is_symlink():
+        if not stat.S_ISDIR(item_stat.st_mode):
             continue
         try:
             with os.scandir(current) as entries:
                 stack.extend(Path(entry.path) for entry in entries)
         except OSError as error:
             raise ResourceError(f"cannot scan database directory {current}: {error}") from error
+    try:
+        final_root_stat = root.lstat()
+    except OSError as error:
+        raise ResourceError(
+            f"cannot re-stat database directory {root}: {error}"
+        ) from error
+    final_identity = (final_root_stat.st_dev, final_root_stat.st_ino)
+    if (
+        stat.S_ISLNK(final_root_stat.st_mode)
+        or not stat.S_ISDIR(final_root_stat.st_mode)
+        or final_identity != root_identity
+    ):
+        raise ResourceError("database directory changed while it was sampled")
     return {
         "allocated_bytes": allocated,
         "apparent_bytes": apparent,
         "inode_count": len(seen),
         "root_identity": {
-            "device": root_stat.st_dev,
-            "inode": root_stat.st_ino,
+            "device": root_identity[0],
+            "inode": root_identity[1],
         },
     }
 
@@ -379,38 +532,6 @@ def append_warning(warnings, code, detail):
 
 def sample_segment(arguments):
     output = Path(arguments.output)
-    started_unix_ns = time.time_ns()
-    started_monotonic_ns = time.monotonic_ns()
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "kind": "rmdb_resource_segment",
-        "status": "collecting",
-        "ranked": False,
-        "score_effect": "none",
-        "root_pid": arguments.root_pid,
-        "process_group": arguments.process_group,
-        "database_path": str(Path(arguments.database_path)),
-        "sample_interval_ms": arguments.interval_ms,
-        "started_unix_ns": started_unix_ns,
-        "started_monotonic_ns": started_monotonic_ns,
-        "warnings": [],
-    }
-    atomic_write_json(output, payload)
-
-    try:
-        backend = select_backend(arguments.proc_root)
-        logical_cpus = online_cpu_count()
-    except ResourceError as error:
-        payload.update(
-            {
-                "status": "unavailable",
-                "reason": str(error),
-                "completed_unix_ns": time.time_ns(),
-            }
-        )
-        atomic_write_json(output, payload)
-        return 0
-
     stop_event = threading.Event()
 
     def request_stop(_signum, _frame):
@@ -419,7 +540,70 @@ def sample_segment(arguments):
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
-    expected_identity = None
+    started_unix_ns = time.time_ns()
+    started_monotonic_ns = time.monotonic_ns()
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "rmdb_resource_segment",
+        "status": "collecting",
+        "ranked": False,
+        "score_effect": "none",
+        "run_id": arguments.run_id,
+        "generation": arguments.generation,
+        "root_pid": arguments.root_pid,
+        "root_identity_expected": arguments.root_identity,
+        "root_identity_observed": None,
+        "root_strong_identity": None,
+        "root_observed_exit": False,
+        "process_group": arguments.process_group,
+        "database_path": str(Path(arguments.database_path)),
+        "database_identity_expected": encode_database_identity(
+            arguments.database_identity
+        ),
+        "database_identity_observed": None,
+        "sample_interval_ms": arguments.interval_ms,
+        "started_unix_ns": started_unix_ns,
+        "started_monotonic_ns": started_monotonic_ns,
+        "completed_unix_ns": None,
+        "completed_monotonic_ns": None,
+        "backend": None,
+        "logical_cpus": None,
+        "process_samples": 0,
+        "disk_samples": 0,
+        "missed_deadlines": 0,
+        "max_sample_collection_span_ns": 0,
+        "clock_offset_spread_ns": None,
+        "max_rss_bytes": 0,
+        "max_disk_allocated_bytes": 0,
+        "max_disk_apparent_bytes": 0,
+        "final_disk": None,
+        "cpu_intervals": [],
+        "clock_correlations": [],
+        "warnings": [],
+    }
+    atomic_write_json(output, payload)
+
+    try:
+        backend = select_backend(arguments.proc_root)
+        logical_cpus = online_cpu_count()
+    except ResourceError as error:
+        append_warning(
+            payload["warnings"],
+            "resource_backend_unavailable",
+            error,
+        )
+        payload["status"] = "unavailable"
+        payload["completed_unix_ns"] = time.time_ns()
+        payload["completed_monotonic_ns"] = time.monotonic_ns()
+        atomic_write_json(output, payload)
+        return 0
+
+    payload["backend"] = backend.metadata()
+    payload["logical_cpus"] = logical_cpus
+    expected_identity = arguments.root_identity
+    observed_identity = None
+    strong_identity = None
+    database_identity = arguments.database_identity
     previous = None
     intervals = []
     correlations = []
@@ -435,10 +619,9 @@ def sample_segment(arguments):
     deadline = time.monotonic_ns()
 
     while True:
-        monotonic_before = time.monotonic_ns()
-        unix_ns = time.time_ns()
-        monotonic_after = time.monotonic_ns()
-        monotonic_ns = (monotonic_before + monotonic_after) // 2
+        unix_before_ns = time.time_ns()
+        monotonic_before_ns = time.monotonic_ns()
+        stop_after_sample = False
         try:
             tree = collect_tree_sample(
                 backend,
@@ -446,14 +629,45 @@ def sample_segment(arguments):
                 arguments.process_group,
                 expected_identity,
             )
-            if expected_identity is None:
-                expected_identity = tree["identity"]
+            monotonic_after_ns = time.monotonic_ns()
+            unix_after_ns = time.time_ns()
+            monotonic_ns = (
+                monotonic_before_ns + monotonic_after_ns
+            ) // 2
+            unix_ns = (unix_before_ns + unix_after_ns) // 2
+            collection_span_ns = monotonic_after_ns - monotonic_before_ns
+            offset_first = unix_before_ns - monotonic_before_ns
+            offset_second = unix_after_ns - monotonic_after_ns
+            offset_lower_ns = min(offset_first, offset_second)
+            offset_upper_ns = max(offset_first, offset_second)
+            if offset_second < offset_first:
+                append_warning(
+                    payload["warnings"],
+                    "wall_clock_regressed_during_sample",
+                    offset_first - offset_second,
+                )
+            if collection_span_ns > interval_ns // 2:
+                append_warning(
+                    payload["warnings"],
+                    "process_sample_collection_too_slow",
+                    collection_span_ns,
+                )
+            if observed_identity is None:
+                observed_identity = tree["identity"]
+                strong_identity = tree["strong_identity"]
+            elif tree["strong_identity"] != strong_identity:
+                raise ResourceError("registered RMDB strong identity changed")
             process_samples += 1
             max_rss_bytes = max(max_rss_bytes, tree["rss_bytes"])
             correlations.append(
                 {
+                    "monotonic_before_ns": monotonic_before_ns,
+                    "monotonic_after_ns": monotonic_after_ns,
                     "monotonic_ns": monotonic_ns,
                     "unix_ns": unix_ns,
+                    "offset_lower_ns": offset_lower_ns,
+                    "offset_upper_ns": offset_upper_ns,
+                    "collection_span_ns": collection_span_ns,
                 }
             )
             if previous is not None:
@@ -472,26 +686,56 @@ def sample_segment(arguments):
                         cpu_delta_ns,
                     )
                 else:
+                    if (
+                        elapsed_ns * MAX_SAMPLE_GAP_DENOMINATOR
+                        > interval_ns * MAX_SAMPLE_GAP_NUMERATOR
+                    ):
+                        append_warning(
+                            payload["warnings"],
+                            "process_sample_gap_exceeded",
+                            elapsed_ns,
+                        )
                     intervals.append(
                         {
                             "start_monotonic_ns": previous["monotonic_ns"],
                             "end_monotonic_ns": monotonic_ns,
                             "cpu_delta_ns": cpu_delta_ns,
+                            "start_collection_span_ns": previous[
+                                "collection_span_ns"
+                            ],
+                            "end_collection_span_ns": collection_span_ns,
                         }
                     )
             previous = {
                 "monotonic_ns": monotonic_ns,
                 "cpu_ns": tree["cpu_ns"],
+                "collection_span_ns": collection_span_ns,
             }
-        except RootAbsent:
-            if expected_identity is not None:
-                root_observed_exit = True
+        except RootAbsent as error:
+            root_observed_exit = True
+            append_warning(
+                payload["warnings"],
+                "root_exited_before_sampler_stop",
+                error,
+            )
+            stop_after_sample = True
         except ResourceError as error:
             append_warning(payload["warnings"], "process_sample_failed", error)
 
         try:
-            disk = directory_usage(arguments.database_path)
+            disk = directory_usage(
+                arguments.database_path,
+                database_identity,
+            )
             if disk is not None:
+                sampled_identity = decode_database_identity(
+                    disk["root_identity"],
+                    "sampled database identity",
+                )
+                if database_identity is None:
+                    database_identity = sampled_identity
+                elif sampled_identity != database_identity:
+                    raise ResourceError("sampled database identity changed")
                 disk_samples += 1
                 final_disk = disk
                 max_disk_allocated = max(
@@ -505,7 +749,7 @@ def sample_segment(arguments):
         except ResourceError as error:
             append_warning(payload["warnings"], "disk_sample_failed", error)
 
-        if stop_event.is_set():
+        if stop_after_sample or stop_event.is_set():
             break
         deadline += interval_ns
         now = time.monotonic_ns()
@@ -521,22 +765,51 @@ def sample_segment(arguments):
             "sample_deadlines_missed",
             missed_deadlines,
         )
-    if process_samples == 0:
+    if correlations:
+        offset_lower = min(
+            item["offset_lower_ns"] for item in correlations
+        )
+        offset_upper = max(
+            item["offset_upper_ns"] for item in correlations
+        )
+        clock_offset_spread_ns = offset_upper - offset_lower
+        if clock_offset_spread_ns > CLOCK_OFFSET_TOLERANCE_NS:
+            append_warning(
+                payload["warnings"],
+                "wall_monotonic_offset_drift",
+                clock_offset_spread_ns,
+            )
+        max_collection_span_ns = max(
+            item["collection_span_ns"] for item in correlations
+        )
+    else:
+        clock_offset_spread_ns = None
+        max_collection_span_ns = 0
+
+    if process_samples == 0 and disk_samples == 0:
         status = "unavailable"
-    elif disk_samples == 0 or payload["warnings"]:
+    elif (
+        process_samples == 0
+        or disk_samples == 0
+        or payload["warnings"]
+    ):
         status = "partial"
     else:
         status = "available"
     payload.update(
         {
             "status": status,
-            "backend": backend.metadata(),
-            "logical_cpus": logical_cpus,
-            "root_identity": expected_identity,
+            "root_identity_observed": observed_identity,
+            "root_strong_identity": strong_identity,
             "root_observed_exit": root_observed_exit,
+            "database_identity_observed": encode_database_identity(
+                database_identity
+            ),
             "process_samples": process_samples,
             "disk_samples": disk_samples,
             "missed_deadlines": missed_deadlines,
+            "max_sample_collection_span_ns": max_collection_span_ns,
+            "clock_offset_spread_ns": clock_offset_spread_ns,
             "max_rss_bytes": max_rss_bytes,
             "max_disk_allocated_bytes": max_disk_allocated,
             "max_disk_apparent_bytes": max_disk_apparent,
@@ -551,11 +824,36 @@ def sample_segment(arguments):
     return 0
 
 
-def parse_timeline(path):
+def read_stable_file(path, label):
+    path = Path(path)
     try:
-        text = Path(path).read_text(encoding="ascii")
+        before = path.stat()
+        content = path.read_bytes()
+        after = path.stat()
     except OSError as error:
-        raise ResourceError(f"cannot read rank timeline {path}: {error}") from error
+        raise ResourceError(f"cannot read {label} {path}: {error}") from error
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if before_identity != after_identity or len(content) != after.st_size:
+        raise ResourceError(f"{label} changed while it was read")
+    return content, after
+
+
+def parse_timeline_bytes(content):
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ResourceError("rank timeline is not ASCII") from error
     values = {}
     for raw_line in text.splitlines():
         key, separator, value = raw_line.partition("=")
@@ -587,16 +885,62 @@ def parse_timeline(path):
     return parsed
 
 
+def parse_timeline(path):
+    content, _metadata = read_stable_file(path, "rank timeline")
+    return parse_timeline_bytes(content)
+
+
+def complete_rank(arguments):
+    content, metadata = read_stable_file(arguments.timeline, "rank timeline")
+    parse_timeline_bytes(content)
+    completed_unix_ns = time.time_ns()
+    if metadata.st_mtime_ns > completed_unix_ns:
+        raise ResourceError("rank timeline modification time is in the future")
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "rmdb_rank_completion",
+        "run_id": arguments.run_id,
+        "timeline_sha256": hashlib.sha256(content).hexdigest(),
+        "timeline_size_bytes": len(content),
+        "timeline_mtime_ns": metadata.st_mtime_ns,
+        "completed_unix_ns": completed_unix_ns,
+    }
+    atomic_write_json(arguments.output, payload)
+    return 0
+
+
+def validate_rank_completion(path, run_id, timeline_content, timeline_metadata):
+    marker = load_json(path)
+    require_exact_fields(marker, COMPLETION_FIELDS, "rank completion marker")
+    if marker["schema_version"] != SCHEMA_VERSION:
+        raise ResourceError("rank completion marker schema is unsupported")
+    if marker["kind"] != "rmdb_rank_completion":
+        raise ResourceError("rank completion marker kind is invalid")
+    if marker["run_id"] != run_id:
+        raise ResourceError("rank completion marker belongs to another run")
+    expected_sha256 = hashlib.sha256(timeline_content).hexdigest()
+    if marker["timeline_sha256"] != expected_sha256:
+        raise ResourceError("rank completion marker does not bind this timeline")
+    if marker["timeline_size_bytes"] != len(timeline_content):
+        raise ResourceError("rank completion marker timeline size is stale")
+    if marker["timeline_mtime_ns"] != timeline_metadata.st_mtime_ns:
+        raise ResourceError("rank completion marker timeline time is stale")
+    completed_unix_ns = marker["completed_unix_ns"]
+    if (
+        not isinstance(completed_unix_ns, int)
+        or isinstance(completed_unix_ns, bool)
+        or completed_unix_ns < timeline_metadata.st_mtime_ns
+        or completed_unix_ns > time.time_ns() + 1_000_000_000
+    ):
+        raise ResourceError("rank completion marker time is invalid")
+    return marker
+
+
 def overlap(left_start, left_end, right_start, right_end):
     return max(0, min(left_end, right_end) - max(left_start, right_start))
 
 
-def calculate_rank_cpu(segments, timeline, rank_complete):
-    if not rank_complete:
-        return {
-            "status": "unavailable",
-            "reason": "rank completion marker is missing",
-        }
+def calculate_rank_cpu(segments, timeline, completion):
     correlations = [
         correlation
         for segment in segments
@@ -608,14 +952,45 @@ def calculate_rank_cpu(segments, timeline, rank_complete):
             "status": "unavailable",
             "reason": "no process sample can correlate the rank timeline",
         }
+    earliest_start = min(segment["started_unix_ns"] for segment in segments)
+    if (
+        timeline["origin_unix_ns"] < earliest_start - 1_000_000_000
+        or timeline["origin_unix_ns"] > completion["completed_unix_ns"]
+    ):
+        return {
+            "status": "unavailable",
+            "reason": "rank timeline is outside the bound server generations",
+        }
+    expected_formal_end_unix_ns = (
+        timeline["origin_unix_ns"]
+        + timeline["warmup_ns"]
+        + timeline["measurement_windows"]
+        * timeline["measurement_window_ns"]
+    )
+    if (
+        completion["completed_unix_ns"] + CLOCK_OFFSET_TOLERANCE_NS
+        < expected_formal_end_unix_ns
+    ):
+        return {
+            "status": "unavailable",
+            "reason": "rank completion predates the formal measurement end",
+        }
     correlation = min(
         correlations,
         key=lambda item: abs(item["unix_ns"] - timeline["origin_unix_ns"]),
     )
-    origin_monotonic_ns = (
-        correlation["monotonic_ns"]
-        + timeline["origin_unix_ns"]
-        - correlation["unix_ns"]
+    chosen_offset_ns = (
+        correlation["offset_lower_ns"] + correlation["offset_upper_ns"]
+    ) // 2
+    origin_monotonic_ns = timeline["origin_unix_ns"] - chosen_offset_ns
+    clock_offset_lower_ns = min(
+        item["offset_lower_ns"] for item in correlations
+    )
+    clock_offset_upper_ns = max(
+        item["offset_upper_ns"] for item in correlations
+    )
+    clock_offset_spread_ns = (
+        clock_offset_upper_ns - clock_offset_lower_ns
     )
     formal_start = origin_monotonic_ns + timeline["warmup_ns"]
     window_ns = timeline["measurement_window_ns"]
@@ -629,6 +1004,17 @@ def calculate_rank_cpu(segments, timeline, rank_complete):
         ),
         key=lambda item: item["start_monotonic_ns"],
     )
+    previous_end = None
+    for interval in intervals:
+        if (
+            previous_end is not None
+            and interval["start_monotonic_ns"] < previous_end
+        ):
+            return {
+                "status": "unavailable",
+                "reason": "resource segments contain overlapping CPU intervals",
+            }
+        previous_end = interval["end_monotonic_ns"]
     logical_counts = {
         segment.get("logical_cpus")
         for segment in segments
@@ -643,10 +1029,20 @@ def calculate_rank_cpu(segments, timeline, rank_complete):
     logical_cpus = logical_counts.pop()
 
     windows = []
-    complete = True
+    complete = clock_offset_spread_ns <= CLOCK_OFFSET_TOLERANCE_NS
     combined_cpu_ns = 0.0
     combined_coverage_ns = 0
     combined_peak = 0.0
+    boundaries = [
+        formal_start + index * window_ns
+        for index in range(timeline["measurement_windows"] + 1)
+    ]
+    boundary_uncertain = any(
+        item["monotonic_before_ns"] <= boundary <= item["monotonic_after_ns"]
+        for item in correlations
+        for boundary in boundaries
+    )
+    complete = complete and not boundary_uncertain
     for index in range(timeline["measurement_windows"]):
         start = formal_start + index * window_ns
         end = start + window_ns
@@ -666,7 +1062,12 @@ def calculate_rank_cpu(segments, timeline, rank_complete):
             coverage_ns += shared
             interval_count += 1
             peak = max(peak, 100.0 * delta / elapsed)
-        coverage_ratio = min(1.0, coverage_ns / window_ns)
+        coverage_ratio = coverage_ns / window_ns
+        if coverage_ratio > 1.000000001:
+            return {
+                "status": "unavailable",
+                "reason": "rank CPU coverage exceeds one formal window",
+            }
         window_complete = coverage_ratio >= 0.999
         complete = complete and window_complete
         average = 100.0 * cpu_ns / window_ns if window_ns else 0.0
@@ -692,6 +1093,8 @@ def calculate_rank_cpu(segments, timeline, rank_complete):
     return {
         "status": status,
         "clock_basis": "scheduler_barrier_correlated_to_monotonic_samples",
+        "clock_offset_spread_ns": clock_offset_spread_ns,
+        "boundary_sample_uncertain": boundary_uncertain,
         "origin_unix_ns": timeline["origin_unix_ns"],
         "origin_monotonic_ns": origin_monotonic_ns,
         "formal_start_monotonic_ns": formal_start,
@@ -700,7 +1103,7 @@ def calculate_rank_cpu(segments, timeline, rank_complete):
         "logical_cpus": logical_cpus,
         "combined": {
             "coverage_ratio": round(
-                min(1.0, combined_coverage_ns / formal_duration),
+                combined_coverage_ns / formal_duration,
                 9,
             ),
             "average_single_core_percent": round(combined_average, 6),
@@ -712,68 +1115,444 @@ def calculate_rank_cpu(segments, timeline, rank_complete):
     }
 
 
+def require_integer(value, label, minimum=0):
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < minimum
+    ):
+        raise ResourceError(f"{label} must be an integer >= {minimum}")
+    return value
+
+
+def validate_disk_sample(value, label):
+    if not isinstance(value, dict):
+        raise ResourceError(f"{label} is not an object")
+    require_exact_fields(
+        value,
+        {
+            "allocated_bytes",
+            "apparent_bytes",
+            "inode_count",
+            "root_identity",
+        },
+        label,
+    )
+    require_integer(value["allocated_bytes"], f"{label}.allocated_bytes")
+    require_integer(value["apparent_bytes"], f"{label}.apparent_bytes")
+    require_integer(value["inode_count"], f"{label}.inode_count", 1)
+    return decode_database_identity(
+        value["root_identity"],
+        f"{label}.root_identity",
+    )
+
+
 def validate_segment(path):
     segment = load_json(path)
-    if segment.get("schema_version") != SCHEMA_VERSION:
+    require_exact_fields(segment, SEGMENT_FIELDS, f"resource segment {path}")
+    if segment["schema_version"] != SCHEMA_VERSION:
         raise ResourceError(f"{path} has an unsupported resource schema")
-    if segment.get("kind") != "rmdb_resource_segment":
+    if segment["kind"] != "rmdb_resource_segment":
         raise ResourceError(f"{path} is not an RMDB resource segment")
-    if segment.get("status") not in {
+    if segment["status"] not in {
         "available",
         "partial",
         "unavailable",
         "failed",
     }:
         raise ResourceError(f"{path} has an invalid resource status")
+    if segment["ranked"] is not False or segment["score_effect"] != "none":
+        raise ResourceError(f"{path} incorrectly marks resources as ranked")
+    if not isinstance(segment["run_id"], str) or not segment["run_id"]:
+        raise ResourceError(f"{path} has an invalid run id")
+    require_integer(segment["generation"], f"{path}.generation", 1)
+    require_integer(segment["root_pid"], f"{path}.root_pid", 1)
+    require_integer(segment["process_group"], f"{path}.process_group", 1)
+    if (
+        not isinstance(segment["root_identity_expected"], str)
+        or not segment["root_identity_expected"]
+    ):
+        raise ResourceError(f"{path} has no expected root identity")
+    if not isinstance(segment["database_path"], str) or not segment["database_path"]:
+        raise ResourceError(f"{path} has no database path")
+    expected_database_identity = None
+    if segment["database_identity_expected"] is not None:
+        expected_database_identity = decode_database_identity(
+            segment["database_identity_expected"],
+            f"{path}.database_identity_expected",
+        )
+    observed_database_identity = None
+    if segment["database_identity_observed"] is not None:
+        observed_database_identity = decode_database_identity(
+            segment["database_identity_observed"],
+            f"{path}.database_identity_observed",
+        )
+    if (
+        expected_database_identity is not None
+        and observed_database_identity is not None
+        and expected_database_identity != observed_database_identity
+    ):
+        raise ResourceError(f"{path} observed a different database identity")
+    interval_ms = require_integer(
+        segment["sample_interval_ms"],
+        f"{path}.sample_interval_ms",
+        1,
+    )
+    started_unix_ns = require_integer(
+        segment["started_unix_ns"],
+        f"{path}.started_unix_ns",
+        1,
+    )
+    started_monotonic_ns = require_integer(
+        segment["started_monotonic_ns"],
+        f"{path}.started_monotonic_ns",
+        1,
+    )
+    completed_unix_ns = require_integer(
+        segment["completed_unix_ns"],
+        f"{path}.completed_unix_ns",
+        started_unix_ns,
+    )
+    completed_monotonic_ns = require_integer(
+        segment["completed_monotonic_ns"],
+        f"{path}.completed_monotonic_ns",
+        started_monotonic_ns,
+    )
+    process_samples = require_integer(
+        segment["process_samples"],
+        f"{path}.process_samples",
+    )
+    disk_samples = require_integer(
+        segment["disk_samples"],
+        f"{path}.disk_samples",
+    )
+    require_integer(segment["missed_deadlines"], f"{path}.missed_deadlines")
+    require_integer(
+        segment["max_sample_collection_span_ns"],
+        f"{path}.max_sample_collection_span_ns",
+    )
+    require_integer(segment["max_rss_bytes"], f"{path}.max_rss_bytes")
+    require_integer(
+        segment["max_disk_allocated_bytes"],
+        f"{path}.max_disk_allocated_bytes",
+    )
+    require_integer(
+        segment["max_disk_apparent_bytes"],
+        f"{path}.max_disk_apparent_bytes",
+    )
+    if not isinstance(segment["root_observed_exit"], bool):
+        raise ResourceError(f"{path}.root_observed_exit is not boolean")
+    if process_samples:
+        if segment["root_identity_observed"] != segment["root_identity_expected"]:
+            raise ResourceError(f"{path} root identity is not launcher-bound")
+        if (
+            not isinstance(segment["root_strong_identity"], str)
+            or not segment["root_strong_identity"]
+        ):
+            raise ResourceError(f"{path} has no strong root identity")
+        if not isinstance(segment["backend"], dict):
+            raise ResourceError(f"{path} has no process backend metadata")
+        require_integer(segment["logical_cpus"], f"{path}.logical_cpus", 1)
+    elif (
+        segment["root_identity_observed"] is not None
+        or segment["root_strong_identity"] is not None
+    ):
+        raise ResourceError(f"{path} has root identity without process samples")
+    if disk_samples:
+        if segment["final_disk"] is None:
+            raise ResourceError(f"{path} has disk samples without final disk")
+        final_identity = validate_disk_sample(
+            segment["final_disk"],
+            f"{path}.final_disk",
+        )
+        if final_identity != observed_database_identity:
+            raise ResourceError(f"{path} final database identity changed")
+    elif segment["final_disk"] is not None:
+        raise ResourceError(f"{path} has final disk without disk samples")
+
+    warnings = segment["warnings"]
+    if not isinstance(warnings, list):
+        raise ResourceError(f"{path}.warnings is not a list")
+    for index, warning in enumerate(warnings):
+        if not isinstance(warning, dict):
+            raise ResourceError(f"{path}.warnings[{index}] is not an object")
+        require_exact_fields(
+            warning,
+            {"code", "detail"},
+            f"{path}.warnings[{index}]",
+        )
+        if not all(isinstance(warning[key], str) for key in warning):
+            raise ResourceError(f"{path}.warnings[{index}] is not textual")
+
+    correlations = segment["clock_correlations"]
+    if not isinstance(correlations, list):
+        raise ResourceError(f"{path}.clock_correlations is not a list")
+    previous_monotonic = None
+    for index, item in enumerate(correlations):
+        if not isinstance(item, dict):
+            raise ResourceError(f"{path}.clock_correlations[{index}] is invalid")
+        require_exact_fields(
+            item,
+            CORRELATION_FIELDS,
+            f"{path}.clock_correlations[{index}]",
+        )
+        before = require_integer(
+            item["monotonic_before_ns"],
+            f"{path}.clock_correlations[{index}].monotonic_before_ns",
+            started_monotonic_ns,
+        )
+        after = require_integer(
+            item["monotonic_after_ns"],
+            f"{path}.clock_correlations[{index}].monotonic_after_ns",
+            before,
+        )
+        midpoint = require_integer(
+            item["monotonic_ns"],
+            f"{path}.clock_correlations[{index}].monotonic_ns",
+            before,
+        )
+        if midpoint > after or item["collection_span_ns"] != after - before:
+            raise ResourceError(f"{path} has an invalid process sample bracket")
+        require_integer(item["unix_ns"], f"{path}.clock_correlations[{index}].unix_ns", 1)
+        lower = require_integer(
+            item["offset_lower_ns"],
+            f"{path}.clock_correlations[{index}].offset_lower_ns",
+        )
+        upper = require_integer(
+            item["offset_upper_ns"],
+            f"{path}.clock_correlations[{index}].offset_upper_ns",
+            lower,
+        )
+        if previous_monotonic is not None and midpoint <= previous_monotonic:
+            raise ResourceError(f"{path} clock correlations are not monotonic")
+        previous_monotonic = midpoint
+    if len(correlations) != process_samples:
+        raise ResourceError(f"{path} process sample count is inconsistent")
+    calculated_spread = (
+        max(item["offset_upper_ns"] for item in correlations)
+        - min(item["offset_lower_ns"] for item in correlations)
+        if correlations
+        else None
+    )
+    if segment["clock_offset_spread_ns"] != calculated_spread:
+        raise ResourceError(f"{path} clock offset spread is inconsistent")
+    calculated_max_span = max(
+        (item["collection_span_ns"] for item in correlations),
+        default=0,
+    )
+    if segment["max_sample_collection_span_ns"] != calculated_max_span:
+        raise ResourceError(f"{path} process collection span is inconsistent")
+
+    intervals = segment["cpu_intervals"]
+    if not isinstance(intervals, list):
+        raise ResourceError(f"{path}.cpu_intervals is not a list")
+    previous_end = None
+    for index, item in enumerate(intervals):
+        if not isinstance(item, dict):
+            raise ResourceError(f"{path}.cpu_intervals[{index}] is invalid")
+        require_exact_fields(
+            item,
+            INTERVAL_FIELDS,
+            f"{path}.cpu_intervals[{index}]",
+        )
+        start = require_integer(
+            item["start_monotonic_ns"],
+            f"{path}.cpu_intervals[{index}].start_monotonic_ns",
+            started_monotonic_ns,
+        )
+        end = require_integer(
+            item["end_monotonic_ns"],
+            f"{path}.cpu_intervals[{index}].end_monotonic_ns",
+            start + 1,
+        )
+        if end > completed_monotonic_ns:
+            raise ResourceError(f"{path} CPU interval exceeds segment lifetime")
+        require_integer(
+            item["cpu_delta_ns"],
+            f"{path}.cpu_intervals[{index}].cpu_delta_ns",
+        )
+        require_integer(
+            item["start_collection_span_ns"],
+            f"{path}.cpu_intervals[{index}].start_collection_span_ns",
+        )
+        require_integer(
+            item["end_collection_span_ns"],
+            f"{path}.cpu_intervals[{index}].end_collection_span_ns",
+        )
+        if previous_end is not None and start < previous_end:
+            raise ResourceError(f"{path} contains overlapping CPU intervals")
+        previous_end = end
+    if len(intervals) > max(0, process_samples - 1):
+        raise ResourceError(f"{path} has too many CPU intervals")
+    if segment["status"] == "available" and (
+        warnings
+        or process_samples == 0
+        or disk_samples == 0
+        or segment["root_observed_exit"]
+        or segment["clock_offset_spread_ns"] > CLOCK_OFFSET_TOLERANCE_NS
+    ):
+        raise ResourceError(f"{path} overclaims available resource coverage")
+    if interval_ms <= 0:
+        raise ResourceError(f"{path} has an invalid sample interval")
     return segment
 
 
 def aggregate_segments(arguments):
     warnings = []
     segments = []
+    requested_paths = []
+    seen_paths = set()
     for path in arguments.segment:
+        canonical = str(Path(path).resolve(strict=False))
+        requested_paths.append(canonical)
+        if canonical in seen_paths:
+            append_warning(
+                warnings,
+                "duplicate_resource_segment",
+                canonical,
+            )
+            continue
+        seen_paths.add(canonical)
         try:
-            segments.append(validate_segment(path))
+            segment = validate_segment(path)
+            if segment["run_id"] != arguments.run_id:
+                raise ResourceError(f"{path} belongs to another workflow run")
+            if segment["sample_interval_ms"] != arguments.interval_ms:
+                raise ResourceError(f"{path} uses a different sample interval")
+            if (
+                str(Path(segment["database_path"]).resolve(strict=False))
+                != str(Path(arguments.database_path).resolve(strict=False))
+            ):
+                raise ResourceError(f"{path} belongs to another database path")
+            observed_identity = segment["database_identity_observed"]
+            if (
+                observed_identity is None
+                or decode_database_identity(
+                    observed_identity,
+                    f"{path}.database_identity_observed",
+                )
+                != arguments.database_identity
+            ):
+                raise ResourceError(f"{path} belongs to another database inode")
+            segments.append(segment)
         except ResourceError as error:
             append_warning(warnings, "invalid_resource_segment", error)
 
-    rss_values = [
-        segment.get("max_rss_bytes")
+    generations = {}
+    for segment in segments:
+        generation = segment["generation"]
+        if generation in generations:
+            append_warning(
+                warnings,
+                "duplicate_resource_generation",
+                generation,
+            )
+            continue
+        generations[generation] = segment
+    expected_generation_ids = set(range(1, arguments.expected_generations + 1))
+    actual_generation_ids = set(generations)
+    if actual_generation_ids != expected_generation_ids:
+        append_warning(
+            warnings,
+            "resource_generation_set_mismatch",
+            (
+                f"expected={sorted(expected_generation_ids)}, "
+                f"actual={sorted(actual_generation_ids)}"
+            ),
+        )
+    segments = [
+        generations[generation]
+        for generation in sorted(actual_generation_ids & expected_generation_ids)
+    ]
+
+    backend_identities = {
+        (
+            segment["backend"].get("backend"),
+            segment["backend"].get("boot_id"),
+        )
         for segment in segments
-        if isinstance(segment.get("max_rss_bytes"), int)
-        and segment["max_rss_bytes"] > 0
+        if isinstance(segment["backend"], dict)
+    }
+    if len(backend_identities) > 1:
+        append_warning(
+            warnings,
+            "resource_backend_identity_changed",
+            sorted(str(value) for value in backend_identities),
+        )
+
+    all_intervals = sorted(
+        (
+            (interval["start_monotonic_ns"], interval["end_monotonic_ns"])
+            for segment in segments
+            for interval in segment["cpu_intervals"]
+        )
+    )
+    intervals_overlap = any(
+        current[0] < previous[1]
+        for previous, current in zip(all_intervals, all_intervals[1:])
+    )
+    if intervals_overlap:
+        append_warning(
+            warnings,
+            "resource_segments_overlap",
+            "CPU intervals from distinct generations overlap",
+        )
+
+    generation_set_complete = (
+        len(requested_paths) == arguments.expected_generations
+        and len(seen_paths) == arguments.expected_generations
+        and actual_generation_ids == expected_generation_ids
+        and len(segments) == arguments.expected_generations
+        and not intervals_overlap
+        and len(backend_identities) <= 1
+    )
+    all_generations_available = (
+        generation_set_complete
+        and all(segment["status"] == "available" for segment in segments)
+    )
+
+    rss_values = [
+        segment["max_rss_bytes"]
+        for segment in segments
+        if segment["process_samples"] > 0 and segment["max_rss_bytes"] > 0
     ]
     disk_peak_values = [
-        segment.get("max_disk_allocated_bytes")
+        segment["max_disk_allocated_bytes"]
         for segment in segments
-        if isinstance(segment.get("max_disk_allocated_bytes"), int)
-        and segment["max_disk_allocated_bytes"] >= 0
-        and segment.get("disk_samples", 0) > 0
+        if segment["disk_samples"] > 0
     ]
     apparent_peak_values = [
-        segment.get("max_disk_apparent_bytes")
+        segment["max_disk_apparent_bytes"]
         for segment in segments
-        if isinstance(segment.get("max_disk_apparent_bytes"), int)
-        and segment["max_disk_apparent_bytes"] >= 0
-        and segment.get("disk_samples", 0) > 0
+        if segment["disk_samples"] > 0
     ]
     final_candidates = [
         (
-            segment.get("completed_monotonic_ns", 0),
-            segment.get("final_disk"),
+            segment["completed_monotonic_ns"],
+            segment["final_disk"],
         )
         for segment in segments
-        if isinstance(segment.get("final_disk"), dict)
+        if segment["final_disk"] is not None
     ]
     final_disk = max(final_candidates, default=(0, None))[1]
 
     if arguments.mode in {"all", "rank"}:
         try:
-            timeline = parse_timeline(arguments.timeline)
+            timeline_content, timeline_metadata = read_stable_file(
+                arguments.timeline,
+                "rank timeline",
+            )
+            timeline = parse_timeline_bytes(timeline_content)
+            completion = validate_rank_completion(
+                arguments.rank_complete,
+                arguments.run_id,
+                timeline_content,
+                timeline_metadata,
+            )
             rank_cpu = calculate_rank_cpu(
                 segments,
                 timeline,
-                Path(arguments.rank_complete).is_file(),
+                completion,
             )
         except ResourceError as error:
             rank_cpu = {"status": "unavailable", "reason": str(error)}
@@ -784,12 +1563,18 @@ def aggregate_segments(arguments):
         }
 
     for segment in segments:
-        for warning in segment.get("warnings", []):
-            if isinstance(warning, dict) and warning not in warnings:
+        for warning in segment["warnings"]:
+            if warning not in warnings:
                 warnings.append(warning)
 
-    rss_status = "available" if rss_values else "unavailable"
-    disk_status = "available" if disk_peak_values and final_disk else "unavailable"
+    if rss_values:
+        rss_status = "available" if all_generations_available else "partial"
+    else:
+        rss_status = "unavailable"
+    if disk_peak_values and final_disk:
+        disk_status = "available" if all_generations_available else "partial"
+    else:
+        disk_status = "unavailable"
     required_statuses = [rss_status, disk_status]
     if rank_cpu["status"] != "not_applicable":
         required_statuses.append(rank_cpu["status"])
@@ -799,8 +1584,10 @@ def aggregate_segments(arguments):
         status = "partial"
     else:
         status = "unavailable"
-    if any(segment.get("status") in {"partial", "failed"} for segment in segments):
-        status = "partial" if status == "available" else status
+    if not generation_set_complete and status == "available":
+        status = "partial"
+    if warnings and status == "available":
+        status = "partial"
 
     max_rss = max(rss_values, default=0)
     disk_peak = max(disk_peak_values, default=0)
@@ -811,13 +1598,20 @@ def aggregate_segments(arguments):
         "status": status,
         "ranked": False,
         "score_effect": "none",
+        "run_id": arguments.run_id,
         "scope": (
             "full_workflow_server_lifetimes"
             if arguments.mode == "all"
             else "selected_mode_server_lifetimes"
         ),
+        "database_path": str(Path(arguments.database_path)),
+        "database_identity": encode_database_identity(
+            arguments.database_identity
+        ),
         "sample_interval_ms": arguments.interval_ms,
-        "server_generations": len(segments),
+        "expected_server_generations": arguments.expected_generations,
+        "requested_server_generations": len(requested_paths),
+        "valid_server_generations": len(segments),
         "max_rss": {
             "status": rss_status,
             "bytes": max_rss,
@@ -834,7 +1628,15 @@ def aggregate_segments(arguments):
         },
         "rank_cpu": rank_cpu,
         "warnings": warnings,
-        "segments": [str(Path(path).name) for path in arguments.segment],
+        "segments": [
+            {
+                "generation": segment["generation"],
+                "status": segment["status"],
+                "root_pid": segment["root_pid"],
+                "root_identity": segment["root_identity_observed"],
+            }
+            for segment in segments
+        ],
     }
     atomic_write_json(arguments.output, payload)
     return 0
@@ -850,20 +1652,65 @@ def positive_integer(value):
     return parsed
 
 
+def nonempty_text(value):
+    if not value or "\0" in value:
+        raise argparse.ArgumentTypeError("value must be non-empty text")
+    return value
+
+
+def required_database_identity(value):
+    parsed = parse_database_identity(value)
+    if parsed is None:
+        raise argparse.ArgumentTypeError(
+            "aggregate requires an exact DEVICE:INODE database identity"
+        )
+    return parsed
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     sample = subparsers.add_parser("sample", help="sample one RMDB process generation")
+    sample.add_argument("--run-id", required=True, type=nonempty_text)
+    sample.add_argument("--generation", required=True, type=positive_integer)
     sample.add_argument("--root-pid", required=True, type=positive_integer)
+    sample.add_argument("--root-identity", required=True, type=nonempty_text)
     sample.add_argument("--process-group", required=True, type=positive_integer)
     sample.add_argument("--database-path", required=True, type=Path)
+    sample.add_argument(
+        "--database-identity",
+        required=True,
+        type=parse_database_identity,
+        metavar="auto|DEVICE:INODE",
+    )
     sample.add_argument("--output", required=True, type=Path)
     sample.add_argument("--interval-ms", type=positive_integer, default=DEFAULT_INTERVAL_MS)
     sample.add_argument("--proc-root", type=Path, default=Path("/proc"))
 
+    complete = subparsers.add_parser(
+        "complete-rank",
+        help="bind a successful rank to its scheduler timeline",
+    )
+    complete.add_argument("--run-id", required=True, type=nonempty_text)
+    complete.add_argument("--timeline", required=True, type=Path)
+    complete.add_argument("--output", required=True, type=Path)
+
     aggregate = subparsers.add_parser("aggregate", help="merge resource segments")
     aggregate.add_argument("--segment", action="append", default=[], type=Path)
+    aggregate.add_argument("--run-id", required=True, type=nonempty_text)
+    aggregate.add_argument(
+        "--expected-generations",
+        required=True,
+        type=positive_integer,
+    )
+    aggregate.add_argument("--database-path", required=True, type=Path)
+    aggregate.add_argument(
+        "--database-identity",
+        required=True,
+        type=required_database_identity,
+        metavar="DEVICE:INODE",
+    )
     aggregate.add_argument("--timeline", required=True, type=Path)
     aggregate.add_argument("--rank-complete", required=True, type=Path)
     aggregate.add_argument(
@@ -885,8 +1732,17 @@ def main():
     try:
         if arguments.command == "sample":
             return sample_segment(arguments)
+        if arguments.command == "complete-rank":
+            return complete_rank(arguments)
         return aggregate_segments(arguments)
-    except (OSError, ResourceError, ValueError, OverflowError) as error:
+    except (
+        OSError,
+        ResourceError,
+        ValueError,
+        OverflowError,
+        TypeError,
+        KeyError,
+    ) as error:
         try:
             atomic_write_json(
                 arguments.output,
@@ -895,7 +1751,11 @@ def main():
                     "kind": (
                         "rmdb_resource_segment"
                         if arguments.command == "sample"
-                        else "rmdb_resource_metrics"
+                        else (
+                            "rmdb_rank_completion"
+                            if arguments.command == "complete-rank"
+                            else "rmdb_resource_metrics"
+                        )
                     ),
                     "status": "failed",
                     "ranked": False,
