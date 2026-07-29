@@ -1491,7 +1491,50 @@ if "--benchmark" in sys.argv:
             finally:
                 listener.close()
 
-    def test_readiness_probe_is_bounded_by_monotonic_absolute_deadline(self):
+    def test_readiness_probe_can_use_more_than_two_seconds_of_shared_budget(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, _, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            tester = self.make_python_executable(
+                temp_path / "three-second-tpcc",
+                """
+import sys
+import time
+
+if "--probe-ready" in sys.argv:
+    time.sleep(3)
+""",
+            )
+            started = time.monotonic()
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                "--allow-deviation",
+                "--ready-timeout-seconds",
+                "5",
+                env=env,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreaterEqual(elapsed, 3.0)
+            self.assertLess(elapsed, 5.0)
+
+    def test_readiness_probe_is_bounded_by_shared_absolute_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)
             server = self.make_python_executable(
@@ -1558,10 +1601,10 @@ exit 0
             self.assertLess(
                 elapsed,
                 3.0,
-                "a single readiness probe exceeded the remaining deadline",
+                "readiness probe exceeded the shared absolute deadline",
             )
 
-    def test_timed_out_probe_leaves_budget_for_a_successful_retry(self):
+    def test_probe_response_timeout_can_retry_before_shared_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             root = self.make_root(temp)
@@ -1585,7 +1628,8 @@ if "--probe-ready" in sys.argv:
     count = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
     counter.write_text(str(count + 1), encoding="utf-8")
     if count == 0:
-        time.sleep(30)
+        time.sleep(0.25)
+        raise SystemExit(124)
 """,
             )
             env["FAKE_PROBE_COUNT"] = str(probe_count)
@@ -1624,6 +1668,81 @@ if "--probe-ready" in sys.argv:
                 args for args in invocations if "--probe-ready" in args
             ]
             self.assertGreaterEqual(len(probes), 2)
+
+    def test_hung_probe_exec_path_respects_deadline_and_leaves_no_processes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, _, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            probe_pid_file = temp_path / "hung-exec-probe.pid"
+            child_pid_file = temp_path / "hung-exec-child.pid"
+            tester = self.make_python_executable(
+                temp_path / "hung-exec-tpcc",
+                """
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+Path(os.environ["HUNG_EXEC_PROBE_PID"]).write_text(
+    str(os.getpid()),
+    encoding="utf-8",
+)
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(60)"]
+)
+Path(os.environ["HUNG_EXEC_CHILD_PID"]).write_text(
+    str(child.pid),
+    encoding="utf-8",
+)
+time.sleep(60)
+""",
+            )
+            env["HUNG_EXEC_PROBE_PID"] = str(probe_pid_file)
+            env["HUNG_EXEC_CHILD_PID"] = str(child_pid_file)
+
+            started = time.monotonic()
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                "--allow-deviation",
+                "--ready-timeout-seconds",
+                "3",
+                env=env,
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("within 3s", result.stderr)
+            self.assertTrue(self.wait_for_path(probe_pid_file), result.stderr)
+            self.assertTrue(self.wait_for_path(child_pid_file), result.stderr)
+            self.assert_pid_gone(
+                int(probe_pid_file.read_text(encoding="utf-8"))
+            )
+            self.assert_pid_gone(
+                int(child_pid_file.read_text(encoding="utf-8"))
+            )
+            listener_check = socket.socket()
+            try:
+                listener_check.bind(("127.0.0.1", port))
+            finally:
+                listener_check.close()
+            self.assertLess(elapsed, 5.0)
 
     @unittest.skipIf(
         Path("/proc/self/stat").is_file(),

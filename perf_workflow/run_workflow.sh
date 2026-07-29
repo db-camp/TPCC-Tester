@@ -2592,12 +2592,8 @@ import time
 
 deadline_millis = int(sys.argv[1])
 working_directory, executable, host, port = sys.argv[2:]
-attempt_started_millis = time.monotonic_ns() // 1_000_000
-attempt_deadline_millis = min(
-    deadline_millis,
-    attempt_started_millis + 2_000,
-)
-if attempt_started_millis >= attempt_deadline_millis:
+started_millis = time.monotonic_ns() // 1_000_000
+if started_millis >= deadline_millis:
     raise SystemExit(124)
 
 probe_pid = None
@@ -2664,14 +2660,14 @@ while True:
         exit_code = os.waitstatus_to_exitcode(status)
         raise SystemExit(exit_code if exit_code >= 0 else 128 - exit_code)
     now_millis = time.monotonic_ns() // 1_000_000
-    if now_millis >= attempt_deadline_millis:
+    if now_millis >= deadline_millis:
         kill_probe()
         try:
             os.waitpid(probe_pid, 0)
         except ChildProcessError:
             pass
         raise SystemExit(124)
-    time.sleep(min(0.01, (attempt_deadline_millis - now_millis) / 1000.0))
+    time.sleep(min(0.01, (deadline_millis - now_millis) / 1000.0))
 PY
   PROBE_PID=$!
   local probe_rc=0
