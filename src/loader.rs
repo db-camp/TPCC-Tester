@@ -149,6 +149,13 @@ impl<'a> Loader<'a> {
     ) -> Result<LoadSummary, TpccError> {
         if materialized.scale_factor != self.scale_factor
             || materialized.schema_fingerprint != self.schema.fingerprint()
+            || materialized.summary.setup_evidence.load_seed != self.schema.seed()
+            || materialized
+                .summary
+                .setup_evidence
+                .runtime_schema_fingerprint
+                != self.schema.fingerprint()
+            || materialized.summary.setup_evidence.dataset_checksum != materialized.dataset_checksum
         {
             return Err(TpccError::Protocol(
                 "materialized CSV assets do not match this setup runtime".to_owned(),
@@ -228,7 +235,8 @@ impl<'a> CsvMaterializer<'a> {
             gen.load_seed(),
             gen.load_timestamp()
         );
-        let mut setup_evidence = SetupEvidenceCollector::new(&gen, self.scale_factor)?;
+        let mut setup_evidence =
+            SetupEvidenceCollector::new(&gen, self.scale_factor, self.schema.fingerprint())?;
         let csv_dir_path = self.csv_dir.clone();
         let load_dir_path = self.load_dir.clone();
         let csv_dir = csv_dir_path.as_path();
@@ -467,8 +475,8 @@ impl<'a> CsvMaterializer<'a> {
                 "materialized CSV set is incomplete or lost order-line FLOAT evidence".to_owned(),
             ));
         }
-        let setup_evidence = setup_evidence.finish()?;
         let dataset_checksum: [u8; 32] = self.dataset_hasher.clone().finalize().into();
+        let setup_evidence = setup_evidence.finish(dataset_checksum)?;
 
         info!("[数据物化] 9 个 CSV 已全部完成");
         Ok(MaterializedLoad {

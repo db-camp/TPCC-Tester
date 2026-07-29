@@ -15,6 +15,8 @@ use crate::data_gen::{
     NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT,
 };
 use crate::error::TpccError;
+#[cfg(test)]
+use crate::runtime_schema::RuntimeSchema;
 
 pub const SETUP_SAMPLE_LIMIT: usize = 16;
 pub const MAX_SETUP_SAMPLE_LINES: usize = SETUP_SAMPLE_LIMIT * 15;
@@ -22,8 +24,9 @@ const FIRST_UNDELIVERED_ORDER_ID: i32 = ORDERS_PER_DISTRICT - NEW_ORDERS_PER_DIS
 const SAMPLE_ORDER_DOMAIN: u64 = 0xa954_6f3c_7d1e_b820;
 const ONLINE_ANCHOR_DOMAIN: u64 = 0x5d9b_2a74_c381_e60f;
 const ONLINE_LINE_DOMAIN: u64 = 0xb217_45ce_68a9_03fd;
-const EVIDENCE_VERSION: u32 = 1;
+const EVIDENCE_VERSION: u32 = 2;
 const MAX_EVIDENCE_HEX_BYTES: usize = 512 * 1024;
+const DATASET_CHECKSUM_BYTES: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WarehouseSample {
@@ -143,6 +146,8 @@ pub struct SetupAnchorSample {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupEvidence {
     pub load_seed: u64,
+    pub runtime_schema_fingerprint: u64,
+    pub dataset_checksum: [u8; DATASET_CHECKSUM_BYTES],
     pub load_timestamp: Vec<u8>,
     pub anchors: Vec<SetupAnchorSample>,
     pub items: Vec<ItemSample>,
@@ -150,6 +155,25 @@ pub struct SetupEvidence {
 }
 
 impl SetupEvidence {
+    pub fn validate_binding(
+        &self,
+        warehouses: i32,
+        expected_seed: u64,
+        expected_schema_fingerprint: u64,
+        expected_dataset_checksum: &[u8; DATASET_CHECKSUM_BYTES],
+    ) -> Result<(), String> {
+        if self.load_seed != expected_seed {
+            return Err("setup evidence does not match the dataset seed".to_owned());
+        }
+        if self.runtime_schema_fingerprint != expected_schema_fingerprint {
+            return Err("setup evidence does not match the runtime schema".to_owned());
+        }
+        if &self.dataset_checksum != expected_dataset_checksum {
+            return Err("setup evidence does not match the generated CSV dataset".to_owned());
+        }
+        self.validate(warehouses)
+    }
+
     pub fn validate(&self, warehouses: i32) -> Result<(), String> {
         if warehouses <= 0 {
             return Err("setup evidence warehouse count must be positive".to_owned());
@@ -357,6 +381,8 @@ impl SetupEvidence {
         let mut encoder = Encoder::default();
         encoder.u32(EVIDENCE_VERSION);
         encoder.u64(self.load_seed);
+        encoder.u64(self.runtime_schema_fingerprint);
+        encoder.bytes(&self.dataset_checksum);
         encoder.bytes(&self.load_timestamp);
         encoder.count(self.anchors.len());
         for anchor in &self.anchors {
@@ -392,6 +418,13 @@ impl SetupEvidence {
             ));
         }
         let load_seed = decoder.u64("setup load seed")?;
+        let runtime_schema_fingerprint = decoder.u64("setup runtime schema fingerprint")?;
+        let dataset_checksum = decoder
+            .bytes("setup dataset checksum", DATASET_CHECKSUM_BYTES)?
+            .try_into()
+            .map_err(|_| {
+                format!("setup dataset checksum must be {DATASET_CHECKSUM_BYTES} bytes")
+            })?;
         let load_timestamp = decoder.bytes("setup load timestamp", 30)?;
         let anchor_count = decoder.count("setup anchor count", SETUP_SAMPLE_LIMIT)?;
         let mut anchors = Vec::with_capacity(anchor_count);
@@ -430,6 +463,8 @@ impl SetupEvidence {
         decoder.finish()?;
         let evidence = Self {
             load_seed,
+            runtime_schema_fingerprint,
+            dataset_checksum,
             load_timestamp,
             anchors,
             items,
@@ -454,6 +489,7 @@ struct TargetAnchor {
 pub struct SetupEvidenceCollector {
     warehouses: i32,
     load_seed: u64,
+    runtime_schema_fingerprint: u64,
     load_timestamp: Vec<u8>,
     targets: Vec<TargetAnchor>,
     target_warehouses: BTreeSet<i32>,
@@ -474,7 +510,11 @@ pub struct SetupEvidenceCollector {
 }
 
 impl SetupEvidenceCollector {
-    pub fn new(generator: &TpccDataGen, warehouses: i32) -> Result<Self, TpccError> {
+    pub fn new(
+        generator: &TpccDataGen,
+        warehouses: i32,
+        runtime_schema_fingerprint: u64,
+    ) -> Result<Self, TpccError> {
         if warehouses <= 0 || generator.scale_factor != warehouses {
             return Err(TpccError::Protocol(
                 "setup evidence generator/warehouse mismatch".to_owned(),
@@ -519,6 +559,7 @@ impl SetupEvidenceCollector {
         Ok(Self {
             warehouses,
             load_seed: generator.load_seed(),
+            runtime_schema_fingerprint,
             load_timestamp: generator.load_timestamp().as_bytes().to_vec(),
             targets,
             target_warehouses,
@@ -767,7 +808,10 @@ impl SetupEvidenceCollector {
         )
     }
 
-    pub fn finish(mut self) -> Result<SetupEvidence, TpccError> {
+    pub fn finish(
+        mut self,
+        dataset_checksum: [u8; DATASET_CHECKSUM_BYTES],
+    ) -> Result<SetupEvidence, TpccError> {
         let mut anchors = Vec::with_capacity(self.targets.len());
         for target in self.targets {
             let partition = (target.warehouse_id, target.district_id);
@@ -809,14 +853,23 @@ impl SetupEvidenceCollector {
         }
         let evidence = SetupEvidence {
             load_seed: self.load_seed,
+            runtime_schema_fingerprint: self.runtime_schema_fingerprint,
+            dataset_checksum,
             load_timestamp: self.load_timestamp,
             anchors,
             items: self.items_seen.into_values().collect(),
             stocks: self.stocks_seen.into_values().collect(),
         };
-        evidence.validate(self.warehouses).map_err(|error| {
-            TpccError::Protocol(format!("invalid captured setup evidence: {error}"))
-        })?;
+        evidence
+            .validate_binding(
+                self.warehouses,
+                self.load_seed,
+                self.runtime_schema_fingerprint,
+                &dataset_checksum,
+            )
+            .map_err(|error| {
+                TpccError::Protocol(format!("invalid captured setup evidence: {error}"))
+            })?;
         Ok(evidence)
     }
 }
@@ -1586,8 +1639,18 @@ pub fn setup_evidence_fixture(warehouses: i32, seed: u64) -> SetupEvidence {
             lines,
         });
     }
+    let schema = RuntimeSchema::opaque(seed).unwrap();
+    let mut dataset_checksum = [0_u8; DATASET_CHECKSUM_BYTES];
+    for (ordinal, chunk) in dataset_checksum.chunks_exact_mut(8).enumerate() {
+        chunk.copy_from_slice(
+            &splitmix64(seed ^ (warehouses as u32 as u64).rotate_left(17) ^ ordinal as u64)
+                .to_be_bytes(),
+        );
+    }
     let evidence = SetupEvidence {
         load_seed: seed,
+        runtime_schema_fingerprint: schema.fingerprint(),
+        dataset_checksum,
         load_timestamp: timestamp,
         anchors,
         items: items.into_values().collect(),
@@ -1663,6 +1726,32 @@ mod tests {
         let encoded = evidence.encode_hex();
         assert!(encoded.len() < MAX_EVIDENCE_HEX_BYTES);
         assert_eq!(SetupEvidence::decode_hex(&encoded, 50).unwrap(), evidence);
+        assert!(evidence
+            .validate_binding(
+                50,
+                2026,
+                evidence.runtime_schema_fingerprint,
+                &evidence.dataset_checksum,
+            )
+            .is_ok());
+        assert!(evidence
+            .validate_binding(
+                50,
+                2026,
+                evidence.runtime_schema_fingerprint ^ 1,
+                &evidence.dataset_checksum,
+            )
+            .is_err());
+        let mut different_checksum = evidence.dataset_checksum;
+        different_checksum[0] ^= 1;
+        assert!(evidence
+            .validate_binding(
+                50,
+                2026,
+                evidence.runtime_schema_fingerprint,
+                &different_checksum,
+            )
+            .is_err());
 
         let mut tampered = evidence.clone();
         tampered.anchors[0].lines[0].amount_bits ^= 1;
