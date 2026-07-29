@@ -6,6 +6,7 @@
 //! and outer run metadata.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use thiserror::Error;
 
@@ -13,6 +14,7 @@ use crate::consistency::{
     CustomerLogicalVersion, CustomerUpdateEndpoint, FloatError, NonNegativeF32Accumulator,
 };
 use crate::data_gen::TpccDataGen;
+use crate::profile::OFFICIAL_WAREHOUSES;
 
 use super::bounded_stats::{
     BoundedPhysicalStats, BoundedStatsError, ClassTotals, PartitionTotals, LEDGER_CLASS_COUNT,
@@ -26,6 +28,12 @@ use super::payment_endpoints::{
     PaymentEndpointError, PaymentEndpointView, PersistedPaymentEndpoints,
     DISTRICTS_PER_WAREHOUSE as PAYMENT_DISTRICTS_PER_WAREHOUSE, MAX_PAYMENT_WAREHOUSES,
 };
+use super::recovery_samples::SampleScore;
+use super::rich_recovery_samples::{
+    CanonicalRichNewOrder, CanonicalRichOrderLine, CanonicalRichOrderWitness,
+    CanonicalRichRecoveryHeader, OrderKey, RichRecoveryError, SealedRichRecoverySamples,
+    MAX_RICH_RECOVERY_RAW_BYTES, RICH_RECOVERY_POLICY_VERSION, RICH_RECOVERY_SAMPLE_CAPACITY,
+};
 use super::runner::StockVersion;
 
 const SECTION_MAGIC: [u8; 4] = *b"TCS1";
@@ -37,8 +45,37 @@ pub(crate) const MAX_PHYSICAL_STATS_SECTION_BYTES: usize = MAX_CORE_SECTION_BYTE
 pub(crate) const MAX_CUSTOMER_INTERVAL_SECTION_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_STOCK_INTERVAL_SECTION_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_PAYMENT_ENDPOINT_SECTION_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_RICH_NEW_ORDER_SECTION_BYTES: usize = 68 * 1024;
 const MAX_ACCUMULATOR_WORDS: u32 = 6;
 const MAX_INTERVAL_SAMPLES: u32 = 64;
+const MAX_RICH_ENTRY_TIMESTAMP_BYTES: usize = 19;
+const MAX_RICH_DELIVERY_TIMESTAMP_BYTES: usize = 30;
+const RICH_DISTRICT_INFO_BYTES: usize = 24;
+const MIN_RICH_ORDER_LINES: usize = 5;
+const MAX_RICH_ORDER_LINES: usize = 15;
+const SECTION_HEADER_BYTES: usize = 7;
+const RICH_HEADER_BYTES: usize = 2 + 8 + 4 + 4 + 4 * 8;
+const RICH_NEW_ORDER_WITNESS_BYTES: usize = 1 + 16 + 7;
+const MAX_ENCODED_RICH_NEW_ORDER_LINE_BYTES: usize =
+    1 + 4 + 2 + 1 + MAX_RICH_DELIVERY_TIMESTAMP_BYTES + 1 + 4 + 1 + RICH_DISTRICT_INFO_BYTES;
+const MAX_ENCODED_RICH_NEW_ORDER_BYTES: usize = 16
+    + 7
+    + 2
+    + 1
+    + MAX_RICH_ENTRY_TIMESTAMP_BYTES
+    + 1
+    + 1
+    + 1
+    + 1
+    + MAX_RICH_ORDER_LINES * MAX_ENCODED_RICH_NEW_ORDER_LINE_BYTES;
+const _: () = assert!(
+    SECTION_HEADER_BYTES
+        + RICH_HEADER_BYTES
+        + RICH_NEW_ORDER_WITNESS_BYTES
+        + 4
+        + RICH_RECOVERY_SAMPLE_CAPACITY * MAX_ENCODED_RICH_NEW_ORDER_BYTES
+        <= MAX_RICH_NEW_ORDER_SECTION_BYTES
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -47,6 +84,7 @@ enum SectionKind {
     CustomerIntervals = 2,
     StockIntervals = 3,
     PaymentEndpoints = 4,
+    RichNewOrders = 5,
 }
 
 impl SectionKind {
@@ -56,6 +94,7 @@ impl SectionKind {
             Self::CustomerIntervals => "customer intervals",
             Self::StockIntervals => "stock intervals",
             Self::PaymentEndpoints => "Payment endpoints",
+            Self::RichNewOrders => "rich NewOrder samples",
         }
     }
 }
@@ -122,6 +161,21 @@ pub(crate) enum CoreCodecError {
         warehouse_id: u16,
         district_id: Option<u8>,
     },
+    #[error("{field} length {actual} is outside the canonical range {minimum}..={maximum}")]
+    InvalidLength {
+        field: &'static str,
+        actual: usize,
+        minimum: usize,
+        maximum: usize,
+    },
+    #[error("canonical {field} boolean has invalid value {actual}")]
+    InvalidBoolean { field: &'static str, actual: u8 },
+    #[error("canonical {domain} samples are not in strict (score, key) order")]
+    NonCanonicalRichOrder { domain: &'static str },
+    #[error("canonical {domain} section contains duplicate key {key:?}")]
+    DuplicateRichOrderKey { domain: &'static str, key: OrderKey },
+    #[error("invalid canonical rich recovery evidence: {0}")]
+    InvalidRichRecovery(#[source] RichRecoveryError),
 }
 
 /// A limit-aware writer for fixed-width little-endian canonical values.
@@ -1082,6 +1136,430 @@ fn decode_payment_endpoint(reader: &mut CanonicalReader<'_>) -> Result<(u32, u64
     Ok((reader.get_u32()?, reader.get_u64()?))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedRichNewOrderSection {
+    header: CanonicalRichRecoveryHeader,
+    rejected: Option<CanonicalRichOrderWitness>,
+    entries: Vec<CanonicalRichNewOrder>,
+}
+
+pub(crate) fn encode_rich_new_order_section(
+    samples: &SealedRichRecoverySamples,
+) -> Result<Vec<u8>, CoreCodecError> {
+    let mut writer = section_writer(SectionKind::RichNewOrders, MAX_RICH_NEW_ORDER_SECTION_BYTES)?;
+    encode_rich_header(&mut writer, samples)?;
+    encode_rich_order_witness(&mut writer, samples.order_rejected_witness())?;
+    let count = encode_rich_count("rich NewOrder samples", samples.new_orders().len())?;
+    writer.put_u32(count)?;
+
+    let mut previous = None;
+    let mut keys = BTreeSet::new();
+    for sample in samples.new_orders() {
+        validate_rich_order_entry(
+            "NewOrder",
+            &mut previous,
+            &mut keys,
+            sample.score(),
+            sample.key(),
+        )?;
+        encode_sample_score(&mut writer, sample.score())?;
+        encode_order_key(&mut writer, sample.key())?;
+        writer.put_u16(sample.customer_id())?;
+        encode_bounded_bytes(
+            &mut writer,
+            "NewOrder entry timestamp",
+            sample.entry_timestamp(),
+            1,
+            MAX_RICH_ENTRY_TIMESTAMP_BYTES,
+        )?;
+        writer.put_u8(sample.carrier_id())?;
+        let line_count = sample.lines().len();
+        if usize::from(sample.line_count()) != line_count {
+            return Err(CoreCodecError::InvalidRichRecovery(
+                RichRecoveryError::InvalidEvidence(
+                    "sealed NewOrder line_count differs from its retained lines",
+                ),
+            ));
+        }
+        let line_count = encode_u8_count(
+            "NewOrder lines",
+            line_count,
+            MIN_RICH_ORDER_LINES,
+            MAX_RICH_ORDER_LINES,
+        )?;
+        writer.put_u8(line_count)?;
+        encode_boolean(&mut writer, sample.all_local())?;
+        encode_boolean(&mut writer, sample.queue_present())?;
+        for line in sample.lines() {
+            writer.put_u8(line.number())?;
+            writer.put_u32(line.item_id())?;
+            writer.put_u16(line.supply_warehouse())?;
+            encode_bounded_bytes(
+                &mut writer,
+                "NewOrder line delivery timestamp",
+                line.delivery_timestamp(),
+                0,
+                MAX_RICH_DELIVERY_TIMESTAMP_BYTES,
+            )?;
+            writer.put_u8(line.quantity())?;
+            writer.put_u32(line.amount_bits())?;
+            encode_bounded_bytes(
+                &mut writer,
+                "NewOrder line district information",
+                line.district_info(),
+                RICH_DISTRICT_INFO_BYTES,
+                RICH_DISTRICT_INFO_BYTES,
+            )?;
+        }
+    }
+    Ok(writer.finish())
+}
+
+fn decode_rich_new_order_section(
+    bytes: &[u8],
+) -> Result<DecodedRichNewOrderSection, CoreCodecError> {
+    let mut reader = section_reader(
+        bytes,
+        SectionKind::RichNewOrders,
+        MAX_RICH_NEW_ORDER_SECTION_BYTES,
+    )?;
+    let header = decode_rich_header(&mut reader)?;
+    let rejected = decode_rich_order_witness(&mut reader, "NewOrder cutoff witness")?;
+    let count = reader.bounded_count(
+        "rich NewOrder samples",
+        u32::try_from(RICH_RECOVERY_SAMPLE_CAPACITY).expect("sample capacity fits u32"),
+    )?;
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut previous = None;
+    let mut keys = BTreeSet::new();
+    for _ in 0..count {
+        let score = decode_sample_score(&mut reader)?;
+        let key = decode_order_key(&mut reader)?;
+        validate_rich_order_entry("NewOrder", &mut previous, &mut keys, score, key)?;
+        let customer_id = reader.get_u16()?;
+        let entry_timestamp = decode_bounded_bytes(
+            &mut reader,
+            "NewOrder entry timestamp",
+            1,
+            MAX_RICH_ENTRY_TIMESTAMP_BYTES,
+        )?;
+        let carrier_id = reader.get_u8()?;
+        let line_count = decode_u8_count(
+            &mut reader,
+            "NewOrder lines",
+            MIN_RICH_ORDER_LINES,
+            MAX_RICH_ORDER_LINES,
+        )?;
+        let all_local = decode_boolean(&mut reader, "NewOrder all_local")?;
+        let queue_present = decode_boolean(&mut reader, "NewOrder queue_present")?;
+        let mut lines = Vec::with_capacity(line_count);
+        for _ in 0..line_count {
+            let number = reader.get_u8()?;
+            let item_id = reader.get_u32()?;
+            let supply_warehouse = reader.get_u16()?;
+            let delivery_timestamp = decode_bounded_bytes(
+                &mut reader,
+                "NewOrder line delivery timestamp",
+                0,
+                MAX_RICH_DELIVERY_TIMESTAMP_BYTES,
+            )?;
+            let quantity = reader.get_u8()?;
+            let amount_bits = reader.get_u32()?;
+            let district_info = decode_bounded_bytes(
+                &mut reader,
+                "NewOrder line district information",
+                RICH_DISTRICT_INFO_BYTES,
+                RICH_DISTRICT_INFO_BYTES,
+            )?;
+            lines.push(CanonicalRichOrderLine::new(
+                number,
+                item_id,
+                supply_warehouse,
+                delivery_timestamp,
+                quantity,
+                amount_bits,
+                district_info,
+            ));
+        }
+        entries.push(
+            CanonicalRichNewOrder::new(
+                score,
+                key,
+                customer_id,
+                entry_timestamp,
+                carrier_id,
+                u8::try_from(line_count).expect("bounded line count fits u8"),
+                all_local,
+                queue_present,
+                lines.into_iter(),
+            )
+            .map_err(CoreCodecError::InvalidRichRecovery)?,
+        );
+    }
+    reader.finish()?;
+    Ok(DecodedRichNewOrderSection {
+        header,
+        rejected,
+        entries,
+    })
+}
+
+fn encode_rich_header(
+    writer: &mut CanonicalWriter,
+    samples: &SealedRichRecoverySamples,
+) -> Result<(), CoreCodecError> {
+    let raw_size =
+        u32::try_from(samples.raw_size_bytes()).map_err(|_| CoreCodecError::OversizedCount {
+            field: "rich recovery raw size",
+            actual: u64::try_from(samples.raw_size_bytes()).unwrap_or(u64::MAX),
+            maximum: MAX_RICH_RECOVERY_RAW_BYTES as u64,
+        })?;
+    if samples.raw_size_bytes() > MAX_RICH_RECOVERY_RAW_BYTES {
+        return Err(CoreCodecError::OversizedCount {
+            field: "rich recovery raw size",
+            actual: samples.raw_size_bytes() as u64,
+            maximum: MAX_RICH_RECOVERY_RAW_BYTES as u64,
+        });
+    }
+    writer.put_u16(samples.warehouses())?;
+    writer.put_u64(samples.run_seed())?;
+    writer.put_u32(samples.policy_version())?;
+    writer.put_u32(raw_size)?;
+    writer.put_u64(samples.new_order_commit_count())?;
+    writer.put_u64(samples.delivered_order_count())?;
+    writer.put_u64(samples.committed_history_row_count())?;
+    writer.put_u64(samples.bad_credit_payment_count())
+}
+
+fn decode_rich_header(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<CanonicalRichRecoveryHeader, CoreCodecError> {
+    let warehouses = reader.get_u16()?;
+    let run_seed = reader.get_u64()?;
+    let policy_version = reader.get_u32()?;
+    let raw_size = reader.get_u32()?;
+    let new_order_commits = reader.get_u64()?;
+    let delivered_orders = reader.get_u64()?;
+    let history_rows = reader.get_u64()?;
+    let bad_credit_payments = reader.get_u64()?;
+    if warehouses == 0 || warehouses > OFFICIAL_WAREHOUSES {
+        return Err(CoreCodecError::InvalidRichRecovery(
+            RichRecoveryError::InvalidConfiguration("warehouses must be in 1..=50"),
+        ));
+    }
+    if policy_version != RICH_RECOVERY_POLICY_VERSION {
+        return Err(CoreCodecError::InvalidRichRecovery(
+            RichRecoveryError::UnsupportedPolicy {
+                actual: policy_version,
+                expected: RICH_RECOVERY_POLICY_VERSION,
+            },
+        ));
+    }
+    let raw_size = usize::try_from(raw_size).map_err(|_| CoreCodecError::OversizedCount {
+        field: "rich recovery raw size",
+        actual: u64::from(raw_size),
+        maximum: MAX_RICH_RECOVERY_RAW_BYTES as u64,
+    })?;
+    if raw_size > MAX_RICH_RECOVERY_RAW_BYTES {
+        return Err(CoreCodecError::InvalidRichRecovery(
+            RichRecoveryError::RawSizeCeiling {
+                actual: raw_size,
+                limit: MAX_RICH_RECOVERY_RAW_BYTES,
+            },
+        ));
+    }
+    if bad_credit_payments > history_rows {
+        return Err(CoreCodecError::InvalidRichRecovery(
+            RichRecoveryError::InvalidEvidence(
+                "bad-credit Payment count exceeds the committed History row count",
+            ),
+        ));
+    }
+    Ok(CanonicalRichRecoveryHeader::new(
+        warehouses,
+        run_seed,
+        policy_version,
+        raw_size,
+        new_order_commits,
+        delivered_orders,
+        history_rows,
+        bad_credit_payments,
+    ))
+}
+
+fn encode_sample_score(
+    writer: &mut CanonicalWriter,
+    score: SampleScore,
+) -> Result<(), CoreCodecError> {
+    writer.put_u64(score.high)?;
+    writer.put_u64(score.low)
+}
+
+fn decode_sample_score(reader: &mut CanonicalReader<'_>) -> Result<SampleScore, CoreCodecError> {
+    Ok(SampleScore {
+        high: reader.get_u64()?,
+        low: reader.get_u64()?,
+    })
+}
+
+fn encode_order_key(writer: &mut CanonicalWriter, key: OrderKey) -> Result<(), CoreCodecError> {
+    writer.put_u16(key.warehouse_id())?;
+    writer.put_u8(key.district_id())?;
+    writer.put_i32(key.order_id())
+}
+
+fn decode_order_key(reader: &mut CanonicalReader<'_>) -> Result<OrderKey, CoreCodecError> {
+    Ok(OrderKey::from_parts(
+        reader.get_u16()?,
+        reader.get_u8()?,
+        reader.get_i32()?,
+    ))
+}
+
+fn encode_rich_order_witness(
+    writer: &mut CanonicalWriter,
+    witness: Option<&super::rich_recovery_samples::OrderCutoffWitness>,
+) -> Result<(), CoreCodecError> {
+    match witness {
+        None => writer.put_u8(0),
+        Some(witness) => {
+            writer.put_u8(1)?;
+            encode_sample_score(writer, witness.score())?;
+            encode_order_key(writer, witness.key())
+        }
+    }
+}
+
+fn decode_rich_order_witness(
+    reader: &mut CanonicalReader<'_>,
+    field: &'static str,
+) -> Result<Option<CanonicalRichOrderWitness>, CoreCodecError> {
+    match reader.get_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(CanonicalRichOrderWitness::new(
+            decode_sample_score(reader)?,
+            decode_order_key(reader)?,
+        ))),
+        actual => Err(CoreCodecError::InvalidPresenceFlag { field, actual }),
+    }
+}
+
+fn encode_rich_count(field: &'static str, count: usize) -> Result<u32, CoreCodecError> {
+    let maximum = RICH_RECOVERY_SAMPLE_CAPACITY as u64;
+    let actual = u64::try_from(count).unwrap_or(u64::MAX);
+    if actual > maximum {
+        return Err(CoreCodecError::OversizedCount {
+            field,
+            actual,
+            maximum,
+        });
+    }
+    u32::try_from(count).map_err(|_| CoreCodecError::OversizedCount {
+        field,
+        actual,
+        maximum,
+    })
+}
+
+fn encode_u8_count(
+    field: &'static str,
+    count: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<u8, CoreCodecError> {
+    validate_length(field, count, minimum, maximum)?;
+    u8::try_from(count).map_err(|_| CoreCodecError::InvalidLength {
+        field,
+        actual: count,
+        minimum,
+        maximum,
+    })
+}
+
+fn decode_u8_count(
+    reader: &mut CanonicalReader<'_>,
+    field: &'static str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<usize, CoreCodecError> {
+    let count = usize::from(reader.get_u8()?);
+    validate_length(field, count, minimum, maximum)?;
+    Ok(count)
+}
+
+fn encode_bounded_bytes(
+    writer: &mut CanonicalWriter,
+    field: &'static str,
+    bytes: &[u8],
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), CoreCodecError> {
+    let length = encode_u8_count(field, bytes.len(), minimum, maximum)?;
+    writer.put_u8(length)?;
+    writer.put_bytes(bytes)
+}
+
+fn decode_bounded_bytes(
+    reader: &mut CanonicalReader<'_>,
+    field: &'static str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<Vec<u8>, CoreCodecError> {
+    let length = decode_u8_count(reader, field, minimum, maximum)?;
+    Ok(reader.take(length)?.to_vec())
+}
+
+fn validate_length(
+    field: &'static str,
+    actual: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), CoreCodecError> {
+    if (minimum..=maximum).contains(&actual) {
+        Ok(())
+    } else {
+        Err(CoreCodecError::InvalidLength {
+            field,
+            actual,
+            minimum,
+            maximum,
+        })
+    }
+}
+
+fn encode_boolean(writer: &mut CanonicalWriter, value: bool) -> Result<(), CoreCodecError> {
+    writer.put_u8(u8::from(value))
+}
+
+fn decode_boolean(
+    reader: &mut CanonicalReader<'_>,
+    field: &'static str,
+) -> Result<bool, CoreCodecError> {
+    match reader.get_u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        actual => Err(CoreCodecError::InvalidBoolean { field, actual }),
+    }
+}
+
+fn validate_rich_order_entry(
+    domain: &'static str,
+    previous: &mut Option<(SampleScore, OrderKey)>,
+    keys: &mut BTreeSet<OrderKey>,
+    score: SampleScore,
+    key: OrderKey,
+) -> Result<(), CoreCodecError> {
+    if !keys.insert(key) {
+        return Err(CoreCodecError::DuplicateRichOrderKey { domain, key });
+    }
+    let current = (score, key);
+    if previous.as_ref().is_some_and(|prior| prior >= &current) {
+        return Err(CoreCodecError::NonCanonicalRichOrder { domain });
+    }
+    *previous = Some(current);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1497,6 +1975,271 @@ mod tests {
                 )
             ))
         ));
+    }
+
+    #[test]
+    fn rich_new_order_section_round_trips_empty_canonical_state() {
+        let intervals = empty_rich_intervals();
+        let samples = empty_rich_samples(&intervals);
+        let encoded = encode_rich_new_order_section(&samples).unwrap();
+        assert_eq!(&encoded[..4], b"TCS1");
+        assert_eq!(encoded[4], SectionKind::RichNewOrders as u8);
+        assert_eq!(
+            &encoded[SECTION_HEADER_BYTES..SECTION_HEADER_BYTES + 2],
+            &1_u16.to_le_bytes()
+        );
+        assert_eq!(
+            &encoded[SECTION_HEADER_BYTES + 2..SECTION_HEADER_BYTES + 10],
+            &TEST_SAMPLE_SEED.to_le_bytes()
+        );
+
+        let decoded = decode_rich_new_order_section(&encoded).unwrap();
+        assert!(decoded.entries.is_empty());
+        assert!(decoded.rejected.is_none());
+        let restored = restore_new_order_only(decoded, &intervals);
+        assert_eq!(encode_rich_new_order_section(&restored).unwrap(), encoded);
+    }
+
+    #[test]
+    fn rich_new_order_decoder_prechecks_counts_lengths_and_booleans() {
+        let encoded = test_new_order_section(&[(
+            SampleScore { high: 1, low: 2 },
+            OrderKey::from_parts(1, 1, 3_001),
+        )]);
+        let count_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1;
+        let entry_offset = count_offset + 4;
+
+        let mut oversized_count = encoded.clone();
+        oversized_count[count_offset..count_offset + 4].copy_from_slice(
+            &(u32::try_from(RICH_RECOVERY_SAMPLE_CAPACITY).unwrap() + 1).to_le_bytes(),
+        );
+        assert!(matches!(
+            decode_rich_new_order_section(&oversized_count),
+            Err(CoreCodecError::OversizedCount {
+                field: "rich NewOrder samples",
+                ..
+            })
+        ));
+
+        let mut oversized_timestamp = encoded.clone();
+        oversized_timestamp[entry_offset + 25] =
+            u8::try_from(MAX_RICH_ENTRY_TIMESTAMP_BYTES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_new_order_section(&oversized_timestamp),
+            Err(CoreCodecError::InvalidLength {
+                field: "NewOrder entry timestamp",
+                ..
+            })
+        ));
+
+        let mut oversized_lines = encoded.clone();
+        oversized_lines[entry_offset + 46] = u8::try_from(MAX_RICH_ORDER_LINES + 1).unwrap();
+        assert!(matches!(
+            decode_rich_new_order_section(&oversized_lines),
+            Err(CoreCodecError::InvalidLength {
+                field: "NewOrder lines",
+                ..
+            })
+        ));
+
+        let mut invalid_boolean = encoded;
+        invalid_boolean[entry_offset + 47] = 2;
+        assert!(matches!(
+            decode_rich_new_order_section(&invalid_boolean),
+            Err(CoreCodecError::InvalidBoolean {
+                field: "NewOrder all_local",
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn rich_new_order_decoder_rejects_reordered_duplicate_and_noncanonical_frames() {
+        let first = (
+            SampleScore { high: 1, low: 2 },
+            OrderKey::from_parts(1, 1, 3_001),
+        );
+        let second = (
+            SampleScore { high: 3, low: 4 },
+            OrderKey::from_parts(1, 1, 3_002),
+        );
+        let canonical = test_new_order_section(&[first, second]);
+        let decoded = decode_rich_new_order_section(&canonical).unwrap();
+        assert_eq!(decoded.entries.len(), 2);
+
+        let entry_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1 + 4;
+        assert_eq!(
+            &canonical[entry_offset..entry_offset + 8],
+            &first.0.high.to_le_bytes()
+        );
+        assert_eq!(
+            &canonical[entry_offset + 16..entry_offset + 18],
+            &first.1.warehouse_id().to_le_bytes()
+        );
+
+        let reordered = test_new_order_section(&[second, first]);
+        assert!(matches!(
+            decode_rich_new_order_section(&reordered),
+            Err(CoreCodecError::NonCanonicalRichOrder { domain: "NewOrder" })
+        ));
+
+        let duplicate = test_new_order_section(&[
+            first,
+            (
+                SampleScore { high: 3, low: 4 },
+                OrderKey::from_parts(1, 1, 3_001),
+            ),
+        ]);
+        assert!(matches!(
+            decode_rich_new_order_section(&duplicate),
+            Err(CoreCodecError::DuplicateRichOrderKey {
+                domain: "NewOrder",
+                ..
+            })
+        ));
+
+        for end in [0, 1, 6, canonical.len() / 2, canonical.len() - 1] {
+            assert!(decode_rich_new_order_section(&canonical[..end]).is_err());
+        }
+        let mut unknown = canonical.clone();
+        unknown[4] = 0xff;
+        assert!(matches!(
+            decode_rich_new_order_section(&unknown),
+            Err(CoreCodecError::UnexpectedSection { actual: 0xff, .. })
+        ));
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(matches!(
+            decode_rich_new_order_section(&trailing),
+            Err(CoreCodecError::TrailingBytes { remaining: 1 })
+        ));
+        assert!(matches!(
+            decode_rich_new_order_section(&vec![0; MAX_RICH_NEW_ORDER_SECTION_BYTES + 1]),
+            Err(CoreCodecError::OversizedSection { .. })
+        ));
+    }
+
+    fn empty_rich_intervals() -> SealedIntervalEvidence {
+        IntervalCollector::new(1, 1, TEST_SAMPLE_SEED, |_key: StockKey| None)
+            .unwrap()
+            .seal()
+            .unwrap()
+    }
+
+    fn empty_rich_samples(intervals: &SealedIntervalEvidence) -> SealedRichRecoverySamples {
+        use crate::ranking::rich_recovery_samples::{
+            CanonicalRichBadCreditCustomer, CanonicalRichDelivery, CanonicalRichHistoryTuple,
+            InitialCustomerData, InitialHistoryRow,
+        };
+
+        let no_history = |_key: CustomerKey| None::<InitialHistoryRow>;
+        let no_customer = |_key: CustomerKey| None::<InitialCustomerData>;
+        SealedRichRecoverySamples::from_canonical_parts(
+            CanonicalRichRecoveryHeader::new(
+                1,
+                TEST_SAMPLE_SEED,
+                RICH_RECOVERY_POLICY_VERSION,
+                64,
+                0,
+                0,
+                0,
+                0,
+            ),
+            std::iter::empty::<CanonicalRichNewOrder>(),
+            std::iter::empty::<CanonicalRichDelivery>(),
+            std::iter::empty::<CanonicalRichBadCreditCustomer>(),
+            std::iter::empty::<CanonicalRichHistoryTuple>(),
+            None,
+            None,
+            None,
+            None,
+            intervals,
+            &no_history,
+            &no_customer,
+        )
+        .unwrap()
+    }
+
+    fn restore_new_order_only(
+        decoded: DecodedRichNewOrderSection,
+        intervals: &SealedIntervalEvidence,
+    ) -> SealedRichRecoverySamples {
+        use crate::ranking::rich_recovery_samples::{
+            CanonicalRichBadCreditCustomer, CanonicalRichDelivery, CanonicalRichHistoryTuple,
+            InitialCustomerData, InitialHistoryRow,
+        };
+
+        let no_history = |_key: CustomerKey| None::<InitialHistoryRow>;
+        let no_customer = |_key: CustomerKey| None::<InitialCustomerData>;
+        SealedRichRecoverySamples::from_canonical_parts(
+            decoded.header,
+            decoded.entries.into_iter(),
+            std::iter::empty::<CanonicalRichDelivery>(),
+            std::iter::empty::<CanonicalRichBadCreditCustomer>(),
+            std::iter::empty::<CanonicalRichHistoryTuple>(),
+            decoded.rejected,
+            None,
+            None,
+            None,
+            intervals,
+            &no_history,
+            &no_customer,
+        )
+        .unwrap()
+    }
+
+    fn test_new_order_section(entries: &[(SampleScore, OrderKey)]) -> Vec<u8> {
+        let empty = encode_rich_new_order_section(&empty_rich_samples(&empty_rich_intervals()))
+            .expect("empty rich section encodes");
+        let count_offset = SECTION_HEADER_BYTES + RICH_HEADER_BYTES + 1;
+        let mut writer = CanonicalWriter::new(MAX_RICH_NEW_ORDER_SECTION_BYTES);
+        writer.put_bytes(&empty[..count_offset]).unwrap();
+        writer
+            .put_u32(u32::try_from(entries.len()).unwrap())
+            .unwrap();
+        for (score, key) in entries {
+            encode_sample_score(&mut writer, *score).unwrap();
+            encode_order_key(&mut writer, *key).unwrap();
+            writer.put_u16(1).unwrap();
+            encode_bounded_bytes(
+                &mut writer,
+                "NewOrder entry timestamp",
+                b"2026-07-29 12:34:56",
+                1,
+                MAX_RICH_ENTRY_TIMESTAMP_BYTES,
+            )
+            .unwrap();
+            writer.put_u8(0).unwrap();
+            writer
+                .put_u8(u8::try_from(MIN_RICH_ORDER_LINES).unwrap())
+                .unwrap();
+            encode_boolean(&mut writer, true).unwrap();
+            encode_boolean(&mut writer, true).unwrap();
+            for number in 1..=u8::try_from(MIN_RICH_ORDER_LINES).unwrap() {
+                writer.put_u8(number).unwrap();
+                writer.put_u32(u32::from(number)).unwrap();
+                writer.put_u16(1).unwrap();
+                encode_bounded_bytes(
+                    &mut writer,
+                    "NewOrder line delivery timestamp",
+                    b"",
+                    0,
+                    MAX_RICH_DELIVERY_TIMESTAMP_BYTES,
+                )
+                .unwrap();
+                writer.put_u8(1).unwrap();
+                writer.put_u32(1.0_f32.to_bits()).unwrap();
+                encode_bounded_bytes(
+                    &mut writer,
+                    "NewOrder line district information",
+                    &[b'D'; RICH_DISTRICT_INFO_BYTES],
+                    RICH_DISTRICT_INFO_BYTES,
+                    RICH_DISTRICT_INFO_BYTES,
+                )
+                .unwrap();
+            }
+        }
+        writer.finish()
     }
 
     fn interval_binding() -> IntervalSectionBinding {
