@@ -138,6 +138,7 @@ impl WarehouseWheel {
 #[derive(Debug, Clone)]
 pub struct OfficialRouter {
     seed: WorkloadSeed,
+    warehouse_count: u16,
     nurand_constants: NurandConstants,
     hot_warehouses: [u16; HOT_WAREHOUSES],
     hot_districts: [u8; HOT_WAREHOUSES],
@@ -146,11 +147,29 @@ pub struct OfficialRouter {
 
 impl OfficialRouter {
     pub fn new(seed: WorkloadSeed) -> Self {
-        let mut warehouses: Vec<u16> = (1..=OFFICIAL_WAREHOUSES).collect();
+        Self::build(seed, OFFICIAL_WAREHOUSES)
+    }
+
+    /// Builds a deterministic router for an explicitly reduced local smoke run.
+    ///
+    /// This constructor is a deviation-only aid and must be gated by
+    /// `--allow-deviation`; it does not describe a ranked final configuration.
+    /// The official path must continue to use [`OfficialRouter::new`].
+    pub fn new_for_warehouses(
+        seed: WorkloadSeed,
+        warehouse_count: u16,
+    ) -> Result<Self, RouteError> {
+        if !(1..=OFFICIAL_WAREHOUSES).contains(&warehouse_count) {
+            return Err(RouteError::InvalidWarehouseCount(warehouse_count));
+        }
+        Ok(Self::build(seed, warehouse_count))
+    }
+
+    fn build(seed: WorkloadSeed, warehouse_count: u16) -> Self {
+        let mut warehouses: Vec<u16> = (1..=warehouse_count).collect();
         shuffle(&mut warehouses, derive_seed(seed.0, "hot-warehouses", &[]));
-        let hot_warehouses: [u16; HOT_WAREHOUSES] = warehouses[..HOT_WAREHOUSES]
-            .try_into()
-            .expect("published hot warehouse count must fit");
+        let hot_distinct = usize::from(warehouse_count).min(HOT_WAREHOUSES);
+        let hot_warehouses = std::array::from_fn(|index| warehouses[index % hot_distinct]);
 
         let hot_districts = hot_warehouses.map(|warehouse| {
             1 + bounded(
@@ -167,6 +186,7 @@ impl OfficialRouter {
 
         Self {
             seed,
+            warehouse_count,
             nurand_constants: NurandConstants::for_seed(seed),
             hot_warehouses,
             hot_districts,
@@ -176,6 +196,10 @@ impl OfficialRouter {
 
     pub fn seed(&self) -> WorkloadSeed {
         self.seed
+    }
+
+    pub fn warehouse_count(&self) -> u16 {
+        self.warehouse_count
     }
 
     pub fn nurand_constants(&self) -> NurandConstants {
@@ -198,6 +222,10 @@ impl OfficialRouter {
     }
 
     pub fn wheel(&self, stage: StageId) -> WarehouseWheel {
+        if self.warehouse_count != OFFICIAL_WAREHOUSES {
+            return self.smoke_wheel(stage);
+        }
+
         let mut cold: Vec<u16> = (1..=OFFICIAL_WAREHOUSES)
             .filter(|warehouse| !self.hot_warehouses.contains(warehouse))
             .collect();
@@ -227,6 +255,51 @@ impl OfficialRouter {
             slots: slots
                 .try_into()
                 .expect("published wheel must contain exactly 160 slots"),
+            extra_cold_warehouses,
+        }
+    }
+
+    fn smoke_wheel(&self, stage: StageId) -> WarehouseWheel {
+        let hot_distinct = usize::from(self.warehouse_count).min(HOT_WAREHOUSES);
+        let unique_hot = &self.hot_warehouses[..hot_distinct];
+        let mut cold: Vec<u16> = (1..=self.warehouse_count)
+            .filter(|warehouse| !unique_hot.contains(warehouse))
+            .collect();
+        shuffle(
+            &mut cold,
+            derive_seed(self.seed.0, "stage-extra-cold", &[stage.value()]),
+        );
+
+        let fallback = if cold.is_empty() { unique_hot } else { &cold };
+        let extra_cold_warehouses = std::array::from_fn(|index| fallback[index % fallback.len()]);
+
+        let mut slots = Vec::with_capacity(ROUTING_SLOTS);
+        for index in 0..HOT_WAREHOUSES * HOT_SLOTS_PER_WAREHOUSE {
+            slots.push(unique_hot[index % unique_hot.len()]);
+        }
+        if cold.is_empty() {
+            while slots.len() < ROUTING_SLOTS {
+                slots.push(unique_hot[slots.len() % unique_hot.len()]);
+            }
+        } else {
+            slots.extend(cold.iter().copied());
+            let mut extra_index = 0;
+            while slots.len() < ROUTING_SLOTS {
+                slots.push(cold[extra_index % cold.len()]);
+                extra_index += 1;
+            }
+        }
+        assert_eq!(slots.len(), ROUTING_SLOTS);
+        shuffle(
+            &mut slots,
+            derive_seed(self.seed.0, "stage-slot-shuffle", &[stage.value()]),
+        );
+
+        WarehouseWheel {
+            stage,
+            slots: slots
+                .try_into()
+                .expect("smoke wheel must contain exactly 160 slots"),
             extra_cold_warehouses,
         }
     }
@@ -280,16 +353,17 @@ impl OfficialRouter {
             }
         };
 
-        let payment_customer_warehouse = if chance(
-            derive_seed(self.seed.0, "payment-remote", &coordinates),
-            PAYMENT_REMOTE_PERCENT,
-        ) {
+        let payment_customer_warehouse = if self.warehouse_count > 1
+            && chance(
+                derive_seed(self.seed.0, "payment-remote", &coordinates),
+                PAYMENT_REMOTE_PERCENT,
+            ) {
             select_u16_excluding(
                 bounded(
                     derive_seed(self.seed.0, "payment-remote-warehouse", &coordinates),
-                    u64::from(OFFICIAL_WAREHOUSES - 1),
+                    u64::from(self.warehouse_count - 1),
                 ) as u16,
-                OFFICIAL_WAREHOUSES,
+                self.warehouse_count,
                 home_warehouse,
             )
         } else {
@@ -307,6 +381,7 @@ impl OfficialRouter {
             payment_customer_warehouse,
             nurand_constants: self.nurand_constants,
             hot_items: self.hot_items,
+            warehouse_count: self.warehouse_count,
         })
     }
 }
@@ -359,6 +434,7 @@ pub struct RoutedTransaction {
     pub payment_customer_warehouse: u16,
     nurand_constants: NurandConstants,
     hot_items: [u32; HOT_ITEMS],
+    warehouse_count: u16,
 }
 
 impl RoutedTransaction {
@@ -474,19 +550,21 @@ impl RoutedTransaction {
 
     pub fn new_order_supply_warehouse(&self, line_number: u8) -> u16 {
         let coordinates = self.line_coordinates(line_number);
-        if !chance(
-            derive_seed(self.seed.0, "new-order-remote", &coordinates),
-            NEW_ORDER_REMOTE_PERCENT,
-        ) {
+        if self.warehouse_count == 1
+            || !chance(
+                derive_seed(self.seed.0, "new-order-remote", &coordinates),
+                NEW_ORDER_REMOTE_PERCENT,
+            )
+        {
             return self.home_warehouse;
         }
 
         select_u16_excluding(
             bounded(
                 derive_seed(self.seed.0, "new-order-remote-warehouse", &coordinates),
-                u64::from(OFFICIAL_WAREHOUSES - 1),
+                u64::from(self.warehouse_count - 1),
             ) as u16,
-            OFFICIAL_WAREHOUSES,
+            self.warehouse_count,
             self.home_warehouse,
         )
     }
@@ -505,6 +583,7 @@ impl RoutedTransaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteError {
     InvalidClient(u16),
+    InvalidWarehouseCount(u16),
 }
 
 impl fmt::Display for RouteError {
@@ -513,6 +592,10 @@ impl fmt::Display for RouteError {
             Self::InvalidClient(client_id) => {
                 write!(f, "client_id {client_id} is outside 0..{OFFICIAL_CLIENTS}")
             }
+            Self::InvalidWarehouseCount(warehouse_count) => write!(
+                f,
+                "warehouse_count {warehouse_count} is outside 1..={OFFICIAL_WAREHOUSES}"
+            ),
         }
     }
 }
