@@ -379,8 +379,12 @@ where
             )));
         }
 
-        let mut exchange_complete = false;
-        let result = async {
+        // Fail closed across cancellation: once this future starts an
+        // exchange, dropping it at any await point must leave the connection
+        // unusable. Only a fully consumed and validated terminal clears this
+        // marker.
+        self.incomplete_exchange = Some("EXEC_STREAM");
+        async {
             let deadline = self
                 .write_request_frame(
                     FrameTag::ExecStream,
@@ -440,7 +444,7 @@ where
                                 "query response terminated with COMMAND_OK".to_owned(),
                             ));
                         }
-                        exchange_complete = true;
+                        self.incomplete_exchange = None;
                         return Ok(FoldStreamResponse::CommandOk);
                     }
                     FrameTag::ResultEnd => {
@@ -455,7 +459,7 @@ where
                                 "RESULT_END row_count {declared_row_count} does not match {row_count} ROW frames"
                             )));
                         }
-                        exchange_complete = true;
+                        self.incomplete_exchange = None;
                         if let Some(error) = callback_error {
                             return Err(error);
                         }
@@ -468,12 +472,12 @@ where
                     FrameTag::TransactionAbort => {
                         let diagnostic =
                             parse_diagnostic(&frame.payload, "TRANSACTION_ABORT")?;
-                        exchange_complete = true;
+                        self.incomplete_exchange = None;
                         return Ok(FoldStreamResponse::TransactionAbort { diagnostic });
                     }
                     FrameTag::Error => {
                         let diagnostic = parse_diagnostic(&frame.payload, "ERROR")?;
-                        exchange_complete = true;
+                        self.incomplete_exchange = None;
                         return Ok(FoldStreamResponse::Error { diagnostic });
                     }
                     other => {
@@ -485,11 +489,7 @@ where
                 }
             }
         }
-        .await;
-        if result.is_err() && !exchange_complete {
-            self.incomplete_exchange = Some("EXEC_STREAM");
-        }
-        result
+        .await
     }
 
     pub(crate) fn ensure_handshaken(&self, request_name: &str) -> WireResult<()> {
@@ -1312,6 +1312,57 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(first_error.contains("row_count 2 does not match 1 ROW"));
+        let reuse_error = connection
+            .exec_stream("show tables;")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reuse_error.contains("cannot be reused after incomplete or invalid EXEC_STREAM"),
+            "{reuse_error}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn folded_cancellation_before_terminal_poisons_without_second_request() {
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let (client_io, mut server_io) = duplex(128);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io
+                .write_all(&frame(FrameTag::Meta, 0, 0, &columns))
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(80)).await;
+            server_io
+                .write_all(&frame(FrameTag::ResultEnd, 0, 0, &0_u64.to_be_bytes()))
+                .await
+                .unwrap();
+
+            let mut unexpected_request = [0_u8; 1];
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    server_io.read_exact(&mut unexpected_request),
+                )
+                .await
+                .is_err(),
+                "client sent a second request after cancelling an incomplete exchange"
+            );
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(25),
+            connection.exec_stream_fold("select i from t;", (), |_, _| Ok(()), |_, _, _| Ok(())),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        sleep(Duration::from_millis(100)).await;
+
         let reuse_error = connection
             .exec_stream("show tables;")
             .await
