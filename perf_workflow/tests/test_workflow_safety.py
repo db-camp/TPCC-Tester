@@ -603,6 +603,16 @@ if (
     and os.environ.get("FAKE_TPCC_FAIL_ATTESTATION") == "1"
 ):
     raise SystemExit(42)
+if (
+    "--attest-formal-state" in sys.argv
+    and os.environ.get("FAKE_TPCC_DAMAGE_IDENTITY_AFTER_ATTESTATION") == "1"
+):
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    with (state_dir / "database.identity").open(
+        "a",
+        encoding="ascii",
+    ) as identity:
+        identity.write("tampered_after_attestation=1\\n")
 if "--lifecycle-event" in sys.argv:
     event = sys.argv[sys.argv.index("--lifecycle-event") + 1]
     with open(
@@ -1811,6 +1821,46 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 for item in manifest["attestations"]["required"]
             }
             self.assertEqual(attestations["formal_state_chain"], "failed")
+
+    def test_cleanup_failure_prevents_terminal_success_claim(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            env["FAKE_TPCC_DAMAGE_IDENTITY_AFTER_ATTESTATION"] = "1"
+            records = temp_path / "records"
+            result = self.run_script(
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            manifest = json.loads(
+                (next(records.iterdir()) / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "failed")
+            self.assertNotEqual(
+                manifest["conformance"],
+                "public_spec_aligned",
+            )
+            self.assertFalse(manifest["ranking_eligible"])
+            self.assertTrue(Path(manifest["paths"]["database"]).is_dir())
 
     def test_custom_recovery_budget_reaches_every_stateful_tester_call(self):
         with tempfile.TemporaryDirectory() as temp:

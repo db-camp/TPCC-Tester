@@ -4737,6 +4737,9 @@ esac
 finalize_resource_metrics
 assert_database_identity_ready_for_success
 attest_formal_state
+if [[ "${CLEAN_DB_ON_EXIT}" == "1" ]]; then
+  remove_current_owned_database
+fi
 WORKFLOW_STATUS="success"
 write_manifest
 write_summary
