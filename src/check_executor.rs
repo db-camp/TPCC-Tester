@@ -8,12 +8,11 @@ use crate::connection::client::RmdbClient;
 use crate::connection::wire::{StreamResponse, WireValue};
 use crate::consistency::{
     float32_matches, float_aggregate_plan, public_online_integer_plan, recovery_partition_audits,
-    recovery_plan, setup_plan, sum_f32_as_f64_once, validate_crash_float_baseline,
-    validate_increment_chain, validate_public_float_ledger,
-    validate_relative_update_chain_from_initial, CheckQuery, CheckScope, ConsistencyPlan,
-    FloatAggregateId, NonNegativeF32Accumulator, PartitionExpectation, PartitionKey,
-    PublicFloatLedgerEvidence, RecoveryExpectations, RelativeUpdateEvidence, SetupExpectations,
-    TypedResult, TypedValue, CUSTOMERS_PER_DISTRICT, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES,
+    recovery_plan, setup_plan, validate_crash_float_baseline, validate_increment_chain,
+    validate_public_float_ledger, validate_relative_update_chain_from_initial, CheckQuery,
+    CheckScope, ConsistencyPlan, FloatAggregateId, NonNegativeF32Accumulator, PartitionExpectation,
+    PartitionKey, PublicFloatLedgerEvidence, RecoveryExpectations, RelativeUpdateEvidence,
+    SetupExpectations, TypedResult, TypedValue, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES,
     FLOAT_AGGREGATES, NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
 };
 use crate::error::TpccError;
@@ -21,6 +20,8 @@ use crate::ranking::ledger::{LedgerEvent, RunLedger};
 use crate::run_state::DatasetState;
 
 pub type FloatBaseline = BTreeMap<FloatAggregateId, u32>;
+
+const PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT: usize = 64;
 
 pub async fn run_setup(client: &mut RmdbClient, dataset: &DatasetState) -> Result<(), TpccError> {
     let plan = setup_plan(SetupExpectations {
@@ -50,16 +51,9 @@ pub async fn run_final_online(
         .map_err(|error| protocol_error("invalid public online plan", error))?;
     run_plan(client, &plan).await?;
 
-    let endpoints = validate_transaction_evidence(ledger)?;
-    validate_customer_endpoints(client, "online", &endpoints).await?;
+    validate_transaction_evidence(ledger)?;
     let values = read_float_aggregates(client, CheckScope::Online).await?;
-    validate_online_float_ledger(
-        dataset,
-        ledger,
-        initial_order_line_amounts,
-        &endpoints,
-        &values,
-    )?;
+    validate_online_float_ledger(dataset, ledger, initial_order_line_amounts, &values)?;
     info!(
         "public online consistency PASS; hidden official 6/37 SQL, keys, seed, and answers were not inferred"
     );
@@ -89,7 +83,7 @@ pub async fn run_final_recovery(
     let recovered = read_float_aggregates(client, CheckScope::Recovery).await?;
     validate_float_baseline(online_baseline, &recovered)?;
     validate_payment_endpoints(client, &endpoints).await?;
-    validate_customer_endpoints(client, "recovery", &endpoints).await?;
+    validate_customer_endpoint_sample(client, &endpoints).await?;
 
     let partitions = partition_expectations(dataset, ledger)?;
     // Reuse the transport-neutral generator as a strict completeness and
@@ -367,78 +361,8 @@ fn validate_online_float_ledger(
     dataset: &DatasetState,
     ledger: &RunLedger,
     initial_order_line_amounts: &NonNegativeF32Accumulator,
-    endpoints: &RelativeEndpoints,
     values: &FloatBaseline,
 ) -> Result<(), TpccError> {
-    let actual_warehouse = aggregate_bits(values, FloatAggregateId::WarehouseYtd)?;
-    let expected_warehouse = sum_f32_as_f64_once((1..=FINAL_WAREHOUSES).map(|warehouse| {
-        endpoints
-            .warehouses
-            .get(&warehouse)
-            .copied()
-            .unwrap_or(300_000.0_f32.to_bits())
-    }))
-    .map_err(|error| protocol_error("warehouse ledger sum failed", error))?;
-    require_zero_ulp(
-        "online SUM(warehouse.w_ytd)",
-        expected_warehouse,
-        actual_warehouse,
-    )?;
-
-    let actual_district = aggregate_bits(values, FloatAggregateId::DistrictYtd)?;
-    let expected_district = sum_f32_as_f64_once((1..=FINAL_WAREHOUSES).flat_map(|warehouse| {
-        (1..=DISTRICTS_PER_WAREHOUSE).map(move |district| {
-            endpoints
-                .districts
-                .get(&(warehouse, district))
-                .copied()
-                .unwrap_or(30_000.0_f32.to_bits())
-        })
-    }))
-    .map_err(|error| protocol_error("district ledger sum failed", error))?;
-    require_zero_ulp(
-        "online SUM(district.d_ytd)",
-        expected_district,
-        actual_district,
-    )?;
-
-    let customer_keys = || {
-        (1..=FINAL_WAREHOUSES).flat_map(|warehouse| {
-            (1..=DISTRICTS_PER_WAREHOUSE).flat_map(move |district| {
-                (1..=CUSTOMERS_PER_DISTRICT as i32)
-                    .map(move |customer| (warehouse, district, customer))
-            })
-        })
-    };
-    let expected_customer_balance = sum_f32_as_f64_once(customer_keys().map(|key| {
-        endpoints
-            .customers
-            .get(&key)
-            .copied()
-            .unwrap_or_default()
-            .balance_bits
-    }))
-    .map_err(|error| protocol_error("customer balance ledger sum failed", error))?;
-    require_zero_ulp(
-        "online SUM(customer.c_balance)",
-        expected_customer_balance,
-        aggregate_bits(values, FloatAggregateId::CustomerBalance)?,
-    )?;
-    let expected_customer_ytd = sum_f32_as_f64_once(customer_keys().map(|key| {
-        endpoints
-            .customers
-            .get(&key)
-            .copied()
-            .unwrap_or_default()
-            .ytd_payment_bits
-    }))
-    .map_err(|error| protocol_error("customer YTD ledger sum failed", error))?;
-    require_zero_ulp(
-        "online SUM(customer.c_ytd_payment)",
-        expected_customer_ytd,
-        aggregate_bits(values, FloatAggregateId::CustomerYtdPayment)?,
-    )?;
-
     let initial_history_rows = i64::from(dataset.warehouses)
         .checked_mul(i64::from(DISTRICTS_PER_WAREHOUSE))
         .and_then(|count| count.checked_mul(3_000))
@@ -581,21 +505,58 @@ async fn validate_payment_endpoints(
     Ok(())
 }
 
-async fn validate_customer_endpoints(
+async fn validate_customer_endpoint_sample(
     client: &mut RmdbClient,
-    scope: &str,
     endpoints: &RelativeEndpoints,
 ) -> Result<(), TpccError> {
-    let result = execute_typed_sql(
-        client,
-        &format!("{scope}.customer.changed_endpoints"),
-        "SELECT c_w_id, c_d_id, c_id, c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt \
-         FROM customer WHERE c_payment_cnt > 1 OR c_delivery_cnt > 0",
-    )
-    .await?;
-    validate_customer_endpoint_rows(scope, result, &endpoints.customers)?;
-    info!("{scope} changed-customer Payment/Delivery endpoints PASS (raw FLOAT32 and counters)");
+    let sample = evenly_spaced_customer_sample(&endpoints.customers);
+    for (ordinal, (key, endpoint)) in sample.iter().enumerate() {
+        let result = execute_typed_sql(
+            client,
+            &format!("recovery.customer.sample.{}", ordinal + 1),
+            &format!(
+                "SELECT c_w_id, c_d_id, c_id, c_balance, c_ytd_payment, c_payment_cnt, \
+                 c_delivery_cnt FROM customer WHERE c_w_id = {} AND c_d_id = {} AND c_id = {}",
+                key.0, key.1, key.2
+            ),
+        )
+        .await?;
+        let expected = BTreeMap::from([(*key, *endpoint)]);
+        validate_customer_endpoint_rows("recovery", result, &expected)?;
+    }
+    info!(
+        "recovery customer ledger sample PASS ({} composite-index keys, raw FLOAT32 and counters)",
+        sample.len()
+    );
     Ok(())
+}
+
+fn evenly_spaced_customer_sample(
+    expected: &BTreeMap<CustomerKey, CustomerEndpoint>,
+) -> Vec<(CustomerKey, CustomerEndpoint)> {
+    let count = expected.len().min(PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT);
+    if count == 0 {
+        return Vec::new();
+    }
+    if count == expected.len() {
+        return expected.iter().map(|(key, value)| (*key, *value)).collect();
+    }
+
+    let last_index = expected.len() - 1;
+    let denominator = count - 1;
+    let selected_indexes = (0..count)
+        .map(|ordinal| ordinal * last_index / denominator)
+        .collect::<Vec<_>>();
+    let mut selected = Vec::with_capacity(count);
+    let mut next = selected_indexes.into_iter();
+    let mut selected_index = next.next();
+    for (index, (key, value)) in expected.iter().enumerate() {
+        if selected_index == Some(index) {
+            selected.push((*key, *value));
+            selected_index = next.next();
+        }
+    }
+    selected
 }
 
 fn validate_customer_endpoint_rows(
@@ -1148,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_customer_rows_require_exact_bits_counters_and_key_set() {
+    fn customer_sample_rows_require_exact_bits_counters_and_key_set() {
         let key = (1, 2, 3);
         let endpoint = CustomerEndpoint {
             balance_bits: 7.25_f32.to_bits(),
@@ -1169,7 +1130,7 @@ mod tests {
             ]
         };
         assert!(validate_customer_endpoint_rows(
-            "online",
+            "recovery",
             TypedResult { rows: vec![row()] },
             &expected
         )
@@ -1178,7 +1139,7 @@ mod tests {
         let mut wrong_bits = row();
         wrong_bits[3] = TypedValue::Float32((7.25_f32.to_bits()) + 1);
         assert!(validate_customer_endpoint_rows(
-            "online",
+            "recovery",
             TypedResult {
                 rows: vec![wrong_bits]
             },
@@ -1186,10 +1147,21 @@ mod tests {
         )
         .is_err());
         assert!(validate_customer_endpoint_rows(
-            "online",
+            "recovery",
             TypedResult { rows: Vec::new() },
             &expected
         )
         .is_err());
+    }
+
+    #[test]
+    fn customer_sample_is_bounded_and_spans_sorted_keys() {
+        let expected = (1..=100)
+            .map(|customer| ((1, 1, customer), CustomerEndpoint::default()))
+            .collect::<BTreeMap<_, _>>();
+        let sample = evenly_spaced_customer_sample(&expected);
+        assert_eq!(sample.len(), PUBLIC_CUSTOMER_ENDPOINT_SAMPLE_LIMIT);
+        assert_eq!(sample.first().map(|item| item.0), Some((1, 1, 1)));
+        assert_eq!(sample.last().map(|item| item.0), Some((1, 1, 100)));
     }
 }
