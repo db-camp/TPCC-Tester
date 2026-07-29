@@ -20,6 +20,7 @@ use crate::consistency::{
 use crate::error::TpccError;
 use crate::ranking::bounded_stats::BoundedPhysicalStats;
 use crate::ranking::ledger::{LedgerEvent, RunLedger};
+use crate::ranking::payment_endpoints::PaymentEndpointView;
 use crate::run_state::DatasetState;
 use crate::runtime_schema::RuntimeSchema;
 use crate::sample_evidence::{
@@ -933,6 +934,140 @@ async fn validate_payment_endpoints(
     Ok(())
 }
 
+async fn validate_bounded_payment_endpoints(
+    client: &mut RmdbClient,
+    schema: &RuntimeSchema,
+    warehouse_count: i32,
+    endpoints: &dyn PaymentEndpointView,
+) -> Result<(), TpccError> {
+    let (expected_warehouses, expected_districts) =
+        bounded_payment_endpoint_expectations(warehouse_count, endpoints)?;
+    let warehouses = execute_typed_sql(
+        client,
+        schema,
+        "recovery.payment.warehouse_endpoints",
+        "SELECT w_id, w_ytd FROM warehouse",
+    )
+    .await?;
+    validate_float_endpoint_rows("warehouse w_ytd", warehouses, expected_warehouses, false)?;
+
+    let districts = execute_typed_sql(
+        client,
+        schema,
+        "recovery.payment.district_endpoints",
+        "SELECT d_w_id, d_id, d_ytd FROM district",
+    )
+    .await?;
+    validate_float_endpoint_rows("district d_ytd", districts, expected_districts, true)?;
+    info!("recovery bounded Payment warehouse/district endpoints PASS (0 ULP)");
+    Ok(())
+}
+
+type FloatEndpointExpectations = (Vec<(PartitionKey, u32)>, Vec<(PartitionKey, u32)>);
+
+fn bounded_payment_endpoint_expectations(
+    warehouse_count: i32,
+    endpoints: &dyn PaymentEndpointView,
+) -> Result<FloatEndpointExpectations, TpccError> {
+    validate_consistency_warehouse_count(warehouse_count)?;
+    let expected_warehouses = u16::try_from(warehouse_count)
+        .map_err(|_| TpccError::Protocol("recovery warehouse count exceeds UINT16".to_owned()))?;
+    if endpoints.warehouses() != expected_warehouses
+        || endpoints.warehouse_edge_count() != endpoints.terminal_count()
+        || endpoints.district_edge_count() != endpoints.terminal_count()
+    {
+        return Err(TpccError::Protocol(
+            "bounded Payment evidence disagrees with the recovery dataset".to_owned(),
+        ));
+    }
+
+    let mut warehouse_rows = Vec::with_capacity(usize::from(expected_warehouses));
+    let mut district_rows =
+        Vec::with_capacity(usize::from(expected_warehouses) * DISTRICTS_PER_WAREHOUSE as usize);
+    let mut warehouse_updates = 0_u64;
+    let mut district_updates = 0_u64;
+    for warehouse_id in 1..=expected_warehouses {
+        let endpoint_bits = endpoints
+            .warehouse_endpoint_bits(warehouse_id)
+            .ok_or_else(|| {
+                TpccError::Protocol(
+                    "bounded Payment evidence omitted a warehouse endpoint".to_owned(),
+                )
+            })?;
+        require_finite_endpoint_bits(endpoint_bits)?;
+        warehouse_updates = warehouse_updates
+            .checked_add(
+                endpoints
+                    .warehouse_update_count(warehouse_id)
+                    .ok_or_else(|| {
+                        TpccError::Protocol(
+                            "bounded Payment evidence omitted a warehouse update count".to_owned(),
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                TpccError::Protocol("bounded Payment warehouse count overflowed".to_owned())
+            })?;
+        warehouse_rows.push((
+            PartitionKey {
+                warehouse_id: i32::from(warehouse_id),
+                district_id: 0,
+            },
+            endpoint_bits,
+        ));
+
+        for district_id in 1..=DISTRICTS_PER_WAREHOUSE as u8 {
+            let endpoint_bits = endpoints
+                .district_endpoint_bits(warehouse_id, district_id)
+                .ok_or_else(|| {
+                    TpccError::Protocol(
+                        "bounded Payment evidence omitted a district endpoint".to_owned(),
+                    )
+                })?;
+            require_finite_endpoint_bits(endpoint_bits)?;
+            district_updates = district_updates
+                .checked_add(
+                    endpoints
+                        .district_update_count(warehouse_id, district_id)
+                        .ok_or_else(|| {
+                            TpccError::Protocol(
+                                "bounded Payment evidence omitted a district update count"
+                                    .to_owned(),
+                            )
+                        })?,
+                )
+                .ok_or_else(|| {
+                    TpccError::Protocol("bounded Payment district count overflowed".to_owned())
+                })?;
+            district_rows.push((
+                PartitionKey {
+                    warehouse_id: i32::from(warehouse_id),
+                    district_id: i32::from(district_id),
+                },
+                endpoint_bits,
+            ));
+        }
+    }
+    if warehouse_updates != endpoints.terminal_count()
+        || district_updates != endpoints.terminal_count()
+    {
+        return Err(TpccError::Protocol(
+            "bounded Payment per-key counts disagree with the terminal total".to_owned(),
+        ));
+    }
+    Ok((warehouse_rows, district_rows))
+}
+
+fn require_finite_endpoint_bits(bits: u32) -> Result<(), TpccError> {
+    if f32::from_bits(bits).is_finite() {
+        Ok(())
+    } else {
+        Err(TpccError::Protocol(
+            "bounded Payment endpoint is not finite binary32".to_owned(),
+        ))
+    }
+}
+
 async fn validate_customer_endpoint_sample(
     client: &mut RmdbClient,
     schema: &RuntimeSchema,
@@ -1518,6 +1653,54 @@ mod tests {
     use crate::runtime_schema::{LogicalTable, SchemaMode};
     use crate::sample_evidence::setup_evidence_fixture;
 
+    struct EmptyPaymentEndpoints {
+        warehouses: u16,
+        omit_last_warehouse: bool,
+    }
+
+    impl PaymentEndpointView for EmptyPaymentEndpoints {
+        fn warehouses(&self) -> u16 {
+            self.warehouses
+        }
+
+        fn terminal_count(&self) -> u64 {
+            0
+        }
+
+        fn warehouse_edge_count(&self) -> u64 {
+            0
+        }
+
+        fn district_edge_count(&self) -> u64 {
+            0
+        }
+
+        fn warehouse_endpoint_bits(&self, warehouse_id: u16) -> Option<u32> {
+            if self.omit_last_warehouse && warehouse_id == self.warehouses {
+                None
+            } else {
+                Some(300_000.0_f32.to_bits())
+            }
+        }
+
+        fn warehouse_update_count(&self, warehouse_id: u16) -> Option<u64> {
+            self.warehouse_endpoint_bits(warehouse_id).map(|_| 0)
+        }
+
+        fn district_endpoint_bits(&self, warehouse_id: u16, district_id: u8) -> Option<u32> {
+            (warehouse_id > 0
+                && warehouse_id <= self.warehouses
+                && district_id > 0
+                && district_id <= DISTRICTS_PER_WAREHOUSE as u8)
+                .then(|| 30_000.0_f32.to_bits())
+        }
+
+        fn district_update_count(&self, warehouse_id: u16, district_id: u8) -> Option<u64> {
+            self.district_endpoint_bits(warehouse_id, district_id)
+                .map(|_| 0)
+        }
+    }
+
     fn smoke_dataset(warehouses: i32) -> DatasetState {
         let partitions = (1..=warehouses)
             .flat_map(|warehouse_id| {
@@ -1586,6 +1769,29 @@ mod tests {
                 .len(),
             DISTRICTS_PER_WAREHOUSE as usize
         );
+    }
+
+    #[test]
+    fn bounded_payment_endpoints_are_total_and_dataset_bound() {
+        let complete = EmptyPaymentEndpoints {
+            warehouses: 1,
+            omit_last_warehouse: false,
+        };
+        let (warehouses, districts) = bounded_payment_endpoint_expectations(1, &complete).unwrap();
+        assert_eq!(warehouses.len(), 1);
+        assert_eq!(districts.len(), DISTRICTS_PER_WAREHOUSE as usize);
+
+        let wrong_scale = EmptyPaymentEndpoints {
+            warehouses: 2,
+            omit_last_warehouse: false,
+        };
+        assert!(bounded_payment_endpoint_expectations(1, &wrong_scale).is_err());
+
+        let missing = EmptyPaymentEndpoints {
+            warehouses: 1,
+            omit_last_warehouse: true,
+        };
+        assert!(bounded_payment_endpoint_expectations(1, &missing).is_err());
     }
 
     #[test]
