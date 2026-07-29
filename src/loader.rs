@@ -1,8 +1,10 @@
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fs::{create_dir_all, rename, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::fs::{create_dir_all, rename, symlink_metadata, File, Metadata, OpenOptions};
+use std::io::{BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{debug, error, info};
@@ -43,6 +45,115 @@ pub struct CsvAsset {
     pub host_path: PathBuf,
     pub load_path: String,
     pub row_count: i64,
+    seal: CsvFileSeal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CsvFileSeal {
+    byte_len: u64,
+    content_sha256: [u8; 32],
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    link_count: u64,
+}
+
+impl CsvFileSeal {
+    fn capture(path: &Path, content_sha256: [u8; 32]) -> Result<Self, TpccError> {
+        let metadata = symlink_metadata(path)?;
+        Self::require_regular_readonly(path, &metadata)?;
+        #[cfg(unix)]
+        if metadata.nlink() != 1 {
+            return Err(TpccError::Protocol(format!(
+                "refusing to seal CSV {} with {} hard links",
+                path.display(),
+                metadata.nlink()
+            )));
+        }
+        Ok(Self {
+            byte_len: metadata.len(),
+            content_sha256,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            link_count: metadata.nlink(),
+        })
+    }
+
+    fn validate_metadata(&self, path: &Path, metadata: &Metadata) -> Result<(), TpccError> {
+        Self::require_regular_readonly(path, metadata)?;
+        if metadata.len() != self.byte_len {
+            return Err(TpccError::Protocol(format!(
+                "sealed CSV {} changed length from {} to {}",
+                path.display(),
+                self.byte_len,
+                metadata.len()
+            )));
+        }
+        #[cfg(unix)]
+        if (metadata.dev(), metadata.ino(), metadata.nlink())
+            != (self.device, self.inode, self.link_count)
+        {
+            return Err(TpccError::Protocol(format!(
+                "sealed CSV {} changed file identity",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_regular_readonly(path: &Path, metadata: &Metadata) -> Result<(), TpccError> {
+        if !metadata.file_type().is_file() {
+            return Err(TpccError::Protocol(format!(
+                "sealed CSV {} is not a regular file",
+                path.display()
+            )));
+        }
+        if !metadata.permissions().readonly() {
+            return Err(TpccError::Protocol(format!(
+                "sealed CSV {} is writable",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl CsvAsset {
+    fn verify_sealed(&self, boundary: &str) -> Result<(), TpccError> {
+        let path_metadata = symlink_metadata(&self.host_path)?;
+        self.seal
+            .validate_metadata(&self.host_path, &path_metadata)?;
+
+        let mut file = File::open(&self.host_path)?;
+        self.seal
+            .validate_metadata(&self.host_path, &file.metadata()?)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let actual: [u8; 32] = hasher.finalize().into();
+        if actual != self.seal.content_sha256 {
+            return Err(TpccError::Protocol(format!(
+                "sealed CSV {} failed SHA-256 verification {boundary}",
+                self.host_path.display()
+            )));
+        }
+        self.seal
+            .validate_metadata(&self.host_path, &file.metadata()?)?;
+        self.seal
+            .validate_metadata(&self.host_path, &symlink_metadata(&self.host_path)?)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +270,7 @@ impl<'a> Loader<'a> {
         }
         for (ordinal, table) in self.schema.schedule().load_tables().iter().enumerate() {
             let asset = materialized.asset(*table)?;
+            asset.verify_sealed("before LOAD")?;
             info!(
                 "[表加载] ordinal={}: 通过 load 导入 {} 行",
                 ordinal + 1,
@@ -169,7 +281,9 @@ impl<'a> Loader<'a> {
                 asset.load_path,
                 self.schema.table(*table)
             );
-            self.cursor.execute_update(&sql, &[]).await?;
+            let load_result = self.cursor.execute_update(&sql, &[]).await;
+            asset.verify_sealed("after LOAD")?;
+            load_result?;
         }
         self.verify_counts(&materialized).await?;
         Ok(materialized.summary)
@@ -187,12 +301,17 @@ pub struct CsvMaterializer<'a> {
 
 struct DigestWriter<'a, W> {
     inner: W,
-    digest: &'a mut Sha256,
+    dataset_digest: &'a mut Sha256,
+    asset_digest: &'a mut Sha256,
 }
 
 impl<'a, W> DigestWriter<'a, W> {
-    fn new(inner: W, digest: &'a mut Sha256) -> Self {
-        Self { inner, digest }
+    fn new(inner: W, dataset_digest: &'a mut Sha256, asset_digest: &'a mut Sha256) -> Self {
+        Self {
+            inner,
+            dataset_digest,
+            asset_digest,
+        }
     }
 
     fn into_inner(self) -> W {
@@ -203,7 +322,8 @@ impl<'a, W> DigestWriter<'a, W> {
 impl<W: Write> Write for DigestWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let written = self.inner.write(bytes)?;
-        self.digest.update(&bytes[..written]);
+        self.dataset_digest.update(&bytes[..written]);
+        self.asset_digest.update(&bytes[..written]);
         Ok(written)
     }
 
@@ -577,7 +697,12 @@ impl<'a> CsvMaterializer<'a> {
         self.dataset_hasher
             .update((basename.len() as u32).to_be_bytes());
         self.dataset_hasher.update(basename.as_bytes());
-        let mut writer = DigestWriter::new(BufWriter::new(file), &mut self.dataset_hasher);
+        let mut asset_hasher = Sha256::new();
+        let mut writer = DigestWriter::new(
+            BufWriter::new(file),
+            &mut self.dataset_hasher,
+            &mut asset_hasher,
+        );
         writeln!(writer, "{}", runtime_columns.join(","))?;
         let mut total = 0_u64;
         for row in rows {
@@ -605,6 +730,10 @@ impl<'a> CsvMaterializer<'a> {
         self.dataset_hasher.update([0xfe, ordinal as u8]);
         self.dataset_hasher.update(total.to_be_bytes());
         rename(&partial_file, &csv_file)?;
+        let mut permissions = symlink_metadata(&csv_file)?.permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&csv_file, permissions)?;
+        let content_sha256 = asset_hasher.finalize().into();
         let load_path = format!("{load_dir}/{basename}");
         let row_count = i64::try_from(total).map_err(|_| {
             TpccError::Protocol(format!("{} CSV row count overflow", table.canonical()))
@@ -614,6 +743,7 @@ impl<'a> CsvMaterializer<'a> {
             host_path: csv_file,
             load_path,
             row_count,
+            seal: CsvFileSeal::capture(&csv_dir.join(basename), content_sha256)?,
         };
         if self.assets.insert(table, asset).is_some() {
             return Err(TpccError::Protocol(format!(
@@ -828,6 +958,48 @@ mod tests {
             schema.columns(LogicalTable::Warehouse).unwrap().join(",")
         );
         assert!(!header.contains("w_id"));
+        asset.verify_sealed("during test").unwrap();
+
+        let original = fs::read(&asset.host_path).unwrap();
+        let mut permissions = fs::metadata(&asset.host_path).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&asset.host_path, permissions).unwrap();
+        let mut tampered = original.clone();
+        let last = tampered.last_mut().unwrap();
+        *last ^= 1;
+        fs::write(&asset.host_path, tampered).unwrap();
+        let mut permissions = fs::metadata(&asset.host_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&asset.host_path, permissions).unwrap();
+        assert!(asset
+            .verify_sealed("after same-length modification")
+            .unwrap_err()
+            .to_string()
+            .contains("SHA-256"));
+
+        let mut permissions = fs::metadata(&asset.host_path).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&asset.host_path, permissions).unwrap();
+        fs::write(&asset.host_path, &original).unwrap();
+        let mut permissions = fs::metadata(&asset.host_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&asset.host_path, permissions).unwrap();
+        asset.verify_sealed("after restoration").unwrap();
+
+        #[cfg(unix)]
+        {
+            let replacement = directory.join("replacement.csv");
+            fs::write(&replacement, &original).unwrap();
+            let mut permissions = fs::metadata(&replacement).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&replacement, permissions).unwrap();
+            fs::rename(replacement, &asset.host_path).unwrap();
+            assert!(asset
+                .verify_sealed("after replacement")
+                .unwrap_err()
+                .to_string()
+                .contains("file identity"));
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 }
