@@ -1694,7 +1694,8 @@ write_manifest() {
     "${RANKED_CONFIGURATION}" "${SEED}" "${SEED_CALLER_SUPPLIED}" \
     "${ALLOW_DEVIATION}" "${EFFECTIVE_SCALE}" "${EFFECTIVE_CLIENTS}" \
     "${EFFECTIVE_WARMUP_SECONDS}" "${PUBLIC_WINDOWS}" \
-    "${EFFECTIVE_WINDOW_SECONDS}" "${RMDB_SHA}" "${TPCC_SHA}" \
+    "${EFFECTIVE_WINDOW_SECONDS}" "${RECOVERY_READY_TIMEOUT_SECONDS}" \
+    "${RMDB_SHA}" "${TPCC_SHA}" \
     "${RMDB_DIR}" "${TPCC_DIR}" "${DB_PATH}" "${RESULT_DIR}" "${STATE_DIR}" \
     "${DB_NAME}" "${DB_NAME_CALLER_SUPPLIED}" "${DB_IDENTITY_SOURCE}" \
     "${DB_NAME_DEVIATION_ACTIVE}" "${DB_IDENTITY_STATUS}" \
@@ -1708,8 +1709,10 @@ write_manifest() {
     "${RESOURCE_INTERVAL_MS}" "${RESOURCE_METRICS}" \
     "${FORMAL_STATE_ATTESTATION_STATUS}" <<'PY'
 import json
+import hashlib
 import os
 from pathlib import Path
+import stat
 import sys
 
 (
@@ -1728,6 +1731,7 @@ import sys
     warmup_seconds,
     windows,
     window_seconds,
+    recovery_ready_budget_seconds,
     rmdb_sha,
     tpcc_sha,
     rmdb_dir,
@@ -1797,6 +1801,79 @@ def describe_artifact(name):
     else:
         descriptor["status"] = "present"
     return descriptor
+
+
+def describe_rank_result():
+    name = "rank.log"
+    path = Path(result_dir) / name
+    descriptor = {
+        "path": name,
+        "status": "missing",
+        "size_bytes": None,
+        "sha256": None,
+    }
+    try:
+        path_metadata = path.lstat()
+    except FileNotFoundError:
+        return descriptor
+    if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(
+        path_metadata.st_mode
+    ):
+        descriptor["status"] = "unsafe"
+        return descriptor
+    if path_metadata.st_size == 0:
+        descriptor["status"] = "empty"
+        return descriptor
+    if path_metadata.st_size > 64 * 1024 * 1024:
+        descriptor["status"] = "oversized"
+        return descriptor
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    file_descriptor = -1
+    try:
+        file_descriptor = os.open(path, flags)
+        opened_metadata = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(opened_metadata.st_mode)
+            or opened_metadata.st_dev != path_metadata.st_dev
+            or opened_metadata.st_ino != path_metadata.st_ino
+            or opened_metadata.st_size != path_metadata.st_size
+        ):
+            descriptor["status"] = "changed"
+            return descriptor
+        digest = hashlib.sha256()
+        remaining = opened_metadata.st_size
+        while remaining:
+            chunk = os.read(file_descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        final_metadata = os.fstat(file_descriptor)
+        if (
+            remaining != 0
+            or final_metadata.st_dev != opened_metadata.st_dev
+            or final_metadata.st_ino != opened_metadata.st_ino
+            or final_metadata.st_size != opened_metadata.st_size
+            or final_metadata.st_mtime_ns != opened_metadata.st_mtime_ns
+        ):
+            descriptor["status"] = "changed"
+            return descriptor
+        descriptor.update(
+            {
+                "status": "verified",
+                "size_bytes": opened_metadata.st_size,
+                "sha256": digest.hexdigest(),
+            }
+        )
+        return descriptor
+    except OSError:
+        descriptor["status"] = "unsafe"
+        return descriptor
+    finally:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
 
 
 def load_resource_metrics():
@@ -1945,6 +2022,7 @@ database_identity = {
     "database_marker": ".tpcc-workflow-database-identity",
 }
 
+rank_result = describe_rank_result()
 formal_phases = {
     "setup": phase_setup,
     "rank": phase_rank,
@@ -1953,8 +2031,10 @@ formal_phases = {
     "recovery": phase_recovery,
 }
 configuration_verified = mode == "all" and ranked_configuration == "1"
-phases_verified = mode == "all" and all(
-    value == "passed" for value in formal_phases.values()
+phases_verified = (
+    mode == "all"
+    and all(value == "passed" for value in formal_phases.values())
+    and rank_result["status"] == "verified"
 )
 identity_verified = (
     db_identity_status == "verified"
@@ -2093,6 +2173,9 @@ payload = {
         "warmup_seconds": int(warmup_seconds),
         "measurement_windows": int(windows),
         "window_seconds": int(window_seconds),
+        "recovery_ready_budget_seconds": int(
+            recovery_ready_budget_seconds
+        ),
         "transaction_mix_percent": {
             "new_order": 45,
             "payment": 43,
@@ -2112,10 +2195,11 @@ payload = {
         "rmdb": rmdb_dir,
         "tpcc_tester": tpcc_dir,
         "database": db_path,
-        "result": result_dir,
+        "result": str(Path(result_dir).resolve()),
         "state": state_dir,
     },
     "database_identity": database_identity,
+    "rank_result": rank_result,
     "phases": {
         "setup": phase_setup,
         "rank": phase_rank,

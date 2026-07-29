@@ -38,26 +38,65 @@ class WorkflowSafetyTests(unittest.TestCase):
         ranking_eligible=False,
         conformance="not_public_spec_aligned",
         attestation_status="failed",
+        rank_text=None,
     ):
+        rank_result = {
+            "path": "rank.log",
+            "status": "missing",
+            "size_bytes": None,
+            "sha256": None,
+        }
+        if rank_text is not None:
+            rank_bytes = rank_text.encode("utf-8")
+            (result_dir / "rank.log").write_bytes(rank_bytes)
+            rank_result = {
+                "path": "rank.log",
+                "status": "verified",
+                "size_bytes": len(rank_bytes),
+                "sha256": hashlib.sha256(rank_bytes).hexdigest(),
+            }
         required = [
             {
                 "name": name,
                 "required_for_ranking": True,
-                "status": attestation_status,
-                "validator": "test",
+                "status": (
+                    "verified"
+                    if name
+                    in {
+                        "public_configuration",
+                        "opaque_sealed_database",
+                    }
+                    else attestation_status
+                ),
+                "validator": validator,
             }
-            for name in (
-                "public_configuration",
-                "opaque_sealed_database",
-                "formal_workflow_phases",
-                "formal_state_chain",
+            for name, validator in (
+                (
+                    "public_configuration",
+                    "workflow_exact_public_profile_and_mode",
+                ),
+                ("opaque_sealed_database", "database_identity_v2"),
+                ("formal_workflow_phases", "shell_phase_receipts_v1"),
+                (
+                    "formal_state_chain",
+                    "tpcc_tester_read_only_state_attestation_v1",
+                ),
             )
         ]
+        phase_status = (
+            "passed" if attestation_status == "verified" else "failed"
+        )
+        run_id = "summary-test-run"
+        dataset_run_id = "summary-test-dataset"
+        database_name = "tpcc_opaque_summary_test"
+        database_path = result_dir / database_name
         manifest = {
             "schema_version": 3,
             "authority": "manifest.json",
             "status": status,
             "mode": "all",
+            "run_id": run_id,
+            "dataset_run_id": dataset_run_id,
             "profile": "final2026",
             "conformance": conformance,
             "ranking_eligible": ranking_eligible,
@@ -65,6 +104,82 @@ class WorkflowSafetyTests(unittest.TestCase):
             "attestations": {
                 "policy": "all_required_must_be_verified",
                 "required": required,
+            },
+            "seed": {
+                "value": 2026,
+                "caller_supplied": False,
+                "source": "local_workflow_default_not_official",
+            },
+            "effective": {
+                "warehouses": 50,
+                "clients": 32,
+                "warmup_seconds": 30,
+                "measurement_windows": 3,
+                "window_seconds": 150,
+                "recovery_ready_budget_seconds": 90,
+                "transaction_mix_percent": {
+                    "new_order": 45,
+                    "payment": 43,
+                    "order_status": 4,
+                    "delivery": 4,
+                    "stock_level": 4,
+                },
+                "derived_write_ratio": 0.92,
+                "deviation_opt_in": False,
+                "deviation_active": False,
+            },
+            "paths": {
+                "database": str(database_path),
+                "result": str(result_dir.resolve()),
+                "state": str(result_dir / "state"),
+            },
+            "database_identity": {
+                "status": "verified",
+                "binding_status": "sealed",
+                "opaque_name": True,
+                "name": database_name,
+                "path_basename": database_name,
+                "name_source": "derived_opaque",
+                "name_algorithm": "sha256_domain_run_id_seed_v1",
+                "caller_supplied_this_invocation": False,
+                "deviation_active": False,
+                "filesystem": {
+                    "device": 1,
+                    "inode": 2,
+                    "path_fingerprint": "1" * 64,
+                },
+                "dataset_binding": {
+                    "dataset_run_id": dataset_run_id,
+                    "seed": 2026,
+                    "runtime_schema_fingerprint": "2" * 16,
+                    "dataset_state_fingerprint": "3" * 64,
+                },
+                "identity_fingerprint": "4" * 64,
+                "state_artifact": "database.identity",
+                "database_marker": ".tpcc-workflow-database-identity",
+            },
+            "phases": {
+                "setup": phase_status,
+                "rank": phase_status,
+                "online": phase_status,
+                "crash_restart": phase_status,
+                "recovery": phase_status,
+                "diagnostics": "not_requested",
+            },
+            "rank_result": rank_result,
+            "diagnostics": {
+                "requested": False,
+                "ranked": False,
+                "status": "not_requested",
+            },
+            "resources": {
+                "observation_only": True,
+                "ranked": False,
+                "score_effect": "none",
+                "status": "unavailable",
+                "sampling": {
+                    "official_hidden_sampler_reproduced": False,
+                },
             },
             "warnings": [],
         }
@@ -85,13 +200,13 @@ class WorkflowSafetyTests(unittest.TestCase):
     def test_summary_uses_only_manifest_json_and_suppresses_failed_metrics(self):
         with tempfile.TemporaryDirectory() as temp:
             result_dir = Path(temp)
-            self.write_summary_manifest(result_dir, status="failed")
+            self.write_summary_manifest(
+                result_dir,
+                status="failed",
+                rank_text="Throughput: 12345 txn/s\ntpmC: 67890\n",
+            )
             (result_dir / "manifest.txt").write_text(
                 "workflow_status=success\nconformance=public_spec_aligned\n",
-                encoding="utf-8",
-            )
-            (result_dir / "rank.log").write_text(
-                "Throughput: 12345 txn/s\ntpmC: 67890\n",
                 encoding="utf-8",
             )
 
@@ -115,10 +230,7 @@ class WorkflowSafetyTests(unittest.TestCase):
                 ranking_eligible=True,
                 conformance="public_spec_aligned",
                 attestation_status="verified",
-            )
-            (result_dir / "rank.log").write_text(
-                "Throughput: 12345 txn/s\ntpmC: 67890\n",
-                encoding="utf-8",
+                rank_text="Throughput: 12345 txn/s\ntpmC: 67890\n",
             )
 
             result = self.run_summary(result_dir)
@@ -154,16 +266,13 @@ class WorkflowSafetyTests(unittest.TestCase):
     def test_summary_requires_every_core_attestation_to_remain_mandatory(self):
         with tempfile.TemporaryDirectory() as temp:
             result_dir = Path(temp)
-            (result_dir / "rank.log").write_text(
-                "Throughput: 12345 txn/s\n",
-                encoding="utf-8",
-            )
             self.write_summary_manifest(
                 result_dir,
                 status="success",
                 ranking_eligible=True,
                 conformance="public_spec_aligned",
                 attestation_status="verified",
+                rank_text="Throughput: 12345 txn/s\n",
             )
             manifest_path = result_dir / "manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -179,6 +288,7 @@ class WorkflowSafetyTests(unittest.TestCase):
                 ranking_eligible=True,
                 conformance="public_spec_aligned",
                 attestation_status="verified",
+                rank_text="Throughput: 12345 txn/s\n",
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["attestations"]["required"][0][
@@ -188,6 +298,85 @@ class WorkflowSafetyTests(unittest.TestCase):
             optional = self.run_summary(result_dir)
             self.assertEqual(optional.returncode, 2)
             self.assertNotIn("12345", optional.stdout)
+
+    def test_summary_rejects_cross_field_public_claims(self):
+        mutations = {
+            "effective scale": lambda manifest: manifest["effective"].update(
+                warehouses=1,
+            ),
+            "active deviation": lambda manifest: manifest["effective"].update(
+                deviation_active=True,
+            ),
+            "unfinished phase": lambda manifest: manifest["phases"].update(
+                recovery="failed",
+            ),
+            "unsealed database": lambda manifest: manifest[
+                "database_identity"
+            ].update(binding_status="provisioned"),
+            "ranked resources": lambda manifest: manifest["resources"].update(
+                ranked=True,
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                result_dir = Path(temp)
+                self.write_summary_manifest(
+                    result_dir,
+                    status="success",
+                    ranking_eligible=True,
+                    conformance="public_spec_aligned",
+                    attestation_status="verified",
+                    rank_text="Throughput: 12345 txn/s\n",
+                )
+                manifest_path = result_dir / "manifest.json"
+                manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                mutate(manifest)
+                manifest_path.write_text(
+                    json.dumps(manifest),
+                    encoding="utf-8",
+                )
+
+                result = self.run_summary(result_dir)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("metrics: suppressed", result.stdout.lower())
+                self.assertNotIn("12345", result.stdout)
+
+    def test_summary_only_ranks_the_bound_rank_log(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            result_dir = temp_path / "result"
+            result_dir.mkdir()
+            self.write_summary_manifest(
+                result_dir,
+                status="success",
+                ranking_eligible=True,
+                conformance="public_spec_aligned",
+                attestation_status="verified",
+                rank_text="Throughput: 12345 txn/s\ntpmC: 67890\n",
+            )
+            outside = temp_path / "outside"
+            outside.mkdir()
+            (outside / "benchmark.log").write_text(
+                "Throughput: 99999 txn/s\ntpmC: 99999\n",
+                encoding="utf-8",
+            )
+            (result_dir / "perf").symlink_to(outside, target_is_directory=True)
+
+            result = self.run_summary(result_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Throughput: 12345 txn/s", result.stdout)
+            self.assertNotIn("99999", result.stdout)
+
+            (result_dir / "rank.log").write_text(
+                "Throughput: 77777 txn/s\n",
+                encoding="utf-8",
+            )
+            damaged = self.run_summary(result_dir)
+            self.assertEqual(damaged.returncode, 2, damaged.stdout)
+            self.assertIn("metrics: suppressed", damaged.stdout.lower())
+            self.assertNotIn("77777", damaged.stdout)
 
     def kill_process_session(self, session_id):
         for requested_signal in (signal.SIGTERM, signal.SIGKILL):
@@ -406,6 +595,9 @@ import sys
 
 with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
     output.write("\\t".join(sys.argv[1:]) + "\\n")
+if "--benchmark" in sys.argv:
+    print("Throughput: 1 txn/s")
+    print("tpmC: 1")
 if (
     "--attest-formal-state" in sys.argv
     and os.environ.get("FAKE_TPCC_FAIL_ATTESTATION") == "1"
@@ -3308,6 +3500,9 @@ import sys
 
 with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
     output.write("\\t".join(sys.argv[1:]) + "\\n")
+if "--benchmark" in sys.argv:
+    print("Throughput: 1 txn/s")
+    print("tpmC: 1")
 if "--create-schema" in sys.argv:
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
     run_id = os.environ["RMDB_TPCC_RUN_ID"]
@@ -3684,7 +3879,10 @@ while :; do sleep 0.05; done
                     },
                 },
             )
-            self.assertEqual(manifest["paths"]["result"], str(result_dirs[0]))
+            self.assertEqual(
+                manifest["paths"]["result"],
+                str(result_dirs[0].resolve()),
+            )
             self.assertEqual(
                 manifest["paths"]["state"],
                 str(result_dirs[0] / "state"),
