@@ -13,6 +13,12 @@ from typing import Any
 
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_TEXT_ARTIFACT_BYTES = 64 * 1024 * 1024
+CORE_RANKING_ATTESTATIONS = {
+    "public_configuration",
+    "opaque_sealed_database",
+    "formal_workflow_phases",
+    "formal_state_chain",
+}
 
 
 class ManifestError(ValueError):
@@ -112,6 +118,16 @@ def load_authoritative_manifest(result_dir: pathlib.Path) -> dict[str, Any]:
             raise ManifestError(f"manifest.json has an invalid {name} requirement")
         if required_for_ranking and item_status != "verified":
             all_required_verified = False
+    if not CORE_RANKING_ATTESTATIONS.issubset(names):
+        raise ManifestError("manifest.json is missing a core ranking attestation")
+    for item in required:
+        if (
+            item["name"] in CORE_RANKING_ATTESTATIONS
+            and item["required_for_ranking"] is not True
+        ):
+            raise ManifestError(
+                f"manifest.json makes core attestation {item['name']} optional"
+            )
 
     eligible_shape = (
         status == "success"

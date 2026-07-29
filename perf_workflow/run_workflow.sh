@@ -2159,12 +2159,25 @@ payload = {
 
 path = Path(output)
 temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-with temporary.open("w", encoding="utf-8") as stream:
-    json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
-    stream.write("\n")
-    stream.flush()
-    os.fsync(stream.fileno())
-os.replace(temporary, path)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = os.open(temporary, flags, 0o600)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        descriptor = -1
+        json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
 PY
   MANIFEST_READY=1
 }

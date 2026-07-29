@@ -151,6 +151,44 @@ class WorkflowSafetyTests(unittest.TestCase):
                 self.assertIn("metrics: suppressed", unsafe.stdout.lower())
                 self.assertNotIn("12345", unsafe.stdout)
 
+    def test_summary_requires_every_core_attestation_to_remain_mandatory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result_dir = Path(temp)
+            (result_dir / "rank.log").write_text(
+                "Throughput: 12345 txn/s\n",
+                encoding="utf-8",
+            )
+            self.write_summary_manifest(
+                result_dir,
+                status="success",
+                ranking_eligible=True,
+                conformance="public_spec_aligned",
+                attestation_status="verified",
+            )
+            manifest_path = result_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["attestations"]["required"].pop()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            missing = self.run_summary(result_dir)
+            self.assertEqual(missing.returncode, 2)
+            self.assertNotIn("12345", missing.stdout)
+
+            self.write_summary_manifest(
+                result_dir,
+                status="success",
+                ranking_eligible=True,
+                conformance="public_spec_aligned",
+                attestation_status="verified",
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["attestations"]["required"][0][
+                "required_for_ranking"
+            ] = False
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            optional = self.run_summary(result_dir)
+            self.assertEqual(optional.returncode, 2)
+            self.assertNotIn("12345", optional.stdout)
+
     def kill_process_session(self, session_id):
         for requested_signal in (signal.SIGTERM, signal.SIGKILL):
             result = subprocess.run(
