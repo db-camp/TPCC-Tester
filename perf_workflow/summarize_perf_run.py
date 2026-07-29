@@ -563,9 +563,11 @@ def load_authoritative_manifest(
         raise ManifestError("manifest.json conformance contradicts eligibility")
 
     rank_text = ""
-    if status == "success" and phases["rank"] == "passed":
-        if rank_result["status"] != "verified":
-            raise ManifestError("manifest.json does not bind a successful rank log")
+    if (
+        status == "success"
+        and phases["rank"] == "passed"
+        and rank_result["status"] == "verified"
+    ):
         rank_bytes = read_regular_bytes(
             result_dir,
             rank_result["path"],
@@ -577,6 +579,8 @@ def load_authoritative_manifest(
         ):
             raise ManifestError("rank.log does not match its manifest binding")
         rank_text = rank_bytes.decode("utf-8", errors="replace")
+    elif ranking_eligible:
+        raise ManifestError("manifest.json does not bind its ranked result")
     return manifest, rank_text
 
 
