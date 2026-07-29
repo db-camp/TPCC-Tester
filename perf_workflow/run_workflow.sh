@@ -1755,10 +1755,12 @@ write_manifest() {
     "${TESTER_BINARY_OVERRIDE_ACTIVE}" \
     "${SKIP_BUILD}" <<'PY' || writer_rc=$?
 import fcntl
+from decimal import Decimal
 import json
 import hashlib
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 
@@ -1864,6 +1866,75 @@ def describe_artifact(name):
     return descriptor
 
 
+RANK_METRIC_POLICY = "new_order_three_window_decimal_median_v1"
+
+
+def unavailable_rank_metrics(status):
+    return {
+        "policy": RANK_METRIC_POLICY,
+        "status": status,
+        "window_values": None,
+        "median": None,
+    }
+
+
+def parse_rank_metrics(data):
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return unavailable_rank_metrics("invalid")
+    rate = r"(?:0|[1-9][0-9]*)\.[0-9]{3}"
+    window_pattern = re.compile(
+        rf"^window([1-3]): new_order_per_min=({rate}),"
+    )
+    median_pattern = re.compile(
+        rf"^ranked_new_order_per_min_median=({rate})$"
+    )
+    parsed_windows = []
+    parsed_medians = []
+    for line_number, line in enumerate(text.splitlines()):
+        window = window_pattern.match(line)
+        if window is not None:
+            parsed_windows.append(
+                (
+                    int(window.group(1)),
+                    window.group(2),
+                    Decimal(window.group(2)),
+                    line_number,
+                )
+            )
+            continue
+        if line.startswith("window") and "new_order_per_min" in line:
+            return unavailable_rank_metrics("invalid")
+        median = median_pattern.fullmatch(line)
+        if median is not None:
+            parsed_medians.append(
+                (
+                    median.group(1),
+                    Decimal(median.group(1)),
+                    line_number,
+                )
+            )
+            continue
+        if line.startswith("ranked_new_order_per_min_median"):
+            return unavailable_rank_metrics("invalid")
+    if [item[0] for item in parsed_windows] != [1, 2, 3]:
+        return unavailable_rank_metrics("invalid")
+    if (
+        len(parsed_medians) != 1
+        or parsed_medians[0][2] <= parsed_windows[-1][3]
+        or parsed_medians[0][1]
+        != sorted(item[2] for item in parsed_windows)[1]
+    ):
+        return unavailable_rank_metrics("invalid")
+    return {
+        "policy": RANK_METRIC_POLICY,
+        "status": "verified",
+        "window_values": [item[1] for item in parsed_windows],
+        "median": parsed_medians[0][0],
+    }
+
+
 def describe_rank_result():
     name = "rank.log"
     path = Path(result_dir) / name
@@ -1872,6 +1943,7 @@ def describe_rank_result():
         "status": "missing",
         "size_bytes": None,
         "sha256": None,
+        "metrics": unavailable_rank_metrics("unavailable"),
     }
     try:
         path_metadata = path.lstat()
@@ -1900,32 +1972,46 @@ def describe_rank_result():
             or opened_metadata.st_dev != path_metadata.st_dev
             or opened_metadata.st_ino != path_metadata.st_ino
             or opened_metadata.st_size != path_metadata.st_size
+            or opened_metadata.st_mtime_ns != path_metadata.st_mtime_ns
         ):
             descriptor["status"] = "changed"
             return descriptor
         digest = hashlib.sha256()
         remaining = opened_metadata.st_size
+        chunks = []
         while remaining:
             chunk = os.read(file_descriptor, min(1024 * 1024, remaining))
             if not chunk:
                 break
             digest.update(chunk)
+            chunks.append(chunk)
             remaining -= len(chunk)
         final_metadata = os.fstat(file_descriptor)
+        current_metadata = path.lstat()
         if (
             remaining != 0
             or final_metadata.st_dev != opened_metadata.st_dev
             or final_metadata.st_ino != opened_metadata.st_ino
             or final_metadata.st_size != opened_metadata.st_size
             or final_metadata.st_mtime_ns != opened_metadata.st_mtime_ns
+            or current_metadata.st_dev != opened_metadata.st_dev
+            or current_metadata.st_ino != opened_metadata.st_ino
+            or current_metadata.st_size != opened_metadata.st_size
+            or current_metadata.st_mtime_ns != opened_metadata.st_mtime_ns
         ):
             descriptor["status"] = "changed"
+            return descriptor
+        metrics = parse_rank_metrics(b"".join(chunks))
+        if metrics["status"] != "verified":
+            descriptor["status"] = "invalid_metrics"
+            descriptor["metrics"] = metrics
             return descriptor
         descriptor.update(
             {
                 "status": "verified",
                 "size_bytes": opened_metadata.st_size,
                 "sha256": digest.hexdigest(),
+                "metrics": metrics,
             }
         )
         return descriptor
@@ -2332,6 +2418,21 @@ if formal_attestation_status == "verified" and terminal_evidence_verified:
                 )
         finally:
             os.close(descriptor)
+        locked_rank_result = describe_rank_result()
+        if (
+            locked_rank_result["status"] != "verified"
+            or locked_rank_result != rank_result
+        ):
+            if locked_rank_result["status"] == "verified":
+                locked_rank_result = {
+                    "path": "rank.log",
+                    "status": "changed",
+                    "size_bytes": None,
+                    "sha256": None,
+                    "metrics": unavailable_rank_metrics("unavailable"),
+                }
+            rank_result = locked_rank_result
+            publication_revalidation_failed = True
     except (OSError, RuntimeError):
         publication_revalidation_failed = True
         if safe_terminal_evidence_status == "verified":
@@ -2343,6 +2444,16 @@ if formal_attestation_status == "verified" and terminal_evidence_verified:
         terminal_evidence_verified = False
 if formal_attestation_status == "verified" and not terminal_evidence_verified:
     formal_attestation_status = "failed"
+phases_verified = (
+    mode == "all"
+    and all(value == "passed" for value in formal_phases.values())
+    and rank_result["status"] == "verified"
+    and rank_result["metrics"]["status"] == "verified"
+)
+phase_status = required_status(
+    phases_verified,
+    any(value in {"pending", "running"} for value in formal_phases.values()),
+)
 tester_attestation_status = required_status(
     tester_binary_verified,
     tester_binary_provenance_status == "pending_fresh_build",
@@ -2397,6 +2508,8 @@ safe_workflow_status = (
     if workflow_status in {"running", "success", "failed"}
     else "failed"
 )
+if publication_revalidation_failed and safe_workflow_status == "success":
+    safe_workflow_status = "failed"
 observation_warnings = []
 if phase_diagnostics in {"failed", "unavailable"}:
     observation_warnings.append(

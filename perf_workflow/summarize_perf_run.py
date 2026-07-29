@@ -20,6 +20,7 @@ MAX_TERMINAL_EVIDENCE_STATE_BYTES = (
 )
 TERMINAL_EVIDENCE_FILE = "terminal_evidence.state"
 LEGACY_RUN_LEDGER_FILE = "run_ledger.state"
+RANK_METRIC_POLICY = "new_order_three_window_decimal_median_v1"
 CORE_RANKING_ATTESTATIONS = {
     "public_configuration",
     "trusted_tester_binary",
@@ -402,7 +403,11 @@ def validate_tester_binary(manifest: dict[str, Any]) -> bool:
 
 def validate_rank_result(manifest: dict[str, Any]) -> dict[str, Any]:
     rank_result = manifest.get("rank_result")
-    if not isinstance(rank_result, dict):
+    if (
+        not isinstance(rank_result, dict)
+        or set(rank_result)
+        != {"path", "status", "size_bytes", "sha256", "metrics"}
+    ):
         raise ManifestError("manifest.json is missing the rank result binding")
     if rank_result.get("path") != "rank.log":
         raise ManifestError("manifest.json has an invalid rank result path")
@@ -413,9 +418,19 @@ def validate_rank_result(manifest: dict[str, Any]) -> dict[str, Any]:
         "empty",
         "oversized",
         "changed",
+        "invalid_metrics",
         "verified",
     }:
         raise ManifestError("manifest.json has an invalid rank result status")
+    metrics = rank_result.get("metrics")
+    if (
+        not isinstance(metrics, dict)
+        or set(metrics)
+        != {"policy", "status", "window_values", "median"}
+        or metrics.get("policy") != RANK_METRIC_POLICY
+        or metrics.get("status") not in {"unavailable", "invalid", "verified"}
+    ):
+        raise ManifestError("manifest.json has invalid ranked metric metadata")
     if status == "verified":
         size = rank_result.get("size_bytes")
         digest = rank_result.get("sha256")
@@ -426,11 +441,39 @@ def validate_rank_result(manifest: dict[str, Any]) -> dict[str, Any]:
             or HEX_64.fullmatch(digest) is None
         ):
             raise ManifestError("manifest.json has an invalid rank result digest")
+        windows = metrics.get("window_values")
+        median = metrics.get("median")
+        canonical_rate = re.compile(r"(?:0|[1-9][0-9]*)\.[0-9]{3}")
+        if (
+            metrics.get("status") != "verified"
+            or not isinstance(windows, list)
+            or len(windows) != 3
+            or any(
+                not isinstance(value, str)
+                or canonical_rate.fullmatch(value) is None
+                for value in windows
+            )
+            or not isinstance(median, str)
+            or canonical_rate.fullmatch(median) is None
+            or Decimal(median) != sorted(Decimal(value) for value in windows)[1]
+        ):
+            raise ManifestError(
+                "manifest.json has invalid ranked NewOrder/min metrics"
+            )
     elif (
         rank_result.get("size_bytes") is not None
         or rank_result.get("sha256") is not None
     ):
         raise ManifestError("manifest.json binds an unavailable rank result")
+    elif (
+        metrics.get("status")
+        != ("invalid" if status == "invalid_metrics" else "unavailable")
+        or metrics.get("window_values") is not None
+        or metrics.get("median") is not None
+    ):
+        raise ManifestError(
+            "manifest.json claims metrics for an unavailable rank result"
+        )
     return rank_result
 
 
@@ -961,14 +1004,26 @@ def load_authoritative_manifest(
             or hashlib.sha256(rank_bytes).hexdigest() != rank_result["sha256"]
         ):
             raise ManifestError("rank.log does not match its manifest binding")
-        rank_text = rank_bytes.decode("utf-8", errors="replace")
-        extract_ranked_new_order_metrics(rank_text)
+        try:
+            rank_text = rank_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ManifestError("rank.log is not valid UTF-8") from error
+        window_values, median = parse_ranked_new_order_metrics(rank_text)
+        if rank_result["metrics"] != {
+            "policy": RANK_METRIC_POLICY,
+            "status": "verified",
+            "window_values": window_values,
+            "median": median,
+        }:
+            raise ManifestError(
+                "rank.log metrics do not match their manifest binding"
+            )
     elif ranking_eligible:
         raise ManifestError("manifest.json does not bind its ranked result")
     return manifest, rank_text
 
 
-def extract_ranked_new_order_metrics(text: str) -> list[str]:
+def parse_ranked_new_order_metrics(text: str) -> tuple[list[str], str]:
     rate = r"(?:0|[1-9][0-9]*)\.[0-9]{3}"
     window_pattern = re.compile(
         rf"^window([1-3]): new_order_per_min=({rate}),"
@@ -1013,9 +1068,17 @@ def extract_ranked_new_order_metrics(text: str) -> list[str]:
         raise ManifestError(
             "rank.log NewOrder/min median disagrees with its windows"
         )
+    return [item[1] for item in windows], medians[0][0]
+
+
+def extract_ranked_new_order_metrics(text: str) -> list[str]:
+    windows, median = parse_ranked_new_order_metrics(text)
     return [
-        *(f"NewOrder/min window{number}: {value}" for number, value, _, _ in windows),
-        f"NewOrder/min median: {medians[0][0]}",
+        *(
+            f"NewOrder/min window{number}: {value}"
+            for number, value in enumerate(windows, start=1)
+        ),
+        f"NewOrder/min median: {median}",
     ]
 
 

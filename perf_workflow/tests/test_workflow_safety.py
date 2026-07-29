@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 from copy import deepcopy
+from decimal import Decimal
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import socket
@@ -45,6 +47,12 @@ class WorkflowSafetyTests(unittest.TestCase):
             "status": "missing",
             "size_bytes": None,
             "sha256": None,
+            "metrics": {
+                "policy": "new_order_three_window_decimal_median_v1",
+                "status": "unavailable",
+                "window_values": None,
+                "median": None,
+            },
         }
         if rank_text is not None:
             if "ranked_new_order_per_min_median=" not in rank_text:
@@ -56,11 +64,39 @@ class WorkflowSafetyTests(unittest.TestCase):
                 )
             rank_bytes = rank_text.encode("utf-8")
             (result_dir / "rank.log").write_bytes(rank_bytes)
+            window_values = re.findall(
+                r"^window[1-3]: new_order_per_min="
+                r"((?:0|[1-9][0-9]*)\.[0-9]{3}),",
+                rank_text,
+                flags=re.MULTILINE,
+            )
+            median_values = re.findall(
+                r"^ranked_new_order_per_min_median="
+                r"((?:0|[1-9][0-9]*)\.[0-9]{3})$",
+                rank_text,
+                flags=re.MULTILINE,
+            )
+            valid_metrics = (
+                len(window_values) == 3
+                and len(median_values) == 1
+                and Decimal(median_values[0])
+                == sorted(Decimal(value) for value in window_values)[1]
+            )
             rank_result = {
                 "path": "rank.log",
-                "status": "verified",
-                "size_bytes": len(rank_bytes),
-                "sha256": hashlib.sha256(rank_bytes).hexdigest(),
+                "status": "verified" if valid_metrics else "invalid_metrics",
+                "size_bytes": len(rank_bytes) if valid_metrics else None,
+                "sha256": (
+                    hashlib.sha256(rank_bytes).hexdigest()
+                    if valid_metrics
+                    else None
+                ),
+                "metrics": {
+                    "policy": "new_order_three_window_decimal_median_v1",
+                    "status": "verified" if valid_metrics else "invalid",
+                    "window_values": window_values if valid_metrics else None,
+                    "median": median_values[0] if valid_metrics else None,
+                },
             }
         state_dir = result_dir / "state"
         state_dir.mkdir(exist_ok=True)
@@ -911,10 +947,18 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
 if "--benchmark" in sys.argv:
     print("Throughput: 1 txn/s")
     print("tpmC: 1")
+    rank_metrics_mode = os.environ.get(
+        "FAKE_TPCC_RANK_METRICS_MODE",
+        "canonical",
+    )
     print("window1: new_order_per_min=1.000, fixture=true")
     print("window2: new_order_per_min=2.000, fixture=true")
-    print("window3: new_order_per_min=3.000, fixture=true")
-    print("ranked_new_order_per_min_median=2.000")
+    if rank_metrics_mode != "missing_window":
+        print("window3: new_order_per_min=3.000, fixture=true")
+    print(
+        "ranked_new_order_per_min_median="
+        + ("3.000" if rank_metrics_mode == "false_median" else "2.000")
+    )
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
     state_dir.mkdir(parents=True, exist_ok=True)
     terminal = state_dir / "terminal_evidence.state"
@@ -2777,6 +2821,54 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             )
             self.assertFalse(manifest["ranking_eligible"])
             self.assertTrue(Path(manifest["paths"]["database"]).is_dir())
+
+    def test_final_manifest_never_accepts_malformed_rank_metrics(self):
+        for mode in ("missing_window", "false_median"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                temp_path = Path(temp)
+                root = self.make_root(temp)
+                server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                    temp_path,
+                    root,
+                )
+                env["FAKE_TPCC_RANK_METRICS_MODE"] = mode
+                records = temp_path / "records"
+                result = self.run_script(
+                    "--mode",
+                    "all",
+                    "--target-dir",
+                    root,
+                    "--record-root",
+                    records,
+                    "--skip-build",
+                    "--server-bin",
+                    server,
+                    "--tpcc-bin",
+                    tester,
+                    "--port",
+                    port,
+                    env=env,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                result_dir = next(records.iterdir())
+                manifest = json.loads(
+                    (result_dir / "manifest.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["status"], "failed")
+                self.assertFalse(manifest["ranking_eligible"])
+                self.assertEqual(
+                    manifest["conformance"],
+                    "not_public_spec_aligned",
+                )
+                self.assertEqual(
+                    manifest["rank_result"]["status"],
+                    "invalid_metrics",
+                )
+                self.assertEqual(
+                    manifest["rank_result"]["metrics"]["status"],
+                    "invalid",
+                )
+                self.assertFalse((result_dir / "summary.md").exists())
 
     def test_custom_recovery_budget_reaches_every_stateful_tester_call(self):
         with tempfile.TemporaryDirectory() as temp:
