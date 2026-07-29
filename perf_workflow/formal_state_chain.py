@@ -59,6 +59,19 @@ class FormalStateError(RuntimeError):
     """The state directory cannot prove one immutable formal chain."""
 
 
+class LegacyStateError(FormalStateError):
+    """A forbidden legacy target or canonical publication temp exists."""
+
+
+class ArtifactShapeError(FormalStateError):
+    """One expected state artifact is missing or has an unsafe shape."""
+
+    def __init__(self, name: str, status: str, message: str):
+        super().__init__(message)
+        self.name = name
+        self.status = status
+
+
 def _u32(value: int) -> bytes:
     if value < 0 or value > (1 << 32) - 1:
         raise FormalStateError("formal chain u32 value is out of range")
@@ -118,7 +131,10 @@ def _validate_directory_entries(directory_descriptor: int) -> None:
         raise FormalStateError("could not enumerate the formal state directory") from error
     for name in entries:
         if name == LEGACY_RUN_LEDGER_FILE or LEGACY_RUN_LEDGER_TEMP.fullmatch(name):
-            raise FormalStateError(f"forbidden legacy state entry is present: {name}")
+            raise LegacyStateError(
+                f"forbidden legacy state entry is present: {name}"
+            )
+    for name in entries:
         if name not in ALLOWED_STATE_FILES:
             raise FormalStateError(f"unknown formal state entry is present: {name}")
         try:
@@ -132,9 +148,17 @@ def _validate_directory_entries(directory_descriptor: int) -> None:
                 f"could not inspect formal state entry: {name}"
             ) from error
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0:
-            raise FormalStateError(f"formal state entry is unsafe: {name}")
+            raise ArtifactShapeError(
+                name,
+                "unsafe",
+                f"formal state entry is unsafe: {name}",
+            )
         if metadata.st_size > MAX_FORMAL_CHAIN_CONTENT_BYTES:
-            raise FormalStateError(f"formal state entry is oversized: {name}")
+            raise ArtifactShapeError(
+                name,
+                "oversized",
+                f"formal state entry is oversized: {name}",
+            )
     if DATABASE_IDENTITY_FILE not in entries:
         raise FormalStateError("database identity is missing from formal state")
 
@@ -147,18 +171,33 @@ def _read_regular_file(directory_descriptor: int, name: str) -> bytes:
             follow_symlinks=False,
         )
     except OSError as error:
-        raise FormalStateError(f"required formal artifact is unavailable: {name}") from error
+        status = "missing" if isinstance(error, FileNotFoundError) else "unsafe"
+        raise ArtifactShapeError(
+            name,
+            status,
+            f"required formal artifact is unavailable: {name}",
+        ) from error
     if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
-        raise FormalStateError(
+        raise ArtifactShapeError(
+            name,
+            "unsafe",
             f"required formal artifact is not a non-empty regular file: {name}"
         )
     if before.st_size > MAX_FORMAL_CHAIN_CONTENT_BYTES:
-        raise FormalStateError(f"required formal artifact is oversized: {name}")
+        raise ArtifactShapeError(
+            name,
+            "oversized",
+            f"required formal artifact is oversized: {name}",
+        )
     if (
         name == TERMINAL_EVIDENCE_FILE
         and before.st_size > MAX_TERMINAL_EVIDENCE_BYTES
     ):
-        raise FormalStateError("terminal evidence is oversized")
+        raise ArtifactShapeError(
+            name,
+            "oversized",
+            "terminal evidence is oversized",
+        )
 
     flags = os.O_RDONLY | os.O_NOFOLLOW
     if hasattr(os, "O_CLOEXEC"):

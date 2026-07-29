@@ -220,6 +220,7 @@ class WorkflowSafetyTests(unittest.TestCase):
             }
         state_dir = result_dir / "state"
         state_dir.mkdir(exist_ok=True)
+        (state_dir / "database.identity").write_bytes(b"summary identity\n")
         terminal_path = state_dir / "terminal_evidence.state"
         terminal_descriptor = {
             "path": str(terminal_path),
@@ -232,14 +233,47 @@ class WorkflowSafetyTests(unittest.TestCase):
             ),
             "sha256": None,
         }
+        formal_chain_descriptor = {
+            "status": attestation_status,
+            "policy": "formal_state_chain_v2",
+            "domain": "RMDB_TPCC_FORMAL_CHAIN_V2\\0",
+            "encoding": (
+                "domain_dev_u64be_ino_u64be_count_u32be_"
+                "name_len_u32be_name_content_len_u64be_"
+                "content_content_len_u64be"
+            ),
+            "state_directory": {"device": None, "inode": None},
+            "file_count": len(FORMAL_STATE_CHAIN.FORMAL_CHAIN_FILES),
+            "files": list(FORMAL_STATE_CHAIN.FORMAL_CHAIN_FILES),
+            "sha256": None,
+        }
         if attestation_status == "verified":
-            terminal_bytes = b"summary terminal evidence fixture\n"
-            terminal_path.write_bytes(terminal_bytes)
+            for name in FORMAL_STATE_CHAIN.FORMAL_CHAIN_FILES:
+                (state_dir / name).write_bytes(
+                    (
+                        b"summary terminal evidence fixture\n"
+                        if name == "terminal_evidence.state"
+                        else (name + " summary fixture\n").encode("ascii")
+                    )
+                )
+            terminal_bytes = terminal_path.read_bytes()
+            formal_inspection = (
+                FORMAL_STATE_CHAIN.inspect_formal_state_path(
+                    state_dir.resolve()
+                )
+            )
             terminal_descriptor.update(
                 status="verified",
                 file_type="regular",
                 size_bytes=len(terminal_bytes),
                 sha256=hashlib.sha256(terminal_bytes).hexdigest(),
+            )
+            formal_chain_descriptor.update(
+                state_directory={
+                    "device": formal_inspection["state_device"],
+                    "inode": formal_inspection["state_inode"],
+                },
+                sha256=formal_inspection["formal_chain_sha256"],
             )
         else:
             try:
@@ -383,13 +417,16 @@ class WorkflowSafetyTests(unittest.TestCase):
             "rank_result": rank_result,
             "formal_state": {
                 "status": attestation_status,
-                "publication_policy": "state_directory_fd_flock_v1",
+                "publication_policy": "state_directory_fd_flock_v2",
                 "terminal_evidence": terminal_descriptor,
                 "legacy_run_ledger": {
                     "path": str(state_dir / "run_ledger.state"),
                     "status": "absent",
-                    "inspection_policy": "state_dir_fd_lstat_only_v1",
+                    "inspection_policy": (
+                        "state_dir_fd_exact_target_and_canonical_temps_v2"
+                    ),
                 },
+                "formal_chain": formal_chain_descriptor,
             },
             "diagnostics": {
                 "requested": False,
@@ -485,7 +522,7 @@ class WorkflowSafetyTests(unittest.TestCase):
             )
             self.assertIn(
                 "formal_state.publication_policy: "
-                "state_directory_fd_flock_v1",
+                "state_directory_fd_flock_v2",
                 result.stdout,
             )
             self.assertIn(
@@ -638,6 +675,35 @@ class WorkflowSafetyTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stdout)
                 self.assertNotIn("12345", result.stdout)
                 self.assertTrue(os.path.lexists(legacy))
+
+    def test_summary_revalidates_formal_chain_and_directory_entry_set(self):
+        mutations = {
+            "legacy temp": lambda state: (
+                state / ".run_ledger.state.18.0.tmp"
+            ).write_bytes(b"legacy temp\n"),
+            "core receipt": lambda state: (
+                state / "recovery_check.passed"
+            ).write_bytes(b"mutated recovery receipt\n"),
+            "unknown": lambda state: (
+                state / "unknown.state"
+            ).write_bytes(b"unknown\n"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                result_dir = Path(temp)
+                self.write_summary_manifest(
+                    result_dir,
+                    status="success",
+                    ranking_eligible=True,
+                    conformance="public_spec_aligned",
+                    attestation_status="verified",
+                    rank_text="Throughput: 12345 txn/s\n",
+                )
+                mutate(result_dir / "state")
+                result = self.run_summary(result_dir)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("metrics: suppressed", result.stdout.lower())
+                self.assertNotIn("12345", result.stdout)
 
     def test_summary_rejects_terminal_descriptor_inconsistency(self):
         mutations = {
@@ -1058,6 +1124,7 @@ while True:
 import os
 import hashlib
 import subprocess
+import struct
 from pathlib import Path
 import sys
 import time
@@ -1094,6 +1161,28 @@ if "--benchmark" in sys.argv:
             output.truncate(16 * 1024 * 1024 + 128 + 4 * 1024 + 1)
     elif terminal_mode != "missing":
         raise RuntimeError(f"unknown terminal mode: {terminal_mode}")
+    formal_files = (
+        "dataset.state",
+        "setup.started",
+        "setup.execution.started",
+        "run_contract.state",
+        "setup_check.started",
+        "setup_check.passed",
+        "rank.started",
+        "terminal_evidence.state",
+        "online_check.started",
+        "float_baseline.state",
+        "crash.intent",
+        "crash.killed",
+        "restart.started",
+        "restart.ready",
+        "recovery_check.started",
+        "recovery_check.passed",
+    )
+    for name in formal_files:
+        artifact = state_dir / name
+        if name != "terminal_evidence.state" and not artifact.exists():
+            artifact.write_bytes((name + " fake formal fixture\\n").encode("ascii"))
     legacy_mode = os.environ.get("FAKE_TPCC_LEGACY_MODE", "absent")
     legacy = state_dir / "run_ledger.state"
     if legacy_mode == "file":
@@ -1133,22 +1222,72 @@ if (
 if "--attest-formal-state" in sys.argv:
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
     terminal = state_dir / "terminal_evidence.state"
+    formal_files = (
+        "dataset.state",
+        "setup.started",
+        "setup.execution.started",
+        "run_contract.state",
+        "setup_check.started",
+        "setup_check.passed",
+        "rank.started",
+        "terminal_evidence.state",
+        "online_check.started",
+        "float_baseline.state",
+        "crash.intent",
+        "crash.killed",
+        "restart.started",
+        "restart.ready",
+        "recovery_check.started",
+        "recovery_check.passed",
+    )
+    def chain_digest(terminal_override=None):
+        metadata = state_dir.stat()
+        digest = hashlib.sha256()
+        digest.update(b"RMDB_TPCC_FORMAL_CHAIN_V2\\0")
+        digest.update(struct.pack(">Q", metadata.st_dev))
+        digest.update(struct.pack(">Q", metadata.st_ino))
+        digest.update(struct.pack(">I", len(formal_files)))
+        for name in formal_files:
+            encoded_name = name.encode("ascii")
+            content = (
+                terminal_override
+                if name == "terminal_evidence.state"
+                and terminal_override is not None
+                else (state_dir / name).read_bytes()
+            )
+            digest.update(struct.pack(">I", len(encoded_name)))
+            digest.update(encoded_name)
+            digest.update(struct.pack(">Q", len(content)))
+            digest.update(content)
+            digest.update(struct.pack(">Q", len(content)))
+        return metadata, digest.hexdigest()
     if os.environ.get("FAKE_TPCC_ABA_TERMINAL") == "1":
         original = terminal.read_bytes()
         replacement = b"ABA replacement validated by fake Rust\\n"
         terminal.write_bytes(replacement)
         attested = replacement
+        state_metadata, attested_chain = chain_digest(replacement)
         terminal.write_bytes(original)
     else:
         attested = terminal.read_bytes()
+        state_metadata, attested_chain = chain_digest()
     receipt = (
-        "FORMAL_STATE_V1 "
+        "FORMAL_STATE_V2 "
         f"terminal_evidence_size={len(attested)} "
-        f"terminal_evidence_sha256={hashlib.sha256(attested).hexdigest()}"
+        f"terminal_evidence_sha256={hashlib.sha256(attested).hexdigest()} "
+        f"formal_chain_sha256={attested_chain} "
+        f"state_device={state_metadata.st_dev} "
+        f"state_inode={state_metadata.st_ino}"
     )
     receipt_mode = os.environ.get("FAKE_TPCC_RECEIPT_MODE", "canonical")
     if receipt_mode == "canonical":
         print(receipt)
+    elif receipt_mode == "binary_noise":
+        sys.stdout.buffer.write(
+            b"\\xffnon-ascii tracing\\n"
+            + receipt.encode("ascii")
+            + b"\\n\\xfeafter receipt\\n"
+        )
     elif receipt_mode == "duplicate":
         print(receipt)
         print(receipt)
@@ -1177,6 +1316,15 @@ if "--attest-formal-state" in sys.argv:
                 "elif mode == 'legacy':\\n"
                 "    (Path(state) / 'run_ledger.state').write_bytes("
                 "b'late legacy\\\\n')\\n"
+                "elif mode == 'legacy_temp':\\n"
+                "    (Path(state) / '.run_ledger.state.99.0.tmp').write_bytes("
+                "b'late legacy temp\\\\n')\\n"
+                "elif mode == 'core':\\n"
+                "    (Path(state) / 'recovery_check.passed').write_bytes("
+                "b'late core mutation\\\\n')\\n"
+                "elif mode == 'unknown':\\n"
+                "    (Path(state) / 'unknown.state').write_bytes("
+                "b'late unknown\\\\n')\\n"
                 "elif mode == 'manifest_failure':\\n"
                 "    result = next(Path(record_root).iterdir())\\n"
                 "    manifest = result / 'manifest.json'\\n"
@@ -2325,36 +2473,32 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 / "terminal_evidence.state"
             )
             terminal_bytes = terminal_path.read_bytes()
+            formal = manifest["formal_state"]
+            self.assertEqual(formal["status"], "verified")
             self.assertEqual(
-                manifest["formal_state"],
+                formal["publication_policy"],
+                "state_directory_fd_flock_v2",
+            )
+            self.assertEqual(
+                formal["terminal_evidence"]["sha256"],
+                hashlib.sha256(terminal_bytes).hexdigest(),
+            )
+            self.assertEqual(
+                formal["legacy_run_ledger"]["inspection_policy"],
+                "state_dir_fd_exact_target_and_canonical_temps_v2",
+            )
+            formal_actual = FORMAL_STATE_CHAIN.inspect_formal_state_path(
+                Path(manifest["paths"]["state"])
+            )
+            self.assertEqual(
+                formal["formal_chain"]["sha256"],
+                formal_actual["formal_chain_sha256"],
+            )
+            self.assertEqual(
+                formal["formal_chain"]["state_directory"],
                 {
-                    "status": "verified",
-                    "publication_policy": "state_directory_fd_flock_v1",
-                    "terminal_evidence": {
-                        "path": str(terminal_path),
-                        "status": "verified",
-                        "file_type": "regular",
-                        "open_policy": (
-                            "state_dir_fd_o_nofollow_sha256_v1"
-                        ),
-                        "size_bytes": len(terminal_bytes),
-                        "max_size_bytes": (
-                            16 * 1024 * 1024 + 128 + 4 * 1024
-                        ),
-                        "sha256": hashlib.sha256(
-                            terminal_bytes
-                        ).hexdigest(),
-                    },
-                    "legacy_run_ledger": {
-                        "path": str(
-                            Path(manifest["paths"]["state"])
-                            / "run_ledger.state"
-                        ),
-                        "status": "absent",
-                        "inspection_policy": (
-                            "state_dir_fd_lstat_only_v1"
-                        ),
-                    },
+                    "device": formal_actual["state_device"],
+                    "inode": formal_actual["state_inode"],
                 },
             )
             events = server_events.read_text(encoding="utf-8").splitlines()
@@ -2532,7 +2676,7 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(
-                "terminal evidence changed during formal state attestation",
+                "formal state chain changed during formal state attestation",
                 result.stderr,
             )
             manifest = json.loads(
@@ -2581,7 +2725,7 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(
-                "terminal evidence changed during formal state attestation",
+                "formal state chain changed during formal state attestation",
                 result.stderr,
             )
             manifest = json.loads(
@@ -2639,6 +2783,40 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                     "failed",
                 )
 
+    def test_formal_state_receipt_ignores_non_ascii_tracing_lines(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            env["FAKE_TPCC_RECEIPT_MODE"] = "binary_noise"
+            records = temp_path / "records"
+            result = self.run_script(
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads(
+                (next(records.iterdir()) / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["formal_state"]["status"], "verified")
+
     def test_final_manifest_publication_uses_state_directory_lock(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
@@ -2685,11 +2863,11 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             )
             self.assertEqual(
                 manifest["formal_state"]["publication_policy"],
-                "state_directory_fd_flock_v1",
+                "state_directory_fd_flock_v2",
             )
 
     def test_final_locked_revalidation_rejects_swap_and_legacy_injection(self):
-        for mode in ("swap", "legacy"):
+        for mode in ("swap", "legacy", "legacy_temp", "core", "unknown"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
                 temp_path = Path(temp)
                 root = self.make_root(temp)
@@ -2743,6 +2921,33 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                     self.assertEqual(
                         legacy.read_bytes(),
                         b"late legacy\n",
+                    )
+                elif mode == "legacy_temp":
+                    legacy_temp = (
+                        Path(manifest["paths"]["state"])
+                        / ".run_ledger.state.99.0.tmp"
+                    )
+                    self.assertEqual(
+                        legacy_temp.read_bytes(),
+                        b"late legacy temp\n",
+                    )
+                elif mode == "core":
+                    recovery_receipt = (
+                        Path(manifest["paths"]["state"])
+                        / "recovery_check.passed"
+                    )
+                    self.assertEqual(
+                        recovery_receipt.read_bytes(),
+                        b"late core mutation\n",
+                    )
+                elif mode == "unknown":
+                    unknown = (
+                        Path(manifest["paths"]["state"])
+                        / "unknown.state"
+                    )
+                    self.assertEqual(
+                        unknown.read_bytes(),
+                        b"late unknown\n",
                     )
 
     def test_manifest_write_failure_never_publishes_ranking_eligibility(self):
@@ -2851,7 +3056,7 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             state_dir = temp_path / "state"
-            state_dir.mkdir()
+            self.write_formal_chain_fixture(state_dir)
             terminal = state_dir / "terminal_evidence.state"
             terminal_bytes = b"terminal evidence race fixture\n"
             terminal.write_bytes(terminal_bytes)
@@ -2880,22 +3085,18 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             result = subprocess.run(
                 [
                     sys.executable,
-                    "-",
-                    str(state_dir),
-                    str(16 * 1024 * 1024 + 128 + 4 * 1024),
+                    str(FORMAL_CHAIN_HELPER),
+                    "--state-dir",
+                    str(state_dir.resolve()),
                 ],
-                input=self.terminal_inspector_source(),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
                 timeout=10,
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(
-                result.stdout.strip(),
-                "legacy_present - - present",
-            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("forbidden legacy state entry", result.stderr)
             self.assertEqual(
                 legacy.read_bytes(),
                 b"late legacy must not be read\n",
@@ -4679,6 +4880,7 @@ finally:
                 Path(temp) / "fake-tpcc",
                 """
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import sys
@@ -4697,13 +4899,45 @@ if "--benchmark" in sys.argv:
     (state_dir / "terminal_evidence.state").write_bytes(
         b"RMDB_TPCC_TERMINAL_EVIDENCE_TEST_V1\\n"
     )
+    formal_files = (
+        "dataset.state",
+        "setup.started",
+        "setup.execution.started",
+        "run_contract.state",
+        "setup_check.started",
+        "setup_check.passed",
+        "rank.started",
+        "terminal_evidence.state",
+        "online_check.started",
+        "float_baseline.state",
+        "crash.intent",
+        "crash.killed",
+        "restart.started",
+        "restart.ready",
+        "recovery_check.started",
+        "recovery_check.passed",
+    )
+    for name in formal_files:
+        artifact = state_dir / name
+        if name != "terminal_evidence.state" and not artifact.exists():
+            artifact.write_bytes((name + " fake formal fixture\\n").encode("ascii"))
 if "--attest-formal-state" in sys.argv:
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
-    terminal = (state_dir / "terminal_evidence.state").read_bytes()
+    spec = importlib.util.spec_from_file_location(
+        "fake_formal_state_chain",
+        os.environ["FAKE_FORMAL_CHAIN_HELPER"],
+    )
+    formal_chain = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(formal_chain)
+    inspection = formal_chain.inspect_formal_state_path(state_dir)
     print(
-        "FORMAL_STATE_V1 "
-        f"terminal_evidence_size={len(terminal)} "
-        f"terminal_evidence_sha256={hashlib.sha256(terminal).hexdigest()}"
+        "FORMAL_STATE_V2 "
+        f"terminal_evidence_size={inspection['terminal_evidence_size']} "
+        "terminal_evidence_sha256="
+        f"{inspection['terminal_evidence_sha256']} "
+        f"formal_chain_sha256={inspection['formal_chain_sha256']} "
+        f"state_device={inspection['state_device']} "
+        f"state_inode={inspection['state_inode']}"
     )
 if "--create-schema" in sys.argv:
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
@@ -4777,6 +5011,7 @@ while :; do sleep 0.05; done
             env = os.environ.copy()
             env["FAKE_TPCC_CALLS"] = str(calls)
             env["FAKE_SERVER_CHILDREN"] = str(server_children)
+            env["FAKE_FORMAL_CHAIN_HELPER"] = str(FORMAL_CHAIN_HELPER)
             env["PATH"] = f"{fake_tools}{os.pathsep}{env['PATH']}"
 
             def recorded_child_pids():

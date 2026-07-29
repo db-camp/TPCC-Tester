@@ -11,6 +11,7 @@ DEFAULT_TPCC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 DIAGNOSTIC_METRICS_HELPER="${SCRIPT_DIR}/diagnostic_metrics.py"
 RESOURCE_HELPER="${RMDB_TPCC_RESOURCE_HELPER_OVERRIDE:-${SCRIPT_DIR}/resource_sampler.py}"
 SUMMARY_HELPER="${SCRIPT_DIR}/summarize_perf_run.py"
+FORMAL_STATE_CHAIN_HELPER="${SCRIPT_DIR}/formal_state_chain.py"
 
 MODE="all"
 LABEL="final2026"
@@ -104,6 +105,9 @@ TERMINAL_EVIDENCE_STATUS="not_applicable"
 TERMINAL_EVIDENCE_SIZE=""
 TERMINAL_EVIDENCE_SHA256=""
 LEGACY_RUN_LEDGER_STATUS="not_applicable"
+FORMAL_CHAIN_SHA256=""
+FORMAL_CHAIN_STATE_DEVICE=""
+FORMAL_CHAIN_STATE_INODE=""
 
 PUBLIC_SCALE=50
 PUBLIC_CLIENTS=32
@@ -1748,6 +1752,8 @@ write_manifest() {
     "${TERMINAL_EVIDENCE_STATUS}" "${TERMINAL_EVIDENCE_SIZE}" \
     "${TERMINAL_EVIDENCE_SHA256}" "${LEGACY_RUN_LEDGER_STATUS}" \
     "${TERMINAL_EVIDENCE_STATE_MAX_BYTES}" \
+    "${FORMAL_CHAIN_SHA256}" "${FORMAL_CHAIN_STATE_DEVICE}" \
+    "${FORMAL_CHAIN_STATE_INODE}" "${FORMAL_STATE_CHAIN_HELPER}" \
     "${TESTER_BINARY_PROVENANCE_STATUS}" "${TPCC_BIN}" \
     "${TESTER_BINARY_SHA256}" "${TESTER_BINARY_DEVICE}" \
     "${TESTER_BINARY_INODE}" "${TESTER_BINARY_SIZE}" \
@@ -1756,6 +1762,7 @@ write_manifest() {
     "${SKIP_BUILD}" <<'PY' || writer_rc=$?
 import fcntl
 from decimal import Decimal
+import importlib.util
 import json
 import hashlib
 import os
@@ -1818,6 +1825,10 @@ import sys
     terminal_evidence_sha256,
     legacy_run_ledger_status,
     terminal_evidence_max_bytes,
+    formal_chain_sha256,
+    formal_chain_state_device,
+    formal_chain_state_inode,
+    formal_state_chain_helper,
     tester_binary_provenance_status,
     tester_binary_path,
     tester_binary_sha256,
@@ -1828,6 +1839,15 @@ import sys
     tester_binary_override,
     skip_build,
 ) = sys.argv[1:]
+
+helper_spec = importlib.util.spec_from_file_location(
+    "workflow_formal_state_chain",
+    formal_state_chain_helper,
+)
+if helper_spec is None or helper_spec.loader is None:
+    raise SystemExit("could not load formal state chain helper")
+formal_chain = importlib.util.module_from_spec(helper_spec)
+helper_spec.loader.exec_module(formal_chain)
 
 artifact_names = {
     "proc_before": "diagnostic_proc_before.json",
@@ -2313,9 +2333,42 @@ terminal_evidence_verified = (
     and terminal_evidence_size_value is not None
     and terminal_evidence_sha256_value is not None
 )
+formal_chain_sha256_value = None
+formal_chain_state_device_value = None
+formal_chain_state_inode_value = None
+if formal_attestation_status == "verified":
+    try:
+        formal_chain_state_device_value = int(formal_chain_state_device)
+        formal_chain_state_inode_value = int(formal_chain_state_inode)
+    except ValueError:
+        formal_attestation_status = "failed"
+    if (
+        formal_attestation_status == "verified"
+        and (
+            str(formal_chain_state_device_value) != formal_chain_state_device
+            or str(formal_chain_state_inode_value) != formal_chain_state_inode
+            or formal_chain_state_device_value < 0
+            or formal_chain_state_inode_value < 0
+            or len(formal_chain_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in formal_chain_sha256
+            )
+        )
+    ):
+        formal_attestation_status = "failed"
+    if formal_attestation_status == "verified":
+        formal_chain_sha256_value = formal_chain_sha256
+formal_chain_verified = (
+    formal_attestation_status == "verified"
+    and terminal_evidence_verified
+    and formal_chain_sha256_value is not None
+    and formal_chain_state_device_value is not None
+    and formal_chain_state_inode_value is not None
+)
 state_lock_descriptor = -1
 publication_revalidation_failed = False
-if formal_attestation_status == "verified" and terminal_evidence_verified:
+if formal_chain_verified:
     try:
         if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
             raise OSError("safe directory open is unavailable")
@@ -2324,100 +2377,31 @@ if formal_attestation_status == "verified" and terminal_evidence_verified:
             directory_flags |= os.O_CLOEXEC
         state_lock_descriptor = os.open(state_dir, directory_flags)
         fcntl.flock(state_lock_descriptor, fcntl.LOCK_EX)
-
-        try:
-            os.stat(
-                "run_ledger.state",
-                dir_fd=state_lock_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            pass
-        else:
-            safe_terminal_evidence_status = "legacy_present"
-            safe_legacy_run_ledger_status = "present"
-            raise RuntimeError("legacy run ledger is present")
-
-        before = os.stat(
-            "terminal_evidence.state",
-            dir_fd=state_lock_descriptor,
-            follow_symlinks=False,
+        locked_formal_chain = formal_chain.inspect_formal_state_fd(
+            state_lock_descriptor,
+            expected_path=state_dir,
         )
         if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_size <= 0
-            or before.st_size > int(terminal_evidence_max_bytes)
+            locked_formal_chain["terminal_evidence_size"]
+            != terminal_evidence_size_value
+            or locked_formal_chain["terminal_evidence_sha256"]
+            != terminal_evidence_sha256_value
         ):
-            raise RuntimeError("terminal evidence is not a bounded regular file")
-        file_flags = os.O_RDONLY | os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            file_flags |= os.O_CLOEXEC
-        descriptor = os.open(
-            "terminal_evidence.state",
-            file_flags,
-            dir_fd=state_lock_descriptor,
-        )
-        try:
-            opened = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_dev != before.st_dev
-                or opened.st_ino != before.st_ino
-                or opened.st_size != before.st_size
-                or opened.st_mtime_ns != before.st_mtime_ns
-            ):
-                raise RuntimeError("terminal evidence changed while opening")
-            digest = hashlib.sha256()
-            remaining = opened.st_size
-            while remaining:
-                chunk = os.read(
-                    descriptor,
-                    min(1024 * 1024, remaining),
-                )
-                if not chunk:
-                    break
-                digest.update(chunk)
-                remaining -= len(chunk)
-            after = os.fstat(descriptor)
-            current = os.stat(
-                "terminal_evidence.state",
-                dir_fd=state_lock_descriptor,
-                follow_symlinks=False,
+            safe_terminal_evidence_status = "changed"
+            raise RuntimeError(
+                "terminal evidence differs from the Rust receipt"
             )
-            if (
-                remaining != 0
-                or after.st_dev != opened.st_dev
-                or after.st_ino != opened.st_ino
-                or after.st_size != opened.st_size
-                or after.st_mtime_ns != opened.st_mtime_ns
-                or current.st_dev != opened.st_dev
-                or current.st_ino != opened.st_ino
-                or current.st_size != opened.st_size
-                or current.st_mtime_ns != opened.st_mtime_ns
-            ):
-                raise RuntimeError("terminal evidence changed while hashing")
-            try:
-                os.stat(
-                    "run_ledger.state",
-                    dir_fd=state_lock_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                pass
-            else:
-                safe_terminal_evidence_status = "legacy_present"
-                safe_legacy_run_ledger_status = "present"
-                raise RuntimeError("legacy run ledger appeared while hashing")
-            if (
-                opened.st_size != terminal_evidence_size_value
-                or digest.hexdigest() != terminal_evidence_sha256_value
-            ):
-                safe_terminal_evidence_status = "changed"
-                raise RuntimeError(
-                    "terminal evidence differs from the Rust receipt"
-                )
-        finally:
-            os.close(descriptor)
+        if (
+            locked_formal_chain["formal_chain_sha256"]
+            != formal_chain_sha256_value
+            or locked_formal_chain["state_device"]
+            != formal_chain_state_device_value
+            or locked_formal_chain["state_inode"]
+            != formal_chain_state_inode_value
+        ):
+            raise RuntimeError(
+                "formal state chain differs from the Rust receipt"
+            )
         locked_rank_result = describe_rank_result()
         if (
             locked_rank_result["status"] != "verified"
@@ -2433,16 +2417,36 @@ if formal_attestation_status == "verified" and terminal_evidence_verified:
                 }
             rank_result = locked_rank_result
             publication_revalidation_failed = True
-    except (OSError, RuntimeError):
+    except formal_chain.LegacyStateError:
         publication_revalidation_failed = True
-        if safe_terminal_evidence_status == "verified":
-            safe_terminal_evidence_status = "changed"
-        if safe_legacy_run_ledger_status != "present":
-            safe_legacy_run_ledger_status = "inspection_failed"
-        terminal_evidence_size_value = None
-        terminal_evidence_sha256_value = None
+        safe_terminal_evidence_status = "legacy_present"
+        safe_legacy_run_ledger_status = "present"
         terminal_evidence_verified = False
-if formal_attestation_status == "verified" and not terminal_evidence_verified:
+        formal_chain_verified = False
+    except formal_chain.ArtifactShapeError as error:
+        publication_revalidation_failed = True
+        if error.name == "terminal_evidence.state":
+            safe_terminal_evidence_status = error.status
+            terminal_evidence_verified = False
+        formal_chain_verified = False
+    except (formal_chain.FormalStateError, OSError, RuntimeError):
+        publication_revalidation_failed = True
+        if (
+            safe_terminal_evidence_status == "verified"
+            and not terminal_evidence_verified
+        ):
+            safe_terminal_evidence_status = "changed"
+        formal_chain_verified = False
+if safe_terminal_evidence_status != "verified":
+    terminal_evidence_verified = False
+if not terminal_evidence_verified:
+    terminal_evidence_size_value = None
+    terminal_evidence_sha256_value = None
+if not formal_chain_verified:
+    formal_chain_sha256_value = None
+    formal_chain_state_device_value = None
+    formal_chain_state_inode_value = None
+if formal_attestation_status == "verified" and not formal_chain_verified:
     formal_attestation_status = "failed"
 phases_verified = (
     mode == "all"
@@ -2589,7 +2593,7 @@ payload = {
     "rank_result": rank_result,
     "formal_state": {
         "status": formal_attestation_status,
-        "publication_policy": "state_directory_fd_flock_v1",
+        "publication_policy": "state_directory_fd_flock_v2",
         "terminal_evidence": {
             "path": str(Path(state_dir) / "terminal_evidence.state"),
             "status": safe_terminal_evidence_status,
@@ -2606,7 +2610,30 @@ payload = {
         "legacy_run_ledger": {
             "path": str(Path(state_dir) / "run_ledger.state"),
             "status": safe_legacy_run_ledger_status,
-            "inspection_policy": "state_dir_fd_lstat_only_v1",
+            "inspection_policy": (
+                "state_dir_fd_exact_target_and_canonical_temps_v2"
+            ),
+        },
+        "formal_chain": {
+            "status": (
+                "verified"
+                if formal_chain_verified
+                else formal_attestation_status
+            ),
+            "policy": "formal_state_chain_v2",
+            "domain": "RMDB_TPCC_FORMAL_CHAIN_V2\\0",
+            "encoding": (
+                "domain_dev_u64be_ino_u64be_count_u32be_"
+                "name_len_u32be_name_content_len_u64be_"
+                "content_content_len_u64be"
+            ),
+            "state_directory": {
+                "device": formal_chain_state_device_value,
+                "inode": formal_chain_state_inode_value,
+            },
+            "file_count": len(formal_chain.FORMAL_CHAIN_FILES),
+            "files": list(formal_chain.FORMAL_CHAIN_FILES),
+            "sha256": formal_chain_sha256_value,
         },
     },
     "phases": {
@@ -2699,6 +2726,9 @@ PY
     TERMINAL_EVIDENCE_SIZE=""
     TERMINAL_EVIDENCE_SHA256=""
     LEGACY_RUN_LEDGER_STATUS="inspection_failed"
+    FORMAL_CHAIN_SHA256=""
+    FORMAL_CHAIN_STATE_DEVICE=""
+    FORMAL_CHAIN_STATE_INODE=""
     MANIFEST_READY=1
     return 42
   fi
@@ -5345,6 +5375,84 @@ PY
   [[ "${status}" == "verified" && "${legacy}" == "absent" ]]
 }
 
+inspect_formal_state_chain() {
+  local inspection=""
+  local status=""
+  local size=""
+  local terminal_digest=""
+  local legacy=""
+  local chain_digest=""
+  local state_device=""
+  local state_inode=""
+  local extra=""
+  if ! inspection="$(
+    python3 - "${FORMAL_STATE_CHAIN_HELPER}" "${STATE_DIR}" <<'PY'
+import importlib.util
+import sys
+
+helper_path, state_dir = sys.argv[1:]
+spec = importlib.util.spec_from_file_location(
+    "workflow_formal_state_chain",
+    helper_path,
+)
+if spec is None or spec.loader is None:
+    print("inspection_failed - - inspection_failed - - -")
+    raise SystemExit(0)
+formal_chain = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(formal_chain)
+try:
+    result = formal_chain.inspect_formal_state_path(state_dir)
+except formal_chain.LegacyStateError:
+    print("legacy_present - - present - - -")
+except formal_chain.ArtifactShapeError as error:
+    status = (
+        error.status
+        if error.name == formal_chain.TERMINAL_EVIDENCE_FILE
+        else "inspection_failed"
+    )
+    print(status, "-", "-", "inspection_failed", "-", "-", "-")
+except formal_chain.FormalStateError:
+    print("inspection_failed - - inspection_failed - - -")
+else:
+    print(
+        "verified",
+        result["terminal_evidence_size"],
+        result["terminal_evidence_sha256"],
+        result["legacy_run_ledger_status"],
+        result["formal_chain_sha256"],
+        result["state_device"],
+        result["state_inode"],
+    )
+PY
+  )"; then
+    inspection="inspection_failed - - inspection_failed - - -"
+  fi
+  read -r status size terminal_digest legacy chain_digest \
+    state_device state_inode extra <<<"${inspection}"
+  TERMINAL_EVIDENCE_STATUS="${status:-inspection_failed}"
+  TERMINAL_EVIDENCE_SIZE=""
+  TERMINAL_EVIDENCE_SHA256=""
+  LEGACY_RUN_LEDGER_STATUS="${legacy:-inspection_failed}"
+  FORMAL_CHAIN_SHA256=""
+  FORMAL_CHAIN_STATE_DEVICE=""
+  FORMAL_CHAIN_STATE_INODE=""
+  if [[ -n "${extra}" || "${status}" != "verified" \
+    || "${legacy}" != "absent" \
+    || ! "${size}" =~ ^[1-9][0-9]*$ \
+    || ! "${terminal_digest}" =~ ^[0-9a-f]{64}$ \
+    || ! "${chain_digest}" =~ ^[0-9a-f]{64}$ \
+    || ! "${state_device}" =~ ^(0|[1-9][0-9]*)$ \
+    || ! "${state_inode}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    return 1
+  fi
+  TERMINAL_EVIDENCE_SIZE="${size}"
+  TERMINAL_EVIDENCE_SHA256="${terminal_digest}"
+  FORMAL_CHAIN_SHA256="${chain_digest}"
+  FORMAL_CHAIN_STATE_DEVICE="${state_device}"
+  FORMAL_CHAIN_STATE_INODE="${state_inode}"
+  return 0
+}
+
 read_formal_state_receipt() {
   local receipt_path="${RESULT_DIR}/formal_state_attestation.log"
   python3 - "${receipt_path}" "${TERMINAL_EVIDENCE_STATE_MAX_BYTES}" <<'PY'
@@ -5404,26 +5512,43 @@ try:
         raise SystemExit(1)
 finally:
     os.close(descriptor)
-try:
-    text = b"".join(chunks).decode("ascii")
-except UnicodeDecodeError:
-    raise SystemExit(1)
 pattern = re.compile(
-    r"^FORMAL_STATE_V1 terminal_evidence_size="
-    r"([1-9][0-9]*) terminal_evidence_sha256=([0-9a-f]{64})$"
+    rb"^FORMAL_STATE_V2 terminal_evidence_size="
+    rb"([1-9][0-9]*) terminal_evidence_sha256=([0-9a-f]{64}) "
+    rb"formal_chain_sha256=([0-9a-f]{64}) "
+    rb"state_device=(0|[1-9][0-9]*) "
+    rb"state_inode=(0|[1-9][0-9]*)$"
 )
 matches = []
-for line in text.splitlines():
+for line in b"".join(chunks).splitlines():
     match = pattern.fullmatch(line)
     if match is not None:
         matches.append(match.groups())
 if len(matches) != 1:
     raise SystemExit(1)
-size_text, digest = matches[0]
+size_bytes, terminal_digest, chain_digest, device_bytes, inode_bytes = matches[0]
+size_text = size_bytes.decode("ascii")
 size = int(size_text)
 if size > maximum or str(size) != size_text:
     raise SystemExit(1)
-print(size, digest)
+device_text = device_bytes.decode("ascii")
+inode_text = inode_bytes.decode("ascii")
+device = int(device_text)
+inode = int(inode_text)
+if (
+    device > (1 << 64) - 1
+    or inode > (1 << 64) - 1
+    or str(device) != device_text
+    or str(inode) != inode_text
+):
+    raise SystemExit(1)
+print(
+    size,
+    terminal_digest.decode("ascii"),
+    chain_digest.decode("ascii"),
+    device,
+    inode,
+)
 PY
 }
 
@@ -5435,52 +5560,75 @@ attest_formal_state() {
   TERMINAL_EVIDENCE_SIZE=""
   TERMINAL_EVIDENCE_SHA256=""
   LEGACY_RUN_LEDGER_STATUS="pending"
+  FORMAL_CHAIN_SHA256=""
+  FORMAL_CHAIN_STATE_DEVICE=""
+  FORMAL_CHAIN_STATE_INODE=""
   write_manifest
-  if ! inspect_terminal_evidence_state; then
+  if ! inspect_formal_state_chain; then
     FORMAL_STATE_ATTESTATION_STATUS="failed"
     write_manifest
-    die "formal state attestation rejected terminal evidence state"
+    die "formal state attestation rejected the required formal state chain"
   fi
   local before_size="${TERMINAL_EVIDENCE_SIZE}"
-  local before_digest="${TERMINAL_EVIDENCE_SHA256}"
+  local before_terminal_digest="${TERMINAL_EVIDENCE_SHA256}"
+  local before_chain_digest="${FORMAL_CHAIN_SHA256}"
+  local before_state_device="${FORMAL_CHAIN_STATE_DEVICE}"
+  local before_state_inode="${FORMAL_CHAIN_STATE_INODE}"
   local receipt=""
   local attested_size=""
-  local attested_digest=""
+  local attested_terminal_digest=""
+  local attested_chain_digest=""
+  local attested_state_device=""
+  local attested_state_inode=""
   local receipt_extra=""
   write_manifest
   if ! run_profile_tester "${RESULT_DIR}/formal_state_attestation.log" \
       --attest-formal-state --profile "${PROFILE}" --seed "${SEED}" \
       --state-dir "${STATE_DIR}"; then
     FORMAL_STATE_ATTESTATION_STATUS="failed"
-    inspect_terminal_evidence_state || true
+    inspect_formal_state_chain || true
     write_manifest
     die "formal state attestation failed; see ${RESULT_DIR}/formal_state_attestation.log"
   fi
   if ! receipt="$(read_formal_state_receipt)"; then
     FORMAL_STATE_ATTESTATION_STATUS="failed"
-    inspect_terminal_evidence_state || true
+    inspect_formal_state_chain || true
     write_manifest
     die "formal state attestation did not emit one canonical receipt"
   fi
-  read -r attested_size attested_digest receipt_extra <<<"${receipt}"
+  read -r attested_size attested_terminal_digest attested_chain_digest \
+    attested_state_device attested_state_inode receipt_extra <<<"${receipt}"
   if [[ -n "${receipt_extra}" || -z "${attested_size}" \
-    || -z "${attested_digest}" ]]; then
+    || -z "${attested_terminal_digest}" \
+    || -z "${attested_chain_digest}" \
+    || -z "${attested_state_device}" \
+    || -z "${attested_state_inode}" ]]; then
     FORMAL_STATE_ATTESTATION_STATUS="failed"
     write_manifest
     die "formal state attestation emitted a malformed receipt"
   fi
-  if ! inspect_terminal_evidence_state \
+  if ! inspect_formal_state_chain \
     || [[ "${before_size}" != "${attested_size}" \
-      || "${before_digest}" != "${attested_digest}" \
+      || "${before_terminal_digest}" != "${attested_terminal_digest}" \
+      || "${before_chain_digest}" != "${attested_chain_digest}" \
+      || "${before_state_device}" != "${attested_state_device}" \
+      || "${before_state_inode}" != "${attested_state_inode}" \
       || "${TERMINAL_EVIDENCE_SIZE}" != "${attested_size}" \
-      || "${TERMINAL_EVIDENCE_SHA256}" != "${attested_digest}" ]]; then
+      || "${TERMINAL_EVIDENCE_SHA256}" \
+        != "${attested_terminal_digest}" \
+      || "${FORMAL_CHAIN_SHA256}" != "${attested_chain_digest}" \
+      || "${FORMAL_CHAIN_STATE_DEVICE}" != "${attested_state_device}" \
+      || "${FORMAL_CHAIN_STATE_INODE}" != "${attested_state_inode}" ]]; then
     [[ "${TERMINAL_EVIDENCE_STATUS}" != "verified" ]] \
       || TERMINAL_EVIDENCE_STATUS="changed"
     TERMINAL_EVIDENCE_SIZE=""
     TERMINAL_EVIDENCE_SHA256=""
+    FORMAL_CHAIN_SHA256=""
+    FORMAL_CHAIN_STATE_DEVICE=""
+    FORMAL_CHAIN_STATE_INODE=""
     FORMAL_STATE_ATTESTATION_STATUS="failed"
     write_manifest
-    die "terminal evidence changed during formal state attestation"
+    die "formal state chain changed during formal state attestation"
   fi
   FORMAL_STATE_ATTESTATION_STATUS="verified"
   write_manifest

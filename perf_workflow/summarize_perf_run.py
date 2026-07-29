@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 from decimal import Decimal
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -11,6 +12,16 @@ import re
 import stat
 import sys
 from typing import Any
+
+
+FORMAL_CHAIN_SPEC = importlib.util.spec_from_file_location(
+    "workflow_formal_state_chain",
+    pathlib.Path(__file__).resolve().with_name("formal_state_chain.py"),
+)
+if FORMAL_CHAIN_SPEC is None or FORMAL_CHAIN_SPEC.loader is None:
+    raise RuntimeError("could not load formal state chain helper")
+FORMAL_STATE_CHAIN = importlib.util.module_from_spec(FORMAL_CHAIN_SPEC)
+FORMAL_CHAIN_SPEC.loader.exec_module(FORMAL_STATE_CHAIN)
 
 
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -627,11 +638,13 @@ def validate_formal_state(
             "publication_policy",
             "terminal_evidence",
             "legacy_run_ledger",
+            "formal_chain",
         }
     ):
         raise ManifestError("manifest.json has invalid formal-state metadata")
     terminal = formal.get("terminal_evidence")
     legacy = formal.get("legacy_run_ledger")
+    chain = formal.get("formal_chain")
     if (
         not isinstance(terminal, dict)
         or set(terminal)
@@ -647,6 +660,18 @@ def validate_formal_state(
         or not isinstance(legacy, dict)
         or set(legacy)
         != {"path", "status", "inspection_policy"}
+        or not isinstance(chain, dict)
+        or set(chain)
+        != {
+            "status",
+            "policy",
+            "domain",
+            "encoding",
+            "state_directory",
+            "file_count",
+            "files",
+            "sha256",
+        }
     ):
         raise ManifestError(
             "manifest.json has invalid terminal evidence descriptors"
@@ -665,13 +690,25 @@ def validate_formal_state(
         )
     if (
         formal.get("publication_policy")
-        != "state_directory_fd_flock_v1"
+        != "state_directory_fd_flock_v2"
         or terminal.get("open_policy")
         != "state_dir_fd_o_nofollow_sha256_v1"
         or terminal.get("max_size_bytes")
         != MAX_TERMINAL_EVIDENCE_STATE_BYTES
         or legacy.get("inspection_policy")
-        != "state_dir_fd_lstat_only_v1"
+        != "state_dir_fd_exact_target_and_canonical_temps_v2"
+        or chain.get("policy") != "formal_state_chain_v2"
+        or chain.get("domain") != "RMDB_TPCC_FORMAL_CHAIN_V2\\0"
+        or chain.get("encoding")
+        != (
+            "domain_dev_u64be_ino_u64be_count_u32be_"
+            "name_len_u32be_name_content_len_u64be_"
+            "content_content_len_u64be"
+        )
+        or chain.get("file_count")
+        != len(FORMAL_STATE_CHAIN.FORMAL_CHAIN_FILES)
+        or chain.get("files")
+        != list(FORMAL_STATE_CHAIN.FORMAL_CHAIN_FILES)
     ):
         raise ManifestError(
             "manifest.json has an invalid formal-state inspection policy"
@@ -699,6 +736,9 @@ def validate_formal_state(
         formal.get("status") != attestation_status
         or terminal.get("status") not in valid_terminal_statuses
         or legacy.get("status") not in valid_legacy_statuses
+        or chain.get("status")
+        not in {"pending", "verified", "failed", "not_applicable"}
+        or chain.get("status") != formal.get("status")
     ):
         raise ManifestError(
             "manifest.json formal-state status contradicts its attestation"
@@ -713,11 +753,30 @@ def validate_formal_state(
             or terminal.get("file_type") is not None
             or terminal.get("size_bytes") is not None
             or terminal.get("sha256") is not None
+            or chain.get("state_directory")
+            != {"device": None, "inode": None}
+            or chain.get("sha256") is not None
         ):
             raise ManifestError(
                 "manifest.json split mode claims terminal evidence"
             )
         return False
+
+    state_identity = chain.get("state_directory")
+    if (
+        not isinstance(state_identity, dict)
+        or set(state_identity) != {"device", "inode"}
+    ):
+        raise ManifestError(
+            "manifest.json has invalid formal state directory identity"
+        )
+    if chain["status"] != "verified" and (
+        state_identity != {"device": None, "inode": None}
+        or chain.get("sha256") is not None
+    ):
+        raise ManifestError(
+            "manifest.json binds an unavailable formal state chain"
+        )
 
     if terminal["status"] != "verified":
         if (
@@ -748,13 +807,39 @@ def validate_formal_state(
         raise ManifestError(
             "manifest.json has an invalid terminal evidence binding"
         )
-    actual_size, actual_digest = inspect_terminal_evidence(state_dir)
-    if size != actual_size or digest != actual_digest:
-        raise ManifestError(
-            "terminal_evidence.state does not match its manifest binding"
-        )
     if formal["status"] != "verified":
         return False
+    state_device = state_identity.get("device")
+    state_inode = state_identity.get("inode")
+    chain_digest = chain.get("sha256")
+    if (
+        not is_int(state_device)
+        or state_device < 0
+        or not is_int(state_inode)
+        or state_inode < 0
+        or not isinstance(chain_digest, str)
+        or HEX_64.fullmatch(chain_digest) is None
+    ):
+        raise ManifestError(
+            "manifest.json has an invalid formal state chain binding"
+        )
+    try:
+        actual = FORMAL_STATE_CHAIN.inspect_formal_state_path(state_dir)
+    except FORMAL_STATE_CHAIN.FormalStateError as error:
+        raise ManifestError(
+            f"formal state chain revalidation failed: {error}"
+        ) from error
+    if (
+        size != actual["terminal_evidence_size"]
+        or digest != actual["terminal_evidence_sha256"]
+        or state_device != actual["state_device"]
+        or state_inode != actual["state_inode"]
+        or chain_digest != actual["formal_chain_sha256"]
+        or actual["legacy_run_ledger_status"] != "absent"
+    ):
+        raise ManifestError(
+            "formal state chain does not match its manifest binding"
+        )
     return True
 
 
