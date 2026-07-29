@@ -1129,7 +1129,7 @@ server_process_helper() {
   local absolute_deadline_millis="${3-0}"
   python3 - "${action}" "${SERVER_PID}" "${SERVER_IDENTITY}" \
     "${SERVER_PGID}" "${PORT}" "${HOST}" "${HOST_VERSION}" "${signal_name}" \
-    "${absolute_deadline_millis}" <<'PY'
+    "${absolute_deadline_millis}" "$$" <<'PY'
 import os
 from pathlib import Path
 import ctypes
@@ -1149,12 +1149,14 @@ import time
     host_version_text,
     signal_name,
     deadline_text,
+    expected_parent_text,
 ) = sys.argv[1:]
 root_pid = int(root_text)
 registered_pgid = int(pgid_text)
 port = int(port_text)
 host_version = int(host_version_text)
 absolute_deadline_millis = int(deadline_text)
+expected_parent_pid = int(expected_parent_text)
 
 
 class DeadlineExpired(Exception):
@@ -1514,6 +1516,14 @@ except RuntimeError as error:
 if action == "root-alive":
     raise SystemExit(0 if status == "owned" else (1 if status == "absent" else 2))
 
+if action == "root-running":
+    if status == "reused":
+        print("registered RMDB pid was reused", file=sys.stderr)
+        raise SystemExit(2)
+    if status == "absent" or table[root_pid]["state"].upper().startswith("Z"):
+        raise SystemExit(1)
+    raise SystemExit(0)
+
 if action == "group-running":
     if status == "reused":
         print("registered RMDB pid was reused", file=sys.stderr)
@@ -1632,6 +1642,53 @@ if action == "signal":
         raise SystemExit(2)
     raise SystemExit(0)
 
+if action == "signal-root":
+    if signal_name != "KILL":
+        print("unregistered RMDB root cleanup only supports SIGKILL", file=sys.stderr)
+        raise SystemExit(2)
+    if status != "owned":
+        print("unregistered RMDB root identity is not live", file=sys.stderr)
+        raise SystemExit(2)
+
+    def validate_unregistered_root(candidate_table):
+        if root_status(candidate_table) != "owned":
+            return False
+        root = candidate_table[root_pid]
+        if root["ppid"] != expected_parent_pid:
+            return False
+        if registered_pgid != root_pid or root["pgrp"] == registered_pgid:
+            return False
+        return descendants(candidate_table) == {root_pid}
+
+    if not validate_unregistered_root(table):
+        print(
+            "refusing to signal an unproven pre-group RMDB child",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    try:
+        refreshed_table = process_table()
+    except (DeadlineExpired, RuntimeError):
+        print(
+            "could not revalidate pre-group RMDB child",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if not validate_unregistered_root(refreshed_table):
+        print(
+            "pre-group RMDB child identity changed during cleanup",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    try:
+        os.kill(root_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        print("permission denied while signaling RMDB child", file=sys.stderr)
+        raise SystemExit(2)
+    raise SystemExit(0)
+
 print(f"unknown process-helper action: {action}", file=sys.stderr)
 raise SystemExit(2)
 PY
@@ -1692,6 +1749,23 @@ wait_for_server_group_exit() {
   local now=""
   while true; do
     if server_process_helper group-running "" "${deadline}"; then
+      :
+    else
+      local status=$?
+      [[ "${status}" == "1" ]] && return 0
+      return "${status}"
+    fi
+    now="$(monotonic_millis)"
+    (( now < deadline )) || return 1
+    sleep 0.05
+  done
+}
+
+wait_for_server_root_exit() {
+  local deadline="$1"
+  local now=""
+  while true; do
+    if server_process_helper root-running "" "${deadline}"; then
       :
     else
       local status=$?
@@ -2373,6 +2447,45 @@ force_stop_server() {
   clear_server_registration
 }
 
+force_stop_unregistered_child() {
+  local listener_timeout_millis="$1"
+  local pid="${SERVER_PID}"
+  local captured_identity="${SERVER_IDENTITY}"
+  local identity_before=""
+  local identity_after=""
+  local proof_deadline=""
+  local process_deadline=""
+  local listener_deadline=""
+  [[ -n "${pid}" ]] || return 0
+
+  proof_deadline=$(( $(monotonic_millis) + 1000 ))
+  identity_before="$(
+    process_identity "${pid}" "${proof_deadline}"
+  )" || return 1
+  if [[ -n "${captured_identity}" \
+    && "${captured_identity}" != "${identity_before}" ]]; then
+    return 1
+  fi
+  process_owner_matches "${pid}" "${proof_deadline}" || return 1
+  identity_after="$(
+    process_identity "${pid}" "${proof_deadline}"
+  )" || return 1
+  [[ "${identity_before}" == "${identity_after}" ]] || return 1
+  SERVER_IDENTITY="${identity_after}"
+  SERVER_PGID="${pid}"
+
+  process_deadline=$(( $(monotonic_millis) + 5000 ))
+  server_process_helper signal-root KILL "${process_deadline}" || return 1
+  wait_for_server_root_exit "${process_deadline}" || return 1
+  wait "${pid}" 2>/dev/null || true
+  listener_deadline=$(( $(monotonic_millis) + listener_timeout_millis ))
+  if ! wait_for_listener_gone "${listener_deadline}"; then
+    clear_server_registration
+    return 1
+  fi
+  clear_server_registration
+}
+
 remove_current_owned_database() {
   [[ "${DB_OWNED}" == "1" ]] || return 0
   [[ "${DB_PATH}" == "${RMDB_DIR}/${DB_NAME}" ]] \
@@ -2678,10 +2791,10 @@ os.execv(sys.argv[1], sys.argv[1:])' \
   SERVER_PGID="${SERVER_PID}"
   if ! register_server_process \
       "${SERVER_PID}" "${readiness_deadline_millis}"; then
-    if [[ -z "${SERVER_IDENTITY}" ]]; then
-      establish_cleanup_identity "${SERVER_PID}" || true
+    if ! force_stop_server 1000 \
+      && ! force_stop_unregistered_child 1000; then
+      warn "could not safely stop RMDB after process registration failure"
     fi
-    force_stop_server 1000 || true
     die "RMDB process registration exceeded the shared readiness budget"
   fi
   start_resource_monitor

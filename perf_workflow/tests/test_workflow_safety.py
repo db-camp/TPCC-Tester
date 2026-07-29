@@ -701,6 +701,76 @@ trap - EXIT
         self.assertLess(group_proof, second_identity)
         self.assertLess(second_identity, equality_proof)
 
+    def test_registration_timeout_kills_stalled_pre_group_launcher(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            stalled_pid = temp_path / "stalled-launcher.pid"
+            fake_tools = temp_path / "fake-tools"
+            fake_tools.mkdir()
+            self.make_executable(
+                fake_tools / "python3",
+                """
+if [[ "${1-}" == "-c" \
+  && "${2-}" == *"os.setpgid(0, 0)"* ]]; then
+  exec "${REAL_WORKFLOW_PYTHON}" -c \
+    'import os
+from pathlib import Path
+import time
+Path(os.environ["STALLED_LAUNCHER_PID"]).write_text(
+    str(os.getpid()), encoding="utf-8"
+)
+time.sleep(60)'
+fi
+exec "${REAL_WORKFLOW_PYTHON}" "$@"
+""",
+            )
+            env["PATH"] = f"{fake_tools}{os.pathsep}{env['PATH']}"
+            env["REAL_WORKFLOW_PYTHON"] = sys.executable
+            env["STALLED_LAUNCHER_PID"] = str(stalled_pid)
+
+            started = time.monotonic()
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                "--allow-deviation",
+                "--ready-timeout-seconds",
+                "1",
+                env=env,
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "process registration exceeded the shared readiness budget",
+                result.stderr,
+            )
+            self.assertTrue(self.wait_for_path(stalled_pid), result.stderr)
+            self.assert_pid_gone(
+                int(stalled_pid.read_text(encoding="utf-8"))
+            )
+            listener_check = socket.socket()
+            try:
+                listener_check.bind(("127.0.0.1", port))
+            finally:
+                listener_check.close()
+            self.assertLess(elapsed, 6.0)
+
     def test_diagnostic_metrics_collect_delta_and_parse_strace(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
