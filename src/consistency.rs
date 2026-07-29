@@ -418,6 +418,8 @@ impl SetupExpectations {
 pub fn setup_plan(input: SetupExpectations) -> Result<ConsistencyPlan, PlanError> {
     let counts = validate_setup_expectations(input)?;
     let initial_new_orders = counts["new_orders"];
+    let initial_orders = counts["orders"];
+    let initial_stock = counts["stock"];
 
     let mut plan = ConsistencyPlan::default();
     for (table, expected) in counts {
@@ -441,29 +443,29 @@ pub fn setup_plan(input: SetupExpectations) -> Result<ConsistencyPlan, PlanError
         CheckScope::Setup,
         "setup.stock.quantity_range",
         "every initial stock quantity is in 10..=100",
-        "SELECT COUNT(*) FROM stock WHERE s_quantity < 10 OR s_quantity > 100",
-        0,
+        "SELECT COUNT(*) FROM stock WHERE s_quantity >= 10 AND s_quantity <= 100",
+        initial_stock,
     ));
     plan.queries.push(int_query(
         CheckScope::Setup,
         "setup.orders.line_count_range",
         "every initial order has 5..=15 lines",
-        "SELECT COUNT(*) FROM orders WHERE o_ol_cnt < 5 OR o_ol_cnt > 15",
-        0,
+        "SELECT COUNT(*) FROM orders WHERE o_ol_cnt >= 5 AND o_ol_cnt <= 15",
+        initial_orders,
     ));
     plan.queries.push(int_query(
         CheckScope::Setup,
         "setup.order_line.quantity",
         "every initial order line has quantity 5",
-        "SELECT COUNT(*) FROM order_line WHERE ol_quantity < 5 OR ol_quantity > 5",
-        0,
+        "SELECT COUNT(*) FROM order_line WHERE ol_quantity = 5",
+        input.order_line_rows,
     ));
     plan.queries.push(int_query(
         CheckScope::Setup,
         "setup.orders.carrier_range",
         "every carrier id is in 0..=10",
-        "SELECT COUNT(*) FROM orders WHERE o_carrier_id < 0 OR o_carrier_id > 10",
-        0,
+        "SELECT COUNT(*) FROM orders WHERE o_carrier_id >= 0 AND o_carrier_id <= 10",
+        initial_orders,
     ));
     plan.queries.push(int_query(
         CheckScope::Setup,
@@ -510,8 +512,8 @@ pub fn setup_plan(input: SetupExpectations) -> Result<ConsistencyPlan, PlanError
             CheckScope::Setup,
             format!("setup.stock.nonzero_{suffix}"),
             format!("every initial stock.{column} value is zero"),
-            format!("SELECT COUNT(*) FROM stock WHERE {column} < 0 OR {column} > 0"),
-            0,
+            format!("SELECT COUNT(*) FROM stock WHERE {column} = 0"),
+            initial_stock,
         ));
     }
     add_key_range_checks(&mut plan, CheckScope::Setup, input.warehouses);
@@ -2603,6 +2605,24 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn setup_valid_row_checks_use_and_only_predicates_and_exact_counts() {
+        let plan = setup_plan(SetupExpectations::final_2026(15_123_456, 4_571_234)).unwrap();
+        for (id, expected) in [
+            ("setup.stock.quantity_range", 5_000_000),
+            ("setup.orders.line_count_range", 1_500_000),
+            ("setup.order_line.quantity", 15_123_456),
+            ("setup.orders.carrier_range", 1_500_000),
+            ("setup.stock.nonzero_ytd", 5_000_000),
+            ("setup.stock.nonzero_order_cnt", 5_000_000),
+            ("setup.stock.nonzero_remote_cnt", 5_000_000),
+        ] {
+            let query = plan.queries.iter().find(|query| query.id == id).unwrap();
+            assert!(!query.sql.contains(" OR "), "{id} still uses boolean OR");
+            assert_eq!(query.expectation, ScalarExpectation::ExactInt(expected));
+        }
     }
 
     #[test]
