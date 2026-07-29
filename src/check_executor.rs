@@ -1407,8 +1407,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::consistency::PUBLIC_RECOVERY_INTEGER_CHECK_COUNT;
     use crate::loader::{LoadSummary, PartitionLoadSummary};
-    use crate::runtime_schema::LogicalTable;
+    use crate::runtime_schema::{LogicalTable, SchemaMode};
     use crate::sample_evidence::setup_evidence_fixture;
 
     fn smoke_dataset(warehouses: i32) -> DatasetState {
@@ -1460,6 +1461,51 @@ mod tests {
             DISTRICTS_PER_WAREHOUSE as usize
         );
         assert!(validate_consistency_warehouse_count(FINAL_WAREHOUSES + 1).is_err());
+    }
+
+    #[test]
+    fn recovery_integer_gate_uses_production_opaque_renderer() {
+        let dataset = smoke_dataset(1);
+        assert_eq!(dataset.runtime_schema.mode(), SchemaMode::LocalSeedOpaqueV1);
+
+        let ledger = RunLedger::default();
+        let expectations =
+            final_expectations(&dataset, &ledger, dataset.initial_order_line_amounts()).unwrap();
+        let plan = recovery_plan(expectations).unwrap();
+        assert_eq!(plan.queries.len(), PUBLIC_RECOVERY_INTEGER_CHECK_COUNT);
+
+        for query in &plan.queries {
+            let rendered = dataset.runtime_schema.render_sql(&query.sql);
+            assert_ne!(rendered, query.sql, "{} was not rendered", query.id);
+
+            let logical_tokens = query
+                .sql
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .collect::<Vec<_>>();
+            let rendered_tokens = rendered
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .collect::<Vec<_>>();
+            let mut rewritten_identifiers = 0;
+            for table in LogicalTable::ALL {
+                for identifier in
+                    std::iter::once(table.canonical()).chain(table.columns().iter().copied())
+                {
+                    if logical_tokens.contains(&identifier) {
+                        rewritten_identifiers += 1;
+                        assert!(
+                            !rendered_tokens.contains(&identifier),
+                            "{} leaked canonical identifier {identifier}",
+                            query.id
+                        );
+                    }
+                }
+            }
+            assert!(
+                rewritten_identifiers > 0,
+                "{} exercised no runtime identifier",
+                query.id
+            );
+        }
     }
 
     #[test]
