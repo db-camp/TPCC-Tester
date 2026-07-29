@@ -92,6 +92,24 @@ pub struct TpccDataGen {
     population_timestamp: String,
 }
 
+/// Constant-time reconstruction of the setup fields that root bad-credit
+/// Customer recovery evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialCustomerProfile {
+    credit: [u8; 2],
+    data: Vec<u8>,
+}
+
+impl InitialCustomerProfile {
+    pub const fn credit(&self) -> &[u8; 2] {
+        &self.credit
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 impl TpccDataGen {
     /// Uses `RMDB_TPCC_SEED` when set, otherwise a documented local seed.
     ///
@@ -363,6 +381,81 @@ impl TpccDataGen {
         })
     }
 
+    fn initial_customer(&self, w_id: i32, d_id: i32, c_id: i32) -> Option<Customer> {
+        if !(1..=self.scale_factor).contains(&w_id)
+            || !(1..=DISTRICTS_PER_WAREHOUSE).contains(&d_id)
+            || !(1..=CUSTOMERS_PER_DISTRICT).contains(&c_id)
+        {
+            return None;
+        }
+        let mut rng = self.row_rng(DOMAIN_CUSTOMER, &[w_id, d_id, c_id]);
+        let credit = if Self::rng_int(&mut rng, 1, 100) <= 90 {
+            "GC"
+        } else {
+            "BC"
+        };
+        let c_last = if c_id <= 1000 {
+            Self::last_name_from_number(c_id - 1)
+        } else {
+            let mut last_rng = self.row_rng(DOMAIN_CUSTOMER_LAST, &[w_id, d_id, c_id]);
+            let number = Self::nurand(
+                &mut last_rng,
+                255,
+                0,
+                999,
+                self.customer_last_name_load_constant(),
+            );
+            Self::last_name_from_number(number)
+        };
+        Some(Customer {
+            c_id,
+            c_d_id: d_id,
+            c_w_id: w_id,
+            c_first: Self::gen_first_name(&mut rng),
+            c_middle: "OE".to_owned(),
+            c_last,
+            c_street_1: Self::gen_street(&mut rng),
+            c_street_2: Self::gen_street(&mut rng),
+            c_city: Self::gen_city(&mut rng),
+            c_state: Self::gen_state(&mut rng),
+            c_zip: Self::gen_zip(&mut rng),
+            c_phone: Self::gen_phone(&mut rng),
+            c_since: self.population_timestamp(),
+            c_credit: credit.to_owned(),
+            c_credit_lim: 50_000,
+            c_discount: Self::gen_discount(&mut rng),
+            c_balance: -10.0,
+            c_ytd_payment: 10.0,
+            c_payment_cnt: 1,
+            c_delivery_cnt: 0,
+            c_data: Self::gen_data(&mut rng, FINAL_CUSTOMER_DATA_LEN, FINAL_CUSTOMER_DATA_LEN),
+        })
+    }
+
+    /// Reconstruct the setup credit and C_DATA for one Customer in constant
+    /// time without scanning or materializing the Customer relation.
+    ///
+    /// The returned values come from the same row constructor used by
+    /// [`Self::generate_customers`], so recovery roots cannot drift from the
+    /// bytes written to the generated CSV.
+    pub fn initial_customer_profile(
+        &self,
+        w_id: i32,
+        d_id: i32,
+        c_id: i32,
+    ) -> Option<InitialCustomerProfile> {
+        let customer = self.initial_customer(w_id, d_id, c_id)?;
+        let credit: [u8; 2] = customer
+            .c_credit
+            .as_bytes()
+            .try_into()
+            .expect("generated Customer credit is exactly two bytes");
+        Some(InitialCustomerProfile {
+            credit,
+            data: customer.c_data.into_bytes(),
+        })
+    }
+
     /// Return the item referenced by one initial order line.
     ///
     /// The loader needs the key before item and stock streaming finishes. This
@@ -457,52 +550,8 @@ impl TpccDataGen {
         (1..=self.scale_factor).flat_map(move |w_id| {
             (1..=DISTRICTS_PER_WAREHOUSE).flat_map(move |d_id| {
                 (1..=CUSTOMERS_PER_DISTRICT).map(move |c_id| {
-                    let mut rng = self.row_rng(DOMAIN_CUSTOMER, &[w_id, d_id, c_id]);
-                    let credit = if Self::rng_int(&mut rng, 1, 100) <= 90 {
-                        "GC"
-                    } else {
-                        "BC"
-                    };
-                    let c_last = if c_id <= 1000 {
-                        Self::last_name_from_number(c_id - 1)
-                    } else {
-                        let mut last_rng = self.row_rng(DOMAIN_CUSTOMER_LAST, &[w_id, d_id, c_id]);
-                        let number = Self::nurand(
-                            &mut last_rng,
-                            255,
-                            0,
-                            999,
-                            self.customer_last_name_load_constant(),
-                        );
-                        Self::last_name_from_number(number)
-                    };
-                    Customer {
-                        c_id,
-                        c_d_id: d_id,
-                        c_w_id: w_id,
-                        c_first: Self::gen_first_name(&mut rng),
-                        c_middle: "OE".to_string(),
-                        c_last,
-                        c_street_1: Self::gen_street(&mut rng),
-                        c_street_2: Self::gen_street(&mut rng),
-                        c_city: Self::gen_city(&mut rng),
-                        c_state: Self::gen_state(&mut rng),
-                        c_zip: Self::gen_zip(&mut rng),
-                        c_phone: Self::gen_phone(&mut rng),
-                        c_since: self.population_timestamp(),
-                        c_credit: credit.to_string(),
-                        c_credit_lim: 50_000,
-                        c_discount: Self::gen_discount(&mut rng),
-                        c_balance: -10.0,
-                        c_ytd_payment: 10.0,
-                        c_payment_cnt: 1,
-                        c_delivery_cnt: 0,
-                        c_data: Self::gen_data(
-                            &mut rng,
-                            FINAL_CUSTOMER_DATA_LEN,
-                            FINAL_CUSTOMER_DATA_LEN,
-                        ),
-                    }
+                    self.initial_customer(w_id, d_id, c_id)
+                        .expect("generated Customer keys are inside the setup domain")
                 })
             })
         })
@@ -928,6 +977,42 @@ mod tests {
         assert!(gen.initial_history(3, 1, 1).is_none());
         assert!(gen.initial_history(1, 11, 1).is_none());
         assert!(gen.initial_history(1, 1, 3_001).is_none());
+    }
+
+    #[test]
+    fn initial_customer_profile_matches_rows_from_full_stream() {
+        let gen = TpccDataGen::with_seed_and_timestamp(
+            2,
+            0x4355_5354_4f4d_5226,
+            "2026-07-29 12:34:56".to_owned(),
+        );
+        let targets = [(1, 1, 1), (1, 7, 997), (2, 3, 2_001), (2, 10, 3_000)];
+        let streamed = gen
+            .generate_customers()
+            .filter(|row| targets.contains(&(row.c_w_id, row.c_d_id, row.c_id)))
+            .collect::<Vec<_>>();
+        assert_eq!(streamed.len(), targets.len());
+        for (warehouse_id, district_id, customer_id) in targets {
+            let row = streamed
+                .iter()
+                .find(|row| {
+                    row.c_w_id == warehouse_id
+                        && row.c_d_id == district_id
+                        && row.c_id == customer_id
+                })
+                .unwrap();
+            let profile = gen
+                .initial_customer_profile(warehouse_id, district_id, customer_id)
+                .unwrap();
+            assert_eq!(profile.credit(), row.c_credit.as_bytes());
+            assert_eq!(profile.data(), row.c_data.as_bytes());
+        }
+        assert!(gen.initial_customer_profile(0, 1, 1).is_none());
+        assert!(gen.initial_customer_profile(1, 0, 1).is_none());
+        assert!(gen.initial_customer_profile(1, 1, 0).is_none());
+        assert!(gen.initial_customer_profile(3, 1, 1).is_none());
+        assert!(gen.initial_customer_profile(1, 11, 1).is_none());
+        assert!(gen.initial_customer_profile(1, 1, 3_001).is_none());
     }
 
     #[test]
