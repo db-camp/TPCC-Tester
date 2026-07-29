@@ -4,6 +4,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{debug, trace};
 
+use crate::connection::prepared::{BatchResponse, Operation, PrepareResponse, Statement};
 use crate::connection::wire::{StreamResponse, WireConnection, WireError, WireValue};
 use crate::error::TpccError;
 
@@ -56,6 +57,42 @@ impl RmdbClient {
             .map_err(map_wire_error)
     }
 
+    pub async fn prepare_set(
+        &mut self,
+        statements: &[Statement],
+    ) -> Result<PrepareResponse, TpccError> {
+        tokio::time::timeout(
+            self.response_timeout,
+            self.connection.prepare_set(statements),
+        )
+        .await
+        .map_err(|_| TpccError::Timeout {
+            context: format!(
+                "等待 PREPARE_SET 完整响应帧超时 ({:?})",
+                self.response_timeout
+            ),
+        })?
+        .map_err(map_wire_error)
+    }
+
+    pub async fn exec_batch(
+        &mut self,
+        operations: &[Operation],
+    ) -> Result<BatchResponse, TpccError> {
+        tokio::time::timeout(
+            self.response_timeout,
+            self.connection.exec_batch(operations),
+        )
+        .await
+        .map_err(|_| TpccError::Timeout {
+            context: format!(
+                "等待 EXEC_BATCH 完整响应帧超时 ({:?})",
+                self.response_timeout
+            ),
+        })?
+        .map_err(map_wire_error)
+    }
+
     /// Transitional text adapter for legacy callers.
     ///
     /// New code should use `exec_stream` so FLOAT32 raw bits and terminal
@@ -81,10 +118,6 @@ impl RmdbClient {
             StreamResponse::TransactionAbort { diagnostic } => Err(TpccError::Abort(diagnostic)),
             StreamResponse::Error { diagnostic } => Err(TpccError::QueryError(diagnostic)),
         }
-    }
-
-    pub fn wire_mut(&mut self) -> &mut WireConnection<TcpStream> {
-        &mut self.connection
     }
 }
 
