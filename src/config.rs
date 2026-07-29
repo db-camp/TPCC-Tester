@@ -419,6 +419,12 @@ impl Config {
                 official: "--create-schema --init".to_owned(),
                 effective: "--create-schema without --init".to_owned(),
             });
+        } else if self.init && !self.create_schema {
+            extra_deviations.push(EffectiveDeviation {
+                field: "setup_actions",
+                official: "--create-schema --init".to_owned(),
+                effective: "--init without --create-schema".to_owned(),
+            });
         }
         if self.canonical_schema {
             extra_deviations.push(EffectiveDeviation {
@@ -746,25 +752,29 @@ mod tests {
     }
 
     #[test]
-    fn standalone_formal_schema_creation_is_an_explicit_deviation() {
-        let formal = Config::try_parse_from([
-            "tpcc-tester",
-            "--create-schema",
-            "--seed",
-            "7",
-        ])
-        .expect("valid CLI syntax");
-        assert!(matches!(
-            formal.validate(),
-            Err(ConfigError::DeviationRequiresOptIn { .. })
-        ));
+    fn partial_setup_actions_are_explicit_deviations() {
+        for action in ["--create-schema", "--init"] {
+            let formal = Config::try_parse_from([
+                "tpcc-tester",
+                action,
+                "--seed",
+                "7",
+                "--state-dir",
+                "/tmp/tpcc-final2026-partial-setup",
+            ])
+            .expect("valid CLI syntax");
+            assert!(matches!(
+                formal.validate(),
+                Err(ConfigError::DeviationRequiresOptIn { .. })
+            ));
 
-        let local = Config {
-            allow_deviation: true,
-            ..formal
-        };
-        local.validate().unwrap();
-        assert!(!local.resolved_profile().unwrap().is_ranked_configuration());
+            let local = Config {
+                allow_deviation: true,
+                ..formal
+            };
+            local.validate().unwrap();
+            assert!(!local.resolved_profile().unwrap().is_ranked_configuration());
+        }
     }
 
     #[test]
