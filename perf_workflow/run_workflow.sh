@@ -5035,6 +5035,22 @@ try:
         ):
             emit("changed", legacy=legacy_status)
             raise SystemExit(0)
+        try:
+            os.stat(
+                legacy_name,
+                dir_fd=state_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError:
+            emit("inspection_failed")
+            raise SystemExit(0)
+        else:
+            # Detect a legacy entry created after the pre-read lstat. It is
+            # still never opened, read, removed, or rewritten.
+            emit("legacy_present", legacy="present")
+            raise SystemExit(0)
         emit("verified", opened.st_size, digest.hexdigest(), legacy_status)
     finally:
         os.close(descriptor)

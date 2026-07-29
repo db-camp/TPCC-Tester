@@ -667,6 +667,16 @@ class WorkflowSafetyTests(unittest.TestCase):
             timeout=10,
         )
 
+    def terminal_inspector_source(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+        prefix = (
+            '    python3 - "${STATE_DIR}" '
+            '"${TERMINAL_EVIDENCE_STATE_MAX_BYTES}" <<\'PY\'\n'
+        )
+        start = script.index(prefix) + len(prefix)
+        end = script.index('\nPY\n  )"; then', start)
+        return script[start:end]
+
     def write_identity_test_dataset(self, state, run_id, seed):
         dataset = state / "dataset.state"
         dataset.write_text(
@@ -2283,6 +2293,61 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                         else "missing-run-ledger-target"
                     )
                     self.assertEqual(legacy.readlink().name, expected)
+
+    def test_terminal_inspector_detects_legacy_created_during_hash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            state_dir = temp_path / "state"
+            state_dir.mkdir()
+            terminal = state_dir / "terminal_evidence.state"
+            terminal_bytes = b"terminal evidence race fixture\n"
+            terminal.write_bytes(terminal_bytes)
+            legacy = state_dir / "run_ledger.state"
+            hook_dir = temp_path / "hook"
+            hook_dir.mkdir()
+            (hook_dir / "sitecustomize.py").write_text(
+                "import os\n"
+                "from pathlib import Path\n"
+                "_original_read = os.read\n"
+                "_created = False\n"
+                "def _late_legacy_read(descriptor, count):\n"
+                "    global _created\n"
+                "    data = _original_read(descriptor, count)\n"
+                "    if not _created:\n"
+                "        _created = True\n"
+                "        Path(os.environ['LATE_LEGACY_PATH']).write_bytes("
+                "b'late legacy must not be read\\n')\n"
+                "    return data\n"
+                "os.read = _late_legacy_read\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(hook_dir)
+            env["LATE_LEGACY_PATH"] = str(legacy)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-",
+                    str(state_dir),
+                    str(16 * 1024 * 1024 + 128 + 4 * 1024),
+                ],
+                input=self.terminal_inspector_source(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.strip(),
+                "legacy_present - - present",
+            )
+            self.assertEqual(
+                legacy.read_bytes(),
+                b"late legacy must not be read\n",
+            )
+            self.assertEqual(terminal.read_bytes(), terminal_bytes)
 
     def test_cleanup_failure_prevents_terminal_success_claim(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4021,6 +4086,11 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
 if "--benchmark" in sys.argv:
     print("Throughput: 1 txn/s")
     print("tpmC: 1")
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "terminal_evidence.state").write_bytes(
+        b"RMDB_TPCC_TERMINAL_EVIDENCE_TEST_V1\\n"
+    )
 if "--create-schema" in sys.argv:
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
     run_id = os.environ["RMDB_TPCC_RUN_ID"]

@@ -547,6 +547,22 @@ def inspect_terminal_evidence(
                 raise ManifestError(
                     "terminal_evidence.state changed while hashing"
                 )
+            try:
+                os.stat(
+                    LEGACY_RUN_LEDGER_FILE,
+                    dir_fd=state_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise ManifestError(
+                    "could not re-inspect forbidden run_ledger.state"
+                ) from error
+            else:
+                raise ManifestError(
+                    "forbidden run_ledger.state appeared while hashing"
+                )
             return opened.st_size, digest.hexdigest()
         finally:
             os.close(descriptor)
