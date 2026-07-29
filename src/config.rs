@@ -146,6 +146,14 @@ pub struct Config {
     #[arg(long = "phase-tail-grace-seconds", default_value_t = 5)]
     pub phase_tail_grace_seconds: u64,
 
+    /// Public recovery restart/readiness budget; workflow must pass its effective value
+    #[arg(
+        long = "recovery-ready-budget-seconds",
+        visible_alias = "ready-timeout-seconds",
+        default_value_t = crate::profile::RECOVERY_READY_BUDGET_SECONDS
+    )]
+    pub recovery_ready_budget_seconds: u64,
+
     /// Run-owned directory for dataset, commit-ledger, and crash baselines
     #[arg(long = "state-dir")]
     pub state_dir: Option<PathBuf>,
@@ -331,6 +339,7 @@ impl Config {
             clients: Some(self.threads as u16),
             warmup_seconds: self.warmup_seconds,
             measurement_seconds: self.window_seconds,
+            recovery_ready_budget_seconds: Some(self.recovery_ready_budget_seconds),
             ..SmokeOverrides::default()
         })?;
 
@@ -383,6 +392,12 @@ impl Config {
                 range: "1..",
             });
         }
+        if self.recovery_ready_budget_seconds == 0 {
+            return Err(ConfigError::OutOfRange {
+                field: "recovery-ready-budget-seconds",
+                range: "1..",
+            });
+        }
         if self.diagnostic_workload_seconds == Some(0) {
             return Err(ConfigError::OutOfRange {
                 field: "diagnostic-workload-seconds",
@@ -397,7 +412,8 @@ impl Config {
 mod tests {
     use super::*;
     use crate::profile::{
-        Conformance, MEASUREMENT_SECONDS, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES, WARMUP_SECONDS,
+        Conformance, MEASUREMENT_SECONDS, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES,
+        RECOVERY_READY_BUDGET_SECONDS, WARMUP_SECONDS,
     };
 
     #[test]
@@ -422,6 +438,10 @@ mod tests {
         assert_eq!(
             resolved.final2026.measurement_window.as_secs(),
             MEASUREMENT_SECONDS
+        );
+        assert_eq!(
+            resolved.final2026.recovery_ready_budget.as_secs(),
+            RECOVERY_READY_BUDGET_SECONDS
         );
         assert_eq!(resolved.final2026.conformance(), Conformance::Official);
         assert_eq!(resolved.seed, Some(73));
@@ -463,6 +483,34 @@ mod tests {
         assert_eq!(resolved.final2026.clients, 3);
         assert_eq!(resolved.final2026.warmup.as_secs(), 0);
         assert_eq!(resolved.final2026.measurement_window.as_secs(), 5);
+    }
+
+    #[test]
+    fn recovery_ready_budget_override_is_explicitly_non_ranked() {
+        let rejected = Config::try_parse_from([
+            "tpcc-tester",
+            "--benchmark",
+            "--seed",
+            "1",
+            "--state-dir",
+            "/tmp/tpcc-final2026-ready-state",
+            "--recovery-ready-budget-seconds",
+            "30",
+        ])
+        .unwrap();
+        assert!(matches!(
+            rejected.validate(),
+            Err(ConfigError::DeviationRequiresOptIn { .. })
+        ));
+
+        let accepted = Config {
+            allow_deviation: true,
+            ..rejected
+        };
+        accepted.validate().unwrap();
+        let resolved = accepted.resolved_profile().unwrap();
+        assert_eq!(resolved.final2026.recovery_ready_budget.as_secs(), 30);
+        assert!(!resolved.is_ranked_configuration());
     }
 
     #[test]
