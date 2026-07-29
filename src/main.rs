@@ -140,18 +140,6 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
     let needs_control_connection =
         config.create_schema || config.init || config.check || config.stats;
     if needs_control_connection {
-        info!("连接 RMDB: {}:{} ...", config.host, config.port);
-        let client = RmdbClient::connect_with_timeout(
-            &config.host,
-            config.port,
-            Duration::from_secs(config.response_timeout_seconds),
-        )
-        .await?;
-        let mut cursor = RmdbCursor::new(client);
-        cursor.client_mut().ping().await?;
-        info!("RMDB 连接正常");
-        let setup_deadline = (config.create_schema || config.init)
-            .then(|| tokio::time::Instant::now() + effective.final2026.load_budget);
         let mut setup_run = if config.init {
             let seed = effective
                 .seed
@@ -167,13 +155,35 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             let contract = run_contract(&config, &effective);
             let claim = store.begin_setup(&run_id, seed, &contract)?;
             info!(
-                "已在首个 DDL/LOAD 前持久化 write-once setup claim: {}",
+                "已在连接/首个 setup SQL 前持久化 write-once setup claim: {}",
                 store.root().join("setup.started").display()
             );
             Some((store, contract, claim, run_id, seed))
         } else {
             None
         };
+
+        info!("连接 RMDB: {}:{} ...", config.host, config.port);
+        let client = RmdbClient::connect_with_timeout(
+            &config.host,
+            config.port,
+            Duration::from_secs(config.response_timeout_seconds),
+        )
+        .await?;
+        let setup_deadline = (config.create_schema || config.init)
+            .then(|| tokio::time::Instant::now() + effective.final2026.load_budget);
+        let mut cursor = RmdbCursor::new(client);
+        if setup_deadline.is_some() {
+            setup_step(
+                setup_deadline,
+                "complete setup Wire readiness probe",
+                cursor.client_mut().ping(),
+            )
+            .await?;
+        } else {
+            cursor.client_mut().ping().await?;
+        }
+        info!("RMDB 连接正常");
 
         if config.create_schema {
             info!("创建 TPC-C 表和索引");
