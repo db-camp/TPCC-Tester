@@ -13,6 +13,7 @@ mod model;
 pub mod phases;
 mod profile;
 mod ranking;
+mod recovery_sample_checker;
 mod report;
 mod routing;
 mod run_state;
