@@ -14,6 +14,11 @@
 //! Customer data has its own independent rank domain. Its Payment chain is
 //! rooted in the deterministic setup Customer row and therefore does not
 //! require a probabilistic key intersection with numeric interval samples.
+//! A caller using out-of-order worker receipts must include
+//! [`RichRecoveryCollector::pending_edges`] in the same composite ACK gate as
+//! numeric interval pending edges: one worker may not receive its next request
+//! while its terminal leaves either collector unrooted. Under that contract
+//! the exact pending-edge count is bounded by the configured client count.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -50,13 +55,6 @@ const DISTRICT_INFO_BYTES: usize = 24;
 const INITIAL_ORDER_ID_CEILING: i32 = CUSTOMERS_PER_DISTRICT as i32;
 const CUSTOMER_INITIAL_PAYMENT_COUNT: i32 = 1;
 const CUSTOMER_INITIAL_DELIVERY_COUNT: i32 = 0;
-const MIN_BAD_CREDIT_PREFIX_BYTES: usize = 15;
-const BAD_CREDIT_SUFFIX_EDGES: usize =
-    MAX_CUSTOMER_DATA_BYTES.div_ceil(MIN_BAD_CREDIT_PREFIX_BYTES);
-const _: () =
-    assert!(BAD_CREDIT_SUFFIX_EDGES * MIN_BAD_CREDIT_PREFIX_BYTES >= MAX_CUSTOMER_DATA_BYTES);
-const _: () =
-    assert!((BAD_CREDIT_SUFFIX_EDGES - 1) * MIN_BAD_CREDIT_PREFIX_BYTES < MAX_CUSTOMER_DATA_BYTES);
 
 const ORDER_SAMPLE_DOMAIN: &[u8] = b"recovery/rich-order/v1";
 const DELIVERY_SAMPLE_DOMAIN: &[u8] = b"recovery/rich-delivery/v1";
@@ -208,6 +206,7 @@ impl SealedDeliveryLine {
 pub struct SealedDeliverySample {
     score: SampleScore,
     key: OrderKey,
+    customer_id: i32,
     carrier_id: u8,
     queue_present: bool,
     delivery_timestamp: Vec<u8>,
@@ -221,6 +220,10 @@ impl SealedDeliverySample {
 
     pub const fn key(&self) -> OrderKey {
         self.key
+    }
+
+    pub const fn customer_id(&self) -> i32 {
+        self.customer_id
     }
 
     pub const fn carrier_id(&self) -> u8 {
@@ -739,6 +742,19 @@ impl<K: Clone + Eq + Ord, V> RankedReservoir<K, V> {
         })
     }
 
+    fn take(&mut self, key: &K) -> Option<(RankedKey<K>, V)> {
+        let score = self.by_key.remove(key)?;
+        let ranked = RankedKey {
+            score,
+            key: key.clone(),
+        };
+        let value = self
+            .entries
+            .remove(&ranked)
+            .expect("rank and key indexes remain synchronized");
+        Some((ranked, value))
+    }
+
     fn observe_rejected(&mut self, candidate: RankedKey<K>) {
         if self
             .rejected
@@ -807,6 +823,7 @@ struct OriginLine {
 
 #[derive(Clone, Debug)]
 struct DeliveryProjection {
+    customer_id: i32,
     carrier_id: u8,
     timestamp: Vec<u8>,
     line_amount_bits: Vec<u32>,
@@ -815,16 +832,21 @@ struct DeliveryProjection {
 #[derive(Clone, Debug)]
 struct CustomerDataState {
     update_count: u64,
-    setup_data: Vec<u8>,
-    suffix: BTreeMap<i32, CustomerDataEdge>,
+    endpoint: CustomerVersion,
+    endpoint_data: Vec<u8>,
+    pending: BTreeMap<i32, CustomerDataEdge>,
 }
 
 impl CustomerDataState {
     fn new(setup_data: Vec<u8>) -> Self {
         Self {
             update_count: 0,
-            setup_data,
-            suffix: BTreeMap::new(),
+            endpoint: CustomerVersion {
+                payment_count: CUSTOMER_INITIAL_PAYMENT_COUNT,
+                delivery_count: CUSTOMER_INITIAL_DELIVERY_COUNT,
+            },
+            endpoint_data: setup_data,
+            pending: BTreeMap::new(),
         }
     }
 }
@@ -833,13 +855,13 @@ impl CustomerDataState {
 struct CustomerDataEdge {
     before_version: CustomerVersion,
     after_version: CustomerVersion,
-    prefix: Vec<u8>,
     before_data: Vec<u8>,
     after_data: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
 struct DeliverySampleState {
+    customer_id: i32,
     carrier_id: u8,
     timestamp: Vec<u8>,
     line_amount_bits: Vec<u32>,
@@ -868,7 +890,6 @@ struct PreparedBadCustomer {
     setup_data: Vec<u8>,
     before_version: CustomerVersion,
     after_version: CustomerVersion,
-    prefix: Vec<u8>,
     data_before: Vec<u8>,
     data_after: Vec<u8>,
 }
@@ -887,7 +908,9 @@ pub struct RichRecoveryCollector {
     orders: RankedReservoir<OrderKey, MutableOrderState>,
     deliveries: RankedReservoir<OrderKey, DeliverySampleState>,
     customers: RankedReservoir<CustomerKey, CustomerDataState>,
+    retired_customers: BTreeMap<CustomerKey, CustomerDataState>,
     histories: RankedReservoir<HistoryTupleKey, HistoryMultiplicity>,
+    pending_customer_edges: usize,
     new_order_commits: u64,
     delivered_orders: u64,
     history_rows: u64,
@@ -907,7 +930,12 @@ impl fmt::Debug for RichRecoveryCollector {
             .field("orders", &self.orders.entries.len())
             .field("deliveries", &self.deliveries.entries.len())
             .field("bad_credit_customers", &self.customers.entries.len())
+            .field(
+                "retired_bad_credit_customers",
+                &self.retired_customers.len(),
+            )
             .field("history_tuples", &self.histories.entries.len())
+            .field("pending_customer_edges", &self.pending_customer_edges)
             .field("poisoned", &self.poisoned.is_some())
             .finish()
     }
@@ -942,7 +970,9 @@ impl RichRecoveryCollector {
             orders: RankedReservoir::new(RICH_RECOVERY_SAMPLE_CAPACITY),
             deliveries: RankedReservoir::new(RICH_RECOVERY_SAMPLE_CAPACITY),
             customers: RankedReservoir::new(RICH_RECOVERY_SAMPLE_CAPACITY),
+            retired_customers: BTreeMap::new(),
             histories: RankedReservoir::new(RICH_HISTORY_SAMPLE_CAPACITY),
+            pending_customer_edges: 0,
             new_order_commits: 0,
             delivered_orders: 0,
             history_rows: 0,
@@ -971,6 +1001,15 @@ impl RichRecoveryCollector {
 
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.is_some()
+    }
+
+    /// Exact number of BC Payment edges that are not yet connected to their
+    /// generated setup root.
+    ///
+    /// The terminal collector must withhold the worker ACK while this count or
+    /// the numeric interval pending count is nonzero.
+    pub const fn pending_edges(&self) -> usize {
+        self.pending_customer_edges
     }
 
     /// Validate and atomically retain the rich state from one terminal.
@@ -1253,7 +1292,7 @@ impl RichRecoveryCollector {
             });
         }
 
-        let bad_credit_prefix = if evidence.customer_is_bad_credit {
+        if evidence.customer_is_bad_credit {
             let prefix = bad_credit_prefix(
                 evidence.customer_id,
                 evidence.customer_district_id,
@@ -1262,25 +1301,17 @@ impl RichRecoveryCollector {
                 evidence.warehouse_id,
                 input.amount_cents(),
             );
-            if prefix.len() < MIN_BAD_CREDIT_PREFIX_BYTES {
-                return Err(RichRecoveryError::InvalidEvidence(
-                    "bad-credit Payment prefix is below its proven minimum",
-                ));
-            }
             let expected = prepend_bad_credit_data(&prefix, &evidence.customer_data_before);
             if evidence.customer_data_after != expected {
                 return Err(RichRecoveryError::InvalidEvidence(
                     "bad-credit Customer data is not the exact frozen Payment transition",
                 ));
             }
-            Some(prefix)
         } else if evidence.customer_data_after != evidence.customer_data_before {
             return Err(RichRecoveryError::InvalidEvidence(
                 "good-credit Payment changed Customer data",
             ));
-        } else {
-            None
-        };
+        }
 
         let history_key = HistoryTupleKey {
             group: HistoryGroupKey {
@@ -1300,7 +1331,6 @@ impl RichRecoveryCollector {
                 setup_data: initial.data,
                 before_version: evidence.customer_version_before,
                 after_version: evidence.customer_version_after,
-                prefix: bad_credit_prefix.expect("bad-credit prefix was constructed"),
                 data_before: evidence.customer_data_before.clone(),
                 data_after: evidence.customer_data_after.clone(),
             })
@@ -1399,6 +1429,7 @@ impl RichRecoveryCollector {
                 order_id: order.order_id,
             };
             let projection = DeliveryProjection {
+                customer_id: order.customer_id,
                 carrier_id,
                 timestamp: order.delivery_timestamp.clone(),
                 line_amount_bits: order.line_amount_bits.clone(),
@@ -1407,6 +1438,7 @@ impl RichRecoveryCollector {
                 key,
                 projection,
                 sample: DeliverySampleState {
+                    customer_id: order.customer_id,
                     carrier_id,
                     timestamp: order.delivery_timestamp.clone(),
                     line_amount_bits: order.line_amount_bits.clone(),
@@ -1489,28 +1521,66 @@ impl RichRecoveryCollector {
         customer: &PreparedBadCustomer,
     ) -> Result<(), RichRecoveryError> {
         let score = bad_customer_score(self.run_seed, customer.key);
-        let Some(_) = self.customers.insertion_eviction(score, &customer.key) else {
-            return Ok(());
+        let (mut state, evicted) = if let Some(state) = self.customers.get(&customer.key) {
+            (state.clone(), None)
+        } else if let Some(state) = self.retired_customers.get(&customer.key) {
+            (state.clone(), None)
+        } else {
+            let Some(evicted) = self.customers.insertion_eviction(score, &customer.key) else {
+                return Ok(());
+            };
+            (CustomerDataState::new(customer.setup_data.clone()), evicted)
         };
-        let mut state = self
-            .customers
-            .get(&customer.key)
-            .cloned()
-            .unwrap_or_else(|| CustomerDataState::new(customer.setup_data.clone()));
+        let old_pending = state.pending.len();
         state.update_count = state
             .update_count
             .checked_add(1)
             .ok_or(RichRecoveryError::Overflow("bad-credit Payment updates"))?;
-        offer_customer_suffix_edge(
+        apply_customer_data_edge(
             &mut state,
             CustomerDataEdge {
                 before_version: customer.before_version,
                 after_version: customer.after_version,
-                prefix: customer.prefix.clone(),
                 before_data: customer.data_before.clone(),
                 after_data: customer.data_after.clone(),
             },
         )?;
+        let projected_pending = self
+            .pending_customer_edges
+            .checked_sub(old_pending)
+            .and_then(|count| count.checked_add(state.pending.len()))
+            .ok_or(RichRecoveryError::Overflow(
+                "bad-credit pending Payment edges",
+            ))?;
+        if projected_pending > usize::from(self.clients) {
+            return Err(RichRecoveryError::PendingCustomerLimit {
+                actual: projected_pending,
+                limit: usize::from(self.clients),
+            });
+        }
+
+        let target_was_retired = self.retired_customers.contains_key(&customer.key);
+        let target_remains_retired = target_was_retired && !state.pending.is_empty();
+        let evicts_pending = evicted.as_ref().is_some_and(|key| {
+            self.customers
+                .get(key)
+                .is_some_and(|state| !state.pending.is_empty())
+        });
+        let projected_retired = self
+            .retired_customers
+            .len()
+            .checked_sub(usize::from(target_was_retired))
+            .and_then(|count| count.checked_add(usize::from(target_remains_retired)))
+            .and_then(|count| count.checked_add(usize::from(evicts_pending)))
+            .ok_or(RichRecoveryError::Overflow(
+                "retired bad-credit Customer chains",
+            ))?;
+        if projected_retired > usize::from(self.clients) {
+            return Err(RichRecoveryError::RetiredCustomerLimit {
+                actual: projected_retired,
+                limit: usize::from(self.clients),
+            });
+        }
         Ok(())
     }
 
@@ -1550,32 +1620,76 @@ impl RichRecoveryCollector {
 
                 if let Some(customer) = bad_customer {
                     let score = bad_customer_score(self.run_seed, customer.key);
-                    let setup_data = customer.setup_data;
-                    if self
-                        .customers
-                        .ensure(score, customer.key, || CustomerDataState::new(setup_data))
-                    {
-                        let mut state = self
-                            .customers
-                            .get(&customer.key)
-                            .cloned()
-                            .expect("a retained bad-credit Customer has state");
+                    if let Some(mut state) = self.retired_customers.remove(&customer.key) {
+                        self.pending_customer_edges -= state.pending.len();
                         state.update_count += 1;
-                        offer_customer_suffix_edge(
+                        apply_customer_data_edge(
                             &mut state,
                             CustomerDataEdge {
                                 before_version: customer.before_version,
                                 after_version: customer.after_version,
-                                prefix: customer.prefix,
                                 before_data: customer.data_before,
                                 after_data: customer.data_after,
                             },
                         )
                         .expect("preflight validated the bad-credit data edge");
+                        self.pending_customer_edges += state.pending.len();
+                        if state.pending.is_empty() {
+                            validate_rooted_customer_state(&state)
+                                .expect("preflight validated the retired rooted chain");
+                        } else {
+                            self.retired_customers.insert(customer.key, state);
+                        }
+                    } else if self.customers.get(&customer.key).is_some() {
+                        let mut state = self
+                            .customers
+                            .get(&customer.key)
+                            .cloned()
+                            .expect("a retained bad-credit Customer has state");
+                        self.pending_customer_edges -= state.pending.len();
+                        state.update_count += 1;
+                        apply_customer_data_edge(
+                            &mut state,
+                            CustomerDataEdge {
+                                before_version: customer.before_version,
+                                after_version: customer.after_version,
+                                before_data: customer.data_before,
+                                after_data: customer.data_after,
+                            },
+                        )
+                        .expect("preflight validated the bad-credit data edge");
+                        self.pending_customer_edges += state.pending.len();
                         *self
                             .customers
                             .get_mut(&customer.key)
                             .expect("retained bad-credit Customer remains selected") = state;
+                    } else if let Some(evicted) =
+                        self.customers.insertion_eviction(score, &customer.key)
+                    {
+                        if let Some(evicted_key) = evicted {
+                            let (ranked, state) = self
+                                .customers
+                                .take(&evicted_key)
+                                .expect("preflight selected an existing eviction key");
+                            self.customers.observe_rejected(ranked);
+                            if !state.pending.is_empty() {
+                                self.retired_customers.insert(evicted_key, state);
+                            }
+                        }
+                        let mut state = CustomerDataState::new(customer.setup_data);
+                        state.update_count = 1;
+                        apply_customer_data_edge(
+                            &mut state,
+                            CustomerDataEdge {
+                                before_version: customer.before_version,
+                                after_version: customer.after_version,
+                                before_data: customer.data_before,
+                                after_data: customer.data_after,
+                            },
+                        )
+                        .expect("preflight validated the new bad-credit data edge");
+                        self.pending_customer_edges += state.pending.len();
+                        assert!(self.customers.ensure(score, customer.key, || state));
                     }
                     self.bad_credit_payments += 1;
                 }
@@ -1618,6 +1732,34 @@ impl RichRecoveryCollector {
         if intervals.warehouses() != self.warehouses || intervals.sample_seed() != self.run_seed {
             return Err(RichRecoveryError::IntervalBindingMismatch);
         }
+        let recomputed_pending = self
+            .customers
+            .entries
+            .values()
+            .chain(self.retired_customers.values())
+            .try_fold(0_usize, |total, state| {
+                total
+                    .checked_add(state.pending.len())
+                    .ok_or(RichRecoveryError::Overflow(
+                        "bad-credit pending Payment edges",
+                    ))
+            })?;
+        if recomputed_pending != self.pending_customer_edges
+            || self
+                .retired_customers
+                .values()
+                .any(|state| state.pending.is_empty())
+            || self.retired_customers.len() > self.pending_customer_edges
+        {
+            return Err(RichRecoveryError::InvalidEvidence(
+                "bad-credit pending and retired chain accounting is inconsistent",
+            ));
+        }
+        if self.pending_customer_edges != 0 {
+            return Err(RichRecoveryError::DisconnectedCustomerData {
+                pending: self.pending_customer_edges,
+            });
+        }
         let selected_orders = self.orders.entries.len() as u64;
         self.orders.validate_cutoff(
             "NewOrder final state",
@@ -1635,6 +1777,7 @@ impl RichRecoveryCollector {
                 .entries
                 .values()
                 .try_fold(0_u64, |total, state| {
+                    validate_rooted_customer_state(state)?;
                     total
                         .checked_add(state.update_count)
                         .ok_or(RichRecoveryError::Overflow(
@@ -1778,6 +1921,7 @@ impl RichRecoveryCollector {
             deliveries.push(SealedDeliverySample {
                 score: ranked.score,
                 key: ranked.key,
+                customer_id: state.customer_id,
                 carrier_id: state.carrier_id,
                 queue_present: false,
                 delivery_timestamp: state.timestamp,
@@ -1787,13 +1931,13 @@ impl RichRecoveryCollector {
 
         let mut bad_credit_customers = Vec::with_capacity(self.customers.entries.len());
         for (ranked, state) in self.customers.entries {
-            let endpoint = validate_customer_suffix(&state)?;
+            validate_rooted_customer_state(&state)?;
             bad_credit_customers.push(SealedBadCreditCustomerSample {
                 score: ranked.score,
                 key: ranked.key,
-                final_payment_count: endpoint.after_version.payment_count,
+                final_payment_count: state.endpoint.payment_count,
                 credit: *b"BC",
-                data: endpoint.after_data.clone(),
+                data: state.endpoint_data,
                 committed_payment_updates: state.update_count,
             });
         }
@@ -1883,13 +2027,7 @@ impl RichRecoveryCollector {
         }
         for (ranked, customer) in &self.customers.entries {
             size = checked_size_add(size, 48 + customer_key_size(ranked.key))?;
-            size = checked_size_add(
-                size,
-                customer
-                    .suffix
-                    .last_key_value()
-                    .map_or(0, |(_, edge)| edge.after_data.len()),
-            )?;
+            size = checked_size_add(size, customer.endpoint_data.len())?;
         }
         for (ranked, _) in &self.histories.entries {
             size = checked_size_add(
@@ -1942,6 +2080,12 @@ pub enum RichRecoveryError {
         generated: [u8; 2],
         claimed_bad_credit: bool,
     },
+    #[error("bad-credit Customer data has {actual} pending edges, limit is {limit}")]
+    PendingCustomerLimit { actual: usize, limit: usize },
+    #[error("bad-credit Customer data has {actual} retired chains, limit is {limit}")]
+    RetiredCustomerLimit { actual: usize, limit: usize },
+    #[error("bad-credit Customer data has {pending} disconnected edges at seal")]
+    DisconnectedCustomerData { pending: usize },
     #[error("rich recovery and numeric interval run bindings differ")]
     IntervalBindingMismatch,
 }
@@ -2000,59 +2144,83 @@ fn validate_customer_transition(
     Ok(())
 }
 
-fn offer_customer_suffix_edge(
+fn apply_customer_data_edge(
     state: &mut CustomerDataState,
     edge: CustomerDataEdge,
 ) -> Result<(), RichRecoveryError> {
-    let count = edge.after_version.payment_count;
-    if state.suffix.contains_key(&count) {
+    if edge.before_version.payment_count < state.endpoint.payment_count {
         return Err(RichRecoveryError::InvalidEvidence(
-            "one bad-credit Payment version was offered more than once",
+            "bad-credit Payment edge precedes the rooted data endpoint",
         ));
     }
-    if edge.prefix.len() < MIN_BAD_CREDIT_PREFIX_BYTES
-        || prepend_bad_credit_data(&edge.prefix, &edge.before_data) != edge.after_data
-    {
+
+    if edge.before_version.payment_count == state.endpoint.payment_count {
+        if state.endpoint_data != edge.before_data {
+            return Err(RichRecoveryError::InvalidEvidence(
+                "bad-credit Payment before-data does not continue the rooted chain",
+            ));
+        }
+        if edge.before_version.delivery_count < state.endpoint.delivery_count {
+            return Err(RichRecoveryError::InvalidEvidence(
+                "bad-credit Customer delivery version moved backwards",
+            ));
+        }
+        state.endpoint = edge.after_version;
+        state.endpoint_data = edge.after_data;
+        while let Some(next) = state.pending.remove(&state.endpoint.payment_count) {
+            if state.endpoint_data != next.before_data {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "pending bad-credit Payment data does not continue the rooted chain",
+                ));
+            }
+            if next.before_version.delivery_count < state.endpoint.delivery_count {
+                return Err(RichRecoveryError::InvalidEvidence(
+                    "pending bad-credit Customer delivery version moved backwards",
+                ));
+            }
+            state.endpoint = next.after_version;
+            state.endpoint_data = next.after_data;
+        }
+        return Ok(());
+    }
+
+    let start = edge.before_version.payment_count;
+    if state.pending.contains_key(&start) {
         return Err(RichRecoveryError::InvalidEvidence(
-            "bad-credit Payment edge has an invalid prefix transition",
+            "one bad-credit Payment edge was offered more than once",
         ));
     }
-    if let Some((_, predecessor)) = state.suffix.range(..count).next_back() {
-        if predecessor.after_version.payment_count == edge.before_version.payment_count
+    if let Some((_, predecessor)) = state.pending.range(..start).next_back() {
+        if predecessor.after_version.payment_count == start
             && (predecessor.after_data != edge.before_data
                 || edge.before_version.delivery_count < predecessor.after_version.delivery_count)
         {
             return Err(RichRecoveryError::InvalidEvidence(
-                "bad-credit Payment edge disagrees with its retained predecessor",
+                "bad-credit pending Payment edges disagree",
             ));
         }
     }
-    if let Some((_, successor)) = state.suffix.range(count..).next() {
+    if let Some((_, successor)) = state.pending.range(start..).next() {
         if edge.after_version.payment_count == successor.before_version.payment_count
             && (edge.after_data != successor.before_data
                 || successor.before_version.delivery_count < edge.after_version.delivery_count)
         {
             return Err(RichRecoveryError::InvalidEvidence(
-                "bad-credit Payment edge disagrees with its retained successor",
+                "bad-credit pending Payment edges disagree",
             ));
         }
     }
-    state.suffix.insert(count, edge);
-    if state.suffix.len() > BAD_CREDIT_SUFFIX_EDGES {
-        let oldest = *state
-            .suffix
-            .first_key_value()
-            .map(|(count, _)| count)
-            .expect("an oversized suffix is nonempty");
-        state.suffix.remove(&oldest);
-    }
+    state.pending.insert(start, edge);
     Ok(())
 }
 
-fn validate_customer_suffix(
-    state: &CustomerDataState,
-) -> Result<&CustomerDataEdge, RichRecoveryError> {
-    let expected_latest = i64::from(CUSTOMER_INITIAL_PAYMENT_COUNT)
+fn validate_rooted_customer_state(state: &CustomerDataState) -> Result<(), RichRecoveryError> {
+    if !state.pending.is_empty() {
+        return Err(RichRecoveryError::DisconnectedCustomerData {
+            pending: state.pending.len(),
+        });
+    }
+    let expected_payment_count = i64::from(CUSTOMER_INITIAL_PAYMENT_COUNT)
         .checked_add(
             i64::try_from(state.update_count)
                 .map_err(|_| RichRecoveryError::Overflow("bad-credit Customer update count"))?,
@@ -2060,60 +2228,23 @@ fn validate_customer_suffix(
         .ok_or(RichRecoveryError::Overflow(
             "bad-credit Customer payment count",
         ))?;
-    let Some((&latest_count, latest)) = state.suffix.last_key_value() else {
+    if i64::from(state.endpoint.payment_count) != expected_payment_count {
         return Err(RichRecoveryError::InvalidEvidence(
-            "retained bad-credit Customer has no Payment suffix",
-        ));
-    };
-    if i64::from(latest_count) != expected_latest {
-        return Err(RichRecoveryError::InvalidEvidence(
-            "bad-credit Payment versions are not a complete rooted count sequence",
+            "bad-credit c_data chain is not complete and rooted",
         ));
     }
-
-    let mut previous: Option<&CustomerDataEdge> = None;
-    let mut covered_bytes = 0_usize;
-    for edge in state.suffix.values() {
-        if let Some(prior) = previous {
-            if prior.after_version.payment_count != edge.before_version.payment_count
-                || prior.after_data != edge.before_data
-                || edge.before_version.delivery_count < prior.after_version.delivery_count
-            {
-                return Err(RichRecoveryError::InvalidEvidence(
-                    "bad-credit latest Payment suffix is not one monotone data chain",
-                ));
-            }
-        }
-        covered_bytes =
-            covered_bytes
-                .checked_add(edge.prefix.len())
-                .ok_or(RichRecoveryError::Overflow(
-                    "bad-credit retained prefix bytes",
-                ))?;
-        previous = Some(edge);
-    }
-
-    let first = state
-        .suffix
-        .first_key_value()
-        .map(|(_, edge)| edge)
-        .expect("validated suffix is nonempty");
-    if covered_bytes < MAX_CUSTOMER_DATA_BYTES {
-        if first.before_version.payment_count != CUSTOMER_INITIAL_PAYMENT_COUNT
-            || first.before_data != state.setup_data
-        {
-            return Err(RichRecoveryError::InvalidEvidence(
-                "short bad-credit Payment suffix is not rooted in setup data",
-            ));
-        }
-    }
-    Ok(latest)
+    Ok(())
 }
 
 fn validate_origin_delivery(
     origin: &OrderOrigin,
     delivery: &DeliveryProjection,
 ) -> Result<(), RichRecoveryError> {
+    if i32::from(origin.customer_id) != delivery.customer_id {
+        return Err(RichRecoveryError::InvalidEvidence(
+            "Delivery Customer differs from retained NewOrder state",
+        ));
+    }
     if origin.lines.len() != delivery.line_amount_bits.len() {
         return Err(RichRecoveryError::InvalidEvidence(
             "Delivery line count differs from retained NewOrder state",
@@ -2410,7 +2541,7 @@ fn sealed_raw_size(
         }
     }
     for delivery in deliveries {
-        size = checked_size_add(size, 64 + delivery.delivery_timestamp.len())?;
+        size = checked_size_add(size, 68 + delivery.delivery_timestamp.len())?;
         for line in &delivery.lines {
             size = checked_size_add(size, 12 + line.delivery_timestamp.len())?;
         }
@@ -2449,6 +2580,7 @@ const MAX_FINAL_ORDER_BYTES: usize = 48
     + MAX_ENTRY_TIMESTAMP_BYTES
     + MAX_ORDER_LINES as usize * (20 + MAX_DELIVERY_TIMESTAMP_BYTES + 24);
 const MAX_DELIVERY_BYTES: usize = 64
+    + 4
     + MAX_DELIVERY_TIMESTAMP_BYTES
     + MAX_ORDER_LINES as usize * (12 + MAX_DELIVERY_TIMESTAMP_BYTES);
 const MAX_BAD_CUSTOMER_BYTES: usize = 48 + MAX_CUSTOMER_DATA_BYTES;
@@ -2707,8 +2839,51 @@ mod tests {
             .collect()
     }
 
+    fn unrooted_customer_state(start: i32) -> CustomerDataState {
+        let mut state = CustomerDataState::new(b"old-data".to_vec());
+        state.update_count = 1;
+        state.pending.insert(
+            start,
+            CustomerDataEdge {
+                before_version: CustomerVersion {
+                    payment_count: start,
+                    delivery_count: 0,
+                },
+                after_version: CustomerVersion {
+                    payment_count: start + 1,
+                    delivery_count: 0,
+                },
+                before_data: b"before".to_vec(),
+                after_data: b"after".to_vec(),
+            },
+        );
+        state
+    }
+
+    fn prepared_bad_customer(key: CustomerKey, before_count: i32) -> PreparedBadCustomer {
+        PreparedBadCustomer {
+            key,
+            setup_data: b"old-data".to_vec(),
+            before_version: CustomerVersion {
+                payment_count: before_count,
+                delivery_count: 0,
+            },
+            after_version: CustomerVersion {
+                payment_count: before_count + 1,
+                delivery_count: 0,
+            },
+            data_before: if before_count == CUSTOMER_INITIAL_PAYMENT_COUNT {
+                b"old-data".to_vec()
+            } else {
+                b"before".to_vec()
+            },
+            data_after: b"after".to_vec(),
+        }
+    }
+
     fn delivery_evidence(
         key: OrderKey,
+        customer_id: i32,
         timestamp: &[u8],
         line_amount_bits: Vec<u32>,
     ) -> DeliveredOrderEvidence {
@@ -2718,7 +2893,7 @@ mod tests {
             warehouse_id: key.warehouse_id,
             district_id: key.district_id,
             order_id: key.order_id,
-            customer_id: 1,
+            customer_id,
             line_count: line_amount_bits.len() as u8,
             amount_bits,
             customer_balance_before_bits: 10.0_f32.to_bits(),
@@ -2750,7 +2925,16 @@ mod tests {
             TransactionParameters::Delivery(input) => input.carrier_id(),
             _ => unreachable!(),
         };
-        let delivered = delivery_evidence(key, TEST_TIMESTAMP, evidence.line_amount_bits.clone());
+        let customer_id = match new_order_ticket.parameters() {
+            TransactionParameters::NewOrder(input) => i32::from(input.customer_id()),
+            _ => unreachable!(),
+        };
+        let delivered = delivery_evidence(
+            key,
+            customer_id,
+            TEST_TIMESTAMP,
+            evidence.line_amount_bits.clone(),
+        );
 
         let mut first = collector();
         first
@@ -2789,10 +2973,70 @@ mod tests {
         let sample = &left.new_orders()[0];
         assert_eq!(sample.carrier_id(), carrier);
         assert!(!sample.queue_present());
+        assert_eq!(left.deliveries()[0].customer_id(), customer_id);
         assert!(sample
             .lines()
             .iter()
             .all(|line| line.delivery_timestamp() == TEST_TIMESTAMP));
+    }
+
+    #[test]
+    fn delivery_customer_must_match_new_order_in_both_arrival_orders() {
+        let new_order_ticket = normal_new_order_ticket();
+        let evidence = new_order_evidence(&new_order_ticket, 3_001);
+        let key = OrderKey {
+            warehouse_id: evidence.warehouse_id,
+            district_id: evidence.district_id,
+            order_id: evidence.order_id,
+        };
+        let expected_customer = match new_order_ticket.parameters() {
+            TransactionParameters::NewOrder(input) => i32::from(input.customer_id()),
+            _ => unreachable!(),
+        };
+        let wrong_customer = if expected_customer == i32::from(CUSTOMERS_PER_DISTRICT) {
+            1
+        } else {
+            expected_customer + 1
+        };
+        let delivery_ticket = delivery_ticket(Some(key.warehouse_id));
+        let wrong_delivery = delivery_evidence(
+            key,
+            wrong_customer,
+            TEST_TIMESTAMP,
+            evidence.line_amount_bits.clone(),
+        );
+
+        let mut origin_first = collector();
+        origin_first
+            .offer_terminal(
+                &new_order_ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::NewOrder(evidence.clone())),
+            )
+            .unwrap();
+        assert!(origin_first
+            .offer_terminal(
+                &delivery_ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::Delivery(vec![
+                    wrong_delivery.clone(),
+                ])),
+            )
+            .is_err());
+        assert_eq!(origin_first.delivered_orders, 0);
+
+        let mut delivery_first = collector();
+        delivery_first
+            .offer_terminal(
+                &delivery_ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::Delivery(vec![wrong_delivery])),
+            )
+            .unwrap();
+        assert!(delivery_first
+            .offer_terminal(
+                &new_order_ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::NewOrder(evidence)),
+            )
+            .is_err());
+        assert_eq!(delivery_first.new_order_commits, 0);
     }
 
     #[test]
@@ -2866,13 +3110,13 @@ mod tests {
     }
 
     #[test]
-    fn bad_credit_suffix_accepts_reverse_and_one_gap_beyond_client_count() {
+    fn bad_credit_root_chain_accepts_reverse_and_bridges_at_pending_cap() {
         let ticket = local_payment_ticket();
-        let chain = bad_credit_chain(&ticket, BAD_CREDIT_SUFFIX_EDGES + 3);
+        let chain = bad_credit_chain(&ticket, 5);
         let final_data = chain.last().unwrap().customer_data_after.clone();
         let final_count = chain.last().unwrap().customer_version_after.payment_count;
 
-        let mut reverse = collector();
+        let mut reverse = collector_with_customer(*b"BC", b"old-data", 5);
         for evidence in chain.iter().rev().cloned() {
             reverse
                 .offer_terminal(
@@ -2881,6 +3125,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        assert_eq!(reverse.pending_edges(), 0);
         let reverse = reverse.seal(&empty_intervals()).unwrap();
         assert_eq!(reverse.bad_credit_customers()[0].final_data(), final_data);
         assert_eq!(
@@ -2888,33 +3133,97 @@ mod tests {
             final_count
         );
 
-        // One early receipt is delayed while more than `clients` later
-        // terminals arrive. Keeping only the latest four prefixes must not
-        // impose a false receipt-window limit.
-        let mut gap = collector_with_customer(*b"BC", b"old-data", 1);
+        // The composite ACK contract allows at most one unrooted receipt per
+        // client. Three successors may wait behind one gap at clients=3, and
+        // the bridge drains all three exactly.
+        let mut gap = collector_with_customer(*b"BC", b"old-data", 3);
         gap.offer_terminal(
             &ticket,
             &RankedTransactionOutcome::Committed(RankedCommit::Payment(chain[0].clone())),
         )
         .unwrap();
-        for evidence in chain.iter().skip(2).cloned() {
+        for evidence in chain.iter().skip(2).take(3).cloned() {
             gap.offer_terminal(
                 &ticket,
                 &RankedTransactionOutcome::Committed(RankedCommit::Payment(evidence)),
             )
             .unwrap();
         }
+        assert_eq!(gap.pending_edges(), 3);
         gap.offer_terminal(
             &ticket,
             &RankedTransactionOutcome::Committed(RankedCommit::Payment(chain[1].clone())),
         )
         .unwrap();
+        assert_eq!(gap.pending_edges(), 0);
         let gap = gap.seal(&empty_intervals()).unwrap();
         assert_eq!(gap.bad_credit_customers()[0].final_data(), final_data);
         assert_eq!(
             gap.bad_credit_customers()[0].committed_payment_updates(),
             chain.len() as u64
         );
+    }
+
+    #[test]
+    fn bad_credit_pending_cap_plus_one_fails_closed() {
+        let ticket = local_payment_ticket();
+        let chain = bad_credit_chain(&ticket, 6);
+        let mut collector = collector_with_customer(*b"BC", b"old-data", 3);
+        collector
+            .offer_terminal(
+                &ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::Payment(chain[0].clone())),
+            )
+            .unwrap();
+        for evidence in chain.iter().skip(2).take(3).cloned() {
+            collector
+                .offer_terminal(
+                    &ticket,
+                    &RankedTransactionOutcome::Committed(RankedCommit::Payment(evidence)),
+                )
+                .unwrap();
+        }
+        assert_eq!(collector.pending_edges(), 3);
+        assert!(matches!(
+            collector.offer_terminal(
+                &ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::Payment(chain[5].clone())),
+            ),
+            Err(RichRecoveryError::PendingCustomerLimit {
+                actual: 4,
+                limit: 3
+            })
+        ));
+        assert!(collector.is_poisoned());
+        assert_eq!(collector.pending_edges(), 3);
+    }
+
+    #[test]
+    fn bad_credit_missing_count_cannot_be_hidden_by_an_old_duplicate() {
+        let ticket = local_payment_ticket();
+        let chain = bad_credit_chain(&ticket, 6);
+        let mut collector = collector_with_customer(*b"BC", b"old-data", 5);
+        for index in [0, 2, 3, 4, 5] {
+            collector
+                .offer_terminal(
+                    &ticket,
+                    &RankedTransactionOutcome::Committed(RankedCommit::Payment(
+                        chain[index].clone(),
+                    )),
+                )
+                .unwrap();
+        }
+        assert_eq!(collector.pending_edges(), 4);
+        let history_before = collector.history_rows;
+        assert!(collector
+            .offer_terminal(
+                &ticket,
+                &RankedTransactionOutcome::Committed(RankedCommit::Payment(chain[0].clone())),
+            )
+            .is_err());
+        assert!(collector.is_poisoned());
+        assert_eq!(collector.history_rows, history_before);
+        assert_eq!(collector.pending_edges(), 4);
     }
 
     #[test]
@@ -3099,7 +3408,7 @@ mod tests {
             district_id: 1,
             order_id: 1,
         };
-        let malformed = delivery_evidence(key, b"bad\0timestamp", vec![1.0_f32.to_bits(); 5]);
+        let malformed = delivery_evidence(key, 1, b"bad\0timestamp", vec![1.0_f32.to_bits(); 5]);
         let mut timestamp_collector = collector();
         assert!(timestamp_collector
             .offer_terminal(
@@ -3152,6 +3461,7 @@ mod tests {
         };
         let delivery = delivery_evidence(
             key,
+            1,
             &[b'D'; MAX_DELIVERY_TIMESTAMP_BYTES],
             vec![1.0_f32.to_bits(); 5],
         );
@@ -3278,6 +3588,122 @@ mod tests {
     }
 
     #[test]
+    fn retired_pending_reaches_client_cap_without_eviction() {
+        let mut collector = collector_with_customer(*b"BC", b"old-data", 3);
+        for customer_id in 100..102 {
+            collector.retired_customers.insert(
+                CustomerKey {
+                    warehouse_id: 1,
+                    district_id: 1,
+                    customer_id,
+                },
+                unrooted_customer_state(2),
+            );
+        }
+        for customer_id in 1..=RICH_RECOVERY_SAMPLE_CAPACITY as i32 {
+            let key = CustomerKey {
+                warehouse_id: 1,
+                district_id: 1,
+                customer_id,
+            };
+            let state = if customer_id == RICH_RECOVERY_SAMPLE_CAPACITY as i32 {
+                unrooted_customer_state(2)
+            } else {
+                CustomerDataState::new(b"old-data".to_vec())
+            };
+            collector.customers.ensure(
+                SampleScore {
+                    high: u64::MAX,
+                    low: customer_id as u64,
+                },
+                key,
+                || state,
+            );
+        }
+        collector.pending_customer_edges = 3;
+        let candidate_key = CustomerKey {
+            warehouse_id: 1,
+            district_id: 1,
+            customer_id: 3_000,
+        };
+        let prepared = prepared_bad_customer(candidate_key, CUSTOMER_INITIAL_PAYMENT_COUNT);
+        collector.preview_bad_customer(&prepared).unwrap();
+        collector.commit_terminal(PreparedRichTerminal::Payment {
+            history: HistoryTupleKey {
+                group: HistoryGroupKey {
+                    customer_id: 3_000,
+                    customer_district_id: 1,
+                    customer_warehouse_id: 1,
+                    home_district_id: 1,
+                    home_warehouse_id: 1,
+                },
+                timestamp: TEST_TIMESTAMP.to_vec(),
+                amount_bits: 1.0_f32.to_bits(),
+                data: b"RETIRED-CAP".to_vec(),
+            },
+            bad_customer: Some(prepared),
+        });
+        assert_eq!(collector.pending_edges(), 3);
+        assert_eq!(collector.retired_customers.len(), 3);
+        assert!(collector
+            .retired_customers
+            .values()
+            .all(|state| !state.pending.is_empty()));
+    }
+
+    #[test]
+    fn retired_pending_is_stable_under_one_million_rank_rejections() {
+        let mut collector = collector_with_customer(*b"BC", b"old-data", 1);
+        let retired_key = CustomerKey {
+            warehouse_id: 1,
+            district_id: 1,
+            customer_id: 100,
+        };
+        collector
+            .retired_customers
+            .insert(retired_key, unrooted_customer_state(2));
+        collector.pending_customer_edges = 1;
+        for customer_id in 1..=RICH_RECOVERY_SAMPLE_CAPACITY as i32 {
+            let key = CustomerKey {
+                warehouse_id: 1,
+                district_id: 1,
+                customer_id,
+            };
+            collector.customers.ensure(
+                SampleScore {
+                    high: 0,
+                    low: customer_id as u64,
+                },
+                key,
+                || CustomerDataState::new(b"old-data".to_vec()),
+            );
+        }
+        let candidate = prepared_bad_customer(
+            CustomerKey {
+                warehouse_id: 1,
+                district_id: 1,
+                customer_id: 3_000,
+            },
+            CUSTOMER_INITIAL_PAYMENT_COUNT,
+        );
+        let retired = collector.retired_customers.get(&retired_key).unwrap();
+        let endpoint_ptr = retired.endpoint_data.as_ptr();
+        let edge = retired.pending.values().next().unwrap();
+        let before_ptr = edge.before_data.as_ptr();
+        let after_ptr = edge.after_data.as_ptr();
+        for _ in 0..1_000_000 {
+            collector.preview_bad_customer(&candidate).unwrap();
+        }
+        let retired = collector.retired_customers.get(&retired_key).unwrap();
+        let edge = retired.pending.values().next().unwrap();
+        assert_eq!(collector.pending_edges(), 1);
+        assert_eq!(collector.retired_customers.len(), 1);
+        assert_eq!(retired.endpoint_data.as_ptr(), endpoint_ptr);
+        assert_eq!(edge.before_data.as_ptr(), before_ptr);
+        assert_eq!(edge.after_data.as_ptr(), after_ptr);
+    }
+
+    #[test]
     fn all_retained_fields_fit_the_raw_ceiling_by_construction() {
         assert!(THEORETICAL_MAX_RICH_BYTES <= MAX_RICH_RECOVERY_RAW_BYTES);
         assert_eq!(RICH_HISTORY_SAMPLE_CAPACITY, 2);
@@ -3324,6 +3750,7 @@ mod tests {
                     district_id: 1,
                     order_id: 3_001 + index as i32,
                 },
+                customer_id: 1,
                 carrier_id: MAX_CARRIER_ID,
                 queue_present: false,
                 delivery_timestamp: vec![b'T'; MAX_DELIVERY_TIMESTAMP_BYTES],
