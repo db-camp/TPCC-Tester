@@ -22,6 +22,9 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parents[1] / "run_workflow.sh"
 METRICS_HELPER = Path(__file__).resolve().parents[1] / "diagnostic_metrics.py"
 RESOURCE_HELPER = Path(__file__).resolve().parents[1] / "resource_sampler.py"
+FORMAL_CHAIN_HELPER = (
+    Path(__file__).resolve().parents[1] / "formal_state_chain.py"
+)
 SUMMARY_HELPER = Path(__file__).resolve().parents[1] / "summarize_perf_run.py"
 RESOURCE_SPEC = importlib.util.spec_from_file_location(
     "workflow_resource_sampler",
@@ -29,9 +32,126 @@ RESOURCE_SPEC = importlib.util.spec_from_file_location(
 )
 RESOURCE_SAMPLER = importlib.util.module_from_spec(RESOURCE_SPEC)
 RESOURCE_SPEC.loader.exec_module(RESOURCE_SAMPLER)
+FORMAL_CHAIN_SPEC = importlib.util.spec_from_file_location(
+    "workflow_formal_state_chain",
+    FORMAL_CHAIN_HELPER,
+)
+FORMAL_STATE_CHAIN = importlib.util.module_from_spec(FORMAL_CHAIN_SPEC)
+FORMAL_CHAIN_SPEC.loader.exec_module(FORMAL_STATE_CHAIN)
 
 
 class WorkflowSafetyTests(unittest.TestCase):
+    def write_formal_chain_fixture(self, state_dir):
+        state_dir.mkdir()
+        for name in FORMAL_STATE_CHAIN.FORMAL_CHAIN_FILES:
+            (state_dir / name).write_bytes((name + "\n").encode("ascii"))
+        (state_dir / "database.identity").write_bytes(b"identity fixture\n")
+
+    def test_formal_chain_v2_matches_cross_language_golden_digest(self):
+        entries = [
+            (name, (name + "\n").encode("ascii"))
+            for name in FORMAL_STATE_CHAIN.FORMAL_CHAIN_FILES
+        ]
+        self.assertEqual(
+            FORMAL_STATE_CHAIN.compute_formal_chain_digest(1, 2, entries),
+            "95293d5ca572b8805ff6cd84c361f8d4"
+            "b90b163848e03b76c894ad64756b4aae",
+        )
+
+    def test_formal_chain_inspection_binds_directory_and_all_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp) / "state"
+            self.write_formal_chain_fixture(state_dir)
+            inspection = FORMAL_STATE_CHAIN.inspect_formal_state_path(
+                state_dir.resolve()
+            )
+            metadata = state_dir.stat()
+            self.assertEqual(inspection["status"], "verified")
+            self.assertEqual(inspection["state_device"], metadata.st_dev)
+            self.assertEqual(inspection["state_inode"], metadata.st_ino)
+            self.assertEqual(inspection["file_count"], 16)
+            self.assertEqual(
+                inspection["files"],
+                list(FORMAL_STATE_CHAIN.FORMAL_CHAIN_FILES),
+            )
+            terminal = (state_dir / "terminal_evidence.state").read_bytes()
+            self.assertEqual(
+                inspection["terminal_evidence_sha256"],
+                hashlib.sha256(terminal).hexdigest(),
+            )
+
+    def test_formal_chain_rejects_exact_legacy_target_and_temps(self):
+        names = (
+            "run_ledger.state",
+            ".run_ledger.state.0.0.tmp",
+            ".run_ledger.state.9123.0.tmp",
+            ".run_ledger.state.9123.44.tmp",
+        )
+        for name in names:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                state_dir = Path(temp) / "state"
+                self.write_formal_chain_fixture(state_dir)
+                legacy = state_dir / name
+                legacy.write_bytes(b"legacy bytes must remain unread\n")
+                with self.assertRaises(FORMAL_STATE_CHAIN.FormalStateError):
+                    FORMAL_STATE_CHAIN.inspect_formal_state_path(
+                        state_dir.resolve()
+                    )
+                self.assertEqual(
+                    legacy.read_bytes(),
+                    b"legacy bytes must remain unread\n",
+                )
+
+    def test_legacy_temp_matcher_is_canonical(self):
+        matcher = FORMAL_STATE_CHAIN.LEGACY_RUN_LEDGER_TEMP
+        for name in (
+            ".run_ledger.state.0.0.tmp",
+            ".run_ledger.state.1.0.tmp",
+            ".run_ledger.state.42.19.tmp",
+        ):
+            self.assertIsNotNone(matcher.fullmatch(name))
+        for name in (
+            ".run_ledger.state.01.0.tmp",
+            ".run_ledger.state.1.00.tmp",
+            ".run_ledger.state.-1.0.tmp",
+            "run_ledger.state.1.0.tmp",
+            ".run_ledger.state.1.0.tmp.extra",
+        ):
+            self.assertIsNone(matcher.fullmatch(name))
+
+    def test_formal_chain_allows_safe_optional_diagnostics_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp) / "state"
+            self.write_formal_chain_fixture(state_dir)
+            baseline = FORMAL_STATE_CHAIN.inspect_formal_state_path(
+                state_dir.resolve()
+            )["formal_chain_sha256"]
+            for name in FORMAL_STATE_CHAIN.DIAGNOSTIC_STATE_FILES:
+                (state_dir / name).write_bytes((name + "\n").encode("ascii"))
+            with_diagnostics = FORMAL_STATE_CHAIN.inspect_formal_state_path(
+                state_dir.resolve()
+            )
+            self.assertEqual(
+                with_diagnostics["formal_chain_sha256"],
+                baseline,
+            )
+
+    def test_formal_chain_rejects_unknown_and_unsafe_entries(self):
+        for mode in ("unknown", "symlink"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                state_dir = Path(temp) / "state"
+                self.write_formal_chain_fixture(state_dir)
+                if mode == "unknown":
+                    (state_dir / "unrecognized.state").write_bytes(b"unknown\n")
+                else:
+                    target = Path(temp) / "diagnostic-target"
+                    target.write_bytes(b"target\n")
+                    (state_dir / "diagnostic_warmup.started").symlink_to(target)
+                with self.assertRaises(FORMAL_STATE_CHAIN.FormalStateError):
+                    FORMAL_STATE_CHAIN.inspect_formal_state_path(
+                        state_dir.resolve()
+                    )
+
     def write_summary_manifest(
         self,
         result_dir,
