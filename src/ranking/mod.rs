@@ -14,6 +14,7 @@ pub mod payment;
 pub mod payment_endpoints;
 pub mod preflight;
 pub mod recovery_samples;
+pub mod rich_recovery_samples;
 pub mod runner;
 pub mod session;
 pub mod stock_level;
