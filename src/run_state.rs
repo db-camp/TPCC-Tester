@@ -63,6 +63,28 @@ const DIAGNOSTIC_OBSERVATION_CLAIM_ARTIFACT: &str = "diagnostic_observation_clai
 const DIAGNOSTIC_OBSERVATION_CLAIM_FILE: &str = "diagnostic_observation.started";
 const DIAGNOSTIC_OBSERVATION_RECEIPT_ARTIFACT: &str = "diagnostic_observation_receipt";
 const DIAGNOSTIC_OBSERVATION_RECEIPT_FILE: &str = "diagnostic_observation.passed";
+const STATE_ARTIFACT_FILES: [&str; 20] = [
+    DATASET_FILE,
+    SETUP_INTENT_FILE,
+    SETUP_EXECUTION_FILE,
+    RUN_CONTRACT_FILE,
+    SETUP_CHECK_CLAIM_FILE,
+    SETUP_RECEIPT_FILE,
+    RANK_CLAIM_FILE,
+    LEDGER_FILE,
+    ONLINE_CLAIM_FILE,
+    FLOAT_BASELINE_FILE,
+    CRASH_INTENT_FILE,
+    CRASH_KILLED_FILE,
+    RESTART_STARTED_FILE,
+    RESTART_READY_FILE,
+    RECOVERY_CLAIM_FILE,
+    RECOVERY_RECEIPT_FILE,
+    DIAGNOSTIC_WARMUP_CLAIM_FILE,
+    DIAGNOSTIC_WARMUP_RECEIPT_FILE,
+    DIAGNOSTIC_OBSERVATION_CLAIM_FILE,
+    DIAGNOSTIC_OBSERVATION_RECEIPT_FILE,
+];
 const MAX_ARTIFACT_HEADER_BYTES: u64 = 4 * 1024;
 const MAX_LEDGER_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FLOAT_BASELINE_PAYLOAD_BYTES: usize = 4 * 1024;
@@ -579,9 +601,13 @@ impl StateStore {
             }
             Err(error) => return Err(StateError::Io(error)),
         }
-        Ok(Self {
+        let store = Self {
             root: root.to_path_buf(),
-        })
+        };
+        let _directory_lock = lock_state_directory(&store.root)?;
+        cleanup_orphan_temporary_files(&store.root)?;
+        drop(_directory_lock);
+        Ok(store)
     }
 
     pub fn open_existing(root: &Path) -> Result<Self, StateError> {
@@ -596,9 +622,13 @@ impl StateStore {
             }
         })?;
         validate_real_directory(root, &metadata)?;
-        Ok(Self {
+        let store = Self {
             root: root.to_path_buf(),
-        })
+        };
+        let _directory_lock = lock_state_directory(&store.root)?;
+        cleanup_orphan_temporary_files(&store.root)?;
+        drop(_directory_lock);
+        Ok(store)
     }
 
     pub fn publish_setup_intent(
@@ -2597,6 +2627,164 @@ fn lock_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
     Ok(StateDirectoryLock(directory))
 }
 
+fn cleanup_orphan_temporary_files(root: &Path) -> Result<(), StateError> {
+    let mut removed = false;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(target_name) = temporary_target_name(file_name) else {
+            continue;
+        };
+
+        let temporary = entry.path();
+        let temporary_metadata = fs::symlink_metadata(&temporary)?;
+        if temporary_metadata.file_type().is_symlink() || !temporary_metadata.is_file() {
+            return Err(StateError::Invalid(format!(
+                "orphan publication temporary is not a real file: {}",
+                temporary.display()
+            )));
+        }
+        validate_temporary_owner(root, &temporary, &temporary_metadata)?;
+
+        let target = root.join(target_name);
+        match fs::symlink_metadata(&target) {
+            Ok(target_metadata) => {
+                if target_metadata.file_type().is_symlink() || !target_metadata.is_file() {
+                    return Err(StateError::Invalid(format!(
+                        "orphan publication target is not a real file: {}",
+                        target.display()
+                    )));
+                }
+                validate_temporary_hard_link(
+                    &temporary,
+                    &temporary_metadata,
+                    &target,
+                    &target_metadata,
+                )?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                validate_unlinked_temporary(&temporary, &temporary_metadata)?;
+            }
+            Err(error) => return Err(StateError::Io(error)),
+        }
+        fs::remove_file(&temporary)?;
+        removed = true;
+    }
+    if removed {
+        File::open(root)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn temporary_target_name(file_name: &str) -> Option<&str> {
+    let body = file_name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let (target_and_process, counter) = body.rsplit_once('.')?;
+    let (target, process) = target_and_process.rsplit_once('.')?;
+    if !canonical_decimal(process)
+        || !canonical_decimal(counter)
+        || !STATE_ARTIFACT_FILES.contains(&target)
+    {
+        return None;
+    }
+    Some(target)
+}
+
+fn canonical_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+#[cfg(unix)]
+fn validate_temporary_owner(
+    root: &Path,
+    temporary: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.uid() != fs::symlink_metadata(root)?.uid() {
+        return Err(StateError::Invalid(format!(
+            "orphan publication temporary has a foreign owner: {}",
+            temporary.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_temporary_owner(
+    _root: &Path,
+    _temporary: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_temporary_hard_link(
+    temporary: &Path,
+    temporary_metadata: &fs::Metadata,
+    target: &Path,
+    target_metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if temporary_metadata.dev() != target_metadata.dev()
+        || temporary_metadata.ino() != target_metadata.ino()
+        || temporary_metadata.nlink() != 2
+        || target_metadata.nlink() != 2
+    {
+        return Err(StateError::Invalid(format!(
+            "orphan publication temporary is not the target's sole hard link: {} -> {}",
+            temporary.display(),
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_temporary_hard_link(
+    temporary: &Path,
+    _temporary_metadata: &fs::Metadata,
+    target: &Path,
+    _target_metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    Err(StateError::Invalid(format!(
+        "cannot safely recover a linked publication temporary on this platform: {} -> {}",
+        temporary.display(),
+        target.display()
+    )))
+}
+
+#[cfg(unix)]
+fn validate_unlinked_temporary(
+    temporary: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.nlink() != 1 {
+        return Err(StateError::Invalid(format!(
+            "orphan publication temporary has unexpected hard links: {}",
+            temporary.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_unlinked_temporary(
+    _temporary: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), StateError> {
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AtomicPublishStep {
     TemporaryUnlink,
@@ -3412,6 +3600,7 @@ mod tests {
         let encoded = encode_setup_intent(run_id, seed, &contract).unwrap();
         let linked = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
+        let claimant_store = StateStore::open_existing(&directory.0).unwrap();
 
         let publisher_root = directory.0.clone();
         let publisher_linked = Arc::clone(&linked);
@@ -3439,7 +3628,6 @@ mod tests {
         linked.wait();
         assert!(directory.0.join(SETUP_INTENT_FILE).exists());
 
-        let claimant_store = StateStore::open_existing(&directory.0).unwrap();
         let claimant_contract = contract.clone();
         let (send, receive) = mpsc::channel();
         let claimant = thread::spawn(move || {
@@ -3500,6 +3688,53 @@ mod tests {
         let missing = directory.0.join("missing");
         assert!(StateStore::open_existing(&missing).is_err());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn reopening_cleans_strict_unlinked_publication_temporary() {
+        let directory = TestDirectory::new();
+        let temporary = directory.0.join(format!(
+            ".{SETUP_INTENT_FILE}.{}.0.tmp",
+            std::process::id()
+        ));
+        fs::write(&temporary, b"crash-before-link").unwrap();
+
+        let store = StateStore::open(&directory.0).unwrap();
+        assert!(!temporary.exists());
+        let contract = sample_contract(1);
+        store
+            .publish_setup_intent("run-clean-orphan", 51, &contract)
+            .unwrap();
+        assert!(directory.0.join(SETUP_INTENT_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopening_unlinks_only_the_verified_target_hard_link() {
+        let directory = TestDirectory::new();
+        let run_id = "run-linked-orphan";
+        let seed = 52;
+        let contract = sample_contract(1);
+        let temporary = directory.0.join(format!(
+            ".{SETUP_INTENT_FILE}.{}.1.tmp",
+            std::process::id()
+        ));
+        fs::write(
+            &temporary,
+            encode_setup_intent(run_id, seed, &contract).unwrap(),
+        )
+        .unwrap();
+        let target = directory.0.join(SETUP_INTENT_FILE);
+        fs::hard_link(&temporary, &target).unwrap();
+
+        let store = StateStore::open_existing(&directory.0).unwrap();
+        assert!(!temporary.exists());
+        assert!(target.is_file());
+        let (_, origin) = store
+            .begin_or_resume_setup(run_id, seed, &contract)
+            .unwrap();
+        assert_eq!(origin, SetupClaimOrigin::Resumed);
+        assert!(directory.0.join(SETUP_EXECUTION_FILE).is_file());
     }
 
     #[cfg(unix)]
