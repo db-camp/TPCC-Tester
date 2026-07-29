@@ -7,6 +7,7 @@ mod executor;
 mod loader;
 pub mod measurement;
 mod model;
+mod profile;
 mod report;
 mod transaction;
 
@@ -15,9 +16,10 @@ use std::process;
 use clap::Parser;
 use tracing::{error, info, warn};
 
-use config::Config;
+use config::{Config, ResolvedProfile};
 use connection::client::RmdbClient;
 use connection::cursor::RmdbCursor;
+use connection::wire::StreamResponse;
 use error::TpccError;
 
 const SNAPSHOT_ISOLATION_SQL: &str = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION;";
@@ -45,18 +47,41 @@ async fn main() {
     let config = Config::parse();
     setup_tracing(config.verbose);
 
-    if config.scale_factor < 1 {
-        error!("Scale factor 必须至少为 1");
+    if let Err(error) = config.validate() {
+        error!("配置无效: {error}");
         process::exit(1);
     }
+    let effective = match config.resolved_profile() {
+        Ok(effective) => effective,
+        Err(error) => {
+            error!("配置无效: {error}");
+            process::exit(1);
+        }
+    };
+    print_effective_profile(&config, &effective);
 
-    if let Err(e) = run(config).await {
+    if let Err(e) = run(config, effective).await {
         error!("执行失败: {e}");
         process::exit(1);
     }
 }
 
-async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn std::error::Error>> {
+    if config.probe_ready {
+        info!(
+            "执行 Wire v3 readiness probe: {}:{}",
+            config.host, config.port
+        );
+        let mut client = RmdbClient::connect(&config.host, config.port).await?;
+        client.ping().await?;
+        info!("Wire v3 readiness probe 通过（完整执行 `show tables;`）");
+        return Ok(());
+    }
+
+    if let Some(seed) = effective.seed {
+        std::env::set_var("RMDB_TPCC_SEED", seed.to_string());
+    }
+
     // Diagnose mode
     if config.diagnose {
         return run_diagnose(&config).await;
@@ -81,7 +106,6 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     info!("连接 RMDB: {}:{} ...", config.host, config.port);
     let client = RmdbClient::connect(&config.host, config.port).await?;
     let mut cursor = RmdbCursor::new(client);
-    maybe_disable_output_file(&config, &mut cursor).await?;
     configure_session(&mut cursor).await?;
 
     // Ping test
@@ -111,6 +135,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Check
     if config.check {
+        info!("运行 {} 阶段一致性检查", config.check_scope.as_str());
         let mut chk = checker::ConsistencyChecker::new(
             &mut cursor,
             config.scale_factor,
@@ -140,31 +165,67 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn maybe_disable_output_file(
-    config: &Config,
-    cursor: &mut RmdbCursor,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if config.keep_output_file {
-        return Ok(());
-    }
+fn print_effective_profile(config: &Config, effective: &ResolvedProfile) {
+    let profile = &effective.final2026;
+    let mix = config
+        .txn_probs
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("/");
+    let seed = effective
+        .seed
+        .map(|value| format!("{value} (caller-supplied)"))
+        .unwrap_or_else(|| "not supplied (no hidden seed assumed)".to_owned());
 
-    info!("发送 set output_file off，关闭 RMDB output.txt 写入");
-    cursor
-        .execute_update_raw("set output_file off", &[])
-        .await?;
-    Ok(())
+    info!(
+        "Effective profile: name={}, warehouses={}, clients={}, warmup={}s, windows={}x{}s, rw_ratio={}, mix={}, seed={}",
+        config.profile.as_str(),
+        profile.warehouses,
+        profile.clients,
+        profile.warmup.as_secs(),
+        profile.measurement_windows,
+        profile.measurement_window.as_secs(),
+        config.rw_ratio,
+        mix,
+        seed
+    );
+
+    if effective.is_ranked_configuration() {
+        info!("Effective profile conformance: public-spec ranked configuration");
+    } else {
+        warn!("Effective profile conformance: NON-RANKED (--allow-deviation)");
+        for deviation in profile.deviations() {
+            warn!(
+                "  deviation {}: official={}, effective={}",
+                deviation.field, deviation.official, deviation.effective
+            );
+        }
+        for deviation in effective.extra_deviations() {
+            warn!(
+                "  deviation {}: official={}, effective={}",
+                deviation.field, deviation.official, deviation.effective
+            );
+        }
+    }
 }
 
 async fn configure_session(cursor: &mut RmdbCursor) -> Result<(), TpccError> {
     info!("发送 SET TRANSACTION ISOLATION LEVEL SNAPSHOT ISOLATION");
-    let response = cursor.client_mut().send_cmd(SNAPSHOT_ISOLATION_SQL).await?;
-    let trimmed = response.trim();
-    if trimmed.starts_with("abort") || trimmed.starts_with("Error") {
-        return Err(TpccError::QueryError(format!(
-            "设置 SNAPSHOT ISOLATION 失败: {trimmed}"
-        )));
+    match cursor
+        .client_mut()
+        .exec_stream(SNAPSHOT_ISOLATION_SQL)
+        .await?
+    {
+        StreamResponse::CommandOk => Ok(()),
+        StreamResponse::TransactionAbort { diagnostic } => Err(TpccError::Abort(diagnostic)),
+        StreamResponse::Error { diagnostic } => Err(TpccError::QueryError(format!(
+            "设置 SNAPSHOT ISOLATION 失败: {diagnostic}"
+        ))),
+        StreamResponse::Query { .. } => Err(TpccError::Protocol(
+            "SET SNAPSHOT ISOLATION 意外返回查询结果".to_owned(),
+        )),
     }
-    Ok(())
 }
 
 async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -185,7 +246,6 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
         }
     };
     let mut cursor = RmdbCursor::new(client);
-    maybe_disable_output_file(config, &mut cursor).await?;
     configure_session(&mut cursor).await?;
 
     // 2. Basic SQL
