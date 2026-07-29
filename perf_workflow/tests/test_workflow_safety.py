@@ -266,9 +266,28 @@ if "--check-scope" in sys.argv:
         raise SystemExit(12)
 """,
             )
+            fake_tools = Path(temp) / "fake-tools"
+            fake_tools.mkdir()
+            self.make_executable(
+                fake_tools / "strace",
+                """
+output=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) output="$2"; shift 2 ;;
+    -p) shift 2 ;;
+    *) shift ;;
+  esac
+done
+: >"${output}"
+trap 'exit 0' INT TERM
+while :; do sleep 0.05; done
+""",
+            )
             env = os.environ.copy()
             env["FAKE_TPCC_CALLS"] = str(calls)
             env["FAKE_DB_PATH"] = str(root / "tpcc_final2026")
+            env["PATH"] = f"{fake_tools}{os.pathsep}{env['PATH']}"
 
             result = self.run_script(
                 "--mode",
@@ -298,7 +317,17 @@ if "--check-scope" in sys.argv:
             )
             self.assertFalse(
                 any("--diagnose" in args for args in invocations),
-                "unsupported 10s+60s diagnostics must not reuse another mode",
+                "10s+60s diagnostics must not reuse compatibility diagnose mode",
+            )
+            diagnostic_runs = [
+                args for args in invocations if "--diagnostic-workload-seconds" in args
+            ]
+            self.assertEqual(
+                [
+                    args[args.index("--diagnostic-workload-seconds") + 1]
+                    for args in diagnostic_runs
+                ],
+                ["10", "60"],
             )
             self.assertIn("--profile", ranks[0])
             self.assertIn("final2026", ranks[0])
@@ -320,7 +349,7 @@ if "--check-scope" in sys.argv:
                 for args in invocations
                 if "--state-dir" in args
             ]
-            self.assertGreaterEqual(len(state_dirs), 4)
+            self.assertGreaterEqual(len(state_dirs), 6)
             self.assertEqual(len(set(state_dirs)), 1)
             probes = [
                 args for args in invocations if "--probe-ready" in args
@@ -386,10 +415,7 @@ if "--check-scope" in sys.argv:
                     "diagnostics": manifest["diagnostics"]["status"],
                 },
             )
-            self.assertIn(
-                manifest["diagnostics"]["status"],
-                {"unavailable", "unsupported"},
-            )
+            self.assertEqual(manifest["diagnostics"]["status"], "passed")
             self.assertEqual(
                 {
                     key: manifest["diagnostics"][key]
@@ -406,7 +432,7 @@ if "--check-scope" in sys.argv:
                     "ranked": False,
                     "public_warmup_seconds": 10,
                     "public_observation_seconds": 60,
-                    "native_single_observation_supported": False,
+                    "native_single_observation_supported": True,
                 },
             )
             self.assertEqual(manifest["paths"]["result"], str(result_dirs[0]))
@@ -422,7 +448,7 @@ if "--check-scope" in sys.argv:
                 manifest["source"]["tpcc_tester_sha"],
                 r"^[0-9a-f]{40}$",
             )
-            self.assertIn("WARN:", result.stderr)
+            self.assertTrue((result_dirs[0] / "strace.log").is_file())
             server_log = (result_dirs[0] / "server.log").read_text(
                 encoding="utf-8"
             )

@@ -38,6 +38,7 @@ STATE_DIR_OVERRIDE=""
 
 SERVER_PID=""
 PROBE_PID=""
+TRACE_PID=""
 STOPPING_SERVER=0
 SERVER_LOG=""
 RESULT_DIR=""
@@ -581,7 +582,7 @@ payload = {
         "ranked": False,
         "public_warmup_seconds": int(diagnostic_warmup),
         "public_observation_seconds": int(diagnostic_observation),
-        "native_single_observation_supported": False,
+        "native_single_observation_supported": True,
         "status": phase_diagnostics,
     },
 }
@@ -709,6 +710,24 @@ stop_probe() {
   PROBE_PID=""
 }
 
+stop_trace() {
+  local pid="${TRACE_PID}"
+  local attempts=0
+  [[ -n "${pid}" ]] || return 0
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -INT "${pid}" 2>/dev/null || true
+    while kill -0 "${pid}" 2>/dev/null && (( attempts < 20 )); do
+      sleep 0.05
+      attempts=$((attempts + 1))
+    done
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM "${pid}" 2>/dev/null || true
+  fi
+  wait "${pid}" 2>/dev/null || true
+  TRACE_PID=""
+}
+
 crash_server() {
   local pid="${SERVER_PID}"
   [[ -n "${pid}" ]] || die "cannot crash an unregistered server"
@@ -747,6 +766,7 @@ cleanup() {
     mark_unfinished_phases_after_failure
     write_manifest || true
   fi
+  stop_trace || true
   stop_probe || true
   stop_server || true
   if [[ "${WORKFLOW_SUCCEEDED}" == "1" && "${CLEAN_DB_ON_EXIT}" == "1" ]]; then
@@ -1004,11 +1024,42 @@ run_optional_diagnostics() {
     return 0
   fi
 
-  # The native tester currently owns exactly one warmup plus three measurement
-  # windows. Reusing that mode here would falsely label a ranked schedule as a
-  # single 60-second diagnostic observation, so do not invoke it.
-  warn "strace is available, but the native tester has no safe single-observation mode; optional non-ranked 10s + 60s diagnostics are unsupported"
-  set_phase_status diagnostics unsupported
+  log "running ${DIAGNOSTIC_WARMUP_SECONDS}s non-ranked diagnostic warmup"
+  if ! run_tester "${RESULT_DIR}/diagnostic_warmup.log" \
+      --diagnostic-workload-seconds "${DIAGNOSTIC_WARMUP_SECONDS}" \
+      --profile "${PROFILE}" --seed "${SEED}" --state-dir "${STATE_DIR}" \
+      --host "${HOST}" --port "${PORT}"; then
+    warn "diagnostic warmup failed; ranked result remains valid"
+    set_phase_status diagnostics failed
+    return 0
+  fi
+
+  log "attaching strace to registered RMDB pid ${SERVER_PID}"
+  strace -f -tt -T -p "${SERVER_PID}" \
+    -o "${RESULT_DIR}/strace.log" \
+    >"${RESULT_DIR}/strace_attach.log" 2>&1 &
+  TRACE_PID=$!
+  sleep 0.20
+  if ! kill -0 "${TRACE_PID}" 2>/dev/null; then
+    wait "${TRACE_PID}" 2>/dev/null || true
+    TRACE_PID=""
+    warn "strace could not attach; see ${RESULT_DIR}/strace_attach.log"
+    set_phase_status diagnostics unavailable
+    return 0
+  fi
+
+  log "running ${DIAGNOSTIC_OBSERVATION_SECONDS}s non-ranked diagnostic observation"
+  if ! run_tester "${RESULT_DIR}/diagnostic_observation.log" \
+      --diagnostic-workload-seconds "${DIAGNOSTIC_OBSERVATION_SECONDS}" \
+      --profile "${PROFILE}" --seed "${SEED}" --state-dir "${STATE_DIR}" \
+      --host "${HOST}" --port "${PORT}"; then
+    stop_trace
+    warn "diagnostic observation failed; ranked result remains valid"
+    set_phase_status diagnostics failed
+    return 0
+  fi
+  stop_trace
+  set_phase_status diagnostics passed
 }
 
 write_summary() {
