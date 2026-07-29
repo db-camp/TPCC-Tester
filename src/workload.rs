@@ -295,13 +295,7 @@ fn parameters_for(route: &RoutedTransaction) -> TransactionParameters {
 }
 
 fn new_order_input(route: &RoutedTransaction) -> NewOrderInput {
-    let customer_id = inclusive_u16(
-        route,
-        "parameter/new-order/customer-id",
-        0,
-        1,
-        CUSTOMERS_PER_DISTRICT,
-    );
+    let customer_id = route.customer_id("parameter/new-order/customer-id", 0);
     let line_count = inclusive_u8(
         route,
         "parameter/new-order/line-count",
@@ -383,13 +377,13 @@ fn payment_input(route: &RoutedTransaction) -> PaymentInput {
 
 fn customer_selector(route: &RoutedTransaction, domain: &'static str) -> CustomerSelector {
     if chance(route, domain, 0, CUSTOMER_LAST_NAME_PERCENT) {
-        let number = inclusive_u16(route, domain, 1, 0, CUSTOMER_LAST_NAMES - 1);
+        let number = route.customer_last_name_number(domain, 1);
         CustomerSelector::LastName(CustomerLastName {
             number,
             value: last_name(number),
         })
     } else {
-        CustomerSelector::Id(inclusive_u16(route, domain, 2, 1, CUSTOMERS_PER_DISTRICT))
+        CustomerSelector::Id(route.customer_id(domain, 3))
     }
 }
 
@@ -415,16 +409,6 @@ fn inclusive_u8(
     maximum: u8,
 ) -> u8 {
     minimum + route.parameter_sample(domain, ordinal, u64::from(maximum - minimum) + 1) as u8
-}
-
-fn inclusive_u16(
-    route: &RoutedTransaction,
-    domain: &'static str,
-    ordinal: u64,
-    minimum: u16,
-    maximum: u16,
-) -> u16 {
-    minimum + route.parameter_sample(domain, ordinal, u64::from(maximum - minimum) + 1) as u16
 }
 
 fn inclusive_u32(

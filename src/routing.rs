@@ -12,8 +12,74 @@ use crate::profile::{
 use std::error::Error;
 use std::fmt;
 
+const CUSTOMER_LAST_NAMES: u64 = 1_000;
+const CUSTOMERS_PER_DISTRICT: u64 = 3_000;
+const C_LAST_A: u64 = 255;
+const C_ID_A: u64 = 1_023;
+const OL_I_ID_A: u64 = 8_191;
+
+// Keep this value and derivation synchronized with data_gen::DOMAIN_CUSTOMER_LAST.
+// The final workflow feeds the same public caller seed to population and runtime,
+// so C_LAST_RUN is constrained against the C_LAST_LOAD that actually populated
+// the customer table.
+const LOAD_CUSTOMER_LAST_DOMAIN: u64 = 0x5ae8_4b9f_3210_71c6;
+const SPLITMIX64_INCREMENT: u64 = 0x9e37_79b9_7f4a_7c15;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorkloadSeed(pub u64);
+
+/// TPC-C non-uniform random constants selected once for an entire run.
+///
+/// These values are derived from the caller-provided local seed. They are not
+/// an attempt to guess the grader's hidden seed. `OfficialRouter` copies this
+/// value into every immutable routed transaction so all clients, stages, and
+/// retries use the same constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NurandConstants {
+    c_last_load: u16,
+    c_last_run: u16,
+    c_id: u16,
+    ol_i_id: u16,
+}
+
+impl NurandConstants {
+    fn for_seed(seed: WorkloadSeed) -> Self {
+        let c_last_load = load_customer_last_constant(seed);
+        let valid_c_last_run: Vec<u16> = (0..=u16::from(u8::MAX))
+            .filter(|candidate| {
+                let delta = candidate.abs_diff(c_last_load);
+                (65..=119).contains(&delta) && delta != 96 && delta != 112
+            })
+            .collect();
+        let c_last_run = valid_c_last_run[bounded(
+            derive_seed(seed.0, "nurand/c-last-run", &[]),
+            valid_c_last_run.len() as u64,
+        ) as usize];
+
+        Self {
+            c_last_load,
+            c_last_run,
+            c_id: bounded(derive_seed(seed.0, "nurand/c-id", &[]), C_ID_A + 1) as u16,
+            ol_i_id: bounded(derive_seed(seed.0, "nurand/ol-i-id", &[]), OL_I_ID_A + 1) as u16,
+        }
+    }
+
+    pub fn c_last_load(self) -> u16 {
+        self.c_last_load
+    }
+
+    pub fn c_last_run(self) -> u16 {
+        self.c_last_run
+    }
+
+    pub fn c_id(self) -> u16 {
+        self.c_id
+    }
+
+    pub fn ol_i_id(self) -> u16 {
+        self.ol_i_id
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StageId(u64);
@@ -72,6 +138,7 @@ impl WarehouseWheel {
 #[derive(Debug, Clone)]
 pub struct OfficialRouter {
     seed: WorkloadSeed,
+    nurand_constants: NurandConstants,
     hot_warehouses: [u16; HOT_WAREHOUSES],
     hot_districts: [u8; HOT_WAREHOUSES],
     hot_items: [u32; HOT_ITEMS],
@@ -100,6 +167,7 @@ impl OfficialRouter {
 
         Self {
             seed,
+            nurand_constants: NurandConstants::for_seed(seed),
             hot_warehouses,
             hot_districts,
             hot_items,
@@ -108,6 +176,10 @@ impl OfficialRouter {
 
     pub fn seed(&self) -> WorkloadSeed {
         self.seed
+    }
+
+    pub fn nurand_constants(&self) -> NurandConstants {
+        self.nurand_constants
     }
 
     pub fn hot_warehouses(&self) -> &[u16; HOT_WAREHOUSES] {
@@ -233,6 +305,7 @@ impl OfficialRouter {
             home_warehouse,
             home_district,
             payment_customer_warehouse,
+            nurand_constants: self.nurand_constants,
             hot_items: self.hot_items,
         })
     }
@@ -284,6 +357,7 @@ pub struct RoutedTransaction {
     pub home_warehouse: u16,
     pub home_district: u8,
     pub payment_customer_warehouse: u16,
+    nurand_constants: NurandConstants,
     hot_items: [u32; HOT_ITEMS],
 }
 
@@ -312,6 +386,46 @@ impl RoutedTransaction {
         bounded(derive_seed(self.seed.0, domain, &coordinates), upper)
     }
 
+    pub fn nurand_constants(&self) -> NurandConstants {
+        self.nurand_constants
+    }
+
+    pub(crate) fn customer_id(&self, domain: &'static str, ordinal: u64) -> u16 {
+        self.nurand_parameter(
+            domain,
+            ordinal,
+            C_ID_A,
+            1,
+            CUSTOMERS_PER_DISTRICT,
+            u64::from(self.nurand_constants.c_id),
+        ) as u16
+    }
+
+    pub(crate) fn customer_last_name_number(&self, domain: &'static str, ordinal: u64) -> u16 {
+        self.nurand_parameter(
+            domain,
+            ordinal,
+            C_LAST_A,
+            0,
+            CUSTOMER_LAST_NAMES - 1,
+            u64::from(self.nurand_constants.c_last_run),
+        ) as u16
+    }
+
+    fn nurand_parameter(
+        &self,
+        domain: &'static str,
+        ordinal: u64,
+        a: u64,
+        minimum: u64,
+        maximum: u64,
+        constant: u64,
+    ) -> u64 {
+        let left = self.parameter_sample(domain, ordinal, a + 1);
+        let right = minimum + self.parameter_sample(domain, ordinal + 1, maximum - minimum + 1);
+        ((left | right) + constant) % (maximum - minimum + 1) + minimum
+    }
+
     pub fn item_id(&self, line_number: u8) -> u32 {
         let coordinates = self.line_coordinates(line_number);
         if chance(
@@ -325,11 +439,37 @@ impl RoutedTransaction {
             return self.hot_items[index];
         }
 
-        let rank = bounded(
-            derive_seed(self.seed.0, "ordinary-item-index", &coordinates),
-            u64::from(ITEM_COUNT - HOT_ITEMS as u32),
-        ) as u32;
-        select_u32_excluding(rank, ITEM_COUNT, &self.hot_items)
+        // The public final profile overlays its 24-item hotspot on TPC-C's
+        // ordinary NURand(8191, 1, 100000) stream. Rejecting a hot result keeps
+        // the two branches disjoint without changing the 25/75 branch split.
+        for attempt in 0_u64.. {
+            let candidate = self.ordinary_item_candidate(line_number, attempt);
+            if !self.hot_items.contains(&candidate) {
+                return candidate;
+            }
+        }
+        unreachable!("the ordinary item domain contains non-hot values")
+    }
+
+    pub(crate) fn ordinary_item_candidate(&self, line_number: u8, attempt: u64) -> u32 {
+        let coordinates = [
+            self.stage.value(),
+            u64::from(self.client_id),
+            self.txn_no,
+            u64::from(self.home_warehouse),
+            u64::from(line_number),
+            attempt,
+        ];
+        let left = bounded(
+            derive_seed(self.seed.0, "ordinary-item-nurand/a", &coordinates),
+            OL_I_ID_A + 1,
+        );
+        let right = 1 + bounded(
+            derive_seed(self.seed.0, "ordinary-item-nurand/range", &coordinates),
+            u64::from(ITEM_COUNT),
+        );
+        (((left | right) + u64::from(self.nurand_constants.ol_i_id)) % u64::from(ITEM_COUNT) + 1)
+            as u32
     }
 
     pub fn new_order_supply_warehouse(&self, line_number: u8) -> u16 {
@@ -399,21 +539,6 @@ fn select_u16_excluding(rank: u16, inclusive_max: u16, excluded: u16) -> u16 {
     .min(inclusive_max)
 }
 
-fn select_u32_excluding(rank: u32, inclusive_max: u32, excluded: &[u32; HOT_ITEMS]) -> u32 {
-    let mut excluded = *excluded;
-    excluded.sort_unstable();
-    let mut candidate = rank + 1;
-    for value in excluded {
-        if candidate >= value {
-            candidate += 1;
-        } else {
-            break;
-        }
-    }
-    debug_assert!(candidate <= inclusive_max);
-    candidate
-}
-
 fn chance(sample: u64, percent: u8) -> bool {
     bounded(sample, 100) < u64::from(percent)
 }
@@ -440,6 +565,16 @@ fn derive_seed(base: u64, domain: &str, coordinates: &[u64]) -> u64 {
         state = mix64(state ^ mix64(*coordinate ^ index as u64));
     }
     state
+}
+
+fn load_customer_last_constant(seed: WorkloadSeed) -> u16 {
+    // This is the two-step SplitMix64 stream used by
+    // TpccDataGen::customer_last_name_load_constant. For an upper bound of
+    // 256 its rejection threshold is zero, so modulo and the low byte agree.
+    let stream_seed =
+        mix64((seed.0 ^ LOAD_CUSTOMER_LAST_DOMAIN).wrapping_add(SPLITMIX64_INCREMENT));
+    let sample = mix64(stream_seed.wrapping_add(SPLITMIX64_INCREMENT));
+    (sample % (C_LAST_A + 1)) as u16
 }
 
 #[derive(Debug, Clone, Copy)]

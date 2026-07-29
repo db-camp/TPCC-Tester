@@ -17,6 +17,46 @@ use workload::{
 };
 
 #[test]
+fn one_run_level_nurand_constant_set_is_shared_and_tpc_c_legal() {
+    // These values are golden outputs of data_gen's existing C_LAST_LOAD
+    // domain. Runtime must constrain C_LAST_RUN against the value that actually
+    // populated the customer table for the same caller-provided seed.
+    for (seed, expected_c_last_load) in [
+        (0_u64, 90_u16),
+        (1, 186),
+        (0x4c41_5354, 38),
+        (0x4c41_5355, 231),
+    ] {
+        let router = OfficialRouter::new(WorkloadSeed(seed));
+        let constants = router.nurand_constants();
+        assert_eq!(constants.c_last_load(), expected_c_last_load);
+        assert_eq!(
+            constants,
+            OfficialRouter::new(WorkloadSeed(seed)).nurand_constants()
+        );
+
+        let delta = constants.c_last_run().abs_diff(constants.c_last_load());
+        assert!((65..=119).contains(&delta));
+        assert_ne!(delta, 96);
+        assert_ne!(delta, 112);
+        assert!(constants.c_id() <= 1_023);
+        assert!(constants.ol_i_id() <= 8_191);
+
+        for stage in [
+            StageId::WARMUP,
+            StageId::measurement(0),
+            StageId::measurement(2),
+        ] {
+            let wheel = router.wheel(stage);
+            let mut sequence = ClientSequence::new(0).unwrap();
+            let route = router.begin_transaction(&wheel, &mut sequence).unwrap();
+            assert_eq!(route.nurand_constants(), constants);
+            assert_eq!(route.retry().nurand_constants(), constants);
+        }
+    }
+}
+
+#[test]
 fn retry_reuses_the_exact_selection_without_consuming_txn_no() {
     let router = OfficialRouter::new(WorkloadSeed(0x2026_0729));
     let wheel = router.wheel(StageId::measurement(0));
@@ -77,6 +117,18 @@ fn every_generated_parameter_stays_in_the_public_domain() {
             match ticket.parameters() {
                 TransactionParameters::NewOrder(input) => {
                     assert!((1..=CUSTOMERS_PER_DISTRICT).contains(&input.customer_id()));
+                    assert_eq!(
+                        input.customer_id(),
+                        expected_nurand(
+                            route,
+                            "parameter/new-order/customer-id",
+                            0,
+                            1_023,
+                            1,
+                            u64::from(CUSTOMERS_PER_DISTRICT),
+                            u64::from(route.nurand_constants().c_id()),
+                        ) as u16
+                    );
                     assert!(
                         (MIN_ORDER_LINES..=MAX_ORDER_LINES).contains(&(input.lines().len() as u8))
                     );
@@ -99,6 +151,18 @@ fn every_generated_parameter_stays_in_the_public_domain() {
                             assert_eq!(index + 1, input.lines().len());
                         } else {
                             assert!((1..=profile::ITEM_COUNT).contains(&line.item_id()));
+                            if !router.hot_items().contains(&line.item_id()) {
+                                let mut attempt = 0;
+                                loop {
+                                    let candidate =
+                                        route.ordinary_item_candidate(line.number(), attempt);
+                                    if !router.hot_items().contains(&candidate) {
+                                        assert_eq!(line.item_id(), candidate);
+                                        break;
+                                    }
+                                    attempt += 1;
+                                }
+                            }
                         }
                     }
                     assert_eq!(
@@ -120,6 +184,7 @@ fn every_generated_parameter_stays_in_the_public_domain() {
                         assert_eq!(input.customer_district(), route.home_district);
                     }
                     validate_customer(input.customer());
+                    assert_customer_nurand(route, "parameter/payment/customer", input.customer());
                     assert!((MIN_PAYMENT_CENTS..=MAX_PAYMENT_CENTS).contains(&input.amount_cents()));
                     assert_eq!(
                         input.amount_bits(),
@@ -129,6 +194,11 @@ fn every_generated_parameter_stays_in_the_public_domain() {
                 }
                 TransactionParameters::OrderStatus(input) => {
                     validate_customer(input.customer());
+                    assert_customer_nurand(
+                        route,
+                        "parameter/order-status/customer",
+                        input.customer(),
+                    );
                 }
                 TransactionParameters::Delivery(input) => {
                     assert!((MIN_CARRIER_ID..=MAX_CARRIER_ID).contains(&input.carrier_id()));
@@ -249,6 +319,54 @@ fn validate_customer(customer: &CustomerSelector) {
             assert!(last_name.value().len() <= 16);
         }
     }
+}
+
+fn assert_customer_nurand(
+    route: &routing::RoutedTransaction,
+    domain: &'static str,
+    customer: &CustomerSelector,
+) {
+    let constants = route.nurand_constants();
+    match customer {
+        CustomerSelector::LastName(last_name) => assert_eq!(
+            u64::from(last_name.number()),
+            expected_nurand(
+                route,
+                domain,
+                1,
+                255,
+                0,
+                999,
+                u64::from(constants.c_last_run()),
+            )
+        ),
+        CustomerSelector::Id(customer_id) => assert_eq!(
+            u64::from(*customer_id),
+            expected_nurand(
+                route,
+                domain,
+                3,
+                1_023,
+                1,
+                u64::from(CUSTOMERS_PER_DISTRICT),
+                u64::from(constants.c_id()),
+            )
+        ),
+    }
+}
+
+fn expected_nurand(
+    route: &routing::RoutedTransaction,
+    domain: &'static str,
+    ordinal: u64,
+    a: u64,
+    minimum: u64,
+    maximum: u64,
+    constant: u64,
+) -> u64 {
+    let left = route.parameter_sample(domain, ordinal, a + 1);
+    let right = minimum + route.parameter_sample(domain, ordinal + 1, maximum - minimum + 1);
+    ((left | right) + constant) % (maximum - minimum + 1) + minimum
 }
 
 fn assert_percent(observed: u64, total: u64, expected: f64, tolerance: f64) {
