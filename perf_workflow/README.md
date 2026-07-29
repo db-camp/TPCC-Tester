@@ -204,15 +204,22 @@ opaque + sealed、五个正式阶段均通过，并且 Rust 对完整正式状�
 `${STATE_DIR}/terminal_evidence.state`。工作流和 summary 都通过状态目录 fd 与
 `O_NOFOLLOW` 打开它，要求 regular file，按 16 MiB canonical hex + 128-byte
 binding headroom + 4 KiB StateStore envelope 得到 16,781,440-byte 上限，并把
-精确路径、size 和 SHA-256 绑定进 manifest。任何形态的
-`${STATE_DIR}/run_ledger.state`（包括普通文件、目录、符号链接和 dangling
-symlink）只通过 `lstat` 检测，绝不读取、删除或修改，并立即使正式结果
-fail-closed。Rust 在同一个状态目录锁内输出它实际解码验证对象的 canonical
-size/SHA-256 receipt；工作流要求 pre-inspect、Rust receipt 和 final inspect
-精确一致，阻断文件替换后恢复的 ABA。最终 manifest 使用
-`state_directory_fd_flock_v1`：对与 StateStore 同源的状态目录 fd 加独占锁，
-在锁内再次检查 terminal/legacy、原子替换 manifest，并在释放前 fsync 结果
-目录。显式偏差、`init`/`rank`/`recovery` 拆分模式和 `tools` 始终非排名。
+精确路径、size 和 SHA-256 绑定进 manifest。正式链 V2 还按固定顺序绑定
+`dataset.state` 到 `recovery_check.passed` 的 16 个 mandatory 工件、状态目录
+device/inode 和每个工件的原始字节；四个 diagnostic claim/receipt 可缺失、完整
+或只留下 claim，均不进入该摘要。除 `database.identity` 和这四个可选诊断工件
+外，未知或 unsafe 状态目录项都会 fail-closed。
+
+任何形态的 `${STATE_DIR}/run_ledger.state`，以及严格匹配
+`.run_ledger.state.<canonical-pid>.<canonical-counter>.tmp` 的旧原子发布残留，
+都只通过目录枚举和 no-follow metadata 检测，绝不读取、删除或修改。Rust 在同
+一个状态目录锁内输出唯一 ASCII `FORMAL_STATE_V2` receipt，绑定 terminal
+size/SHA-256、formal-chain SHA-256 和目录 device/inode；其他 tracing 行可以是
+任意字节。工作流要求 pre-inspect、Rust receipt 和 final inspect 精确一致，
+阻断 ABA、late legacy temp 和后续 recovery receipt 篡改。最终 manifest 使用
+`state_directory_fd_flock_v2`：对与 StateStore 同源的状态目录 fd 加独占锁，
+在锁内重算完整 V2 chain、原子替换 manifest，并在释放前 fsync 结果目录。
+显式偏差、`init`/`rank`/`recovery` 拆分模式和 `tools` 始终非排名。
 `summary.md` 只从 `manifest.json` 生成，不读取旧式文本 manifest；只有
 size/SHA-256 与 manifest 绑定一致的 `rank.log` 可以提供吞吐，profiling 日志
 始终只是 observation。manifest 缺失、损坏、自相矛盾或状态非成功时不会抽取
@@ -220,8 +227,10 @@ size/SHA-256 与 manifest 绑定一致的 `rank.log` 可以提供吞吐，profil
 
 最终排名指标只取 `rank.log` 中按序且各出现一次的三个
 `windowN: new_order_per_min=` 以及唯一
-`ranked_new_order_per_min_median=`。summary 用三值中值重新验证 median 后明确
-输出 `NewOrder/min`；旧式 `Throughput`/`tpmC` 文本不作为排名依据。
+`ranked_new_order_per_min_median=`。最终 manifest 发布前已在状态目录锁内
+重读绑定的 `rank.log`，用 Decimal 重算中位数，并写入 canonical 三窗和 median
+descriptor；summary 再次核对 descriptor、文件 SHA-256 和三值中位数后明确
+输出 `NewOrder/min`。旧式 `Throughput`/`tpmC` 文本不作为排名依据。
 
 资源工件始终标记 `ranked=false`、`score_effect=none`。RSS 是登记 RMDB
 进程树在固定周期采样时的总和峰值；磁盘占用使用 `lstat`/allocated blocks，

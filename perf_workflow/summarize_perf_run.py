@@ -488,143 +488,6 @@ def validate_rank_result(manifest: dict[str, Any]) -> dict[str, Any]:
     return rank_result
 
 
-def inspect_terminal_evidence(
-    state_dir: pathlib.Path,
-) -> tuple[int, str]:
-    if not state_dir.is_absolute():
-        raise ManifestError("manifest.json state path is not absolute")
-    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
-        raise ManifestError("platform cannot safely inspect terminal evidence")
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        directory_flags |= os.O_CLOEXEC
-    try:
-        state_descriptor = os.open(state_dir, directory_flags)
-    except OSError as error:
-        raise ManifestError(
-            "manifest.json state directory is missing or unsafe"
-        ) from error
-    try:
-        try:
-            os.stat(
-                LEGACY_RUN_LEDGER_FILE,
-                dir_fd=state_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            raise ManifestError(
-                "could not inspect forbidden run_ledger.state"
-            ) from error
-        else:
-            raise ManifestError(
-                "forbidden run_ledger.state is present"
-            )
-
-        try:
-            before = os.stat(
-                TERMINAL_EVIDENCE_FILE,
-                dir_fd=state_descriptor,
-                follow_symlinks=False,
-            )
-        except OSError as error:
-            raise ManifestError(
-                "terminal_evidence.state is missing or unsafe"
-            ) from error
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_size <= 0
-            or before.st_size > MAX_TERMINAL_EVIDENCE_STATE_BYTES
-        ):
-            raise ManifestError(
-                "terminal_evidence.state is empty, oversized, or unsafe"
-            )
-
-        file_flags = os.O_RDONLY | os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            file_flags |= os.O_CLOEXEC
-        try:
-            descriptor = os.open(
-                TERMINAL_EVIDENCE_FILE,
-                file_flags,
-                dir_fd=state_descriptor,
-            )
-        except OSError as error:
-            raise ManifestError(
-                "terminal_evidence.state could not be opened safely"
-            ) from error
-        try:
-            opened = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_dev != before.st_dev
-                or opened.st_ino != before.st_ino
-                or opened.st_size != before.st_size
-                or opened.st_mtime_ns != before.st_mtime_ns
-            ):
-                raise ManifestError(
-                    "terminal_evidence.state changed while opening"
-                )
-            digest = hashlib.sha256()
-            remaining = opened.st_size
-            while remaining:
-                chunk = os.read(
-                    descriptor,
-                    min(1024 * 1024, remaining),
-                )
-                if not chunk:
-                    break
-                digest.update(chunk)
-                remaining -= len(chunk)
-            after = os.fstat(descriptor)
-            try:
-                current = os.stat(
-                    TERMINAL_EVIDENCE_FILE,
-                    dir_fd=state_descriptor,
-                    follow_symlinks=False,
-                )
-            except OSError as error:
-                raise ManifestError(
-                    "terminal_evidence.state changed while hashing"
-                ) from error
-            if (
-                remaining != 0
-                or after.st_dev != opened.st_dev
-                or after.st_ino != opened.st_ino
-                or after.st_size != opened.st_size
-                or after.st_mtime_ns != opened.st_mtime_ns
-                or current.st_dev != opened.st_dev
-                or current.st_ino != opened.st_ino
-                or current.st_size != opened.st_size
-                or current.st_mtime_ns != opened.st_mtime_ns
-            ):
-                raise ManifestError(
-                    "terminal_evidence.state changed while hashing"
-                )
-            try:
-                os.stat(
-                    LEGACY_RUN_LEDGER_FILE,
-                    dir_fd=state_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                pass
-            except OSError as error:
-                raise ManifestError(
-                    "could not re-inspect forbidden run_ledger.state"
-                ) from error
-            else:
-                raise ManifestError(
-                    "forbidden run_ledger.state appeared while hashing"
-                )
-            return opened.st_size, digest.hexdigest()
-        finally:
-            os.close(descriptor)
-    finally:
-        os.close(state_descriptor)
-
-
 def validate_formal_state(
     manifest: dict[str, Any],
     attestation_status: str,
@@ -1256,6 +1119,7 @@ def render_manifest(summary: list[str], manifest: dict[str, Any]) -> None:
     formal = manifest["formal_state"]
     terminal = formal["terminal_evidence"]
     legacy = formal["legacy_run_ledger"]
+    chain = formal["formal_chain"]
     summary.extend(
         [
             f"- formal_state.publication_policy: {formal['publication_policy']}",
@@ -1275,6 +1139,18 @@ def render_manifest(summary: list[str], manifest: dict[str, Any]) -> None:
                 "- legacy_run_ledger.inspection_policy: "
                 f"{legacy['inspection_policy']}"
             ),
+            f"- formal_chain.status: {chain['status']}",
+            f"- formal_chain.policy: {chain['policy']}",
+            (
+                "- formal_chain.state_device: "
+                f"{chain['state_directory']['device']}"
+            ),
+            (
+                "- formal_chain.state_inode: "
+                f"{chain['state_directory']['inode']}"
+            ),
+            f"- formal_chain.file_count: {chain['file_count']}",
+            f"- formal_chain.sha256: {chain['sha256']}",
         ]
     )
     for warning in manifest.get("warnings", []):

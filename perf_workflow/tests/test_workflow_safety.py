@@ -973,16 +973,6 @@ class WorkflowSafetyTests(unittest.TestCase):
             timeout=10,
         )
 
-    def terminal_inspector_source(self):
-        script = SCRIPT.read_text(encoding="utf-8")
-        prefix = (
-            '    python3 - "${STATE_DIR}" '
-            '"${TERMINAL_EVIDENCE_STATE_MAX_BYTES}" <<\'PY\'\n'
-        )
-        start = script.index(prefix) + len(prefix)
-        end = script.index('\nPY\n  )"; then', start)
-        return script[start:end]
-
     def write_identity_test_dataset(self, state, run_id, seed):
         dataset = state / "dataset.state"
         dataset.write_text(
@@ -2621,7 +2611,7 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(
-                    "rejected terminal evidence state",
+                    "rejected the required formal state chain",
                     result.stderr,
                 )
                 manifest = json.loads(
