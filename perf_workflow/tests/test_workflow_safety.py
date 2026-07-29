@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -15,14 +16,54 @@ METRICS_HELPER = Path(__file__).resolve().parents[1] / "diagnostic_metrics.py"
 
 
 class WorkflowSafetyTests(unittest.TestCase):
+    def kill_process_session(self, session_id):
+        for requested_signal in (signal.SIGTERM, signal.SIGKILL):
+            result = subprocess.run(
+                ["ps", "-axo", "pid=,sess="],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            members = []
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    fields = line.split()
+                    if len(fields) != 2:
+                        continue
+                    try:
+                        pid, candidate_session = map(int, fields)
+                    except ValueError:
+                        continue
+                    if candidate_session == session_id and pid != os.getpid():
+                        members.append(pid)
+            for pid in reversed(members):
+                try:
+                    os.kill(pid, requested_signal)
+                except ProcessLookupError:
+                    pass
+            time.sleep(0.05)
+
     def run_script(self, *args, script=SCRIPT, env=None):
-        return subprocess.run(
-            ["bash", str(script), *map(str, args)],
+        command = ["bash", str(script), *map(str, args)]
+        process = subprocess.Popen(
+            command,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=15,
             env=env,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.kill_process_session(process.pid)
+            process.communicate()
+            raise
+        return subprocess.CompletedProcess(
+            command,
+            process.returncode,
+            stdout,
+            stderr,
         )
 
     def make_root(self, parent):
@@ -39,6 +80,82 @@ class WorkflowSafetyTests(unittest.TestCase):
         path.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
         path.chmod(0o755)
         return path
+
+    def reserve_port(self):
+        reservation = socket.socket()
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+        reservation.close()
+        return port
+
+    def make_lifecycle_fakes(self, temp_path, root):
+        calls = temp_path / "tester-calls"
+        server_events = temp_path / "server-events"
+        server = self.make_python_executable(
+            temp_path / "fake-rmdb",
+            """
+import os
+import signal
+import socket
+import sys
+import time
+
+database_existed = os.path.isdir(sys.argv[1])
+os.makedirs(sys.argv[1], exist_ok=True)
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", int(os.environ["RMDB_PORT"])))
+listener.listen(8)
+with open(os.environ["FAKE_SERVER_EVENTS"], "a", encoding="utf-8") as output:
+    output.write(f"start {os.getpid()} {int(database_existed)}\\n")
+def stop(signum, _frame):
+    with open(
+        os.environ["FAKE_SERVER_EVENTS"], "a", encoding="utf-8"
+    ) as output:
+        output.write(f"graceful {os.getpid()} {signum}\\n")
+    listener.close()
+    os._exit(0)
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    time.sleep(0.02)
+""",
+        )
+        tester = self.make_python_executable(
+            temp_path / "fake-tpcc",
+            """
+import os
+import sys
+
+with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
+    output.write("\\t".join(sys.argv[1:]) + "\\n")
+""",
+        )
+        env = os.environ.copy()
+        env["FAKE_TPCC_CALLS"] = str(calls)
+        env["FAKE_SERVER_EVENTS"] = str(server_events)
+        return server, tester, calls, server_events, env, self.reserve_port()
+
+    def wait_for_path(self, path, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists():
+                return True
+            time.sleep(0.01)
+        return path.exists()
+
+    def assert_pid_gone(self, pid):
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            result = subprocess.run(
+                ["ps", "-p", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode != 0:
+                return
+            time.sleep(0.02)
+        self.fail(f"process {pid} is still alive")
 
     def test_bash_syntax(self):
         result = subprocess.run(
@@ -355,18 +472,129 @@ class WorkflowSafetyTests(unittest.TestCase):
                 "--allow-deviation",
                 "--scale",
                 "1",
-                "--clients",
-                "1",
-                "--warmup-seconds",
-                "0",
-                "--window-seconds",
-                "1",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("diagnostics_requested=0\n", result.stdout)
             self.assertIn(
                 "diagnostics_phase=not_applicable_non_ranked\n",
                 result.stdout,
+            )
+
+    def test_scale_only_all_skips_diagnostics_and_uses_sigkill_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            (
+                server,
+                tester,
+                calls,
+                server_events,
+                env,
+                port,
+            ) = self.make_lifecycle_fakes(temp_path, root)
+            records = temp_path / "records"
+            result = self.run_script(
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                "--allow-deviation",
+                "--scale",
+                "1",
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            invocations = [
+                line.split("\t")
+                for line in calls.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertFalse(
+                any(
+                    "--diagnostic-workload-seconds" in args
+                    for args in invocations
+                )
+            )
+            result_dir = next(records.iterdir())
+            manifest = json.loads(
+                (result_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["phases"]["diagnostics"],
+                "not_applicable_non_ranked",
+            )
+            events = server_events.read_text(encoding="utf-8").splitlines()
+            starts = [line.split() for line in events if line.startswith("start ")]
+            graceful = [
+                line.split() for line in events if line.startswith("graceful ")
+            ]
+            self.assertEqual(len(starts), 2, events)
+            self.assertEqual([row[2] for row in starts], ["0", "1"])
+            self.assertEqual(
+                [row[1] for row in graceful],
+                [starts[1][1]],
+                "the pre-recovery server must die by SIGKILL, not graceful stop",
+            )
+            for row in starts:
+                self.assert_pid_gone(int(row[1]))
+            rebound = socket.socket()
+            try:
+                rebound.bind(("127.0.0.1", port))
+            finally:
+                rebound.close()
+
+    def test_custom_recovery_budget_reaches_every_stateful_tester_call(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, calls, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                "--allow-deviation",
+                "--ready-timeout-seconds",
+                "5",
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            invocations = [
+                line.split("\t")
+                for line in calls.read_text(encoding="utf-8").splitlines()
+            ]
+            stateful = [
+                args for args in invocations if "--probe-ready" not in args
+            ]
+            self.assertGreaterEqual(len(stateful), 1)
+            self.assertTrue(
+                all(
+                    args[
+                        args.index("--recovery-ready-budget-seconds") + 1
+                    ]
+                    == "5"
+                    for args in stateful
+                )
             )
 
     def test_existing_database_modes_reuse_dataset_run_identity(self):
@@ -560,6 +788,189 @@ exit 0
                 "a single readiness probe exceeded the remaining deadline",
             )
 
+    def test_timed_out_probe_leaves_budget_for_a_successful_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, _, calls, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            probe_count = temp_path / "probe-count"
+            tester = self.make_python_executable(
+                temp_path / "retry-tpcc",
+                """
+import os
+from pathlib import Path
+import sys
+import time
+
+with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
+    output.write("\\t".join(sys.argv[1:]) + "\\n")
+if "--probe-ready" in sys.argv:
+    counter = Path(os.environ["FAKE_PROBE_COUNT"])
+    count = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+    counter.write_text(str(count + 1), encoding="utf-8")
+    if count == 0:
+        time.sleep(30)
+""",
+            )
+            env["FAKE_PROBE_COUNT"] = str(probe_count)
+            started = time.monotonic()
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                "--allow-deviation",
+                "--ready-timeout-seconds",
+                "5",
+                env=env,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreaterEqual(
+                int(probe_count.read_text(encoding="utf-8")),
+                2,
+            )
+            self.assertLess(elapsed, 5.0)
+            invocations = [
+                line.split("\t")
+                for line in calls.read_text(encoding="utf-8").splitlines()
+            ]
+            probes = [
+                args for args in invocations if "--probe-ready" in args
+            ]
+            self.assertGreaterEqual(len(probes), 2)
+
+    @unittest.skipIf(
+        Path("/proc/self/stat").is_file(),
+        "lsof readiness backend is used on macOS, not Linux",
+    )
+    def test_hung_lsof_cannot_exceed_readiness_deadline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            fake_tools = temp_path / "fake-tools"
+            fake_tools.mkdir()
+            self.make_executable(fake_tools / "lsof", "sleep 30\n")
+            env["PATH"] = f"{fake_tools}{os.pathsep}{env['PATH']}"
+            started = time.monotonic()
+            result = self.run_script(
+                "--mode",
+                "init",
+                "--target-dir",
+                root,
+                "--record-root",
+                temp_path / "records",
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                "--allow-deviation",
+                "--ready-timeout-seconds",
+                "1",
+                env=env,
+            )
+            elapsed = time.monotonic() - started
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("inspection exceeded readiness deadline", result.stderr)
+            self.assertLess(elapsed, 3.0)
+
+    def test_term_during_hung_probe_cleans_probe_server_and_port(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, _, _, server_events, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            probe_pid_file = temp_path / "probe-pid"
+            tester = self.make_python_executable(
+                temp_path / "hung-tpcc",
+                """
+import os
+from pathlib import Path
+import sys
+import time
+
+if "--probe-ready" in sys.argv:
+    Path(os.environ["FAKE_PROBE_PID"]).write_text(
+        str(os.getpid()),
+        encoding="utf-8",
+    )
+    time.sleep(60)
+""",
+            )
+            env["FAKE_PROBE_PID"] = str(probe_pid_file)
+            command = [
+                "bash",
+                str(SCRIPT),
+                "--mode",
+                "init",
+                "--target-dir",
+                str(root),
+                "--record-root",
+                str(temp_path / "records"),
+                "--skip-build",
+                "--server-bin",
+                str(server),
+                "--tpcc-bin",
+                str(tester),
+                "--port",
+                str(port),
+            ]
+            process = subprocess.Popen(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                start_new_session=True,
+            )
+            try:
+                self.assertTrue(self.wait_for_path(probe_pid_file))
+                server_pid = int(
+                    server_events.read_text(encoding="utf-8").split()[1]
+                )
+                probe_pid = int(probe_pid_file.read_text(encoding="utf-8"))
+                started = time.monotonic()
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=4)
+                self.assertLess(time.monotonic() - started, 4.0)
+                self.assertNotEqual(
+                    process.returncode,
+                    0,
+                    (stdout, stderr),
+                )
+                self.assert_pid_gone(probe_pid)
+                self.assert_pid_gone(server_pid)
+                rebound = socket.socket()
+                try:
+                    rebound.bind(("127.0.0.1", port))
+                finally:
+                    rebound.close()
+            finally:
+                if process.poll() is None:
+                    self.kill_process_session(process.pid)
+                    process.communicate()
+
     def test_foreign_racing_listener_is_rejected_and_not_killed(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
@@ -667,6 +1078,55 @@ listener.close()
                 if foreign.poll() is None:
                     foreign.terminate()
                 foreign.wait(timeout=3)
+
+    def test_listener_owner_check_ignores_nonmatching_ipv6_address(self):
+        if not socket.has_ipv6:
+            self.skipTest("IPv6 is unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, _ = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            foreign = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            try:
+                foreign.setsockopt(
+                    socket.IPPROTO_IPV6,
+                    socket.IPV6_V6ONLY,
+                    1,
+                )
+                foreign.bind(("::1", 0))
+                foreign.listen(2)
+                port = foreign.getsockname()[1]
+                ipv4_probe = socket.socket()
+                try:
+                    ipv4_probe.bind(("127.0.0.1", port))
+                except OSError:
+                    self.skipTest("IPv4 and IPv6 listeners cannot coexist")
+                finally:
+                    ipv4_probe.close()
+
+                result = self.run_script(
+                    "--mode",
+                    "init",
+                    "--target-dir",
+                    root,
+                    "--record-root",
+                    temp_path / "records",
+                    "--skip-build",
+                    "--server-bin",
+                    server,
+                    "--tpcc-bin",
+                    tester,
+                    "--port",
+                    port,
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(foreign.getsockname()[1], port)
+            finally:
+                foreign.close()
 
     def test_stale_cmake_cache_fails_without_deleting_it(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -810,6 +1270,27 @@ while :; do sleep 0.05; done
             env["FAKE_DB_PATH"] = str(root / "tpcc_final2026")
             env["FAKE_SERVER_CHILDREN"] = str(server_children)
             env["PATH"] = f"{fake_tools}{os.pathsep}{env['PATH']}"
+
+            def recorded_child_pids():
+                if not server_children.exists():
+                    return []
+                return [
+                    int(pid)
+                    for pid in server_children.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
+
+            def assert_cleanup_since(previous_count):
+                new_pids = recorded_child_pids()[previous_count:]
+                self.assertGreaterEqual(len(new_pids), 2)
+                for child_pid in new_pids:
+                    self.assert_pid_gone(child_pid)
+                rebound = socket.socket()
+                try:
+                    rebound.bind(("127.0.0.1", 8765))
+                finally:
+                    rebound.close()
 
             result = self.run_script(
                 "--mode",
@@ -1049,41 +1530,14 @@ while :; do sleep 0.05; done
             self.assertIn("[server start: existing database]", server_log)
             self.assertFalse((root / "tpcc_final2026").exists())
             self.assertEqual(source_csv.read_text(encoding="utf-8"), "tracked csv")
-            child_pids = [
-                int(pid)
-                for pid in server_children.read_text(encoding="utf-8").splitlines()
-            ]
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                if all(
-                    subprocess.run(
-                        ["ps", "-p", str(pid)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    ).returncode
-                    != 0
-                    for pid in child_pids
-                ):
-                    break
-                time.sleep(0.02)
-            self.assertTrue(
-                all(
-                    subprocess.run(
-                        ["ps", "-p", str(pid)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    ).returncode
-                    != 0
-                    for pid in child_pids
-                ),
-                f"registered RMDB descendants survived cleanup: {child_pids}",
-            )
+            assert_cleanup_since(0)
 
             for failure_variable, diagnostic_status in (
                 ("FAKE_STRACE_EMPTY", "failed"),
                 ("FAKE_STRACE_DIE_EARLY", "unavailable"),
             ):
                 with self.subTest(diagnostic_failure=failure_variable):
+                    prior_child_count = len(recorded_child_pids())
                     env[failure_variable] = "1"
                     diagnostic_failure_records = (
                         Path(temp) / f"{failure_variable}-records"
@@ -1127,8 +1581,10 @@ while :; do sleep 0.05; done
                         diagnostic_failure_manifest["phases"]["diagnostics"],
                         diagnostic_status,
                     )
+                    assert_cleanup_since(prior_child_count)
                     env.pop(failure_variable)
 
+            prior_child_count = len(recorded_child_pids())
             env["FAKE_TPCC_FAIL_SCOPE"] = "recovery"
             failed_records = Path(temp) / "failed-records"
             failed = self.run_script(
@@ -1175,6 +1631,7 @@ while :; do sleep 0.05; done
                     "diagnostics": "skipped_due_to_failure",
                 },
             )
+            assert_cleanup_since(prior_child_count)
 
 
 if __name__ == "__main__":

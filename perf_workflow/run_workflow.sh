@@ -753,27 +753,110 @@ PY
 
 process_identity() {
   local pid="$1"
-  python3 - "${pid}" <<'PY'
+  local absolute_deadline_millis="${2-0}"
+  python3 - "${pid}" "${absolute_deadline_millis}" <<'PY'
 from pathlib import Path
+import ctypes
 import subprocess
 import sys
+import time
 
 pid = int(sys.argv[1])
+deadline_millis = int(sys.argv[2])
+
+
+def remaining_seconds():
+    if deadline_millis <= 0:
+        return None
+    remaining = (
+        deadline_millis - time.monotonic_ns() // 1_000_000
+    ) / 1000.0
+    if remaining <= 0:
+        raise SystemExit(124)
+    return remaining
+
+
+def darwin_start_identity(process_id):
+    class ProcBsdInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    library.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    library.proc_pidinfo.restype = ctypes.c_int
+    info = ProcBsdInfo()
+    copied = library.proc_pidinfo(
+        process_id,
+        3,
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if copied != ctypes.sizeof(info):
+        return None
+    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+
+
 stat_path = Path("/proc") / str(pid) / "stat"
 if stat_path.is_file():
     try:
+        remaining_seconds()
         text = stat_path.read_text(encoding="ascii")
+        remaining_seconds()
         fields = text[text.rfind(")") + 2 :].split()
         print(f"linux:{fields[19]}")
     except (OSError, IndexError, ValueError):
         raise SystemExit(1)
+elif sys.platform == "darwin":
+    remaining_seconds()
+    identity = darwin_start_identity(pid)
+    remaining_seconds()
+    if identity is None:
+        raise SystemExit(1)
+    print(identity)
 else:
-    result = subprocess.run(
-        ["ps", "-o", "lstart=", "-p", str(pid)],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=remaining_seconds(),
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(124)
+    remaining_seconds()
     identity = result.stdout.strip()
     if result.returncode != 0 or not identity:
         raise SystemExit(1)
@@ -784,25 +867,128 @@ PY
 server_process_helper() {
   local action="$1"
   local signal_name="${2-}"
+  local absolute_deadline_millis="${3-0}"
   python3 - "${action}" "${SERVER_PID}" "${SERVER_IDENTITY}" \
-    "${SERVER_PGID}" "${PORT}" "${signal_name}" <<'PY'
+    "${SERVER_PGID}" "${PORT}" "${HOST}" "${signal_name}" \
+    "${absolute_deadline_millis}" <<'PY'
 import os
 from pathlib import Path
+import ctypes
+import ipaddress
 import signal
+import socket
 import subprocess
 import sys
+import time
 
-action, root_text, expected_identity, pgid_text, port_text, signal_name = (
-    sys.argv[1:]
-)
+(
+    action,
+    root_text,
+    expected_identity,
+    pgid_text,
+    port_text,
+    host,
+    signal_name,
+    deadline_text,
+) = sys.argv[1:]
 root_pid = int(root_text)
 registered_pgid = int(pgid_text)
 port = int(port_text)
+absolute_deadline_millis = int(deadline_text)
+
+
+class DeadlineExpired(Exception):
+    pass
+
+
+def remaining_seconds():
+    if absolute_deadline_millis <= 0:
+        return None
+    remaining = (
+        absolute_deadline_millis - time.monotonic_ns() // 1_000_000
+    ) / 1000.0
+    if remaining <= 0:
+        raise DeadlineExpired
+    return remaining
+
+
+def check_deadline():
+    remaining_seconds()
+
+
+def run_inspection(command):
+    check_deadline()
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=remaining_seconds(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise DeadlineExpired from error
+    check_deadline()
+    return result
+
+
+def darwin_start_identity(process_id):
+    class ProcBsdInfo(ctypes.Structure):
+        _fields_ = [
+            ("pbi_flags", ctypes.c_uint32),
+            ("pbi_status", ctypes.c_uint32),
+            ("pbi_xstatus", ctypes.c_uint32),
+            ("pbi_pid", ctypes.c_uint32),
+            ("pbi_ppid", ctypes.c_uint32),
+            ("pbi_uid", ctypes.c_uint32),
+            ("pbi_gid", ctypes.c_uint32),
+            ("pbi_ruid", ctypes.c_uint32),
+            ("pbi_rgid", ctypes.c_uint32),
+            ("pbi_svuid", ctypes.c_uint32),
+            ("pbi_svgid", ctypes.c_uint32),
+            ("rfu_1", ctypes.c_uint32),
+            ("pbi_comm", ctypes.c_char * 16),
+            ("pbi_name", ctypes.c_char * 32),
+            ("pbi_nfiles", ctypes.c_uint32),
+            ("pbi_pgid", ctypes.c_uint32),
+            ("pbi_pjobc", ctypes.c_uint32),
+            ("e_tdev", ctypes.c_uint32),
+            ("e_tpgid", ctypes.c_uint32),
+            ("pbi_nice", ctypes.c_int32),
+            ("pbi_start_tvsec", ctypes.c_uint64),
+            ("pbi_start_tvusec", ctypes.c_uint64),
+        ]
+
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError:
+        return None
+    library.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    library.proc_pidinfo.restype = ctypes.c_int
+    info = ProcBsdInfo()
+    copied = library.proc_pidinfo(
+        process_id,
+        3,
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if copied != ctypes.sizeof(info):
+        return None
+    return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
 
 
 def linux_stat(pid):
+    check_deadline()
     try:
         text = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+        check_deadline()
         fields = text[text.rfind(")") + 2 :].split()
         return {
             "pid": pid,
@@ -820,6 +1006,7 @@ def process_table():
     proc = Path("/proc")
     if (proc / "self" / "stat").is_file():
         for entry in proc.iterdir():
+            check_deadline()
             if not entry.name.isdigit():
                 continue
             item = linux_stat(int(entry.name))
@@ -827,12 +1014,7 @@ def process_table():
                 table[item["pid"]] = item
         return table
 
-    result = subprocess.run(
-        ["ps", "-axo", "pid=,ppid=,pgid=,state="],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
+    result = run_inspection(["ps", "-axo", "pid=,ppid=,pgid=,state="])
     if result.returncode != 0:
         raise RuntimeError("cannot inspect the process table")
     for line in result.stdout.splitlines():
@@ -854,15 +1036,15 @@ def process_table():
 
 
 def current_identity(pid):
+    check_deadline()
     item = linux_stat(pid)
     if item is not None:
         return item["identity"]
-    result = subprocess.run(
-        ["ps", "-o", "lstart=", "-p", str(pid)],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
+    if sys.platform == "darwin":
+        identity = darwin_start_identity(pid)
+        check_deadline()
+        return identity
+    result = run_inspection(["ps", "-o", "lstart=", "-p", str(pid)])
     identity = result.stdout.strip()
     if result.returncode != 0 or not identity:
         return None
@@ -873,8 +1055,10 @@ def descendants(table):
     owned = {root_pid}
     changed = True
     while changed:
+        check_deadline()
         changed = False
         for pid, item in table.items():
+            check_deadline()
             if pid not in owned and item["ppid"] in owned:
                 owned.add(pid)
                 changed = True
@@ -891,34 +1075,82 @@ def root_status(table):
 
 
 def listener_owners_linux():
+    try:
+        target_addresses = {
+            ipaddress.ip_address(address[0])
+            for _, _, _, _, address in socket.getaddrinfo(
+                host,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        }
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"cannot resolve readiness host {host}: {error}")
+
+    def decode_address(name, encoded):
+        raw = bytes.fromhex(encoded)
+        if name == "tcp":
+            return ipaddress.ip_address(raw[::-1])
+        reordered = b"".join(
+            raw[offset : offset + 4][::-1]
+            for offset in range(0, len(raw), 4)
+        )
+        return ipaddress.ip_address(reordered)
+
+    def matches_target(name, encoded):
+        try:
+            local_address = decode_address(name, encoded)
+        except ValueError:
+            return False
+        matching_family = {
+            address
+            for address in target_addresses
+            if address.version == local_address.version
+        }
+        return bool(matching_family) and (
+            local_address.is_unspecified or local_address in matching_family
+        )
+
     inodes = set()
+    inspected = False
     for name in ("tcp", "tcp6"):
+        check_deadline()
         path = Path("/proc/net") / name
+        if not path.exists():
+            continue
+        inspected = True
         try:
             lines = path.read_text(encoding="ascii").splitlines()[1:]
+            check_deadline()
         except OSError:
             raise RuntimeError(f"cannot inspect {path}")
         for line in lines:
+            check_deadline()
             fields = line.split()
             if len(fields) < 10 or fields[3] != "0A":
                 continue
             try:
-                local_port = int(fields[1].rsplit(":", 1)[1], 16)
+                encoded_address, encoded_port = fields[1].rsplit(":", 1)
+                local_port = int(encoded_port, 16)
             except (IndexError, ValueError):
                 continue
-            if local_port == port:
+            if local_port == port and matches_target(name, encoded_address):
                 inodes.add(fields[9])
+    if not inspected:
+        raise RuntimeError("neither /proc/net/tcp nor tcp6 is available")
     if not inodes:
         return set(), False
 
     owners = set()
     mapped = set()
     for entry in Path("/proc").iterdir():
+        check_deadline()
         if not entry.name.isdigit():
             continue
         try:
             descriptors = (entry / "fd").iterdir()
             for descriptor in descriptors:
+                check_deadline()
                 try:
                     target = os.readlink(descriptor)
                 except OSError:
@@ -936,22 +1168,27 @@ def listener_owners_linux():
 
 
 def listener_owners_lsof():
+    check_deadline()
     try:
         result = subprocess.run(
             [
                 "lsof",
                 "-nP",
                 "-a",
-                f"-iTCP:{port}",
+                f"-iTCP@{host}:{port}",
                 "-sTCP:LISTEN",
                 "-Fp",
             ],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=remaining_seconds(),
         )
     except FileNotFoundError:
         raise RuntimeError("lsof is required to validate listener ownership")
+    except subprocess.TimeoutExpired as error:
+        raise DeadlineExpired from error
+    check_deadline()
     owners = set()
     for line in result.stdout.splitlines():
         if line.startswith("p") and line[1:].isdigit():
@@ -964,11 +1201,15 @@ def listener_owners_lsof():
 
 
 try:
+    check_deadline()
     table = process_table()
+    status = root_status(table)
+except DeadlineExpired:
+    print("process ownership inspection exceeded readiness deadline", file=sys.stderr)
+    raise SystemExit(124)
 except RuntimeError as error:
     print(error, file=sys.stderr)
     raise SystemExit(2)
-status = root_status(table)
 
 if action == "root-alive":
     raise SystemExit(0 if status == "owned" else (1 if status == "absent" else 2))
@@ -988,18 +1229,46 @@ if action == "listener":
     if status != "owned":
         print("registered RMDB process identity is not live", file=sys.stderr)
         raise SystemExit(2)
-    owned = descendants(table)
     try:
         if (Path("/proc") / "self" / "stat").is_file():
-            owners, present = listener_owners_linux()
+            first_owners, present = listener_owners_linux()
         else:
-            owners, present = listener_owners_lsof()
+            first_owners, present = listener_owners_lsof()
+        if not present:
+            raise SystemExit(1)
+
+        refreshed_table = process_table()
+        if root_status(refreshed_table) != "owned":
+            raise RuntimeError(
+                "registered RMDB identity changed during listener inspection"
+            )
+        refreshed_owned = descendants(refreshed_table)
+        owner_identities = {
+            pid: current_identity(pid) for pid in first_owners
+        }
+        if any(identity is None for identity in owner_identities.values()):
+            raise RuntimeError("listener owner exited during ownership inspection")
+
+        if (Path("/proc") / "self" / "stat").is_file():
+            second_owners, second_present = listener_owners_linux()
+        else:
+            second_owners, second_present = listener_owners_lsof()
+        if not second_present or second_owners != first_owners:
+            raise SystemExit(1)
+        if any(
+            current_identity(pid) != identity
+            for pid, identity in owner_identities.items()
+        ):
+            raise RuntimeError(
+                "listener owner identity changed during ownership inspection"
+            )
+    except DeadlineExpired:
+        print("listener ownership inspection exceeded readiness deadline", file=sys.stderr)
+        raise SystemExit(124)
     except RuntimeError as error:
         print(error, file=sys.stderr)
         raise SystemExit(2)
-    if not present:
-        raise SystemExit(1)
-    if not owners.issubset(owned):
+    if not second_owners.issubset(refreshed_owned):
         print(
             "listening socket is owned outside the registered RMDB process tree",
             file=sys.stderr,
@@ -1036,7 +1305,13 @@ if action == "signal":
                 file=sys.stderr,
             )
             raise SystemExit(2)
-    elif not group_members:
+    elif group_members:
+        print(
+            "refusing to signal a process group after its registered root exited",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    else:
         raise SystemExit(0)
 
     signals = {
@@ -1063,27 +1338,49 @@ PY
 }
 
 port_is_available() {
-  python3 - "${HOST}" "${PORT}" <<'PY'
+  local absolute_deadline_millis="${1-0}"
+  python3 - "${HOST}" "${PORT}" "${absolute_deadline_millis}" <<'PY'
 import socket
 import sys
+import time
 
 host, port = sys.argv[1], int(sys.argv[2])
+deadline_millis = int(sys.argv[3])
+
+
+def remaining_seconds():
+    if deadline_millis <= 0:
+        return None
+    remaining = (
+        deadline_millis - time.monotonic_ns() // 1_000_000
+    ) / 1000.0
+    if remaining <= 0:
+        raise SystemExit(124)
+    return remaining
+
+
+remaining_seconds()
 addresses = {
     (family, socktype, proto, address)
     for family, socktype, proto, _, address in socket.getaddrinfo(
         host, port, type=socket.SOCK_STREAM)
 }
+remaining_seconds()
 if not addresses:
     raise SystemExit(1)
 for family, socktype, proto, address in addresses:
+    remaining = remaining_seconds()
     sock = socket.socket(family, socktype, proto)
     try:
+        if remaining is not None:
+            sock.settimeout(remaining)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(address)
     except OSError:
         sock.close()
         raise SystemExit(1)
     sock.close()
+    remaining_seconds()
 raise SystemExit(0)
 PY
 }
@@ -1096,7 +1393,7 @@ wait_for_server_group_exit() {
   started="$(monotonic_millis)"
   deadline=$(( started + timeout_millis ))
   while true; do
-    if server_process_helper group-running; then
+    if server_process_helper group-running "" "${deadline}"; then
       :
     else
       local status=$?
@@ -1117,7 +1414,7 @@ wait_for_listener_gone() {
   started="$(monotonic_millis)"
   deadline=$(( started + timeout_millis ))
   while true; do
-    port_is_available && return 0
+    port_is_available "${deadline}" && return 0
     now="$(monotonic_millis)"
     (( now < deadline )) || return 1
     sleep 0.05
@@ -1362,7 +1659,7 @@ ensure_port_available() {
 probe_ready() {
   local absolute_deadline_millis="$1"
   python3 - "${absolute_deadline_millis}" "${TPCC_DIR}" "${TPCC_BIN}" \
-    "${HOST}" "${PORT}" <<'PY' >>"${RESULT_DIR}/ready_probe.log" 2>&1
+    "${HOST}" "${PORT}" <<'PY' >>"${RESULT_DIR}/ready_probe.log" 2>&1 &
 import os
 import signal
 import subprocess
@@ -1376,27 +1673,37 @@ remaining_seconds = (
 ) / 1000.0
 if remaining_seconds <= 0:
     raise SystemExit(124)
+probe_timeout_seconds = min(2.0, remaining_seconds)
 
-process = subprocess.Popen(
-    [executable, "--probe-ready", "--host", host, "--port", port],
-    cwd=working_directory,
-    start_new_session=True,
-)
-
-
+process = None
 def terminate_probe(signum, _frame):
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+    if process is not None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
     raise SystemExit(128 + signum)
 
 
+blocked_signals = {signal.SIGINT, signal.SIGTERM}
+signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
 signal.signal(signal.SIGINT, terminate_probe)
 signal.signal(signal.SIGTERM, terminate_probe)
 try:
-    raise SystemExit(process.wait(timeout=remaining_seconds))
+    process = subprocess.Popen(
+        [executable, "--probe-ready", "--host", host, "--port", port],
+        cwd=working_directory,
+        start_new_session=True,
+    )
+except OSError as error:
+    print(f"could not start readiness probe: {error}", file=sys.stderr)
+finally:
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked_signals)
+if process is None:
+    raise SystemExit(127)
+try:
+    raise SystemExit(process.wait(timeout=probe_timeout_seconds))
 except subprocess.TimeoutExpired:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -1405,28 +1712,30 @@ except subprocess.TimeoutExpired:
     process.wait()
     raise SystemExit(124)
 PY
+  PROBE_PID=$!
+  local probe_rc=0
+  wait "${PROBE_PID}" || probe_rc=$?
+  PROBE_PID=""
+  return "${probe_rc}"
 }
 
 wait_for_ready() {
-  local started_millis=""
-  local deadline_millis=""
+  local deadline_millis="$1"
   local now_millis=""
   local listener_status=0
-  started_millis="$(monotonic_millis)"
-  deadline_millis=$(( (10#${READY_TIMEOUT_SECONDS} * 1000) + started_millis ))
   while true; do
     now_millis="$(monotonic_millis)"
     (( now_millis < deadline_millis )) || return 1
     if [[ -z "${SERVER_PID}" ]] \
-      || ! server_process_helper root-alive; then
+      || ! server_process_helper root-alive "" "${deadline_millis}"; then
       return 1
     fi
 
-    if server_process_helper listener; then
+    if server_process_helper listener "" "${deadline_millis}"; then
       if probe_ready "${deadline_millis}"; then
         now_millis="$(monotonic_millis)"
         (( now_millis <= deadline_millis )) || return 1
-        server_process_helper listener || return 1
+        server_process_helper listener "" "${deadline_millis}" || return 1
         now_millis="$(monotonic_millis)"
         (( now_millis <= deadline_millis )) || return 1
         return 0
@@ -1452,18 +1761,27 @@ PY
 
 register_server_process() {
   local pid="$1"
-  local started_millis=""
-  local deadline_millis=""
+  local readiness_deadline_millis="$2"
+  local registration_deadline_millis=""
+  local now_millis=""
   local current_pgid=""
-  SERVER_IDENTITY="$(process_identity "${pid}")" \
-    || die "could not capture registered RMDB process identity"
-  started_millis="$(monotonic_millis)"
-  deadline_millis=$(( started_millis + 2000 ))
+  if ! SERVER_IDENTITY="$(
+    process_identity "${pid}" "${readiness_deadline_millis}"
+  )"; then
+    warn "could not capture registered RMDB process identity"
+    return 1
+  fi
+  now_millis="$(monotonic_millis)"
+  registration_deadline_millis=$(( now_millis + 2000 ))
+  if (( registration_deadline_millis > readiness_deadline_millis )); then
+    registration_deadline_millis="${readiness_deadline_millis}"
+  fi
   while true; do
-    if ! server_process_helper root-alive; then
-      die "RMDB exited before its process group could be registered"
+    if ! server_process_helper root-alive "" "${readiness_deadline_millis}"; then
+      warn "RMDB exited before its process group could be registered"
+      return 1
     fi
-    current_pgid="$(python3 - "${pid}" <<'PY'
+    if ! current_pgid="$(python3 - "${pid}" <<'PY'
 import os
 import sys
 
@@ -1472,22 +1790,32 @@ try:
 except ProcessLookupError:
     raise SystemExit(1)
 PY
-)" || die "could not inspect registered RMDB process group"
+)"; then
+      warn "could not inspect registered RMDB process group"
+      return 1
+    fi
     if [[ "${current_pgid}" == "${pid}" ]]; then
       SERVER_PGID="${current_pgid}"
       return 0
     fi
-    (( $(monotonic_millis) < deadline_millis )) \
-      || die "RMDB did not enter its dedicated process group"
+    if (( $(monotonic_millis) >= registration_deadline_millis )); then
+      warn "RMDB did not enter its dedicated process group before readiness deadline"
+      return 1
+    fi
     sleep 0.02
   done
 }
 
 start_server() {
   local purpose="$1"
+  local readiness_started_millis=""
+  local readiness_deadline_millis=""
   ensure_port_available
   printf '\n[server start: %s]\n' "${purpose}" >>"${SERVER_LOG}"
   log "starting RMDB for ${purpose}"
+  readiness_started_millis="$(monotonic_millis)"
+  readiness_deadline_millis=$(( (10#${READY_TIMEOUT_SECONDS} * 1000) \
+    + readiness_started_millis ))
   (
     cd "${RMDB_DIR}"
     exec env RMDB_PORT="${PORT}" python3 -c \
@@ -1499,9 +1827,13 @@ os.execv(sys.argv[1], sys.argv[1:])' \
   ) >>"${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
   SERVER_PGID="${SERVER_PID}"
-  register_server_process "${SERVER_PID}"
+  if ! register_server_process \
+      "${SERVER_PID}" "${readiness_deadline_millis}"; then
+    force_stop_server 1000 || true
+    die "RMDB process registration exceeded the shared readiness budget"
+  fi
   printf '%s\n' "${SERVER_PID}" >"${RESULT_DIR}/server.pid"
-  if ! wait_for_ready; then
+  if ! wait_for_ready "${readiness_deadline_millis}"; then
     force_stop_server 1000 || true
     die "RMDB did not pass the exact show-tables readiness probe within ${READY_TIMEOUT_SECONDS}s; see ${SERVER_LOG}"
   fi
