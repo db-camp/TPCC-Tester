@@ -5,11 +5,12 @@ use consistency::{
     add_f32_once, float32_matches, float_aggregate_plan, large_set_boundary,
     large_set_boundary_from_f32, public_online_integer_plan, recovery_partition_audits,
     recovery_plan, setup_plan, sum_f32_as_f64_once, ulp_distance, validate_crash_float_baseline,
-    validate_public_float_ledger, validate_relative_add, validate_relative_update_chain,
-    CheckScope, CommittedLedger, FloatAggregateId, IdentifierMap, LedgerFloatRule, OnlineKeySample,
-    PartitionExpectation, PartitionKey, PublicFloatLedgerEvidence, RecoveryExpectations,
-    RelativeUpdateEvidence, ScalarExpectation, SetupExpectations, TypedResult, TypedValue,
-    FLOAT_AGGREGATES, PUBLIC_SPEC_NOTICE,
+    validate_public_float_ledger, validate_public_recovery_integer_gate, validate_relative_add,
+    validate_relative_update_chain, CheckScope, CommittedLedger, FloatAggregateId, IdentifierMap,
+    LedgerFloatRule, OnlineKeySample, PartitionExpectation, PartitionKey, PlanError,
+    PublicFloatLedgerEvidence, RecoveryExpectations, RelativeUpdateEvidence, ScalarExpectation,
+    SetupExpectations, TypedResult, TypedValue, FLOAT_AGGREGATES,
+    PUBLIC_RECOVERY_INTEGER_CHECK_COUNT, PUBLIC_SPEC_NOTICE,
 };
 
 fn expectation(plan: &consistency::ConsistencyPlan, id: &str) -> ScalarExpectation {
@@ -19,6 +20,27 @@ fn expectation(plan: &consistency::ConsistencyPlan, id: &str) -> ScalarExpectati
         .unwrap_or_else(|| panic!("missing check {id}"))
         .expectation
         .clone()
+}
+
+fn sql_identifiers(sql: &str) -> Vec<&str> {
+    sql.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn recovery_fixture() -> RecoveryExpectations {
+    RecoveryExpectations {
+        setup: SetupExpectations::final_2026(15_000_000, 4_500_000),
+        committed: CommittedLedger {
+            new_orders: 10,
+            new_order_lines: 100,
+            remote_new_order_lines: 4,
+            stock_ytd_delta: 550,
+            payments: 20,
+            delivered_orders: 3,
+            delivered_order_lines: 30,
+        },
+    }
 }
 
 #[test]
@@ -114,17 +136,7 @@ fn recovery_plan_rejects_impossible_committed_ledgers() {
 
 #[test]
 fn committed_ledger_drives_public_online_and_recovery_answers() {
-    let input = RecoveryExpectations {
-        setup: SetupExpectations::final_2026(15_000_000, 4_500_000),
-        committed: CommittedLedger {
-            new_orders: 10,
-            new_order_lines: 100,
-            remote_new_order_lines: 4,
-            payments: 20,
-            delivered_orders: 3,
-            delivered_order_lines: 30,
-        },
-    };
+    let input = recovery_fixture();
 
     let sample = OnlineKeySample {
         item_id: 72_345,
@@ -187,6 +199,7 @@ fn committed_ledger_drives_public_online_and_recovery_answers() {
         ("recovery.count.order_line", 15_000_100),
         ("recovery.count.history", 1_500_020),
         ("recovery.count.new_orders", 450_007),
+        ("recovery.order_line.sum_quantity", 75_000_550),
         ("recovery.district.sum_next_order_id", 1_500_510),
         ("recovery.customer.sum_payment_cnt", 1_500_020),
         ("recovery.customer.sum_delivery_cnt", 3),
@@ -199,6 +212,177 @@ fn committed_ledger_drives_public_online_and_recovery_answers() {
             ScalarExpectation::ExactInt(expected)
         );
     }
+}
+
+#[test]
+fn recovery_integer_gate_is_exactly_37_typed_and_partition_independent() {
+    let plan = recovery_plan(recovery_fixture()).unwrap();
+    let expected_ids = [
+        "recovery.count.customer",
+        "recovery.count.district",
+        "recovery.count.history",
+        "recovery.count.item",
+        "recovery.count.new_orders",
+        "recovery.count.order_line",
+        "recovery.count.orders",
+        "recovery.count.stock",
+        "recovery.count.warehouse",
+        "recovery.orders.sum_o_ol_cnt",
+        "recovery.order_line.sum_quantity",
+        "recovery.orders.open_carrier_count",
+        "recovery.order_line.empty_delivery_time_count",
+        "recovery.district.sum_next_order_id",
+        "recovery.customer.sum_payment_cnt",
+        "recovery.customer.sum_delivery_cnt",
+        "recovery.stock.sum_order_cnt",
+        "recovery.stock.sum_remote_cnt",
+        "recovery.stock.quantity_range",
+        "recovery.orders.line_count_range",
+        "recovery.order_line.quantity_range",
+        "recovery.orders.carrier_range",
+        "recovery.orders.all_local_range",
+        "recovery.stock.counter_range",
+        "recovery.customer.counter_range",
+        "recovery.district.next_order_id_range",
+        "recovery.warehouse.key_range",
+        "recovery.item.key_range",
+        "recovery.history.key_range",
+        "recovery.new_orders.key_range",
+        "recovery.orders.order_id_range",
+        "recovery.order_line.order_key_range",
+        "recovery.district.key_range",
+        "recovery.customer.key_range",
+        "recovery.orders.key_range",
+        "recovery.order_line.key_range",
+        "recovery.stock.key_range",
+    ];
+
+    assert_eq!(PUBLIC_RECOVERY_INTEGER_CHECK_COUNT, 37);
+    assert_eq!(
+        plan.queries
+            .iter()
+            .map(|query| query.id.as_str())
+            .collect::<Vec<_>>(),
+        expected_ids
+    );
+    validate_public_recovery_integer_gate(&plan).unwrap();
+    for query in &plan.queries {
+        assert_eq!(query.scope, CheckScope::Recovery);
+        assert!(!query.id.starts_with("recovery.partition."));
+        assert!(!query.sql.contains(" OR "));
+        assert!(!query.sql.contains(';'));
+        let expected = match query.expectation {
+            ScalarExpectation::ExactInt(value) => i32::try_from(value).unwrap(),
+            _ => panic!("{} is not an exact integer check", query.id),
+        };
+        assert!(query
+            .validate(&TypedResult::scalar(TypedValue::Int32(expected)))
+            .is_ok());
+        assert!(query
+            .validate(&TypedResult::scalar(TypedValue::Float32(
+                (expected as f32).to_bits()
+            )))
+            .is_err());
+    }
+}
+
+#[test]
+fn recovery_integer_gate_shape_and_int32_bounds_fail_closed() {
+    let plan = recovery_plan(recovery_fixture()).unwrap();
+
+    let mut missing = plan.clone();
+    missing.queries.pop();
+    assert!(matches!(
+        validate_public_recovery_integer_gate(&missing),
+        Err(PlanError::InvalidRecoveryIntegerCheckCount {
+            expected: 37,
+            actual: 36
+        })
+    ));
+
+    let mut duplicate = plan.clone();
+    duplicate.queries[36] = duplicate.queries[0].clone();
+    assert!(matches!(
+        validate_public_recovery_integer_gate(&duplicate),
+        Err(PlanError::DuplicateRecoveryCheckId(_))
+    ));
+
+    let mut wrong_type = plan.clone();
+    wrong_type.queries[0].expectation = ScalarExpectation::FiniteFloat32;
+    assert!(matches!(
+        validate_public_recovery_integer_gate(&wrong_type),
+        Err(PlanError::InvalidRecoveryIntegerCheck(_))
+    ));
+
+    let mut too_large = plan;
+    too_large.queries[0].expectation = ScalarExpectation::ExactInt(i64::from(i32::MAX) + 1);
+    assert!(matches!(
+        validate_public_recovery_integer_gate(&too_large),
+        Err(PlanError::IntegerExpectationOutOfRange { .. })
+    ));
+}
+
+#[test]
+fn recovery_quantity_evidence_is_exact_and_rejects_invalid_or_unsafe_ledgers() {
+    let mut invalid = recovery_fixture();
+    invalid.committed.stock_ytd_delta = invalid.committed.new_order_lines - 1;
+    assert!(matches!(
+        recovery_plan(invalid),
+        Err(PlanError::InconsistentLedger(
+            "committed stock YTD delta must equal 1..=10 per committed NewOrder line"
+        ))
+    ));
+
+    let unsafe_int32 = RecoveryExpectations {
+        setup: SetupExpectations::final_2026(15_000_000, 4_500_000),
+        committed: CommittedLedger {
+            new_orders: 300_000_000,
+            new_order_lines: 1_500_000_000,
+            remote_new_order_lines: 0,
+            stock_ytd_delta: 15_000_000_000,
+            ..CommittedLedger::default()
+        },
+    };
+    assert!(matches!(
+        recovery_plan(unsafe_int32),
+        Err(PlanError::IntegerExpectationOutOfRange { .. })
+    ));
+}
+
+#[test]
+fn recovery_integer_gate_covers_sf1_and_sf50_dynamic_line_extremes() {
+    let sf1 = recovery_plan(RecoveryExpectations {
+        setup: SetupExpectations {
+            warehouses: 1,
+            order_line_rows: 150_000,
+            undelivered_order_line_rows: 45_000,
+        },
+        committed: CommittedLedger::default(),
+    })
+    .unwrap();
+    assert_eq!(sf1.queries.len(), PUBLIC_RECOVERY_INTEGER_CHECK_COUNT);
+    assert_eq!(
+        expectation(&sf1, "recovery.count.stock"),
+        ScalarExpectation::ExactInt(100_000)
+    );
+    assert_eq!(
+        expectation(&sf1, "recovery.order_line.sum_quantity"),
+        ScalarExpectation::ExactInt(750_000)
+    );
+
+    let sf50_max_lines = recovery_plan(RecoveryExpectations {
+        setup: SetupExpectations::final_2026(22_500_000, 6_750_000),
+        committed: CommittedLedger::default(),
+    })
+    .unwrap();
+    assert_eq!(
+        sf50_max_lines.queries.len(),
+        PUBLIC_RECOVERY_INTEGER_CHECK_COUNT
+    );
+    assert_eq!(
+        expectation(&sf50_max_lines, "recovery.order_line.sum_quantity"),
+        ScalarExpectation::ExactInt(112_500_000)
+    );
 }
 
 #[test]
@@ -222,6 +406,91 @@ fn logical_sql_can_be_rendered_with_opaque_runtime_identifiers() {
         .unwrap();
     assert!(delivery.sql.contains("c_z9 = ''"));
     assert!(names.insert("orders", "bad-name").is_err());
+}
+
+#[test]
+fn all_37_recovery_queries_render_every_logical_identifier_opaquely() {
+    let plan = recovery_plan(recovery_fixture()).unwrap();
+    let logical_names = [
+        "warehouse",
+        "district",
+        "customer",
+        "history",
+        "orders",
+        "new_orders",
+        "order_line",
+        "item",
+        "stock",
+        "w_id",
+        "d_w_id",
+        "d_id",
+        "d_next_o_id",
+        "c_w_id",
+        "c_d_id",
+        "c_id",
+        "c_payment_cnt",
+        "c_delivery_cnt",
+        "h_c_id",
+        "h_c_d_id",
+        "h_c_w_id",
+        "h_d_id",
+        "h_w_id",
+        "o_w_id",
+        "o_d_id",
+        "o_id",
+        "o_c_id",
+        "o_carrier_id",
+        "o_ol_cnt",
+        "o_all_local",
+        "no_w_id",
+        "no_d_id",
+        "no_o_id",
+        "ol_w_id",
+        "ol_d_id",
+        "ol_o_id",
+        "ol_number",
+        "ol_i_id",
+        "ol_supply_w_id",
+        "ol_delivery_d",
+        "ol_quantity",
+        "i_id",
+        "s_w_id",
+        "s_i_id",
+        "s_quantity",
+        "s_order_cnt",
+        "s_remote_cnt",
+    ];
+    let mut names = IdentifierMap::default();
+    let mappings = logical_names
+        .iter()
+        .enumerate()
+        .map(|(index, logical)| {
+            let runtime = format!("z_{index}");
+            names.insert(*logical, runtime.clone()).unwrap();
+            (*logical, runtime)
+        })
+        .collect::<Vec<_>>();
+    let rendered = names.render_plan(&plan);
+
+    for (logical, opaque) in plan.queries.iter().zip(&rendered.queries) {
+        assert_ne!(logical.sql, opaque.sql, "{} was not rendered", logical.id);
+        let before = sql_identifiers(&logical.sql);
+        let after = sql_identifiers(&opaque.sql);
+        for (canonical, runtime) in &mappings {
+            if before.contains(canonical) {
+                assert!(
+                    !after.contains(canonical),
+                    "{} leaked canonical identifier {canonical}",
+                    logical.id
+                );
+                assert!(
+                    after.contains(&runtime.as_str()),
+                    "{} did not render {canonical} as {runtime}",
+                    logical.id
+                );
+            }
+        }
+    }
 }
 
 fn final_partition_expectations() -> Vec<PartitionExpectation> {

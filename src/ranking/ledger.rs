@@ -1360,6 +1360,7 @@ impl RunLedger {
             new_orders: self.new_orders,
             new_order_lines: self.new_order_lines,
             remote_new_order_lines: self.remote_new_order_lines,
+            stock_ytd_delta: self.stock_ytd_delta,
             payments: self.payments,
             delivered_orders: self.delivered_orders,
             delivered_order_lines: self.delivered_order_lines,

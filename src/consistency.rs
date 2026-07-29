@@ -10,7 +10,7 @@
 //! are therefore suitable for local regression; they are not represented as a
 //! clone of that hidden checker.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub const FINAL_WAREHOUSES: i32 = 50;
@@ -19,6 +19,7 @@ pub const CUSTOMERS_PER_DISTRICT: i64 = 3_000;
 pub const ORDERS_PER_DISTRICT: i64 = 3_000;
 pub const NEW_ORDERS_PER_DISTRICT: i64 = 900;
 pub const ITEMS: i64 = 100_000;
+pub const PUBLIC_RECOVERY_INTEGER_CHECK_COUNT: usize = 37;
 
 /// Makes the public/hidden boundary available to reports and command help.
 pub const PUBLIC_SPEC_NOTICE: &str = "public-spec consistency plan; the official 37 integer \
@@ -349,6 +350,10 @@ pub enum PlanError {
     DuplicatePartition(PartitionKey),
     MissingPartition(PartitionKey),
     InconsistentLedger(&'static str),
+    InvalidRecoveryIntegerCheckCount { expected: usize, actual: usize },
+    DuplicateRecoveryCheckId(String),
+    InvalidRecoveryIntegerCheck(String),
+    IntegerExpectationOutOfRange { check_id: String, expected: i64 },
 }
 
 impl fmt::Display for PlanError {
@@ -388,6 +393,21 @@ impl fmt::Display for PlanError {
                 key.warehouse_id, key.district_id
             ),
             Self::InconsistentLedger(message) => write!(f, "inconsistent ledger: {message}"),
+            Self::InvalidRecoveryIntegerCheckCount { expected, actual } => write!(
+                f,
+                "public recovery integer gate requires exactly {expected} checks, got {actual}"
+            ),
+            Self::DuplicateRecoveryCheckId(check_id) => {
+                write!(f, "duplicate public recovery integer check id {check_id:?}")
+            }
+            Self::InvalidRecoveryIntegerCheck(check_id) => write!(
+                f,
+                "public recovery check {check_id:?} is not a Recovery ExactInt scalar"
+            ),
+            Self::IntegerExpectationOutOfRange { check_id, expected } => write!(
+                f,
+                "public recovery check {check_id:?} expectation {expected} is outside INT32"
+            ),
         }
     }
 }
@@ -422,13 +442,13 @@ pub fn setup_plan(input: SetupExpectations) -> Result<ConsistencyPlan, PlanError
     let initial_stock = counts["stock"];
 
     let mut plan = ConsistencyPlan::default();
-    for (table, expected) in counts {
+    for (table, expected) in &counts {
         plan.queries.push(int_query(
             CheckScope::Setup,
             format!("setup.count.{table}"),
             format!("initial {table} row count"),
             format!("SELECT COUNT(*) FROM {table}"),
-            expected,
+            *expected,
         ));
     }
 
@@ -516,7 +536,7 @@ pub fn setup_plan(input: SetupExpectations) -> Result<ConsistencyPlan, PlanError
             initial_stock,
         ));
     }
-    add_key_range_checks(&mut plan, CheckScope::Setup, input.warehouses);
+    add_key_range_checks(&mut plan, CheckScope::Setup, input.warehouses, &counts);
     Ok(plan)
 }
 
@@ -595,6 +615,7 @@ pub struct CommittedLedger {
     pub new_orders: i64,
     pub new_order_lines: i64,
     pub remote_new_order_lines: i64,
+    pub stock_ytd_delta: i64,
     pub payments: i64,
     pub delivered_orders: i64,
     pub delivered_order_lines: i64,
@@ -665,6 +686,7 @@ impl RecoveryExpectations {
                 "committed.remote_new_order_lines",
                 self.committed.remote_new_order_lines,
             ),
+            ("committed.stock_ytd_delta", self.committed.stock_ytd_delta),
             ("committed.payments", self.committed.payments),
             (
                 "committed.delivered_orders",
@@ -695,6 +717,18 @@ impl RecoveryExpectations {
         if !(minimum_lines..=maximum_lines).contains(&self.committed.new_order_lines) {
             return Err(PlanError::InconsistentLedger(
                 "committed NewOrder lines must be 5..=15 per committed NewOrder",
+            ));
+        }
+        let maximum_stock_ytd_delta = checked_mul(
+            self.committed.new_order_lines,
+            10,
+            "maximum committed stock YTD delta",
+        )?;
+        if !(self.committed.new_order_lines..=maximum_stock_ytd_delta)
+            .contains(&self.committed.stock_ytd_delta)
+        {
+            return Err(PlanError::InconsistentLedger(
+                "committed stock YTD delta must equal 1..=10 per committed NewOrder line",
             ));
         }
         let minimum_delivered_lines = checked_mul(
@@ -738,11 +772,12 @@ impl RecoveryExpectations {
     }
 }
 
-/// Generate public full-scan recovery checks.
+/// Generate exactly 37 public-spec integer recovery checks.
 ///
-/// This intentionally has no "37" claim: the official integer query set and
-/// answers are withheld.  The returned plan covers the published row-count,
-/// counter, range, order-line, and queue invariants.
+/// This is an independently derived, replayable local gate. The official SQL,
+/// generated identifiers, keys, seed, and answers are withheld, so this plan
+/// must not be represented as a clone of the official checker. The separate
+/// 500-partition audit and seven FLOAT32 checks are not counted here.
 pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, PlanError> {
     let counts = input.expected_counts()?;
     let mut plan = ConsistencyPlan::default();
@@ -779,6 +814,56 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
         ORDERS_PER_DISTRICT + 1,
         "initial d_next_o_id sum",
     )?;
+    let initial_line_quantity = checked_mul(
+        input.setup.order_line_rows,
+        5,
+        "initial order-line quantity sum",
+    )?;
+    let expected_line_quantity = checked_add(
+        initial_line_quantity,
+        input.committed.stock_ytd_delta,
+        "recovery order-line quantity sum",
+    )?;
+    let maximum_order_id = checked_add(
+        ORDERS_PER_DISTRICT,
+        input.committed.new_orders,
+        "maximum recovery order id",
+    )?;
+    let maximum_next_order_id = checked_add(
+        maximum_order_id,
+        1,
+        "maximum recovery district next order id",
+    )?;
+    let maximum_customer_payment_count = checked_add(
+        1,
+        input.committed.payments,
+        "maximum customer payment count",
+    )?;
+    for (name, value) in [
+        ("recovery.bound.maximum_order_id", maximum_order_id),
+        (
+            "recovery.bound.maximum_next_order_id",
+            maximum_next_order_id,
+        ),
+        (
+            "recovery.bound.maximum_customer_payment_count",
+            maximum_customer_payment_count,
+        ),
+        (
+            "recovery.bound.maximum_customer_delivery_count",
+            input.committed.delivered_orders,
+        ),
+        (
+            "recovery.bound.maximum_stock_order_count",
+            input.committed.new_order_lines,
+        ),
+        (
+            "recovery.bound.maximum_stock_remote_count",
+            input.committed.remote_new_order_lines,
+        ),
+    ] {
+        require_int32(name, value)?;
+    }
 
     plan.queries.push(int_query(
         CheckScope::Recovery,
@@ -786,6 +871,13 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
         "SUM(o_ol_cnt) equals all visible order_line rows",
         "SELECT SUM(o_ol_cnt) FROM orders",
         order_line_rows,
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.order_line.sum_quantity",
+        "SUM(ol_quantity) equals initial quantity plus committed NewOrder quantities",
+        "SELECT SUM(ol_quantity) FROM order_line",
+        expected_line_quantity,
     ));
     plan.queries.push(int_query(
         CheckScope::Recovery,
@@ -848,32 +940,176 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
         CheckScope::Recovery,
         "recovery.stock.quantity_range",
         "post-load stock quantity remains in the TPC-C update range 10..=100",
-        "SELECT COUNT(*) FROM stock WHERE s_quantity < 10 OR s_quantity > 100",
-        0,
+        "SELECT COUNT(*) FROM stock WHERE s_quantity >= 10 AND s_quantity <= 100",
+        counts["stock"],
     ));
     plan.queries.push(int_query(
         CheckScope::Recovery,
         "recovery.orders.line_count_range",
         "every order still has 5..=15 lines",
-        "SELECT COUNT(*) FROM orders WHERE o_ol_cnt < 5 OR o_ol_cnt > 15",
-        0,
+        "SELECT COUNT(*) FROM orders WHERE o_ol_cnt >= 5 AND o_ol_cnt <= 15",
+        counts["orders"],
     ));
     plan.queries.push(int_query(
         CheckScope::Recovery,
         "recovery.order_line.quantity_range",
         "every order-line quantity remains in 1..=10",
-        "SELECT COUNT(*) FROM order_line WHERE ol_quantity < 1 OR ol_quantity > 10",
-        0,
+        "SELECT COUNT(*) FROM order_line WHERE ol_quantity >= 1 AND ol_quantity <= 10",
+        counts["order_line"],
     ));
     plan.queries.push(int_query(
         CheckScope::Recovery,
         "recovery.orders.carrier_range",
         "every carrier id remains in 0..=10",
-        "SELECT COUNT(*) FROM orders WHERE o_carrier_id < 0 OR o_carrier_id > 10",
-        0,
+        "SELECT COUNT(*) FROM orders WHERE o_carrier_id >= 0 AND o_carrier_id <= 10",
+        counts["orders"],
     ));
-    add_key_range_checks(&mut plan, CheckScope::Recovery, input.setup.warehouses);
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.orders.all_local_range",
+        "every order all-local flag remains Boolean",
+        "SELECT COUNT(*) FROM orders WHERE o_all_local >= 0 AND o_all_local <= 1",
+        counts["orders"],
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.stock.counter_range",
+        "stock counters are non-negative, bounded by the ledger, and remote never exceeds order",
+        format!(
+            "SELECT COUNT(*) FROM stock WHERE s_order_cnt >= 0 \
+             AND s_order_cnt <= {} AND s_remote_cnt >= 0 \
+             AND s_remote_cnt <= {} AND s_remote_cnt <= s_order_cnt",
+            input.committed.new_order_lines, input.committed.remote_new_order_lines
+        ),
+        counts["stock"],
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.customer.counter_range",
+        "customer counters retain their initial lower bounds and ledger-derived upper bounds",
+        format!(
+            "SELECT COUNT(*) FROM customer WHERE c_payment_cnt >= 1 \
+             AND c_payment_cnt <= {maximum_customer_payment_count} \
+             AND c_delivery_cnt >= 0 AND c_delivery_cnt <= {}",
+            input.committed.delivered_orders
+        ),
+        counts["customer"],
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.district.next_order_id_range",
+        "district next-order ids stay within the initial and committed allocation domain",
+        format!(
+            "SELECT COUNT(*) FROM district WHERE d_next_o_id >= {} \
+             AND d_next_o_id <= {}",
+            ORDERS_PER_DISTRICT + 1,
+            maximum_next_order_id
+        ),
+        counts["district"],
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.warehouse.key_range",
+        "warehouse identifiers remain in the dataset keyspace",
+        format!(
+            "SELECT COUNT(*) FROM warehouse WHERE w_id >= 1 AND w_id <= {}",
+            input.setup.warehouses
+        ),
+        counts["warehouse"],
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.item.key_range",
+        "item identifiers remain in the public keyspace",
+        format!("SELECT COUNT(*) FROM item WHERE i_id >= 1 AND i_id <= {ITEMS}"),
+        counts["item"],
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.history.key_range",
+        "history customer and owning partition identifiers remain in range",
+        format!(
+            "SELECT COUNT(*) FROM history WHERE h_c_id >= 1 \
+             AND h_c_id <= {CUSTOMERS_PER_DISTRICT} AND h_c_d_id >= 1 \
+             AND h_c_d_id <= {DISTRICTS_PER_WAREHOUSE} AND h_c_w_id >= 1 \
+             AND h_c_w_id <= {} AND h_d_id >= 1 \
+             AND h_d_id <= {DISTRICTS_PER_WAREHOUSE} AND h_w_id >= 1 \
+             AND h_w_id <= {}",
+            input.setup.warehouses, input.setup.warehouses
+        ),
+        counts["history"],
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.new_orders.key_range",
+        "new-order queue keys remain in the dataset and allocated-order domain",
+        format!(
+            "SELECT COUNT(*) FROM new_orders WHERE no_w_id >= 1 \
+             AND no_w_id <= {} AND no_d_id >= 1 \
+             AND no_d_id <= {DISTRICTS_PER_WAREHOUSE} AND no_o_id >= 1 \
+             AND no_o_id <= {maximum_order_id}",
+            input.setup.warehouses
+        ),
+        counts["new_orders"],
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.orders.order_id_range",
+        "order identifiers remain in the allocated-order domain",
+        format!("SELECT COUNT(*) FROM orders WHERE o_id >= 1 AND o_id <= {maximum_order_id}"),
+        counts["orders"],
+    ));
+    plan.queries.push(int_query(
+        CheckScope::Recovery,
+        "recovery.order_line.order_key_range",
+        "order-line order and line identifiers remain in their legal domains",
+        format!(
+            "SELECT COUNT(*) FROM order_line WHERE ol_o_id >= 1 \
+             AND ol_o_id <= {maximum_order_id} AND ol_number >= 1 \
+             AND ol_number <= 15"
+        ),
+        counts["order_line"],
+    ));
+    add_key_range_checks(
+        &mut plan,
+        CheckScope::Recovery,
+        input.setup.warehouses,
+        &counts,
+    );
+    validate_public_recovery_integer_gate(&plan)?;
     Ok(plan)
+}
+
+pub fn validate_public_recovery_integer_gate(plan: &ConsistencyPlan) -> Result<(), PlanError> {
+    if plan.queries.len() != PUBLIC_RECOVERY_INTEGER_CHECK_COUNT {
+        return Err(PlanError::InvalidRecoveryIntegerCheckCount {
+            expected: PUBLIC_RECOVERY_INTEGER_CHECK_COUNT,
+            actual: plan.queries.len(),
+        });
+    }
+
+    let mut ids = BTreeSet::new();
+    for query in &plan.queries {
+        if query.scope != CheckScope::Recovery
+            || !query.id.starts_with("recovery.")
+            || query.id.starts_with("recovery.partition.")
+            || query.sql.contains(" OR ")
+            || query.sql.contains(';')
+            || !(query.sql.starts_with("SELECT COUNT(*) ") || query.sql.starts_with("SELECT SUM("))
+        {
+            return Err(PlanError::InvalidRecoveryIntegerCheck(query.id.clone()));
+        }
+        if !ids.insert(query.id.clone()) {
+            return Err(PlanError::DuplicateRecoveryCheckId(query.id.clone()));
+        }
+        match query.expectation {
+            ScalarExpectation::ExactInt(expected) => {
+                require_int32(&query.id, expected)?;
+            }
+            _ => return Err(PlanError::InvalidRecoveryIntegerCheck(query.id.clone())),
+        }
+    }
+    Ok(())
 }
 
 /// A six-query, public-semantic online plan.
@@ -953,55 +1189,65 @@ pub fn public_online_integer_plan(
     })
 }
 
-fn add_key_range_checks(plan: &mut ConsistencyPlan, scope: CheckScope, warehouses: i32) {
+fn add_key_range_checks(
+    plan: &mut ConsistencyPlan,
+    scope: CheckScope,
+    warehouses: i32,
+    counts: &BTreeMap<&'static str, i64>,
+) {
     let prefix = match scope {
         CheckScope::Setup => "setup",
         CheckScope::Online => "online",
         CheckScope::Recovery => "recovery",
     };
-    for (suffix, description, sql) in [
+    for (table, suffix, description, sql) in [
         (
+            "district",
             "district.key_range",
             "district warehouse and district identifiers are in range",
             format!(
-                "SELECT COUNT(*) FROM district WHERE d_w_id < 1 OR d_w_id > {warehouses} \
-                 OR d_id < 1 OR d_id > {DISTRICTS_PER_WAREHOUSE}"
+                "SELECT COUNT(*) FROM district WHERE d_w_id >= 1 AND d_w_id <= {warehouses} \
+                 AND d_id >= 1 AND d_id <= {DISTRICTS_PER_WAREHOUSE}"
             ),
         ),
         (
+            "customer",
             "customer.key_range",
             "customer warehouse and district identifiers are in range",
             format!(
-                "SELECT COUNT(*) FROM customer WHERE c_w_id < 1 OR c_w_id > {warehouses} \
-                 OR c_d_id < 1 OR c_d_id > {DISTRICTS_PER_WAREHOUSE} \
-                 OR c_id < 1 OR c_id > {CUSTOMERS_PER_DISTRICT}"
+                "SELECT COUNT(*) FROM customer WHERE c_w_id >= 1 AND c_w_id <= {warehouses} \
+                 AND c_d_id >= 1 AND c_d_id <= {DISTRICTS_PER_WAREHOUSE} \
+                 AND c_id >= 1 AND c_id <= {CUSTOMERS_PER_DISTRICT}"
             ),
         ),
         (
+            "orders",
             "orders.key_range",
             "order warehouse, district, and customer identifiers are in range",
             format!(
-                "SELECT COUNT(*) FROM orders WHERE o_w_id < 1 OR o_w_id > {warehouses} \
-                 OR o_d_id < 1 OR o_d_id > {DISTRICTS_PER_WAREHOUSE} \
-                 OR o_c_id < 1 OR o_c_id > {CUSTOMERS_PER_DISTRICT}"
+                "SELECT COUNT(*) FROM orders WHERE o_w_id >= 1 AND o_w_id <= {warehouses} \
+                 AND o_d_id >= 1 AND o_d_id <= {DISTRICTS_PER_WAREHOUSE} \
+                 AND o_c_id >= 1 AND o_c_id <= {CUSTOMERS_PER_DISTRICT}"
             ),
         ),
         (
+            "order_line",
             "order_line.key_range",
             "order-line warehouse, district, item, and supply-warehouse identifiers are in range",
             format!(
-                "SELECT COUNT(*) FROM order_line WHERE ol_w_id < 1 OR ol_w_id > {warehouses} \
-                 OR ol_d_id < 1 OR ol_d_id > {DISTRICTS_PER_WAREHOUSE} \
-                 OR ol_i_id < 1 OR ol_i_id > {ITEMS} \
-                 OR ol_supply_w_id < 1 OR ol_supply_w_id > {warehouses}"
+                "SELECT COUNT(*) FROM order_line WHERE ol_w_id >= 1 AND ol_w_id <= {warehouses} \
+                 AND ol_d_id >= 1 AND ol_d_id <= {DISTRICTS_PER_WAREHOUSE} \
+                 AND ol_i_id >= 1 AND ol_i_id <= {ITEMS} \
+                 AND ol_supply_w_id >= 1 AND ol_supply_w_id <= {warehouses}"
             ),
         ),
         (
+            "stock",
             "stock.key_range",
             "stock warehouse and item identifiers are in range",
             format!(
-                "SELECT COUNT(*) FROM stock WHERE s_w_id < 1 OR s_w_id > {warehouses} \
-                 OR s_i_id < 1 OR s_i_id > {ITEMS}"
+                "SELECT COUNT(*) FROM stock WHERE s_w_id >= 1 AND s_w_id <= {warehouses} \
+                 AND s_i_id >= 1 AND s_i_id <= {ITEMS}"
             ),
         ),
     ] {
@@ -1010,7 +1256,7 @@ fn add_key_range_checks(plan: &mut ConsistencyPlan, scope: CheckScope, warehouse
             format!("{prefix}.{suffix}"),
             description,
             sql,
-            0,
+            counts[table],
         ));
     }
 }
@@ -2560,6 +2806,13 @@ fn validate_non_negative(name: &'static str, value: i64) -> Result<(), PlanError
     } else {
         Ok(())
     }
+}
+
+fn require_int32(check_id: &str, value: i64) -> Result<i32, PlanError> {
+    i32::try_from(value).map_err(|_| PlanError::IntegerExpectationOutOfRange {
+        check_id: check_id.to_owned(),
+        expected: value,
+    })
 }
 
 fn checked_mul(left: i64, right: i64, name: &'static str) -> Result<i64, PlanError> {
