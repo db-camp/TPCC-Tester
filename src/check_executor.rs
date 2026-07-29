@@ -13,8 +13,8 @@ use crate::consistency::{
     validate_relative_update_chain_from_initial, CheckQuery, CheckScope, ConsistencyPlan,
     FloatAggregateId, NonNegativeF32Accumulator, PartitionExpectation, PartitionKey,
     PublicFloatLedgerEvidence, RecoveryExpectations, RelativeUpdateEvidence, SetupExpectations,
-    TypedResult, TypedValue, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES, FLOAT_AGGREGATES,
-    NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
+    TypedResult, TypedValue, CUSTOMERS_PER_DISTRICT, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES,
+    FLOAT_AGGREGATES, NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
 };
 use crate::error::TpccError;
 use crate::ranking::ledger::{LedgerEvent, RunLedger};
@@ -51,6 +51,7 @@ pub async fn run_final_online(
     run_plan(client, &plan).await?;
 
     let endpoints = validate_transaction_evidence(ledger)?;
+    validate_customer_endpoints(client, "online", &endpoints).await?;
     let values = read_float_aggregates(client, CheckScope::Online).await?;
     validate_online_float_ledger(
         dataset,
@@ -88,6 +89,7 @@ pub async fn run_final_recovery(
     let recovered = read_float_aggregates(client, CheckScope::Recovery).await?;
     validate_float_baseline(online_baseline, &recovered)?;
     validate_payment_endpoints(client, &endpoints).await?;
+    validate_customer_endpoints(client, "recovery", &endpoints).await?;
 
     let partitions = partition_expectations(dataset, ledger)?;
     // Reuse the transport-neutral generator as a strict completeness and
@@ -177,9 +179,29 @@ fn final_expectations(
 struct RelativeEndpoints {
     warehouses: BTreeMap<i32, u32>,
     districts: BTreeMap<(i32, i32), u32>,
+    customers: BTreeMap<CustomerKey, CustomerEndpoint>,
 }
 
 type CustomerKey = (i32, i32, i32);
+
+#[derive(Clone, Copy, Debug)]
+struct CustomerEndpoint {
+    balance_bits: u32,
+    ytd_payment_bits: u32,
+    payment_count: i32,
+    delivery_count: i32,
+}
+
+impl Default for CustomerEndpoint {
+    fn default() -> Self {
+        Self {
+            balance_bits: (-10.0_f32).to_bits(),
+            ytd_payment_bits: 10.0_f32.to_bits(),
+            payment_count: 1,
+            delivery_count: 0,
+        }
+    }
+}
 
 fn validate_transaction_evidence(ledger: &RunLedger) -> Result<RelativeEndpoints, TpccError> {
     let mut warehouse_updates: BTreeMap<i32, Vec<RelativeUpdateEvidence>> = BTreeMap::new();
@@ -285,36 +307,58 @@ fn validate_transaction_evidence(ledger: &RunLedger) -> Result<RelativeEndpoints
         endpoints.districts.insert((warehouse, district), endpoint);
     }
     for ((warehouse, district, customer), updates) in customer_balance_updates {
-        validate_relative_update_chain_from_initial((-10.0_f32).to_bits(), &updates).map_err(
-            |error| {
+        let endpoint =
+            validate_relative_update_chain_from_initial((-10.0_f32).to_bits(), &updates).map_err(
+                |error| {
                 TpccError::QueryError(format!(
                     "Payment/Delivery c_balance chain for ({warehouse},{district},{customer}) failed: {error}"
                 ))
-            },
-        )?;
+                },
+            )?;
+        endpoints
+            .customers
+            .entry((warehouse, district, customer))
+            .or_default()
+            .balance_bits = endpoint;
     }
     for ((warehouse, district, customer), updates) in customer_ytd_updates {
-        validate_relative_update_chain_from_initial(10.0_f32.to_bits(), &updates).map_err(
-            |error| {
+        let endpoint =
+            validate_relative_update_chain_from_initial(10.0_f32.to_bits(), &updates).map_err(
+                |error| {
                 TpccError::QueryError(format!(
                     "Payment c_ytd_payment chain for ({warehouse},{district},{customer}) failed: {error}"
                 ))
-            },
-        )?;
+                },
+            )?;
+        endpoints
+            .customers
+            .entry((warehouse, district, customer))
+            .or_default()
+            .ytd_payment_bits = endpoint;
     }
     for ((warehouse, district, customer), updates) in customer_payment_counts {
-        validate_increment_chain(1, &updates).map_err(|error| {
+        let endpoint = validate_increment_chain(1, &updates).map_err(|error| {
             TpccError::QueryError(format!(
                 "Payment c_payment_cnt chain for ({warehouse},{district},{customer}) failed: {error}"
             ))
         })?;
+        endpoints
+            .customers
+            .entry((warehouse, district, customer))
+            .or_default()
+            .payment_count = endpoint;
     }
     for ((warehouse, district, customer), updates) in customer_delivery_counts {
-        validate_increment_chain(0, &updates).map_err(|error| {
+        let endpoint = validate_increment_chain(0, &updates).map_err(|error| {
             TpccError::QueryError(format!(
                 "Delivery c_delivery_cnt chain for ({warehouse},{district},{customer}) failed: {error}"
             ))
         })?;
+        endpoints
+            .customers
+            .entry((warehouse, district, customer))
+            .or_default()
+            .delivery_count = endpoint;
     }
     Ok(endpoints)
 }
@@ -356,6 +400,43 @@ fn validate_online_float_ledger(
         "online SUM(district.d_ytd)",
         expected_district,
         actual_district,
+    )?;
+
+    let customer_keys = || {
+        (1..=FINAL_WAREHOUSES).flat_map(|warehouse| {
+            (1..=DISTRICTS_PER_WAREHOUSE).flat_map(move |district| {
+                (1..=CUSTOMERS_PER_DISTRICT as i32)
+                    .map(move |customer| (warehouse, district, customer))
+            })
+        })
+    };
+    let expected_customer_balance = sum_f32_as_f64_once(customer_keys().map(|key| {
+        endpoints
+            .customers
+            .get(&key)
+            .copied()
+            .unwrap_or_default()
+            .balance_bits
+    }))
+    .map_err(|error| protocol_error("customer balance ledger sum failed", error))?;
+    require_zero_ulp(
+        "online SUM(customer.c_balance)",
+        expected_customer_balance,
+        aggregate_bits(values, FloatAggregateId::CustomerBalance)?,
+    )?;
+    let expected_customer_ytd = sum_f32_as_f64_once(customer_keys().map(|key| {
+        endpoints
+            .customers
+            .get(&key)
+            .copied()
+            .unwrap_or_default()
+            .ytd_payment_bits
+    }))
+    .map_err(|error| protocol_error("customer YTD ledger sum failed", error))?;
+    require_zero_ulp(
+        "online SUM(customer.c_ytd_payment)",
+        expected_customer_ytd,
+        aggregate_bits(values, FloatAggregateId::CustomerYtdPayment)?,
     )?;
 
     let initial_history_rows = i64::from(dataset.warehouses)
@@ -497,6 +578,101 @@ async fn validate_payment_endpoints(
         true,
     )?;
     info!("recovery Payment warehouse/district endpoints PASS (0 ULP)");
+    Ok(())
+}
+
+async fn validate_customer_endpoints(
+    client: &mut RmdbClient,
+    scope: &str,
+    endpoints: &RelativeEndpoints,
+) -> Result<(), TpccError> {
+    let result = execute_typed_sql(
+        client,
+        &format!("{scope}.customer.changed_endpoints"),
+        "SELECT c_w_id, c_d_id, c_id, c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt \
+         FROM customer WHERE c_payment_cnt > 1 OR c_delivery_cnt > 0",
+    )
+    .await?;
+    validate_customer_endpoint_rows(scope, result, &endpoints.customers)?;
+    info!("{scope} changed-customer Payment/Delivery endpoints PASS (raw FLOAT32 and counters)");
+    Ok(())
+}
+
+fn validate_customer_endpoint_rows(
+    scope: &str,
+    result: TypedResult,
+    expected: &BTreeMap<CustomerKey, CustomerEndpoint>,
+) -> Result<(), TpccError> {
+    let mut actual = BTreeMap::new();
+    for row in result.rows {
+        let endpoint = match row.as_slice() {
+            [TypedValue::Int32(warehouse), TypedValue::Int32(district), TypedValue::Int32(customer), TypedValue::Float32(balance_bits), TypedValue::Float32(ytd_payment_bits), TypedValue::Int32(payment_count), TypedValue::Int32(delivery_count)] => {
+                (
+                    (*warehouse, *district, *customer),
+                    CustomerEndpoint {
+                        balance_bits: *balance_bits,
+                        ytd_payment_bits: *ytd_payment_bits,
+                        payment_count: *payment_count,
+                        delivery_count: *delivery_count,
+                    },
+                )
+            }
+            _ => {
+                return Err(TpccError::Protocol(format!(
+                    "{scope} changed-customer endpoint query returned an invalid typed row"
+                )));
+            }
+        };
+        let (key, value) = endpoint;
+        if !expected.contains_key(&key) {
+            return Err(TpccError::QueryError(format!(
+                "{scope} changed-customer endpoint query returned unexpected key ({},{},{})",
+                key.0, key.1, key.2
+            )));
+        }
+        if actual.insert(key, value).is_some() {
+            return Err(TpccError::Protocol(format!(
+                "{scope} changed-customer endpoint query returned duplicate key ({},{},{})",
+                key.0, key.1, key.2
+            )));
+        }
+    }
+
+    for (key, expected_endpoint) in expected {
+        let actual_endpoint = actual.get(key).ok_or_else(|| {
+            TpccError::QueryError(format!(
+                "{scope} changed-customer endpoint query omitted key ({},{},{})",
+                key.0, key.1, key.2
+            ))
+        })?;
+        require_zero_ulp(
+            &format!("{scope} customer ({},{},{}) c_balance", key.0, key.1, key.2),
+            expected_endpoint.balance_bits,
+            actual_endpoint.balance_bits,
+        )?;
+        require_zero_ulp(
+            &format!(
+                "{scope} customer ({},{},{}) c_ytd_payment",
+                key.0, key.1, key.2
+            ),
+            expected_endpoint.ytd_payment_bits,
+            actual_endpoint.ytd_payment_bits,
+        )?;
+        if actual_endpoint.payment_count != expected_endpoint.payment_count
+            || actual_endpoint.delivery_count != expected_endpoint.delivery_count
+        {
+            return Err(TpccError::QueryError(format!(
+                "{scope} customer ({},{},{}) counters expected payment/delivery={}/{}, got {}/{}",
+                key.0,
+                key.1,
+                key.2,
+                expected_endpoint.payment_count,
+                expected_endpoint.delivery_count,
+                actual_endpoint.payment_count,
+                actual_endpoint.delivery_count
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -969,5 +1145,51 @@ mod tests {
             false
         )
         .is_ok());
+    }
+
+    #[test]
+    fn changed_customer_rows_require_exact_bits_counters_and_key_set() {
+        let key = (1, 2, 3);
+        let endpoint = CustomerEndpoint {
+            balance_bits: 7.25_f32.to_bits(),
+            ytd_payment_bits: 22.5_f32.to_bits(),
+            payment_count: 4,
+            delivery_count: 2,
+        };
+        let expected = [(key, endpoint)].into_iter().collect();
+        let row = || {
+            vec![
+                TypedValue::Int32(key.0),
+                TypedValue::Int32(key.1),
+                TypedValue::Int32(key.2),
+                TypedValue::Float32(endpoint.balance_bits),
+                TypedValue::Float32(endpoint.ytd_payment_bits),
+                TypedValue::Int32(endpoint.payment_count),
+                TypedValue::Int32(endpoint.delivery_count),
+            ]
+        };
+        assert!(validate_customer_endpoint_rows(
+            "online",
+            TypedResult { rows: vec![row()] },
+            &expected
+        )
+        .is_ok());
+
+        let mut wrong_bits = row();
+        wrong_bits[3] = TypedValue::Float32((7.25_f32.to_bits()) + 1);
+        assert!(validate_customer_endpoint_rows(
+            "online",
+            TypedResult {
+                rows: vec![wrong_bits]
+            },
+            &expected
+        )
+        .is_err());
+        assert!(validate_customer_endpoint_rows(
+            "online",
+            TypedResult { rows: Vec::new() },
+            &expected
+        )
+        .is_err());
     }
 }
