@@ -9,9 +9,12 @@ use crate::connection::client::RmdbClient;
 use crate::connection::wire::{
     Column, FoldStreamResponse, SqlType, WireError, WireResult, WireValue,
 };
+use crate::data_gen::TpccDataGen;
 use crate::error::TpccError;
+use crate::ranking::evidence_collector::SealedIntervalEvidence;
 use crate::ranking::rich_recovery_samples::{
-    SealedDeliverySample, SealedNewOrderSample, SealedRichRecoverySamples,
+    SealedBadCreditCustomerSample, SealedDeliverySample, SealedNewOrderSample,
+    SealedRichRecoverySamples,
 };
 use crate::runtime_schema::RuntimeSchema;
 
@@ -513,6 +516,238 @@ fn delivery_point_queries(
     Ok(vec![order, queue, lines])
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct StockExpected {
+    warehouse_id: i32,
+    item_id: i32,
+    quantity: i32,
+    ytd_bits: u32,
+    order_count: i32,
+    remote_count: i32,
+}
+
+async fn check_stock_samples(
+    client: &mut RmdbClient,
+    schema: &RuntimeSchema,
+    intervals: &SealedIntervalEvidence,
+) -> Result<(), TpccError> {
+    require_nonempty_samples(
+        SampleDomain::Stock,
+        intervals.stock_update_count(),
+        intervals.stock_sample_count(),
+    )?;
+    for (sample_index, sample) in intervals.stocks().enumerate() {
+        let ordinal = checked_query_ordinal(SampleDomain::Stock, sample_index, 1)?;
+        let key = sample.key();
+        let endpoint = sample.endpoint();
+        let expected = StockExpected {
+            warehouse_id: key.warehouse_id,
+            item_id: key.item_id,
+            quantity: endpoint.quantity,
+            ytd_bits: endpoint.ytd_bits,
+            order_count: endpoint.order_count,
+            remote_count: endpoint.remote_count,
+        };
+        execute_exact_point_query(client, schema, stock_point_query(&expected, ordinal)?).await?;
+    }
+    Ok(())
+}
+
+fn stock_point_query(
+    stock: &StockExpected,
+    ordinal: usize,
+) -> Result<ExpectedPointQuery, TpccError> {
+    ExpectedPointQuery::new(
+        QueryScope::new(SampleDomain::Stock, ordinal),
+        format!(
+            "SELECT stock.s_w_id, stock.s_i_id, stock.s_quantity, stock.s_ytd, stock.s_order_cnt, stock.s_remote_cnt FROM stock WHERE stock.s_w_id = {} AND stock.s_i_id = {}",
+            stock.warehouse_id, stock.item_id
+        ),
+        vec![
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Float32,
+            SqlType::Int32,
+            SqlType::Int32,
+        ],
+        vec![vec![
+            WireValue::Int32(stock.warehouse_id),
+            WireValue::Int32(stock.item_id),
+            WireValue::Int32(stock.quantity),
+            WireValue::Float32(stock.ytd_bits),
+            WireValue::Int32(stock.order_count),
+            WireValue::Int32(stock.remote_count),
+        ]],
+    )
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CustomerExpected {
+    warehouse_id: i32,
+    district_id: i32,
+    customer_id: i32,
+    credit: Vec<u8>,
+    balance_bits: u32,
+    ytd_payment_bits: u32,
+    payment_count: i32,
+    delivery_count: i32,
+}
+
+async fn check_customer_samples(
+    client: &mut RmdbClient,
+    schema: &RuntimeSchema,
+    intervals: &SealedIntervalEvidence,
+) -> Result<(), TpccError> {
+    require_nonempty_samples(
+        SampleDomain::Customer,
+        intervals.customer_update_count(),
+        intervals.customer_sample_count(),
+    )?;
+    let generator =
+        TpccDataGen::with_seed(i32::from(intervals.warehouses()), intervals.sample_seed());
+    for (sample_index, sample) in intervals.customers().enumerate() {
+        let ordinal = checked_query_ordinal(SampleDomain::Customer, sample_index, 1)?;
+        let scope = QueryScope::new(SampleDomain::Customer, ordinal);
+        let key = sample.key();
+        let endpoint = sample.endpoint();
+        let profile = generator
+            .initial_customer_profile(key.warehouse_id, key.district_id, key.customer_id)
+            .ok_or_else(|| TpccError::Protocol(scope.message("has invalid setup-root evidence")))?;
+        let expected = CustomerExpected {
+            warehouse_id: key.warehouse_id,
+            district_id: key.district_id,
+            customer_id: key.customer_id,
+            credit: profile.credit().to_vec(),
+            balance_bits: endpoint.balance_bits,
+            ytd_payment_bits: endpoint.ytd_payment_bits,
+            payment_count: endpoint.version.payment_count,
+            delivery_count: endpoint.version.delivery_count,
+        };
+        execute_exact_point_query(client, schema, customer_point_query(&expected, ordinal)?)
+            .await?;
+    }
+    Ok(())
+}
+
+fn customer_point_query(
+    customer: &CustomerExpected,
+    ordinal: usize,
+) -> Result<ExpectedPointQuery, TpccError> {
+    ExpectedPointQuery::new(
+        QueryScope::new(SampleDomain::Customer, ordinal),
+        format!(
+            "SELECT customer.c_w_id, customer.c_d_id, customer.c_id, customer.c_credit, customer.c_balance, customer.c_ytd_payment, customer.c_payment_cnt, customer.c_delivery_cnt FROM customer WHERE customer.c_w_id = {} AND customer.c_d_id = {} AND customer.c_id = {}",
+            customer.warehouse_id, customer.district_id, customer.customer_id
+        ),
+        vec![
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Char,
+            SqlType::Float32,
+            SqlType::Float32,
+            SqlType::Int32,
+            SqlType::Int32,
+        ],
+        vec![vec![
+            WireValue::Int32(customer.warehouse_id),
+            WireValue::Int32(customer.district_id),
+            WireValue::Int32(customer.customer_id),
+            WireValue::Char(customer.credit.clone()),
+            WireValue::Float32(customer.balance_bits),
+            WireValue::Float32(customer.ytd_payment_bits),
+            WireValue::Int32(customer.payment_count),
+            WireValue::Int32(customer.delivery_count),
+        ]],
+    )
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct BadCreditExpected {
+    warehouse_id: i32,
+    district_id: i32,
+    customer_id: i32,
+    credit: Vec<u8>,
+    payment_count: i32,
+    data: Vec<u8>,
+}
+
+impl BadCreditExpected {
+    fn from_sealed(
+        sample: &SealedBadCreditCustomerSample,
+        ordinal: usize,
+    ) -> Result<Self, TpccError> {
+        let scope = QueryScope::new(SampleDomain::BadCredit, ordinal);
+        let key = sample.customer_key();
+        let expected_updates = sample
+            .final_payment_count()
+            .checked_sub(1)
+            .and_then(|count| u64::try_from(count).ok());
+        if expected_updates != Some(sample.committed_payment_updates()) {
+            return Err(TpccError::Protocol(
+                scope.message("has invalid sealed evidence"),
+            ));
+        }
+        Ok(Self {
+            warehouse_id: key.warehouse_id,
+            district_id: key.district_id,
+            customer_id: key.customer_id,
+            credit: sample.expected_credit().to_vec(),
+            payment_count: sample.final_payment_count(),
+            data: sample.final_data().to_vec(),
+        })
+    }
+}
+
+async fn check_bad_credit_samples(
+    client: &mut RmdbClient,
+    schema: &RuntimeSchema,
+    rich: &SealedRichRecoverySamples,
+) -> Result<(), TpccError> {
+    require_nonempty_samples(
+        SampleDomain::BadCredit,
+        rich.bad_credit_payment_count(),
+        rich.bad_credit_customers().len(),
+    )?;
+    for (sample_index, sample) in rich.bad_credit_customers().iter().enumerate() {
+        let ordinal = checked_query_ordinal(SampleDomain::BadCredit, sample_index, 1)?;
+        let expected = BadCreditExpected::from_sealed(sample, ordinal)?;
+        execute_exact_point_query(client, schema, bad_credit_point_query(&expected, ordinal)?)
+            .await?;
+    }
+    Ok(())
+}
+
+fn bad_credit_point_query(
+    customer: &BadCreditExpected,
+    ordinal: usize,
+) -> Result<ExpectedPointQuery, TpccError> {
+    ExpectedPointQuery::new(
+        QueryScope::new(SampleDomain::BadCredit, ordinal),
+        format!(
+            "SELECT customer.c_w_id, customer.c_d_id, customer.c_id, customer.c_credit, customer.c_payment_cnt, customer.c_data FROM customer WHERE customer.c_w_id = {} AND customer.c_d_id = {} AND customer.c_id = {}",
+            customer.warehouse_id, customer.district_id, customer.customer_id
+        ),
+        vec![
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Int32,
+            SqlType::Char,
+            SqlType::Int32,
+            SqlType::Char,
+        ],
+        vec![vec![
+            WireValue::Int32(customer.warehouse_id),
+            WireValue::Int32(customer.district_id),
+            WireValue::Int32(customer.customer_id),
+            WireValue::Char(customer.credit.clone()),
+            WireValue::Int32(customer.payment_count),
+            WireValue::Char(customer.data.clone()),
+        ]],
+    )
+}
+
 async fn execute_exact_point_query(
     client: &mut RmdbClient,
     schema: &RuntimeSchema,
@@ -726,6 +961,41 @@ mod tests {
                     amount_bits: (-0.0_f32).to_bits(),
                 },
             ],
+        }
+    }
+
+    fn stock_expected() -> StockExpected {
+        StockExpected {
+            warehouse_id: 6,
+            item_id: 9_001,
+            quantity: 73,
+            ytd_bits: 0x8000_0000,
+            order_count: 41,
+            remote_count: 3,
+        }
+    }
+
+    fn customer_expected() -> CustomerExpected {
+        CustomerExpected {
+            warehouse_id: 2,
+            district_id: 7,
+            customer_id: 811,
+            credit: b"GC".to_vec(),
+            balance_bits: 0xc120_0001,
+            ytd_payment_bits: 0x4120_0001,
+            payment_count: 9,
+            delivery_count: 17,
+        }
+    }
+
+    fn bad_credit_expected() -> BadCreditExpected {
+        BadCreditExpected {
+            warehouse_id: 3,
+            district_id: 4,
+            customer_id: 512,
+            credit: b"BC".to_vec(),
+            payment_count: 6,
+            data: b"512 4 3 4 3 1.00 | setup-data".to_vec(),
         }
     }
 
@@ -1031,5 +1301,111 @@ mod tests {
         }
         assert!(require_nonempty_samples(SampleDomain::Delivery, 0, 0).is_err());
         assert!(require_nonempty_samples(SampleDomain::Delivery, 1, 1).is_ok());
+    }
+
+    #[test]
+    fn stock_query_keeps_all_endpoint_fields_bit_exact() {
+        let query = stock_point_query(&stock_expected(), 5).unwrap();
+        assert_eq!(
+            query.column_types,
+            vec![
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Int32,
+                SqlType::Float32,
+                SqlType::Int32,
+                SqlType::Int32,
+            ]
+        );
+        assert_eq!(
+            query.expected_rows,
+            vec![vec![
+                WireValue::Int32(6),
+                WireValue::Int32(9_001),
+                WireValue::Int32(73),
+                WireValue::Float32(0x8000_0000),
+                WireValue::Int32(41),
+                WireValue::Int32(3),
+            ]]
+        );
+    }
+
+    #[test]
+    fn normal_customer_query_includes_credit_and_four_numeric_endpoints() {
+        let query = customer_point_query(&customer_expected(), 6).unwrap();
+        assert_eq!(
+            query.expected_rows,
+            vec![vec![
+                WireValue::Int32(2),
+                WireValue::Int32(7),
+                WireValue::Int32(811),
+                WireValue::Char(b"GC".to_vec()),
+                WireValue::Float32(0xc120_0001),
+                WireValue::Float32(0x4120_0001),
+                WireValue::Int32(9),
+                WireValue::Int32(17),
+            ]]
+        );
+        let generator = TpccDataGen::with_seed(2, 0x1234);
+        let profile = generator.initial_customer_profile(2, 7, 811).unwrap();
+        assert!(matches!(profile.credit().as_slice(), b"GC" | b"BC"));
+    }
+
+    #[test]
+    fn bad_credit_query_is_independent_of_later_delivery_state() {
+        let query = bad_credit_point_query(&bad_credit_expected(), 7).unwrap();
+        assert_eq!(
+            query.expected_rows,
+            vec![vec![
+                WireValue::Int32(3),
+                WireValue::Int32(4),
+                WireValue::Int32(512),
+                WireValue::Char(b"BC".to_vec()),
+                WireValue::Int32(6),
+                WireValue::Char(b"512 4 3 4 3 1.00 | setup-data".to_vec()),
+            ]]
+        );
+        let tokens = query
+            .logical_sql
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .collect::<Vec<_>>();
+        for forbidden in [
+            "c_balance",
+            "c_ytd_payment",
+            "c_delivery_cnt",
+            "c_payment_cnt",
+        ] {
+            assert_eq!(
+                tokens.iter().filter(|token| **token == forbidden).count(),
+                usize::from(forbidden == "c_payment_cnt")
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_customer_domains_render_as_opaque_and_only_points() {
+        let schema = RuntimeSchema::opaque(0x9988).unwrap();
+        let queries = [
+            stock_point_query(&stock_expected(), 1).unwrap(),
+            customer_point_query(&customer_expected(), 1).unwrap(),
+            bad_credit_point_query(&bad_credit_expected(), 1).unwrap(),
+        ];
+        for query in queries {
+            let rendered =
+                render_and_only_point_sql(&schema, query.scope, &query.logical_sql).unwrap();
+            for logical in ["stock", "customer", "s_ytd", "c_balance", "c_data"] {
+                assert!(!rendered
+                    .split(|character: char| {
+                        !(character.is_ascii_alphanumeric() || character == '_')
+                    })
+                    .any(|token| token == logical));
+            }
+        }
+        assert!(require_nonempty_samples(SampleDomain::Stock, 1, 1).is_ok());
+        assert!(require_nonempty_samples(SampleDomain::Customer, 1, 1).is_ok());
+        assert!(require_nonempty_samples(SampleDomain::BadCredit, 1, 1).is_ok());
+        assert!(require_nonempty_samples(SampleDomain::Stock, 1, 0).is_err());
+        assert!(require_nonempty_samples(SampleDomain::Customer, 0, 1).is_err());
+        assert!(require_nonempty_samples(SampleDomain::BadCredit, 0, 0).is_err());
     }
 }
