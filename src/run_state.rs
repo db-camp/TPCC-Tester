@@ -607,6 +607,7 @@ impl StateStore {
         seed: u64,
         contract: &RunContract,
     ) -> Result<(), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.create_setup_intent(run_id, seed, contract)?;
         Ok(())
     }
@@ -635,6 +636,7 @@ impl StateStore {
         seed: u64,
         contract: &RunContract,
     ) -> Result<(SetupClaim, SetupClaimOrigin), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         let (intent_checksum, origin) =
             match fs::symlink_metadata(self.root.join(SETUP_INTENT_FILE)) {
                 Ok(_) => (
@@ -692,6 +694,7 @@ impl StateStore {
         contract: &RunContract,
         claim: SetupClaim,
     ) -> Result<(), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         dataset.validate()?;
         contract.validate(dataset)?;
         self.ensure_setup_execution_pending()?;
@@ -733,7 +736,8 @@ impl StateStore {
     }
 
     pub fn load_bound_dataset(&self, expected: &RunContract) -> Result<DatasetState, StateError> {
-        let dataset = self.load_dataset()?;
+        let _directory_lock = lock_state_directory(&self.root)?;
+        let dataset = self.load_dataset_unlocked()?;
         self.contract_checksum(&dataset, expected)?;
         Ok(dataset)
     }
@@ -743,6 +747,7 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<SetupCheckClaim, StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let claim_checksum = self.publish_marker(
@@ -765,6 +770,7 @@ impl StateStore {
         contract: &RunContract,
         claim: SetupCheckClaim,
     ) -> Result<(), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.validate_claim(
             dataset,
             contract,
@@ -787,6 +793,7 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<RankClaim, StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let setup_claim = self.load_marker(
@@ -824,6 +831,7 @@ impl StateStore {
         claim: RankClaim,
         ledger: &RunLedger,
     ) -> Result<(), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.validate_claim(
             dataset,
             contract,
@@ -846,6 +854,7 @@ impl StateStore {
         dataset: &DatasetState,
         contract: &RunContract,
     ) -> Result<(OnlineCheckClaim, RunLedger), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, ledger, ledger_checksum) =
             self.load_bound_ledger(dataset, contract)?;
@@ -876,6 +885,7 @@ impl StateStore {
         claim: OnlineCheckClaim,
         values: &BTreeMap<FloatAggregateId, u32>,
     ) -> Result<(), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.validate_claim(
             dataset,
             contract,
@@ -910,6 +920,7 @@ impl StateStore {
         contract: &RunContract,
         event: CrashLifecycleEvent,
     ) -> Result<(), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, ledger_checksum, baseline_checksum) =
             self.load_crash_context(dataset, contract)?;
@@ -953,6 +964,7 @@ impl StateStore {
         ),
         StateError,
     > {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.ensure_no_diagnostic_drift()?;
         let (contract_checksum, _, ledger, ledger_checksum) =
             self.load_bound_ledger(dataset, contract)?;
@@ -991,6 +1003,7 @@ impl StateStore {
         contract: &RunContract,
         claim: RecoveryCheckClaim,
     ) -> Result<(), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         self.validate_claim(
             dataset,
             contract,
@@ -1034,6 +1047,7 @@ impl StateStore {
         contract: &RunContract,
         stage: DiagnosticStage,
     ) -> Result<DiagnosticClaim, StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         let contract_checksum = self.contract_checksum(dataset, contract)?;
         let predecessor_checksum = match stage {
             DiagnosticStage::Warmup => {
@@ -1096,6 +1110,7 @@ impl StateStore {
         contract: &RunContract,
         claim: DiagnosticClaim,
     ) -> Result<(), StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
         let (claim_file, claim_artifact) = diagnostic_claim_spec(claim.stage);
         self.validate_claim(dataset, contract, claim.token, claim_file, claim_artifact)?;
         let (receipt_file, receipt_artifact) = diagnostic_receipt_spec(claim.stage);
@@ -1208,6 +1223,11 @@ impl StateStore {
     }
 
     pub fn load_dataset(&self) -> Result<DatasetState, StateError> {
+        let _directory_lock = lock_state_directory(&self.root)?;
+        self.load_dataset_unlocked()
+    }
+
+    fn load_dataset_unlocked(&self) -> Result<DatasetState, StateError> {
         let input = read_limited(
             &self.root.join(DATASET_FILE),
             MAX_DATASET_STATE_BYTES as u64,
@@ -2553,6 +2573,30 @@ fn read_limited(path: &Path, limit: u64) -> Result<String, StateError> {
     Ok(input)
 }
 
+struct StateDirectoryLock(File);
+
+impl Drop for StateDirectoryLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Serialize every dependent read/claim/publication sequence on the state
+/// directory itself. Directory locks are released by the kernel on process
+/// exit, so a crash cannot leave a permanent lock artifact.
+fn lock_state_directory(root: &Path) -> Result<StateDirectoryLock, StateError> {
+    let directory = File::open(root)?;
+    directory.lock()?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(StateError::Invalid(format!(
+            "state path changed while locking: {}",
+            root.display()
+        )));
+    }
+    Ok(StateDirectoryLock(directory))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AtomicPublishStep {
     TemporaryUnlink,
@@ -2653,7 +2697,10 @@ fn rollback_atomic_publish(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
     use crate::sample_evidence::setup_evidence_fixture;
@@ -3354,6 +3401,71 @@ mod tests {
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
         atomic_publish_new(&directory.0, name, b"durable").unwrap();
         assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"durable");
+    }
+
+    #[test]
+    fn dependent_claim_cannot_consume_a_provisional_hard_link() {
+        let directory = TestDirectory::new();
+        let run_id = "run-provisional-link";
+        let seed = 48;
+        let contract = sample_contract(1);
+        let encoded = encode_setup_intent(run_id, seed, &contract).unwrap();
+        let linked = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        let publisher_root = directory.0.clone();
+        let publisher_linked = Arc::clone(&linked);
+        let publisher_release = Arc::clone(&release);
+        let publisher = thread::spawn(move || {
+            let _directory_lock = lock_state_directory(&publisher_root).unwrap();
+            atomic_publish_new_with_fault(
+                &publisher_root,
+                SETUP_INTENT_FILE,
+                encoded.as_bytes(),
+                |step| {
+                    if step == AtomicPublishStep::DirectorySync {
+                        publisher_linked.wait();
+                        publisher_release.wait();
+                        Err(std::io::Error::other(
+                            "injected directory sync failure",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        });
+
+        linked.wait();
+        assert!(directory.0.join(SETUP_INTENT_FILE).exists());
+
+        let claimant_store = StateStore::open_existing(&directory.0).unwrap();
+        let claimant_contract = contract.clone();
+        let (send, receive) = mpsc::channel();
+        let claimant = thread::spawn(move || {
+            send.send(claimant_store.begin_or_resume_setup(
+                run_id,
+                seed,
+                &claimant_contract,
+            ))
+            .unwrap();
+        });
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release.wait();
+        assert!(publisher.join().unwrap().is_err());
+        let (claim, origin) = receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        claimant.join().unwrap();
+        assert_eq!(origin, SetupClaimOrigin::Created);
+        assert_ne!(claim.intent_checksum, 0);
+        assert!(directory.0.join(SETUP_INTENT_FILE).is_file());
+        assert!(directory.0.join(SETUP_EXECUTION_FILE).is_file());
     }
 
     #[test]
