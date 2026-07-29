@@ -185,6 +185,33 @@ pub struct CsvMaterializer<'a> {
     assets: BTreeMap<LogicalTable, CsvAsset>,
 }
 
+struct DigestWriter<'a, W> {
+    inner: W,
+    digest: &'a mut Sha256,
+}
+
+impl<'a, W> DigestWriter<'a, W> {
+    fn new(inner: W, digest: &'a mut Sha256) -> Self {
+        Self { inner, digest }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for DigestWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.digest.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl<'a> CsvMaterializer<'a> {
     pub fn new(scale_factor: i32, schema: &'a RuntimeSchema) -> Result<Self, TpccError> {
         if scale_factor <= 0 {
@@ -537,7 +564,6 @@ impl<'a> CsvMaterializer<'a> {
             .write(true)
             .create_new(true)
             .open(&partial_file)?;
-        let mut writer = BufWriter::new(file);
 
         let runtime_columns = self
             .schema
@@ -551,9 +577,8 @@ impl<'a> CsvMaterializer<'a> {
         self.dataset_hasher
             .update((basename.len() as u32).to_be_bytes());
         self.dataset_hasher.update(basename.as_bytes());
-        let header = format!("{}\n", runtime_columns.join(","));
-        self.dataset_hasher.update(header.as_bytes());
-        writer.write_all(header.as_bytes())?;
+        let mut writer = DigestWriter::new(BufWriter::new(file), &mut self.dataset_hasher);
+        writeln!(writer, "{}", runtime_columns.join(","))?;
         let mut total = 0_u64;
         for row in rows {
             if row.len() != columns.len() {
@@ -565,9 +590,7 @@ impl<'a> CsvMaterializer<'a> {
                 )));
             }
             observe(&row)?;
-            let encoded = Self::csv_row(&row);
-            self.dataset_hasher.update(encoded.as_bytes());
-            writer.write_all(encoded.as_bytes())?;
+            Self::write_csv_row(&mut writer, &row)?;
             total += 1;
             if total >= 10000 && total % 10000 == 0 {
                 let elapsed = start.elapsed().as_secs_f64();
@@ -577,10 +600,10 @@ impl<'a> CsvMaterializer<'a> {
                 );
             }
         }
+        writer.flush()?;
+        drop(writer.into_inner());
         self.dataset_hasher.update([0xfe, ordinal as u8]);
         self.dataset_hasher.update(total.to_be_bytes());
-        writer.flush()?;
-        drop(writer);
         rename(&partial_file, &csv_file)?;
         let load_path = format!("{load_dir}/{basename}");
         let row_count = i64::try_from(total).map_err(|_| {
@@ -604,16 +627,15 @@ impl<'a> CsvMaterializer<'a> {
         Ok(total)
     }
 
-    fn csv_row(row: &[SqlParam]) -> String {
-        let mut output = String::new();
+    fn write_csv_row(writer: &mut impl Write, row: &[SqlParam]) -> Result<(), TpccError> {
         for (idx, param) in row.iter().enumerate() {
             if idx > 0 {
-                output.push(',');
+                writer.write_all(b",")?;
             }
-            output.push_str(&Self::csv_value(param));
+            writer.write_all(Self::csv_value(param).as_bytes())?;
         }
-        output.push('\n');
-        output
+        writer.write_all(b"\n")?;
+        Ok(())
     }
 
     fn csv_value(param: &SqlParam) -> String {
