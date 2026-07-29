@@ -256,6 +256,19 @@ impl TpccDataGen {
         customer_ids
     }
 
+    /// Return the customer referenced by one initial order.
+    ///
+    /// Setup evidence uses this helper only to decide which already-generated
+    /// customer row must be retained while the customer CSV is streamed before
+    /// the orders CSV. The expected row contents still come from the observed
+    /// CSV row, not from regenerating an answer after loading.
+    pub fn initial_order_customer_id(&self, w_id: i32, d_id: i32, o_id: i32) -> i32 {
+        assert!((1..=self.scale_factor).contains(&w_id));
+        assert!((1..=DISTRICTS_PER_WAREHOUSE).contains(&d_id));
+        assert!((1..=ORDERS_PER_DISTRICT).contains(&o_id));
+        self.initial_order_customer_permutation(w_id, d_id)[o_id as usize - 1]
+    }
+
     fn nurand(rng: &mut StableRng, a: i32, x: i32, y: i32, c: i32) -> i32 {
         (((rng.i32_inclusive(0, a) | rng.i32_inclusive(x, y)) + c) % (y - x + 1)) + x
     }
@@ -285,6 +298,38 @@ impl TpccDataGen {
         }
         let mut rng = self.row_rng(DOMAIN_ORDER_LINE, &[w_id, d_id, o_id, ol_number, 2]);
         rng.i32_inclusive(1, 999_999)
+    }
+
+    fn initial_order_line_identity(
+        &self,
+        w_id: i32,
+        d_id: i32,
+        o_id: i32,
+        ol_number: i32,
+    ) -> (i32, String) {
+        let mut rng = self.row_rng(DOMAIN_ORDER_LINE, &[w_id, d_id, o_id, ol_number, 1]);
+        let item_id = Self::rng_int(&mut rng, 1, ITEMS_TOTAL);
+        let dist_info = Self::gen_dist_info(&mut rng);
+        (item_id, dist_info)
+    }
+
+    /// Return the item referenced by one initial order line.
+    ///
+    /// The loader needs the key before item and stock streaming finishes. This
+    /// helper shares the exact generation path with `generate_order_lines`.
+    pub fn initial_order_line_item_id(
+        &self,
+        w_id: i32,
+        d_id: i32,
+        o_id: i32,
+        ol_number: i32,
+    ) -> i32 {
+        assert!((1..=self.scale_factor).contains(&w_id));
+        assert!((1..=DISTRICTS_PER_WAREHOUSE).contains(&d_id));
+        assert!((1..=ORDERS_PER_DISTRICT).contains(&o_id));
+        assert!((1..=self.initial_order_line_count(w_id, d_id, o_id)).contains(&ol_number));
+        self.initial_order_line_identity(w_id, d_id, o_id, ol_number)
+            .0
     }
 
     fn last_name_from_number(number: i32) -> String {
@@ -517,8 +562,8 @@ impl TpccDataGen {
                         String::new()
                     };
                     (1..=ol_count).map(move |ol_number| {
-                        let mut rng =
-                            self.row_rng(DOMAIN_ORDER_LINE, &[w_id, d_id, o_id, ol_number, 1]);
+                        let (item_id, dist_info) =
+                            self.initial_order_line_identity(w_id, d_id, o_id, ol_number);
                         let amount_cents =
                             self.initial_order_line_amount_cents(w_id, d_id, o_id, ol_number);
                         // amount_cents is exactly representable in f32; the division is the one
@@ -529,12 +574,12 @@ impl TpccDataGen {
                             ol_d_id: d_id,
                             ol_w_id: w_id,
                             ol_number,
-                            ol_i_id: Self::rng_int(&mut rng, 1, ITEMS_TOTAL),
+                            ol_i_id: item_id,
                             ol_supply_w_id: w_id,
                             ol_delivery_d: delivery_d.clone(),
                             ol_quantity: 5,
                             ol_amount: f64::from(amount),
-                            ol_dist_info: Self::gen_dist_info(&mut rng),
+                            ol_dist_info: dist_info,
                         }
                     })
                 })

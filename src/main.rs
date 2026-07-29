@@ -17,6 +17,7 @@ mod report;
 mod routing;
 mod run_state;
 mod runtime_schema;
+mod sample_evidence;
 mod transaction;
 mod workload;
 
