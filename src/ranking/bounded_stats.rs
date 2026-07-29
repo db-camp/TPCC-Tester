@@ -8,8 +8,8 @@
 use thiserror::Error;
 
 use crate::consistency::{
-    FloatError, NonNegativeF32Accumulator, CUSTOMERS_PER_DISTRICT, DISTRICTS_PER_WAREHOUSE,
-    FINAL_WAREHOUSES,
+    sum_f32_as_f64_once, FloatError, NonNegativeF32Accumulator, CUSTOMERS_PER_DISTRICT,
+    DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES,
 };
 use crate::profile::{ITEM_COUNT, OFFICIAL_CLIENTS};
 use crate::workload::{
@@ -820,10 +820,30 @@ impl<'a> TerminalDelta<'a> {
                             "Delivery line count must be 5..=15",
                         ));
                     }
+                    if order.line_amount_bits.len() != usize::from(order.line_count) {
+                        return Err(BoundedStatsError::InvalidEvidence(
+                            "Delivery amount-bit count differs from line_count",
+                        ));
+                    }
+                    for amount_bits in &order.line_amount_bits {
+                        validate_positive_amount("Delivery line amount", *amount_bits, 10_000.0)?;
+                    }
+                    let expected_amount = sum_f32_as_f64_once(
+                        order.line_amount_bits.iter().copied(),
+                    )
+                    .map_err(|source| BoundedStatsError::Float {
+                        field: "Delivery line amount sum",
+                        source,
+                    })?;
+                    if expected_amount != order.amount_bits {
+                        return Err(BoundedStatsError::InvalidEvidence(
+                            "Delivery customer amount differs from exact order-line sum",
+                        ));
+                    }
                     validate_positive_amount(
                         "Delivery customer amount",
                         order.amount_bits,
-                        15_000.0,
+                        150_000.0,
                     )?;
                     validate_relative_add(
                         "Delivery customer c_balance",
@@ -1615,6 +1635,58 @@ mod tests {
         }
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn delivery_validates_exact_line_sum_without_a_false_amount_ceiling() {
+        let delivery_ticket = ticket(TransactionKind::Delivery, None, StageId::WARMUP, 1, 37);
+        let mut high_amount = delivery(&delivery_ticket);
+        let RankedTransactionOutcome::Committed(RankedCommit::Delivery(orders)) = &mut high_amount
+        else {
+            unreachable!();
+        };
+        let order = &mut orders[0];
+        order.line_amount_bits = vec![9_999.99_f32.to_bits(); usize::from(order.line_count)];
+        order.amount_bits = sum_f32_as_f64_once(order.line_amount_bits.iter().copied()).unwrap();
+        assert!(f32::from_bits(order.amount_bits) > 15_000.0);
+        order.customer_balance_after_bits = (f32::from_bits(order.customer_balance_before_bits)
+            + f32::from_bits(order.amount_bits))
+        .to_bits();
+
+        let mut stats = BoundedPhysicalStats::default();
+        stats
+            .offer_terminal(LedgerClass::Warmup, &delivery_ticket, &high_amount)
+            .unwrap();
+
+        let before = stats.clone();
+        let mut missing_lines = high_amount.clone();
+        let RankedTransactionOutcome::Committed(RankedCommit::Delivery(orders)) =
+            &mut missing_lines
+        else {
+            unreachable!();
+        };
+        orders[0].line_amount_bits.clear();
+        assert!(matches!(
+            stats.offer_terminal(LedgerClass::Warmup, &delivery_ticket, &missing_lines),
+            Err(BoundedStatsError::InvalidEvidence(
+                "Delivery amount-bit count differs from line_count"
+            ))
+        ));
+        assert_eq!(stats, before);
+
+        let mut wrong_sum = high_amount;
+        let RankedTransactionOutcome::Committed(RankedCommit::Delivery(orders)) = &mut wrong_sum
+        else {
+            unreachable!();
+        };
+        orders[0].line_amount_bits[0] = 1.0_f32.to_bits();
+        assert!(matches!(
+            stats.offer_terminal(LedgerClass::Warmup, &delivery_ticket, &wrong_sum),
+            Err(BoundedStatsError::InvalidEvidence(
+                "Delivery customer amount differs from exact order-line sum"
+            ))
+        ));
+        assert_eq!(stats, before);
     }
 
     #[test]
