@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import argparse
+from copy import deepcopy
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -10,10 +13,18 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "run_workflow.sh"
 METRICS_HELPER = Path(__file__).resolve().parents[1] / "diagnostic_metrics.py"
+RESOURCE_HELPER = Path(__file__).resolve().parents[1] / "resource_sampler.py"
+RESOURCE_SPEC = importlib.util.spec_from_file_location(
+    "workflow_resource_sampler",
+    RESOURCE_HELPER,
+)
+RESOURCE_SAMPLER = importlib.util.module_from_spec(RESOURCE_SPEC)
+RESOURCE_SPEC.loader.exec_module(RESOURCE_SAMPLER)
 
 
 class WorkflowSafetyTests(unittest.TestCase):
@@ -158,6 +169,79 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
             time.sleep(0.02)
         self.fail(f"process {pid} is still alive")
 
+    def make_resource_segment(self, database_path, generation=1, shift=0):
+        origin_monotonic = 1_000_000_000 + shift
+        origin_unix = time.time_ns() - 5_000_000_000 + shift
+        offset = origin_unix - origin_monotonic
+        midpoints = [
+            origin_monotonic - 500_000_000 + index * 1_000_000_000
+            for index in range(5)
+        ]
+        correlations = [
+            {
+                "monotonic_before_ns": midpoint - 1_000,
+                "monotonic_after_ns": midpoint + 1_000,
+                "monotonic_ns": midpoint,
+                "unix_ns": midpoint + offset,
+                "offset_lower_ns": offset - 100,
+                "offset_upper_ns": offset + 100,
+                "collection_span_ns": 2_000,
+            }
+            for midpoint in midpoints
+        ]
+        intervals = [
+            {
+                "start_monotonic_ns": midpoints[index],
+                "end_monotonic_ns": midpoints[index + 1],
+                "cpu_delta_ns": 1_000_000_000,
+                "start_collection_span_ns": 2_000,
+                "end_collection_span_ns": 2_000,
+            }
+            for index in range(4)
+        ]
+        return {
+            "schema_version": 1,
+            "kind": "rmdb_resource_segment",
+            "status": "available",
+            "ranked": False,
+            "score_effect": "none",
+            "run_id": "resource-run",
+            "generation": generation,
+            "root_pid": 100 + generation,
+            "root_identity_expected": f"linux:{generation}",
+            "root_identity_observed": f"linux:{generation}",
+            "root_strong_identity": f"linux:{generation}",
+            "root_observed_exit": False,
+            "process_group": 100 + generation,
+            "database_path": str(database_path),
+            "database_identity_expected": {"device": 7, "inode": 9},
+            "database_identity_observed": {"device": 7, "inode": 9},
+            "sample_interval_ms": 1000,
+            "started_unix_ns": origin_unix - 600_000_000,
+            "started_monotonic_ns": origin_monotonic - 600_000_000,
+            "completed_unix_ns": origin_unix + 4_600_000_000,
+            "completed_monotonic_ns": origin_monotonic + 4_600_000_000,
+            "backend": {"backend": "linux_proc", "boot_id": "boot"},
+            "logical_cpus": 4,
+            "process_samples": 5,
+            "disk_samples": 5,
+            "missed_deadlines": 0,
+            "max_sample_collection_span_ns": 2_000,
+            "clock_offset_spread_ns": 200,
+            "max_rss_bytes": 1_000,
+            "max_disk_allocated_bytes": 2_000,
+            "max_disk_apparent_bytes": 3_000,
+            "final_disk": {
+                "allocated_bytes": 2_000,
+                "apparent_bytes": 3_000,
+                "inode_count": 2,
+                "root_identity": {"device": 7, "inode": 9},
+            },
+            "cpu_intervals": intervals,
+            "clock_correlations": correlations,
+            "warnings": [],
+        }, origin_unix
+
     def test_bash_syntax(self):
         result = subprocess.run(
             ["bash", "-n", str(SCRIPT)],
@@ -166,6 +250,271 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
             stderr=subprocess.PIPE,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_resource_sampler_tracks_tree_and_rejects_symlinked_disk_entries(self):
+        class FakeBackend:
+            def process_table(self):
+                return {
+                    10: {
+                        "ppid": 1,
+                        "pgid": 10,
+                        "identity": "linux:10",
+                        "cpu_ns": 100,
+                        "rss_bytes": 1_000,
+                    },
+                    11: {
+                        "ppid": 10,
+                        "pgid": 10,
+                        "identity": "linux:11",
+                        "cpu_ns": 200,
+                        "rss_bytes": 2_000,
+                    },
+                    12: {
+                        "ppid": 11,
+                        "pgid": 10,
+                        "identity": "linux:12",
+                        "cpu_ns": 300,
+                        "rss_bytes": 3_000,
+                    },
+                    99: {
+                        "ppid": 1,
+                        "pgid": 99,
+                        "identity": "linux:99",
+                        "cpu_ns": 9_999,
+                        "rss_bytes": 9_999,
+                    },
+                }
+
+        sample = RESOURCE_SAMPLER.collect_tree_sample(
+            FakeBackend(),
+            10,
+            10,
+            "linux:10",
+        )
+        self.assertEqual(sample["process_count"], 3)
+        self.assertEqual(sample["cpu_ns"], 600)
+        self.assertEqual(sample["rss_bytes"], 6_000)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "database"
+            root.mkdir()
+            page = root / "page"
+            page.write_bytes(b"x" * 8_192)
+            os.link(page, root / "same-page")
+            usage = RESOURCE_SAMPLER.directory_usage(root)
+            self.assertEqual(usage["inode_count"], 2)
+            outside = Path(temp) / "outside"
+            outside.write_text("outside", encoding="utf-8")
+            (root / "escape").symlink_to(outside)
+            with self.assertRaises(RESOURCE_SAMPLER.ResourceError):
+                RESOURCE_SAMPLER.directory_usage(root)
+
+    def test_resource_sampler_treats_verified_root_exit_as_complete(self):
+        class ExitingBackend:
+            def __init__(self):
+                self.calls = 0
+
+            def metadata(self):
+                return {"backend": "test"}
+
+            def process_table(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return {
+                        10: {
+                            "ppid": 1,
+                            "pgid": 10,
+                            "identity": "linux:10",
+                            "strong_identity": "linux-strong:10",
+                            "cpu_ns": 100,
+                            "rss_bytes": 1_000,
+                        }
+                    }
+                return {}
+
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            database = temp_path / "database"
+            database.mkdir()
+            database_stat = database.stat()
+            output = temp_path / "segment.json"
+            old_sigint = signal.getsignal(signal.SIGINT)
+            old_sigterm = signal.getsignal(signal.SIGTERM)
+            try:
+                with mock.patch.object(
+                    RESOURCE_SAMPLER,
+                    "select_backend",
+                    return_value=ExitingBackend(),
+                ), mock.patch.object(
+                    RESOURCE_SAMPLER,
+                    "online_cpu_count",
+                    return_value=4,
+                ):
+                    result = RESOURCE_SAMPLER.sample_segment(
+                        argparse.Namespace(
+                            output=output,
+                            run_id="root-exit-run",
+                            generation=1,
+                            root_pid=10,
+                            root_identity="linux:10",
+                            process_group=10,
+                            database_path=database,
+                            database_identity=(
+                                database_stat.st_dev,
+                                database_stat.st_ino,
+                            ),
+                            interval_ms=100,
+                            proc_root=Path("/unused"),
+                        )
+                    )
+            finally:
+                signal.signal(signal.SIGINT, old_sigint)
+                signal.signal(signal.SIGTERM, old_sigterm)
+
+            self.assertEqual(result, 0)
+            segment = RESOURCE_SAMPLER.validate_segment(output)
+            self.assertEqual(segment["status"], "available")
+            self.assertTrue(segment["root_observed_exit"])
+            self.assertEqual(segment["process_samples"], 1)
+            self.assertEqual(segment["root_identity_observed"], "linux:10")
+            self.assertEqual(segment["warnings"], [])
+
+    def test_resource_aggregate_fails_closed_on_incomplete_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            database = temp_path / "database"
+            database.mkdir()
+            first, origin = self.make_resource_segment(database)
+            first_path = temp_path / "first.json"
+            RESOURCE_SAMPLER.atomic_write_json(first_path, first)
+            RESOURCE_SAMPLER.validate_segment(first_path)
+            timeline = temp_path / "timeline.state"
+            timeline.write_text(
+                "schema_version=1\n"
+                "kind=final2026_rank_timeline\n"
+                f"origin_unix_ns={origin}\n"
+                "warmup_ns=0\n"
+                "measurement_windows=3\n"
+                "measurement_window_ns=1000000000\n",
+                encoding="ascii",
+            )
+            completion = temp_path / "rank-complete.json"
+            RESOURCE_SAMPLER.complete_rank(
+                argparse.Namespace(
+                    timeline=timeline,
+                    run_id="resource-run",
+                    output=completion,
+                )
+            )
+            output = temp_path / "metrics.json"
+
+            def aggregate(
+                paths,
+                expected,
+                identity=(7, 9),
+                expected_window_seconds=1,
+            ):
+                RESOURCE_SAMPLER.aggregate_segments(
+                    argparse.Namespace(
+                        segment=paths,
+                        run_id="resource-run",
+                        expected_generations=expected,
+                        database_path=database,
+                        database_identity=identity,
+                        timeline=timeline,
+                        rank_complete=completion,
+                        expected_warmup_seconds=0,
+                        expected_window_seconds=expected_window_seconds,
+                        mode="all",
+                        output=output,
+                        interval_ms=1000,
+                    )
+                )
+                return json.loads(output.read_text(encoding="utf-8"))
+
+            baseline = aggregate([first_path], 1)
+            self.assertEqual(baseline["status"], "available")
+            self.assertEqual(
+                baseline["rank_cpu"]["combined"][
+                    "average_single_core_percent"
+                ],
+                100.0,
+            )
+            mismatched_schedule = aggregate(
+                [first_path],
+                1,
+                expected_window_seconds=2,
+            )
+            self.assertEqual(
+                mismatched_schedule["rank_cpu"]["status"],
+                "unavailable",
+            )
+
+            self.assertEqual(aggregate([first_path], 2)["status"], "partial")
+            duplicate = aggregate([first_path, first_path], 2)
+            self.assertEqual(duplicate["status"], "partial")
+            self.assertIn(
+                "duplicate_resource_segment",
+                {warning["code"] for warning in duplicate["warnings"]},
+            )
+
+            second, _ = self.make_resource_segment(
+                database,
+                generation=2,
+                shift=10_000_000_000,
+            )
+            second["status"] = "unavailable"
+            second_path = temp_path / "second.json"
+            RESOURCE_SAMPLER.atomic_write_json(second_path, second)
+            self.assertEqual(
+                aggregate([first_path, second_path], 2)["status"],
+                "partial",
+            )
+
+            overlapping, _ = self.make_resource_segment(
+                database,
+                generation=2,
+                shift=100_000_000,
+            )
+            overlapping_path = temp_path / "overlapping.json"
+            RESOURCE_SAMPLER.atomic_write_json(overlapping_path, overlapping)
+            overlap_result = aggregate([first_path, overlapping_path], 2)
+            self.assertEqual(overlap_result["status"], "partial")
+            self.assertEqual(
+                overlap_result["rank_cpu"]["status"],
+                "unavailable",
+            )
+
+            self.assertNotEqual(
+                aggregate([first_path], 1, identity=(7, 10))["status"],
+                "available",
+            )
+            unknown = deepcopy(first)
+            unknown["unexpected"] = True
+            unknown_path = temp_path / "unknown.json"
+            RESOURCE_SAMPLER.atomic_write_json(unknown_path, unknown)
+            with self.assertRaises(RESOURCE_SAMPLER.ResourceError):
+                RESOURCE_SAMPLER.validate_segment(unknown_path)
+
+            gap = deepcopy(first)
+            gap["status"] = "partial"
+            gap["warnings"] = [
+                {
+                    "code": "process_sample_gap_exceeded",
+                    "detail": "2000000000",
+                }
+            ]
+            gap_path = temp_path / "gap.json"
+            RESOURCE_SAMPLER.atomic_write_json(gap_path, gap)
+            self.assertEqual(aggregate([gap_path], 1)["status"], "partial")
+
+            stale = json.loads(completion.read_text(encoding="utf-8"))
+            stale["run_id"] = "stale-run"
+            RESOURCE_SAMPLER.atomic_write_json(completion, stale)
+            self.assertEqual(
+                aggregate([first_path], 1)["rank_cpu"]["status"],
+                "unavailable",
+            )
 
     @unittest.skipUnless(
         sys.platform == "darwin",

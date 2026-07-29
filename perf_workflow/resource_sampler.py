@@ -713,11 +713,12 @@ def sample_segment(arguments):
             }
         except RootAbsent as error:
             root_observed_exit = True
-            append_warning(
-                payload["warnings"],
-                "root_exited_before_sampler_stop",
-                error,
-            )
+            if process_samples == 0:
+                append_warning(
+                    payload["warnings"],
+                    "root_absent_before_first_sample",
+                    error,
+                )
             stop_after_sample = True
         except ResourceError as error:
             append_warning(payload["warnings"], "process_sample_failed", error)
@@ -1388,7 +1389,6 @@ def validate_segment(path):
         warnings
         or process_samples == 0
         or disk_samples == 0
-        or segment["root_observed_exit"]
         or segment["clock_offset_spread_ns"] > CLOCK_OFFSET_TOLERANCE_NS
     ):
         raise ResourceError(f"{path} overclaims available resource coverage")
@@ -1543,6 +1543,15 @@ def aggregate_segments(arguments):
                 "rank timeline",
             )
             timeline = parse_timeline_bytes(timeline_content)
+            if (
+                timeline["warmup_ns"]
+                != arguments.expected_warmup_seconds * 1_000_000_000
+                or timeline["measurement_window_ns"]
+                != arguments.expected_window_seconds * 1_000_000_000
+            ):
+                raise ResourceError(
+                    "rank timeline durations do not match workflow configuration"
+                )
             completion = validate_rank_completion(
                 arguments.rank_complete,
                 arguments.run_id,
@@ -1652,6 +1661,16 @@ def positive_integer(value):
     return parsed
 
 
+def nonnegative_integer(value):
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be an integer") from error
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
 def nonempty_text(value):
     if not value or "\0" in value:
         raise argparse.ArgumentTypeError("value must be non-empty text")
@@ -1713,6 +1732,16 @@ def build_parser():
     )
     aggregate.add_argument("--timeline", required=True, type=Path)
     aggregate.add_argument("--rank-complete", required=True, type=Path)
+    aggregate.add_argument(
+        "--expected-warmup-seconds",
+        required=True,
+        type=nonnegative_integer,
+    )
+    aggregate.add_argument(
+        "--expected-window-seconds",
+        required=True,
+        type=positive_integer,
+    )
     aggregate.add_argument(
         "--mode",
         required=True,
