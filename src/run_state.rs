@@ -3498,8 +3498,9 @@ fn lock_clean_terminal_state_directory_with_hook(
     ensure_snapshot_legacy_state_absent(&entries)?;
     let temporaries = validate_orphan_temporary_snapshot(root, &entries)?;
     after_snapshot()?;
-    ensure_legacy_state_absent(root)?;
-    cleanup_orphan_temporary_batch_with_fault(&directory_lock.0, &temporaries, |_| Ok(()))?;
+    cleanup_orphan_temporary_batch_with_fault(root, &directory_lock.0, &temporaries, true, |_| {
+        Ok(())
+    })?;
     ensure_legacy_state_absent(root)?;
     validate_locked_directory_identity(root, &directory_lock.0)?;
     Ok(directory_lock)
@@ -3565,6 +3566,7 @@ enum OrphanCleanupStep {
 struct OrphanTemporary {
     path: PathBuf,
     linked_to_target: bool,
+    metadata: fs::Metadata,
 }
 
 fn cleanup_orphan_temporary_files_with_fault(
@@ -3574,7 +3576,7 @@ fn cleanup_orphan_temporary_files_with_fault(
 ) -> Result<(), StateError> {
     let entries = state_directory_snapshot(root)?;
     let temporaries = validate_orphan_temporary_snapshot(root, &entries)?;
-    cleanup_orphan_temporary_batch_with_fault(directory, &temporaries, inject_fault)
+    cleanup_orphan_temporary_batch_with_fault(root, directory, &temporaries, false, inject_fault)
 }
 
 fn state_directory_snapshot(root: &Path) -> Result<Vec<PathBuf>, StateError> {
@@ -3637,16 +3639,20 @@ fn validate_orphan_temporary_snapshot(
         temporaries.push(OrphanTemporary {
             path: temporary.to_path_buf(),
             linked_to_target,
+            metadata: temporary_metadata,
         });
     }
     Ok(temporaries)
 }
 
 fn cleanup_orphan_temporary_batch_with_fault(
+    root: &Path,
     directory: &File,
     temporaries: &[OrphanTemporary],
+    reject_legacy: bool,
     mut inject_fault: impl FnMut(OrphanCleanupStep) -> std::io::Result<()>,
 ) -> Result<(), StateError> {
+    validate_cleanup_batch_before_mutation(root, directory, temporaries, reject_legacy)?;
     if temporaries
         .iter()
         .any(|temporary| temporary.linked_to_target)
@@ -3654,7 +3660,18 @@ fn cleanup_orphan_temporary_batch_with_fault(
         inject_fault(OrphanCleanupStep::BeforeTargetSync)?;
         directory.sync_all()?;
     }
-    for temporary in temporaries {
+    for (index, temporary) in temporaries.iter().enumerate() {
+        // Atomic publishers serialize on this directory lock. Revalidate all
+        // remaining captured entries at the actual unlink boundary so every
+        // cooperating writer either precedes or follows this cleanup batch.
+        // A raw writer that deliberately ignores flock can always race a
+        // pathname operation and is outside the supported publication model.
+        validate_cleanup_batch_before_mutation(
+            root,
+            directory,
+            &temporaries[index..],
+            reject_legacy,
+        )?;
         fs::remove_file(&temporary.path)?;
     }
     if !temporaries.is_empty() {
@@ -3662,6 +3679,55 @@ fn cleanup_orphan_temporary_batch_with_fault(
         directory.sync_all()?;
     }
     Ok(())
+}
+
+fn validate_cleanup_batch_before_mutation(
+    root: &Path,
+    directory: &File,
+    captured: &[OrphanTemporary],
+    reject_legacy: bool,
+) -> Result<(), StateError> {
+    validate_locked_directory_identity(root, directory)?;
+    if reject_legacy {
+        ensure_legacy_state_absent(root)?;
+    }
+    let paths = captured
+        .iter()
+        .map(|temporary| temporary.path.clone())
+        .collect::<Vec<_>>();
+    let refreshed = validate_orphan_temporary_snapshot(root, &paths)?;
+    if refreshed.len() != captured.len()
+        || refreshed.iter().zip(captured).any(|(current, prior)| {
+            current.path != prior.path
+                || current.linked_to_target != prior.linked_to_target
+                || !same_file_identity(&current.metadata, &prior.metadata)
+        })
+    {
+        return Err(StateError::Invalid(
+            "orphan publication batch changed before cleanup".to_owned(),
+        ));
+    }
+    if reject_legacy {
+        ensure_legacy_state_absent(root)?;
+    }
+    validate_locked_directory_identity(root, directory)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.nlink() == right.nlink()
+        && left.len() == right.len()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.created().ok() == right.created().ok()
+        && left.modified().ok() == right.modified().ok()
 }
 
 #[cfg(unix)]
@@ -4529,6 +4595,53 @@ mod tests {
             fs::read(&injected_legacy).unwrap(),
             b"injected-after-snapshot"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_cleanup_rejects_replaced_snapshot_entry_without_unlinking_it() {
+        let directory = TestDirectory::new();
+        let ordinary = directory
+            .0
+            .join(format!(".{DATASET_FILE}.{}.106.tmp", std::process::id()));
+        let staged_replacement = directory.0.join("staged-replacement");
+        fs::write(&ordinary, b"captured-orphan").unwrap();
+        fs::write(&staged_replacement, b"replacement-victim").unwrap();
+
+        let result = lock_clean_terminal_state_directory_with_hook(&directory.0, || {
+            fs::remove_file(&ordinary)?;
+            fs::rename(&staged_replacement, &ordinary)?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&ordinary).unwrap(), b"replacement-victim");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_cleanup_rejects_root_replacement_before_unlinking() {
+        let parent = TestDirectory::new();
+        let root = parent.0.join("state");
+        let moved = parent.0.join("moved-state");
+        fs::create_dir(&root).unwrap();
+        let file_name = format!(".{DATASET_FILE}.{}.107.tmp", std::process::id());
+        let captured = root.join(&file_name);
+        fs::write(&captured, b"captured-orphan").unwrap();
+
+        let result = lock_clean_terminal_state_directory_with_hook(&root, || {
+            fs::rename(&root, &moved)?;
+            fs::create_dir(&root)?;
+            fs::write(root.join(&file_name), b"new-root-victim")?;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(moved.join(&file_name)).unwrap(),
+            b"captured-orphan"
+        );
+        assert_eq!(fs::read(root.join(&file_name)).unwrap(), b"new-root-victim");
     }
 
     #[test]
