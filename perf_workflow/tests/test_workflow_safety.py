@@ -816,6 +816,7 @@ while True:
             temp_path / "fake-tpcc",
             """
 import os
+import hashlib
 from pathlib import Path
 import sys
 
@@ -875,6 +876,32 @@ if (
         encoding="ascii",
     ) as identity:
         identity.write("tampered_after_attestation=1\\n")
+if "--attest-formal-state" in sys.argv:
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    terminal = state_dir / "terminal_evidence.state"
+    if os.environ.get("FAKE_TPCC_ABA_TERMINAL") == "1":
+        original = terminal.read_bytes()
+        replacement = b"ABA replacement validated by fake Rust\\n"
+        terminal.write_bytes(replacement)
+        attested = replacement
+        terminal.write_bytes(original)
+    else:
+        attested = terminal.read_bytes()
+    receipt = (
+        "FORMAL_STATE_V1 "
+        f"terminal_evidence_size={len(attested)} "
+        f"terminal_evidence_sha256={hashlib.sha256(attested).hexdigest()}"
+    )
+    receipt_mode = os.environ.get("FAKE_TPCC_RECEIPT_MODE", "canonical")
+    if receipt_mode == "canonical":
+        print(receipt)
+    elif receipt_mode == "duplicate":
+        print(receipt)
+        print(receipt)
+    elif receipt_mode == "malformed":
+        print(receipt.upper())
+    elif receipt_mode != "missing":
+        raise RuntimeError(f"unknown receipt mode: {receipt_mode}")
 if "--lifecycle-event" in sys.argv:
     event = sys.argv[sys.argv.index("--lifecycle-event") + 1]
     with open(
@@ -2227,6 +2254,92 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             self.assertIsNone(
                 manifest["formal_state"]["terminal_evidence"]["sha256"]
             )
+
+    def test_rust_attestation_receipt_blocks_terminal_aba_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            env["FAKE_TPCC_ABA_TERMINAL"] = "1"
+            records = temp_path / "records"
+            result = self.run_script(
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "terminal evidence changed during formal state attestation",
+                result.stderr,
+            )
+            manifest = json.loads(
+                (next(records.iterdir()) / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["status"], "failed")
+            self.assertFalse(manifest["ranking_eligible"])
+            self.assertEqual(
+                manifest["formal_state"]["terminal_evidence"]["status"],
+                "changed",
+            )
+
+    def test_formal_state_receipt_must_be_unique_and_canonical(self):
+        for mode in ("missing", "duplicate", "malformed"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                temp_path = Path(temp)
+                root = self.make_root(temp)
+                server, tester, _, _, env, port = (
+                    self.make_lifecycle_fakes(temp_path, root)
+                )
+                env["FAKE_TPCC_RECEIPT_MODE"] = mode
+                records = temp_path / "records"
+                result = self.run_script(
+                    "--mode",
+                    "all",
+                    "--target-dir",
+                    root,
+                    "--record-root",
+                    records,
+                    "--skip-build",
+                    "--server-bin",
+                    server,
+                    "--tpcc-bin",
+                    tester,
+                    "--port",
+                    port,
+                    env=env,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "did not emit one canonical receipt",
+                    result.stderr,
+                )
+                manifest = json.loads(
+                    (
+                        next(records.iterdir()) / "manifest.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["status"], "failed")
+                self.assertFalse(manifest["ranking_eligible"])
+                self.assertEqual(
+                    manifest["formal_state"]["status"],
+                    "failed",
+                )
 
     def test_any_legacy_run_ledger_shape_is_preserved_and_fail_closed(self):
         for mode in ("file", "directory", "symlink", "dangling_symlink"):
@@ -4077,6 +4190,7 @@ finally:
             tester = self.make_python_executable(
                 Path(temp) / "fake-tpcc",
                 """
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -4090,6 +4204,14 @@ if "--benchmark" in sys.argv:
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "terminal_evidence.state").write_bytes(
         b"RMDB_TPCC_TERMINAL_EVIDENCE_TEST_V1\\n"
+    )
+if "--attest-formal-state" in sys.argv:
+    state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    terminal = (state_dir / "terminal_evidence.state").read_bytes()
+    print(
+        "FORMAL_STATE_V1 "
+        f"terminal_evidence_size={len(terminal)} "
+        f"terminal_evidence_sha256={hashlib.sha256(terminal).hexdigest()}"
     )
 if "--create-schema" in sys.argv:
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])

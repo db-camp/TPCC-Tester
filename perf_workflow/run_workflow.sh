@@ -5084,6 +5084,88 @@ PY
   [[ "${status}" == "verified" && "${legacy}" == "absent" ]]
 }
 
+read_formal_state_receipt() {
+  local receipt_path="${RESULT_DIR}/formal_state_attestation.log"
+  python3 - "${receipt_path}" "${TERMINAL_EVIDENCE_STATE_MAX_BYTES}" <<'PY'
+import os
+import re
+import stat
+import sys
+
+path, maximum_text = sys.argv[1:]
+maximum = int(maximum_text)
+if maximum != 16 * 1024 * 1024 + 128 + 4 * 1024:
+    raise SystemExit(1)
+try:
+    before = os.lstat(path)
+except OSError:
+    raise SystemExit(1)
+if (
+    not stat.S_ISREG(before.st_mode)
+    or before.st_size <= 0
+    or before.st_size > 8 * 1024 * 1024
+    or not hasattr(os, "O_NOFOLLOW")
+):
+    raise SystemExit(1)
+flags = os.O_RDONLY | os.O_NOFOLLOW
+if hasattr(os, "O_CLOEXEC"):
+    flags |= os.O_CLOEXEC
+try:
+    descriptor = os.open(path, flags)
+except OSError:
+    raise SystemExit(1)
+try:
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_dev != before.st_dev
+        or opened.st_ino != before.st_ino
+        or opened.st_size != before.st_size
+        or opened.st_mtime_ns != before.st_mtime_ns
+    ):
+        raise SystemExit(1)
+    remaining = opened.st_size
+    chunks = []
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    after = os.fstat(descriptor)
+    if (
+        remaining != 0
+        or after.st_dev != opened.st_dev
+        or after.st_ino != opened.st_ino
+        or after.st_size != opened.st_size
+        or after.st_mtime_ns != opened.st_mtime_ns
+    ):
+        raise SystemExit(1)
+finally:
+    os.close(descriptor)
+try:
+    text = b"".join(chunks).decode("ascii")
+except UnicodeDecodeError:
+    raise SystemExit(1)
+pattern = re.compile(
+    r"^FORMAL_STATE_V1 terminal_evidence_size="
+    r"([1-9][0-9]*) terminal_evidence_sha256=([0-9a-f]{64})$"
+)
+matches = []
+for line in text.splitlines():
+    match = pattern.fullmatch(line)
+    if match is not None:
+        matches.append(match.groups())
+if len(matches) != 1:
+    raise SystemExit(1)
+size_text, digest = matches[0]
+size = int(size_text)
+if size > maximum or str(size) != size_text:
+    raise SystemExit(1)
+print(size, digest)
+PY
+}
+
 attest_formal_state() {
   [[ "${MODE}" == "all" ]] || return 0
   log "revalidating every required formal state artifact"
@@ -5100,6 +5182,10 @@ attest_formal_state() {
   fi
   local before_size="${TERMINAL_EVIDENCE_SIZE}"
   local before_digest="${TERMINAL_EVIDENCE_SHA256}"
+  local receipt=""
+  local attested_size=""
+  local attested_digest=""
+  local receipt_extra=""
   write_manifest
   if ! run_profile_tester "${RESULT_DIR}/formal_state_attestation.log" \
       --attest-formal-state --profile "${PROFILE}" --seed "${SEED}" \
@@ -5109,9 +5195,24 @@ attest_formal_state() {
     write_manifest
     die "formal state attestation failed; see ${RESULT_DIR}/formal_state_attestation.log"
   fi
+  if ! receipt="$(read_formal_state_receipt)"; then
+    FORMAL_STATE_ATTESTATION_STATUS="failed"
+    inspect_terminal_evidence_state || true
+    write_manifest
+    die "formal state attestation did not emit one canonical receipt"
+  fi
+  read -r attested_size attested_digest receipt_extra <<<"${receipt}"
+  if [[ -n "${receipt_extra}" || -z "${attested_size}" \
+    || -z "${attested_digest}" ]]; then
+    FORMAL_STATE_ATTESTATION_STATUS="failed"
+    write_manifest
+    die "formal state attestation emitted a malformed receipt"
+  fi
   if ! inspect_terminal_evidence_state \
-    || [[ "${TERMINAL_EVIDENCE_SIZE}" != "${before_size}" \
-      || "${TERMINAL_EVIDENCE_SHA256}" != "${before_digest}" ]]; then
+    || [[ "${before_size}" != "${attested_size}" \
+      || "${before_digest}" != "${attested_digest}" \
+      || "${TERMINAL_EVIDENCE_SIZE}" != "${attested_size}" \
+      || "${TERMINAL_EVIDENCE_SHA256}" != "${attested_digest}" ]]; then
     [[ "${TERMINAL_EVIDENCE_STATUS}" != "verified" ]] \
       || TERMINAL_EVIDENCE_STATUS="changed"
     TERMINAL_EVIDENCE_SIZE=""
