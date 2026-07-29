@@ -129,31 +129,22 @@ impl EventRecorder for Vec<SchedulerEvent> {
 
 /// Runtime-only limits around the published phase schedule.
 ///
-/// Both fields are deliberately named and documented as local safety settings.
-/// The public final specification does not publish the grader's socket response
-/// deadline or phase-tail grace duration, so neither value may be reported as
-/// an official constant.
+/// The public final specification does not publish the grader's phase-tail
+/// grace duration, so this value may not be reported as an official constant.
+/// Socket response deadlines belong to individual Wire requests and are
+/// enforced by the connection layer, not across an entire multi-batch
+/// transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalRuntimeLimits {
-    pub response_timeout: Duration,
     pub phase_tail_grace: Duration,
 }
 
 impl LocalRuntimeLimits {
-    pub fn new(
-        response_timeout: Duration,
-        phase_tail_grace: Duration,
-    ) -> Result<Self, SchedulerError> {
-        if response_timeout.is_zero() {
-            return Err(SchedulerError::InvalidRuntimeLimit("response_timeout"));
-        }
+    pub fn new(phase_tail_grace: Duration) -> Result<Self, SchedulerError> {
         if phase_tail_grace.is_zero() {
             return Err(SchedulerError::InvalidRuntimeLimit("phase_tail_grace"));
         }
-        Ok(Self {
-            response_timeout,
-            phase_tail_grace,
-        })
+        Ok(Self { phase_tail_grace })
     }
 }
 
@@ -642,7 +633,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
     pub fn poll(&mut self) -> Result<(), SchedulerError> {
         let now = self.observe_now()?;
         self.sync_to(now)?;
-        self.expire_response_grace(now)
+        self.expire_phase_tail(now)
     }
 
     /// Reserves exactly one stage-local number for parameter generation.
@@ -761,24 +752,21 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         Ok(ticket)
     }
 
-    /// Returns the one absolute local deadline for the active physical attempt.
+    /// Returns the absolute phase-tail drain deadline for an active attempt.
     ///
-    /// The per-attempt response limit covers all of a transaction's batches,
-    /// while the phase-tail limit bounds how long an attempt selected before a
-    /// phase boundary may continue draining after that boundary.
+    /// Each Wire request has its own connection-layer response deadline. This
+    /// scheduler deadline only prevents an attempt selected before a phase
+    /// boundary from draining indefinitely after that boundary.
     pub fn attempt_deadline(&self, ticket: TransactionTicket) -> Result<Duration, SchedulerError> {
         self.ensure_not_failed()?;
         let worker_index = self.worker_index(ticket.worker())?;
-        let attempt_started_at = match self.workers[worker_index].selection {
+        match self.workers[worker_index].selection {
             Some(SelectionState::InFlight {
-                ticket: current,
-                attempt_started_at,
-            }) if current == ticket => attempt_started_at,
+                ticket: current, ..
+            }) if current == ticket => {}
             _ => return Err(SchedulerError::TicketMismatch(ticket.worker())),
-        };
-        let response_deadline = checked_add(attempt_started_at, self.limits.response_timeout)?;
-        let grace_deadline = checked_add(ticket.phase_deadline(), self.limits.phase_tail_grace)?;
-        Ok(response_deadline.min(grace_deadline))
+        }
+        checked_add(ticket.phase_deadline(), self.limits.phase_tail_grace)
     }
 
     /// Handles a complete terminal response frame for one physical attempt.
@@ -819,15 +807,13 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
                 attempt_started_at,
             });
         }
-        let response_deadline = checked_add(attempt_started_at, self.limits.response_timeout)?;
-        let grace_deadline = checked_add(ticket.phase_deadline(), self.limits.phase_tail_grace)?;
-        let attempt_deadline = response_deadline.min(grace_deadline);
+        let attempt_deadline = checked_add(ticket.phase_deadline(), self.limits.phase_tail_grace)?;
         if completed_at >= attempt_deadline {
             self.fail_worker_at(
                 ticket.worker(),
                 Some(ticket.phase()),
                 format!(
-                    "local response/grace deadline expired at {:?}; this is not an official timeout",
+                    "local phase-tail drain deadline expired at {:?}; this is not an official timeout",
                     attempt_deadline
                 ),
                 completed_at,
@@ -1078,19 +1064,14 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         }
     }
 
-    fn expire_response_grace(&mut self, now: Duration) -> Result<(), SchedulerError> {
+    fn expire_phase_tail(&mut self, now: Duration) -> Result<(), SchedulerError> {
         for index in 0..self.workers.len() {
-            let Some(SelectionState::InFlight {
-                ticket,
-                attempt_started_at,
-            }) = self.workers[index].selection
+            let Some(SelectionState::InFlight { ticket, .. }) = self.workers[index].selection
             else {
                 continue;
             };
-            let response_deadline = checked_add(attempt_started_at, self.limits.response_timeout)?;
-            let grace_deadline =
+            let local_deadline =
                 checked_add(ticket.phase_deadline(), self.limits.phase_tail_grace)?;
-            let local_deadline = response_deadline.min(grace_deadline);
             if now < local_deadline {
                 continue;
             }
@@ -1101,7 +1082,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
                 worker,
                 Some(ticket.phase()),
                 format!(
-                    "local response/grace deadline expired at {:?}; this is not an official timeout",
+                    "local phase-tail drain deadline expired at {:?}; this is not an official timeout",
                     local_deadline
                 ),
                 now,
@@ -1231,9 +1212,7 @@ mod tests {
     type TestScheduler = Final2026Scheduler<FakeClock, Vec<SchedulerEvent>>;
 
     fn ready_scheduler(grace: Duration) -> (FakeClock, TestScheduler) {
-        ready_scheduler_with_limits(
-            LocalRuntimeLimits::new(Duration::from_secs(300), grace).unwrap(),
-        )
+        ready_scheduler_with_limits(LocalRuntimeLimits::new(grace).unwrap())
     }
 
     fn ready_scheduler_with_limits(limits: LocalRuntimeLimits) -> (FakeClock, TestScheduler) {
@@ -1293,7 +1272,7 @@ mod tests {
         let mut scheduler = Final2026Scheduler::new(
             clock,
             Vec::new(),
-            LocalRuntimeLimits::new(Duration::from_secs(300), Duration::from_secs(5)).unwrap(),
+            LocalRuntimeLimits::new(Duration::from_secs(5)).unwrap(),
             [1, 2, 3, 4],
         );
         for id in 0..OFFICIAL_CLIENTS - 1 {
@@ -1414,7 +1393,7 @@ mod tests {
         let mut scheduler = Final2026Scheduler::new_with_schedule(
             clock.clone(),
             Vec::new(),
-            LocalRuntimeLimits::new(Duration::from_secs(5), Duration::from_secs(1)).unwrap(),
+            LocalRuntimeLimits::new(Duration::from_secs(1)).unwrap(),
             [1, 2, 3, 4],
             schedule,
         )
@@ -1574,16 +1553,15 @@ mod tests {
     }
 
     #[test]
-    fn physical_attempt_deadline_covers_all_batches_once() {
-        let (clock, mut scheduler) = ready_scheduler_with_limits(
-            LocalRuntimeLimits::new(Duration::from_secs(2), Duration::from_secs(10)).unwrap(),
-        );
+    fn phase_tail_deadline_is_shared_across_retries() {
+        let (clock, mut scheduler) =
+            ready_scheduler_with_limits(LocalRuntimeLimits::new(Duration::from_secs(10)).unwrap());
         scheduler.start().unwrap();
         clock.set(Duration::from_secs(30));
         let ticket = start_payment(&mut scheduler, WorkerId::new(3).unwrap(), 0xabc);
         assert_eq!(
             scheduler.attempt_deadline(ticket).unwrap(),
-            Duration::from_secs(32)
+            Duration::from_secs(190)
         );
 
         scheduler
@@ -1593,15 +1571,14 @@ mod tests {
         scheduler.start_retry(ticket).unwrap();
         assert_eq!(
             scheduler.attempt_deadline(ticket).unwrap(),
-            Duration::from_secs(181)
+            Duration::from_secs(190)
         );
     }
 
     #[test]
-    fn phase_tail_grace_caps_a_long_response_timeout() {
-        let (clock, mut scheduler) = ready_scheduler_with_limits(
-            LocalRuntimeLimits::new(Duration::from_secs(300), Duration::from_secs(5)).unwrap(),
-        );
+    fn phase_tail_grace_sets_the_attempt_drain_deadline() {
+        let (clock, mut scheduler) =
+            ready_scheduler_with_limits(LocalRuntimeLimits::new(Duration::from_secs(5)).unwrap());
         scheduler.start().unwrap();
         clock.set(Duration::from_secs(179));
         let ticket = start_payment(&mut scheduler, WorkerId::new(3).unwrap(), 0xdef);
@@ -1757,9 +1734,8 @@ mod tests {
 
     #[test]
     fn later_worker_cannot_expire_an_already_arrived_terminal() {
-        let (clock, mut scheduler) = ready_scheduler_with_limits(
-            LocalRuntimeLimits::new(Duration::from_secs(3), Duration::from_secs(10)).unwrap(),
-        );
+        let (clock, mut scheduler) =
+            ready_scheduler_with_limits(LocalRuntimeLimits::new(Duration::from_secs(10)).unwrap());
         scheduler.start().unwrap();
         clock.set(Duration::from_secs(30));
         let first = start_payment(&mut scheduler, WorkerId::new(5).unwrap(), 0x61);
@@ -1794,9 +1770,8 @@ mod tests {
 
     #[test]
     fn sampled_terminal_at_attempt_deadline_is_fatal() {
-        let (clock, mut scheduler) = ready_scheduler_with_limits(
-            LocalRuntimeLimits::new(Duration::from_secs(2), Duration::from_secs(10)).unwrap(),
-        );
+        let (clock, mut scheduler) =
+            ready_scheduler_with_limits(LocalRuntimeLimits::new(Duration::from_secs(10)).unwrap());
         scheduler.start().unwrap();
         clock.set(Duration::from_secs(30));
         let ticket = start_payment(&mut scheduler, WorkerId::new(5).unwrap(), 0x63);
@@ -1807,7 +1782,7 @@ mod tests {
                 AttemptOutcome::Commit {
                     delivery_processed: 0,
                 },
-                Duration::from_secs(32),
+                Duration::from_secs(190),
             )
             .unwrap_err();
         let SchedulerError::RunFailed(failure) = error else {
@@ -1895,31 +1870,22 @@ mod tests {
     }
 
     #[test]
-    fn local_per_attempt_response_timeout_is_also_enforced() {
-        let (clock, mut scheduler) = ready_scheduler_with_limits(
-            LocalRuntimeLimits::new(Duration::from_secs(2), Duration::from_secs(10)).unwrap(),
-        );
+    fn scheduler_does_not_apply_one_timeout_across_multiple_wire_requests() {
+        let (clock, mut scheduler) =
+            ready_scheduler_with_limits(LocalRuntimeLimits::new(Duration::from_secs(10)).unwrap());
         scheduler.start().unwrap();
         let worker = WorkerId::new(8).unwrap();
         start_payment(&mut scheduler, worker, 8);
 
         clock.set(Duration::from_secs(3));
-        let error = scheduler.poll().unwrap_err();
-        let SchedulerError::RunFailed(failure) = error else {
-            panic!("expected local per-attempt response-timeout failure");
-        };
-        assert!(failure.reason.contains("not an official timeout"));
-        assert_eq!(failure.phase, Some(PhaseId::Warmup));
+        scheduler.poll().unwrap();
+        assert!(scheduler.failure.is_none());
     }
 
     #[test]
     fn local_runtime_limits_reject_zero_without_claiming_official_values() {
         assert_eq!(
-            LocalRuntimeLimits::new(Duration::ZERO, Duration::from_secs(1)),
-            Err(SchedulerError::InvalidRuntimeLimit("response_timeout"))
-        );
-        assert_eq!(
-            LocalRuntimeLimits::new(Duration::from_secs(1), Duration::ZERO),
+            LocalRuntimeLimits::new(Duration::ZERO),
             Err(SchedulerError::InvalidRuntimeLimit("phase_tail_grace"))
         );
     }

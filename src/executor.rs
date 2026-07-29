@@ -51,11 +51,9 @@ impl BenchmarkExecutor {
             TpccError::Protocol("ranked run requires an explicit seed".to_owned())
         })?;
         let response_timeout = Duration::from_secs(self.config.response_timeout_seconds);
-        let limits = LocalRuntimeLimits::new(
-            response_timeout,
-            Duration::from_secs(self.config.phase_tail_grace_seconds),
-        )
-        .map_err(scheduler_error)?;
+        let limits =
+            LocalRuntimeLimits::new(Duration::from_secs(self.config.phase_tail_grace_seconds))
+                .map_err(scheduler_error)?;
         let schedule =
             PhaseScheduleConfig::new(profile.clients, profile.warmup, profile.measurement_window)
                 .map_err(scheduler_error)?;
