@@ -1443,6 +1443,129 @@ fn decode_stock(decoder: &mut Decoder<'_>) -> Result<StockSample, String> {
 }
 
 #[cfg(test)]
+pub fn setup_evidence_fixture(warehouses: i32, seed: u64) -> SetupEvidence {
+    let timestamp = b"2026-01-01 00:00:00".to_vec();
+    let generator = TpccDataGen::with_seed_and_timestamp(
+        warehouses,
+        seed,
+        String::from_utf8(timestamp.clone()).unwrap(),
+    );
+    let mut anchors = Vec::new();
+    let mut items = BTreeMap::new();
+    let mut stocks = BTreeMap::new();
+    for (warehouse_id, district_id) in selected_partitions(warehouses).unwrap() {
+        let order_id = selected_order_id(seed, warehouse_id, district_id);
+        let customer_id = generator.initial_order_customer_id(warehouse_id, district_id, order_id);
+        let line_count = generator.initial_order_line_count(warehouse_id, district_id, order_id);
+        let mut lines = Vec::new();
+        for number in 1..=line_count {
+            let item_id =
+                generator.initial_order_line_item_id(warehouse_id, district_id, order_id, number);
+            items.entry(item_id).or_insert_with(|| ItemSample {
+                id: item_id,
+                name: b"sample-item".to_vec(),
+                price_bits: 1.0_f32.to_bits(),
+                data: b"sample-item-data".to_vec(),
+            });
+            stocks
+                .entry((warehouse_id, item_id))
+                .or_insert_with(|| StockSample {
+                    warehouse_id,
+                    item_id,
+                    quantity: 50,
+                    ytd_bits: 0.0_f32.to_bits(),
+                    order_count: 0,
+                    remote_count: 0,
+                    data: b"sample-stock-data".to_vec(),
+                });
+            lines.push(OrderLineSample {
+                warehouse_id,
+                district_id,
+                order_id,
+                number,
+                item_id,
+                supply_warehouse_id: warehouse_id,
+                delivery_date: Vec::new(),
+                quantity: 5,
+                amount_bits: (number as f32).to_bits(),
+                dist_info: vec![b'D'; 24],
+            });
+        }
+        anchors.push(SetupAnchorSample {
+            warehouse: WarehouseSample {
+                id: warehouse_id,
+                name: b"sample".to_vec(),
+                state: b"ST".to_vec(),
+                zip: b"123411111".to_vec(),
+                tax_bits: 0.1_f32.to_bits(),
+                ytd_bits: 300_000.0_f32.to_bits(),
+            },
+            district: DistrictSample {
+                warehouse_id,
+                id: district_id,
+                name: b"sample".to_vec(),
+                state: b"ST".to_vec(),
+                zip: b"123411111".to_vec(),
+                tax_bits: 0.1_f32.to_bits(),
+                ytd_bits: 30_000.0_f32.to_bits(),
+                next_order_id: ORDERS_PER_DISTRICT + 1,
+            },
+            customer: CustomerSample {
+                warehouse_id,
+                district_id,
+                id: customer_id,
+                first: b"sample".to_vec(),
+                middle: b"OE".to_vec(),
+                last: b"sample".to_vec(),
+                since: timestamp.clone(),
+                credit: b"GC".to_vec(),
+                discount_bits: 0.1_f32.to_bits(),
+                balance_bits: (-10.0_f32).to_bits(),
+                ytd_payment_bits: 10.0_f32.to_bits(),
+                payment_count: 1,
+                delivery_count: 0,
+                data: vec![b'C'; 50],
+            },
+            order: OrderSample {
+                warehouse_id,
+                district_id,
+                id: order_id,
+                customer_id,
+                entry_date: timestamp.clone(),
+                carrier_id: 0,
+                line_count,
+                all_local: 1,
+            },
+            new_order: NewOrderSample {
+                warehouse_id,
+                district_id,
+                order_id,
+            },
+            history: HistorySample {
+                customer_warehouse_id: warehouse_id,
+                customer_district_id: district_id,
+                customer_id,
+                warehouse_id,
+                district_id,
+                date: timestamp.clone(),
+                amount_bits: 10.0_f32.to_bits(),
+                data: b"sample-history".to_vec(),
+            },
+            lines,
+        });
+    }
+    let evidence = SetupEvidence {
+        load_seed: seed,
+        load_timestamp: timestamp,
+        anchors,
+        items: items.into_values().collect(),
+        stocks: stocks.into_values().collect(),
+    };
+    evidence.validate(warehouses).unwrap();
+    evidence
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1500,5 +1623,17 @@ mod tests {
         assert!(
             SetupEvidence::decode_hex(&"00".repeat(MAX_EVIDENCE_HEX_BYTES / 2 + 1), 1).is_err()
         );
+    }
+
+    #[test]
+    fn evidence_round_trip_preserves_raw_bits_and_bytes() {
+        let evidence = setup_evidence_fixture(50, 2026);
+        let encoded = evidence.encode_hex();
+        assert!(encoded.len() < MAX_EVIDENCE_HEX_BYTES);
+        assert_eq!(SetupEvidence::decode_hex(&encoded, 50).unwrap(), evidence);
+
+        let mut tampered = evidence.clone();
+        tampered.anchors[0].lines[0].amount_bits ^= 1;
+        assert_ne!(tampered.encode_hex(), encoded);
     }
 }

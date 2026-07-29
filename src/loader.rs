@@ -11,6 +11,7 @@ use crate::consistency::NonNegativeF32Accumulator;
 use crate::data_gen::*;
 use crate::error::TpccError;
 use crate::runtime_schema::{LogicalIndex, LogicalTable, RuntimeSchema};
+use crate::sample_evidence::{SetupEvidence, SetupEvidenceCollector};
 
 pub struct Loader<'a> {
     cursor: &'a mut RmdbCursor,
@@ -32,6 +33,7 @@ pub struct LoadSummary {
     pub undelivered_order_line_rows: i64,
     pub order_line_amounts: NonNegativeF32Accumulator,
     pub partitions: Vec<PartitionLoadSummary>,
+    pub setup_evidence: SetupEvidence,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,13 +220,14 @@ impl<'a> CsvMaterializer<'a> {
             gen.load_seed(),
             gen.load_timestamp()
         );
+        let mut setup_evidence = SetupEvidenceCollector::new(&gen, self.scale_factor)?;
         let csv_dir_path = self.csv_dir.clone();
         let load_dir_path = self.load_dir.clone();
         let csv_dir = csv_dir_path.as_path();
         let load_dir = load_dir_path.as_str();
         create_dir_all(csv_dir)?;
 
-        self.write_table(
+        self.write_table_observed(
             csv_dir,
             load_dir,
             LogicalTable::Warehouse,
@@ -242,8 +245,9 @@ impl<'a> CsvMaterializer<'a> {
             gen.generate_warehouses()
                 .into_iter()
                 .map(|w| w.to_sql_params()),
+            |row| setup_evidence.observe_warehouse(row),
         )?;
-        self.write_table(
+        self.write_table_observed(
             csv_dir,
             load_dir,
             LogicalTable::District,
@@ -263,15 +267,17 @@ impl<'a> CsvMaterializer<'a> {
             gen.generate_districts()
                 .into_iter()
                 .map(|d| d.to_sql_params()),
+            |row| setup_evidence.observe_district(row),
         )?;
-        self.write_table(
+        self.write_table_observed(
             csv_dir,
             load_dir,
             LogicalTable::Item,
             &["i_id", "i_im_id", "i_name", "i_price", "i_data"],
             gen.generate_items().into_iter().map(|i| i.to_sql_params()),
+            |row| setup_evidence.observe_item(row),
         )?;
-        self.write_table(
+        self.write_table_observed(
             csv_dir,
             load_dir,
             LogicalTable::Customer,
@@ -301,8 +307,9 @@ impl<'a> CsvMaterializer<'a> {
             gen.generate_customers()
                 .into_iter()
                 .map(|c| c.to_sql_params()),
+            |row| setup_evidence.observe_customer(row),
         )?;
-        self.write_table(
+        self.write_table_observed(
             csv_dir,
             load_dir,
             LogicalTable::Stock,
@@ -326,6 +333,7 @@ impl<'a> CsvMaterializer<'a> {
                 "s_data",
             ],
             gen.generate_stock().into_iter().map(|s| s.to_sql_params()),
+            |row| setup_evidence.observe_stock(row),
         )?;
         // Sum O_OL_CNT while the order CSV is already being streamed. This
         // avoids a second 1.5-million-order shape traversal at final SF=50.
@@ -341,7 +349,7 @@ impl<'a> CsvMaterializer<'a> {
                 })
                 .collect::<Vec<_>>(),
         );
-        self.write_table(
+        self.write_table_observed(
             csv_dir,
             load_dir,
             LogicalTable::Orders,
@@ -365,8 +373,9 @@ impl<'a> CsvMaterializer<'a> {
                 }
                 o.to_sql_params()
             }),
+            |row| setup_evidence.observe_order(row),
         )?;
-        self.write_table(
+        self.write_table_observed(
             csv_dir,
             load_dir,
             LogicalTable::NewOrders,
@@ -374,8 +383,9 @@ impl<'a> CsvMaterializer<'a> {
             gen.generate_new_orders()
                 .into_iter()
                 .map(|n| n.to_sql_params()),
+            |row| setup_evidence.observe_new_order(row),
         )?;
-        self.write_table(
+        self.write_table_observed(
             csv_dir,
             load_dir,
             LogicalTable::History,
@@ -386,6 +396,7 @@ impl<'a> CsvMaterializer<'a> {
             gen.generate_history()
                 .into_iter()
                 .map(|h| h.to_sql_params()),
+            |row| setup_evidence.observe_history(row),
         )?;
         let mut order_line_amounts = NonNegativeF32Accumulator::default();
         let generated_order_line_count = self.write_table_observed(
@@ -422,7 +433,8 @@ impl<'a> CsvMaterializer<'a> {
                         TpccError::Protocol(format!(
                             "initial order_line FLOAT accumulator failed: {error}"
                         ))
-                    })
+                    })?;
+                setup_evidence.observe_order_line(row)
             },
         )?;
         let partitions = partition_shapes.into_inner();
@@ -447,6 +459,7 @@ impl<'a> CsvMaterializer<'a> {
                 "materialized CSV set is incomplete or lost order-line FLOAT evidence".to_owned(),
             ));
         }
+        let setup_evidence = setup_evidence.finish()?;
 
         info!("[数据物化] 9 个 CSV 已全部完成");
         Ok(MaterializedLoad {
@@ -458,6 +471,7 @@ impl<'a> CsvMaterializer<'a> {
                 undelivered_order_line_rows,
                 order_line_amounts,
                 partitions,
+                setup_evidence,
             },
         })
     }

@@ -1038,6 +1038,7 @@ fn terminated_sql(sql: &str) -> String {
 mod tests {
     use super::*;
     use crate::loader::{LoadSummary, PartitionLoadSummary};
+    use crate::sample_evidence::setup_evidence_fixture;
 
     fn smoke_dataset(warehouses: i32) -> DatasetState {
         let partitions = (1..=warehouses)
@@ -1065,6 +1066,7 @@ mod tests {
                 undelivered_order_line_rows,
                 order_line_amounts,
                 partitions,
+                setup_evidence: setup_evidence_fixture(warehouses, 1),
             },
         )
         .unwrap()

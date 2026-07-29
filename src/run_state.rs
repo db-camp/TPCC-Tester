@@ -14,8 +14,9 @@ use crate::profile::{
 };
 use crate::ranking::ledger::RunLedger;
 use crate::runtime_schema::{RuntimeSchema, ENCODED_BEGIN_MARKER, ENCODED_END_MARKER};
+use crate::sample_evidence::SetupEvidence;
 
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 4;
 const DATASET_FILE: &str = "dataset.state";
 const MAX_DATASET_STATE_BYTES: usize = 256 * 1024;
 const ARTIFACT_VERSION: u32 = 1;
@@ -276,6 +277,7 @@ pub struct DatasetState {
     pub runtime_schema: RuntimeSchema,
     initial_order_line_amounts: NonNegativeF32Accumulator,
     pub partitions: Vec<PartitionLoadSummary>,
+    setup_evidence: SetupEvidence,
 }
 
 impl DatasetState {
@@ -320,6 +322,7 @@ impl DatasetState {
             runtime_schema,
             initial_order_line_amounts: load.order_line_amounts,
             partitions: load.partitions,
+            setup_evidence: load.setup_evidence,
         };
         state.validate()?;
         Ok(state)
@@ -392,6 +395,14 @@ impl DatasetState {
                 "dataset partition totals do not match global totals".to_owned(),
             ));
         }
+        self.setup_evidence
+            .validate(self.warehouses)
+            .map_err(|error| StateError::Invalid(format!("invalid setup evidence: {error}")))?;
+        if self.setup_evidence.load_seed != self.seed {
+            return Err(StateError::Invalid(
+                "setup evidence load seed does not match dataset seed".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -408,9 +419,13 @@ impl DatasetState {
             self.seed,
             self.warehouses,
             self.order_line_rows,
-            self.undelivered_order_line_rows
+            self.undelivered_order_line_rows,
         );
         output.push_str(&self.runtime_schema.encode());
+        output.push_str(&format!(
+            "setup_evidence={}\n",
+            self.setup_evidence.encode_hex()
+        ));
         for partition in &self.partitions {
             output.push_str(&format!(
                 "partition={},{},{},{}\n",
@@ -469,6 +484,9 @@ impl DatasetState {
         }
         let runtime_schema = RuntimeSchema::decode(&encoded_schema)
             .map_err(|error| StateError::Invalid(format!("invalid runtime schema: {error}")))?;
+        let setup_evidence =
+            SetupEvidence::decode_hex(value(&mut lines, "setup_evidence")?, warehouses)
+                .map_err(|error| StateError::Invalid(format!("invalid setup evidence: {error}")))?;
         let mut partitions = Vec::new();
         for line in lines {
             let raw = line
@@ -496,13 +514,23 @@ impl DatasetState {
             runtime_schema,
             initial_order_line_amounts,
             partitions,
+            setup_evidence,
         };
         state.validate()?;
+        if state.encode() != input {
+            return Err(StateError::Invalid(
+                "dataset state encoding is not canonical".to_owned(),
+            ));
+        }
         Ok(state)
     }
 
     pub fn initial_order_line_amounts(&self) -> &NonNegativeF32Accumulator {
         &self.initial_order_line_amounts
+    }
+
+    pub fn setup_evidence(&self) -> &SetupEvidence {
+        &self.setup_evidence
     }
 }
 
@@ -2515,6 +2543,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
+    use crate::sample_evidence::setup_evidence_fixture;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -2569,6 +2598,7 @@ mod tests {
                     })
                 })
                 .collect(),
+            setup_evidence: setup_evidence_fixture(warehouses, seed),
         };
         DatasetState::from_load(run_id.to_owned(), seed, warehouses, load).unwrap()
     }
@@ -2637,7 +2667,10 @@ mod tests {
     fn dataset_round_trip_rejects_wrong_partition_totals() {
         let state = sample_dataset("run-1", 9);
         let encoded = state.encode();
+        assert!(encoded.len() < MAX_DATASET_STATE_BYTES);
         assert_eq!(DatasetState::decode(&encoded).unwrap(), state);
+        assert!(DatasetState::decode(encoded.trim_end()).is_err());
+        assert!(DatasetState::decode(&encoded.replacen("version=4", "version=3", 1)).is_err());
         assert_eq!(
             DatasetState::decode(&encoded)
                 .unwrap()
@@ -2661,6 +2694,14 @@ mod tests {
             1
         ))
         .is_err());
+
+        let mut changed_evidence = state.clone();
+        changed_evidence.setup_evidence.anchors[0].lines[0].amount_bits ^= 1;
+        changed_evidence.validate().unwrap();
+        assert_ne!(
+            dataset_checksum(&changed_evidence),
+            dataset_checksum(&state)
+        );
 
         let mut wrong_seed = state;
         wrong_seed.runtime_schema = RuntimeSchema::opaque(10).unwrap();
