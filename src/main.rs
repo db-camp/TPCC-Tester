@@ -18,6 +18,7 @@ mod run_state;
 mod transaction;
 mod workload;
 
+use std::future::Future;
 use std::process;
 
 use clap::Parser;
@@ -26,6 +27,7 @@ use tracing::{error, info, warn};
 use config::{Config, ResolvedProfile};
 use connection::client::RmdbClient;
 use connection::cursor::RmdbCursor;
+use error::TpccError;
 
 fn setup_tracing(verbose: u8) {
     use tracing_subscriber::EnvFilter;
@@ -113,19 +115,26 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         let mut cursor = RmdbCursor::new(client);
         cursor.client_mut().ping().await?;
         info!("RMDB 连接正常");
+        let setup_deadline = (config.create_schema || config.init)
+            .then(|| tokio::time::Instant::now() + effective.final2026.load_budget);
 
         if config.create_schema {
             info!("创建 TPC-C 表和索引");
             let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
-            ldr.create_tables().await?;
-            ldr.create_indexes().await?;
+            setup_step(setup_deadline, "create 9 tables", ldr.create_tables()).await?;
+            setup_step(setup_deadline, "create 10 indexes", ldr.create_indexes()).await?;
             info!("TPC-C 表和索引创建完成");
         }
 
         if config.init {
             info!("加载 TPC-C 初始数据 (scale_factor={})", config.scale_factor);
             let mut ldr = loader::Loader::new(&mut cursor, config.scale_factor);
-            let load = ldr.load_all_data().await?;
+            let load = setup_step(
+                setup_deadline,
+                "generate/load 9 relations and verify 9 counts",
+                ldr.load_all_data(),
+            )
+            .await?;
             let seed = effective
                 .seed
                 .ok_or("validated init configuration lost its seed")?;
@@ -162,14 +171,16 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                 {
                     return Err(format!(
                         "setup state mismatch: state seed/SF={}/{}, CLI seed/SF={:?}/{}",
-                        dataset.seed,
-                        dataset.warehouses,
-                        effective.seed,
-                        config.scale_factor
+                        dataset.seed, dataset.warehouses, effective.seed, config.scale_factor
                     )
                     .into());
                 }
-                check_executor::run_setup(cursor.client_mut(), &dataset).await?;
+                setup_step(
+                    setup_deadline,
+                    "run public setup integrity checks",
+                    check_executor::run_setup(cursor.client_mut(), &dataset),
+                )
+                .await?;
             } else {
                 let mut chk = checker::ConsistencyChecker::new(
                     &mut cursor,
@@ -197,6 +208,27 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
     }
 
     Ok(())
+}
+
+async fn setup_step<T, F>(
+    deadline: Option<tokio::time::Instant>,
+    context: &'static str,
+    future: F,
+) -> Result<T, TpccError>
+where
+    F: Future<Output = Result<T, TpccError>>,
+{
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| TpccError::Timeout {
+                context: format!(
+                    "final2026 setup exceeded the public {}s budget while attempting {context}",
+                    profile::LOAD_BUDGET_SECONDS
+                ),
+            })?,
+        None => future.await,
+    }
 }
 
 fn print_effective_profile(config: &Config, effective: &ResolvedProfile) {
