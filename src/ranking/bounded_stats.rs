@@ -225,6 +225,50 @@ impl Default for BoundedPhysicalStats {
 }
 
 impl BoundedPhysicalStats {
+    /// Canonical fixed-domain view used by the bounded state codec.
+    ///
+    /// The arrays deliberately preserve the semantic class order documented
+    /// by [`class_index_without_stage`]. Callers must not persist Rust struct
+    /// memory directly.
+    pub(crate) fn canonical_parts(
+        &self,
+    ) -> (
+        &[ClassTotals; LEDGER_CLASS_COUNT],
+        &[PartitionTotals; PHYSICAL_PARTITION_COUNT],
+        &[NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+        &[NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+        &[NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+    ) {
+        (
+            &self.classes,
+            &self.partitions,
+            &self.payment_history_amounts,
+            &self.new_order_line_amounts,
+            &self.delivery_customer_amounts,
+        )
+    }
+
+    /// Rebuild persisted fixed-domain statistics only after rechecking every
+    /// accumulator count, per-class total, partition range, and global
+    /// cross-partition invariant.
+    pub(crate) fn from_canonical_parts(
+        classes: [ClassTotals; LEDGER_CLASS_COUNT],
+        partitions: [PartitionTotals; PHYSICAL_PARTITION_COUNT],
+        payment_history_amounts: [NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+        new_order_line_amounts: [NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+        delivery_customer_amounts: [NonNegativeF32Accumulator; LEDGER_CLASS_COUNT],
+    ) -> Result<Self, BoundedStatsError> {
+        let restored = Self {
+            classes,
+            partitions,
+            payment_history_amounts,
+            new_order_line_amounts,
+            delivery_customer_amounts,
+        };
+        restored.validate()?;
+        Ok(restored)
+    }
+
     pub fn class_totals(&self, class: LedgerClass) -> Result<ClassTotals, BoundedStatsError> {
         let index = class_index_without_stage(class)?;
         Ok(self.classes[index])
@@ -1758,6 +1802,39 @@ mod tests {
             ))
         ));
         assert_eq!(stats, before);
+    }
+
+    #[test]
+    fn canonical_reconstruction_rechecks_cross_field_invariants() {
+        let stats = BoundedPhysicalStats::default();
+        let (classes, partitions, payment_history, new_order_lines, delivery_customers) =
+            stats.canonical_parts();
+        assert_eq!(
+            BoundedPhysicalStats::from_canonical_parts(
+                *classes,
+                *partitions,
+                payment_history.clone(),
+                new_order_lines.clone(),
+                delivery_customers.clone(),
+            )
+            .unwrap(),
+            stats
+        );
+
+        let mut inconsistent_classes = *classes;
+        inconsistent_classes[0].payment_commits = 1;
+        assert!(matches!(
+            BoundedPhysicalStats::from_canonical_parts(
+                inconsistent_classes,
+                *partitions,
+                payment_history.clone(),
+                new_order_lines.clone(),
+                delivery_customers.clone(),
+            ),
+            Err(BoundedStatsError::Inconsistent(
+                "Payment/history amount terms differ from Payment commits"
+            ))
+        ));
     }
 
     #[test]
