@@ -65,11 +65,10 @@ RMDB 服务端必须支持上述 Wire v3 契约。推荐通过下节的工作流
 ```bash
 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --mode all \
-  --db-name tpcc_final2026_local \
   --seed 2026
 ```
 
-工作流依次完成 build、setup、一次原生三窗口测量、在线校验、对本次登记 RMDB PID 执行 `SIGKILL`、原数据库重启和恢复校验。`2026` 只是可复现的本地 seed，不是官方隐藏 seed。结果写入：
+工作流会为新库派生不透明数据库名，并依次完成 build、setup、一次原生三窗口测量、在线校验、对本次登记 RMDB PID 执行 `SIGKILL`、原数据库重启和恢复校验。显式指定新 `--db-name` 属于本地偏差，必须同时使用 `--allow-deviation`。`2026` 只是可复现的本地 seed，不是官方隐藏 seed。结果写入：
 
 ```text
 performance_test_record/<UTC-run-id>_final2026/
