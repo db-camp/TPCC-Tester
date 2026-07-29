@@ -404,8 +404,20 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         info!("启动原生 final2026 连续三窗口基准测试...");
         let (store, dataset, contract) = load_bound_state(&config, &effective)?;
         let claim = store.begin_rank(&dataset, &contract)?;
-        let exec =
-            executor::BenchmarkExecutor::new(config, effective, dataset.runtime_schema.clone());
+        let setup = dataset.setup_evidence();
+        let setup_timestamp = String::from_utf8(setup.load_timestamp.clone())
+            .map_err(|_| "validated setup load timestamp is not UTF-8")?;
+        let setup_generator = Arc::new(data_gen::TpccDataGen::with_seed_and_timestamp(
+            dataset.warehouses,
+            setup.load_seed,
+            setup_timestamp,
+        ));
+        let exec = executor::BenchmarkExecutor::new(
+            config,
+            effective,
+            dataset.runtime_schema.clone(),
+            setup_generator,
+        );
         let result = exec.run().await?;
         store.complete_rank(&dataset, &contract, claim, result.ledger())?;
         info!(

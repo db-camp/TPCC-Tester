@@ -23,13 +23,17 @@ use super::evidence_collector::{
 };
 use super::ledger::LedgerClass;
 use super::payment_endpoints::{
-    PaymentAckReceipt, PaymentEndpointCollector, PaymentEndpointError, PaymentFloatEdge,
-    PaymentTerminalEvidence, SealedPaymentEvidence,
+    PaymentAckReceipt, PaymentEndpointCollector, PaymentEndpointError, PaymentEndpointView,
+    PaymentFloatEdge, PaymentTerminalEvidence, SealedPaymentEvidence,
 };
 use super::preflight::StalePaymentPreflightProof;
+use super::rich_recovery_samples::{
+    InitialCustomerDataProvider, InitialHistoryProvider, RichRecoveryCollector, RichRecoveryError,
+    SealedRichRecoverySamples,
+};
 use super::runner::{CustomerVersion, RankedCommit, RankedTransactionOutcome};
 
-pub const TERMINAL_EVIDENCE_POLICY_VERSION: u32 = 2;
+pub const TERMINAL_EVIDENCE_POLICY_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerState {
@@ -118,6 +122,7 @@ impl Drop for TerminalCallGuard {
 struct CollectorState {
     stats: BoundedPhysicalStats,
     intervals: Option<IntervalCollector>,
+    rich: Option<RichRecoveryCollector>,
     workers: Box<[WorkerState]>,
     interval_waiters: Vec<oneshot::Sender<()>>,
     poisoned: Option<String>,
@@ -176,20 +181,31 @@ impl TerminalEvidenceCollector {
     /// Construct the shared gate only after the controlled stale-Writer
     /// Payment preflight has succeeded.
     ///
-    pub fn new<P>(
+    pub fn new<P, H, C>(
         warehouses: u16,
         clients: u16,
         sample_seed: u64,
         stock_roots: P,
+        initial_history: H,
+        initial_customers: C,
         stale_payment_preflight: StalePaymentPreflightProof,
     ) -> Result<Self, TerminalEvidenceError>
     where
         P: StockRootProvider + 'static,
+        H: InitialHistoryProvider + 'static,
+        C: InitialCustomerDataProvider + 'static,
     {
         if !stale_payment_preflight.matches(sample_seed, warehouses) {
             return Err(TerminalEvidenceError::StalePaymentPreflightBinding);
         }
         let intervals = IntervalCollector::new(warehouses, clients, sample_seed, stock_roots)?;
+        let rich = RichRecoveryCollector::new(
+            warehouses,
+            clients,
+            sample_seed,
+            initial_history,
+            initial_customers,
+        )?;
         let payment = PaymentEndpointCollector::new(warehouses, clients)?;
         let clients = usize::from(clients);
         Ok(Self {
@@ -199,12 +215,65 @@ impl TerminalEvidenceCollector {
             state: Mutex::new(CollectorState {
                 stats: BoundedPhysicalStats::default(),
                 intervals: Some(intervals),
+                rich: Some(rich),
                 workers: vec![WorkerState::Idle; clients].into_boxed_slice(),
                 interval_waiters: Vec::with_capacity(clients),
                 poisoned: None,
                 sealed: false,
             }),
         })
+    }
+
+    fn reject_locked<T>(
+        &self,
+        state: &mut CollectorState,
+        error: TerminalEvidenceError,
+    ) -> Result<T, TerminalEvidenceError> {
+        if state.poisoned.is_none() {
+            state.poisoned = Some(error.to_string());
+        }
+        // Publish abandonment before releasing the parent mutex. A Payment
+        // bridge may already have completed an older receipt, but that worker
+        // cannot pass the final ACK check before observing this sticky state.
+        self.tracker.abandon();
+        Err(error)
+    }
+
+    fn shared_root_pending(state: &CollectorState) -> Result<usize, TerminalEvidenceError> {
+        let interval_pending = state
+            .intervals
+            .as_ref()
+            .ok_or(TerminalEvidenceError::AlreadySealed)?
+            .storage()
+            .pending_intervals();
+        let rich_pending = state
+            .rich
+            .as_ref()
+            .ok_or(TerminalEvidenceError::AlreadySealed)?
+            .pending_edges();
+        interval_pending
+            .checked_add(rich_pending)
+            .ok_or(TerminalEvidenceError::CounterOverflow(
+                "shared rooted terminal evidence",
+            ))
+    }
+
+    async fn all_root_pending(
+        &self,
+        state: &CollectorState,
+    ) -> Result<usize, TerminalEvidenceError> {
+        Self::shared_root_pending(state)?
+            .checked_add(self.payment.storage().await.pending_edges)
+            .ok_or(TerminalEvidenceError::CounterOverflow(
+                "all rooted terminal evidence",
+            ))
+    }
+
+    fn has_idle_bridge(state: &CollectorState) -> bool {
+        state
+            .workers
+            .iter()
+            .any(|worker| *worker == WorkerState::Idle)
     }
 
     /// Offer every evidence domain, then await both rooted-chain receipts.
@@ -330,83 +399,132 @@ impl TerminalEvidenceCollector {
         }
 
         let mut state = self.state.lock().await;
-        if let Some(cause) = &state.poisoned {
-            return Err(TerminalEvidenceError::Poisoned {
-                cause: cause.clone(),
-            });
+        if let Some(cause) = state.poisoned.clone() {
+            return self.reject_locked(&mut state, TerminalEvidenceError::Poisoned { cause });
         }
         if state.sealed {
-            return Err(TerminalEvidenceError::AlreadySealed);
+            return self.reject_locked(&mut state, TerminalEvidenceError::AlreadySealed);
         }
         let worker_index = usize::from(worker_id);
-        let worker_state = state.workers.get(worker_index).copied().ok_or(
-            TerminalEvidenceError::InvalidWorker {
-                worker_id,
-                clients: self.clients,
-            },
-        )?;
+        let Some(worker_state) = state.workers.get(worker_index).copied() else {
+            return self.reject_locked(
+                &mut state,
+                TerminalEvidenceError::InvalidWorker {
+                    worker_id,
+                    clients: self.clients,
+                },
+            );
+        };
         if worker_state != WorkerState::Idle {
-            return Err(TerminalEvidenceError::WorkerState {
-                worker_id,
-                expected: "idle",
-            });
+            return self.reject_locked(
+                &mut state,
+                TerminalEvidenceError::WorkerState {
+                    worker_id,
+                    expected: "idle",
+                },
+            );
         }
 
         let mut next_stats = state.stats.clone();
-        if let Some(accounting) = accounting {
-            next_stats.offer_terminal(accounting.class, accounting.ticket, accounting.outcome)?;
+        if let Some(accounting) = accounting.as_ref() {
+            if let Err(error) =
+                next_stats.offer_terminal(accounting.class, accounting.ticket, accounting.outcome)
+            {
+                return self.reject_locked(&mut state, error.into());
+            }
         }
-        let intervals = state
-            .intervals
-            .as_mut()
-            .ok_or(TerminalEvidenceError::AlreadySealed)?;
-        prepared.intervals.offer(intervals)?;
+        let interval_result = match state.intervals.as_mut() {
+            Some(intervals) => prepared.intervals.offer(intervals),
+            None => {
+                return self.reject_locked(&mut state, TerminalEvidenceError::AlreadySealed);
+            }
+        };
+        if let Err(error) = interval_result {
+            return self.reject_locked(&mut state, error.into());
+        }
+        if let Some(accounting) = accounting.as_ref() {
+            let rich_result = match state.rich.as_mut() {
+                Some(rich) => rich.offer_terminal(accounting.ticket, accounting.outcome),
+                None => {
+                    return self.reject_locked(&mut state, TerminalEvidenceError::AlreadySealed);
+                }
+            };
+            if let Err(error) = rich_result {
+                return self.reject_locked(&mut state, error.into());
+            }
+        }
 
-        // Payment offer is deliberately after every other fallible mapping and
-        // interval offer, but before either receipt is awaited.
+        // Payment is deliberately offered last because it may complete older
+        // receipts. Every error after this point is made sticky while the
+        // parent mutex is still held, before any awakened worker can ACK.
         let payment_receipt = match prepared.payment {
-            Some(payment) => Some(self.payment.offer_terminal(payment).await?),
+            Some(payment) => match self.payment.offer_terminal(payment).await {
+                Ok(receipt) => Some(receipt),
+                Err(error) => return self.reject_locked(&mut state, error.into()),
+            },
             None => None,
         };
         state.stats = next_stats;
         state.workers[worker_index] = WorkerState::Waiting;
 
+        let shared_pending = match Self::shared_root_pending(&state) {
+            Ok(pending) => pending,
+            Err(error) => return self.reject_locked(&mut state, error),
+        };
+        let all_pending = match self.all_root_pending(&state).await {
+            Ok(pending) => pending,
+            Err(error) => return self.reject_locked(&mut state, error),
+        };
+        if all_pending != 0 && !Self::has_idle_bridge(&state) {
+            return self.reject_locked(
+                &mut state,
+                TerminalEvidenceError::NoPotentialBridge {
+                    pending: all_pending,
+                },
+            );
+        }
+        let projected_waiters = if shared_pending == 0 {
+            0
+        } else {
+            match state.interval_waiters.len().checked_add(1) {
+                Some(waiters) => waiters,
+                None => {
+                    return self.reject_locked(
+                        &mut state,
+                        TerminalEvidenceError::CounterOverflow(
+                            "unacknowledged shared terminal calls",
+                        ),
+                    );
+                }
+            }
+        };
+        if projected_waiters > self.clients {
+            return self.reject_locked(
+                &mut state,
+                TerminalEvidenceError::UnacknowledgedLimit {
+                    actual: projected_waiters,
+                    limit: self.clients,
+                },
+            );
+        }
+        if self.tracker.is_abandoned() {
+            return self.reject_locked(
+                &mut state,
+                TerminalEvidenceError::Poisoned {
+                    cause: "terminal ACK gate was abandoned during registration".to_owned(),
+                },
+            );
+        }
+
+        // No fallible work may follow publication of these shared receipts.
         let (ready_tx, ready_rx) = oneshot::channel();
-        let interval_pending = state
-            .intervals
-            .as_ref()
-            .expect("unsealed collector retains intervals")
-            .storage()
-            .pending_intervals();
-        if interval_pending == 0 {
+        if shared_pending == 0 {
             for waiter in state.interval_waiters.drain(..) {
                 let _ = waiter.send(());
             }
             let _ = ready_tx.send(());
         } else {
             state.interval_waiters.push(ready_tx);
-        }
-
-        if interval_pending != 0
-            && !state
-                .workers
-                .iter()
-                .any(|worker| *worker == WorkerState::Idle)
-        {
-            return Err(TerminalEvidenceError::NoPotentialBridge {
-                pending: interval_pending,
-            });
-        }
-        if state.interval_waiters.len() > self.clients {
-            return Err(TerminalEvidenceError::UnacknowledgedLimit {
-                actual: state.interval_waiters.len(),
-                limit: self.clients,
-            });
-        }
-        if self.tracker.is_abandoned() {
-            return Err(TerminalEvidenceError::Poisoned {
-                cause: "terminal ACK gate was abandoned during registration".to_owned(),
-            });
         }
 
         Ok(RegisteredCall {
@@ -440,42 +558,39 @@ impl TerminalEvidenceCollector {
             });
         }
         let mut state = self.state.lock().await;
-        if let Some(cause) = &state.poisoned {
-            return Err(TerminalEvidenceError::Poisoned {
-                cause: cause.clone(),
-            });
+        if let Some(cause) = state.poisoned.clone() {
+            return self.reject_locked(&mut state, TerminalEvidenceError::Poisoned { cause });
         }
-        let worker = state.workers.get_mut(usize::from(worker_id)).ok_or(
-            TerminalEvidenceError::InvalidWorker {
-                worker_id,
-                clients: self.clients,
-            },
-        )?;
-        if *worker != WorkerState::Idle {
-            return Err(TerminalEvidenceError::WorkerState {
-                worker_id,
-                expected: "idle before finish",
-            });
+        let worker_index = usize::from(worker_id);
+        let Some(worker) = state.workers.get(worker_index).copied() else {
+            return self.reject_locked(
+                &mut state,
+                TerminalEvidenceError::InvalidWorker {
+                    worker_id,
+                    clients: self.clients,
+                },
+            );
+        };
+        if worker != WorkerState::Idle {
+            return self.reject_locked(
+                &mut state,
+                TerminalEvidenceError::WorkerState {
+                    worker_id,
+                    expected: "idle before finish",
+                },
+            );
         }
-        *worker = WorkerState::Finished;
+        state.workers[worker_index] = WorkerState::Finished;
 
-        let interval_pending = state
-            .intervals
-            .as_ref()
-            .ok_or(TerminalEvidenceError::AlreadySealed)?
-            .storage()
-            .pending_intervals();
-        let payment_pending = self.payment.storage().await.pending_edges;
-        let pending = interval_pending.checked_add(payment_pending).ok_or(
-            TerminalEvidenceError::CounterOverflow("pending terminal evidence"),
-        )?;
-        if pending != 0
-            && !state
-                .workers
-                .iter()
-                .any(|worker| *worker == WorkerState::Idle)
-        {
-            return Err(TerminalEvidenceError::NoPotentialBridge { pending });
+        let pending = match self.all_root_pending(&state).await {
+            Ok(pending) => pending,
+            Err(error) => return self.reject_locked(&mut state, error),
+        };
+        if pending != 0 && !Self::has_idle_bridge(&state) {
+            return self.reject_locked(
+                &mut state,
+                TerminalEvidenceError::NoPotentialBridge { pending },
+            );
         }
         Ok(())
     }
@@ -514,6 +629,10 @@ impl TerminalEvidenceCollector {
             .intervals
             .as_ref()
             .map_or(0, |collector| collector.storage().pending_intervals());
+        let rich_pending = state
+            .rich
+            .as_ref()
+            .map_or(0, RichRecoveryCollector::pending_edges);
         let payment = self.payment.storage().await;
         TerminalCollectorStorage {
             clients: self.clients,
@@ -521,6 +640,7 @@ impl TerminalEvidenceCollector {
             waiting_workers,
             finished_workers,
             interval_pending,
+            rich_pending,
             interval_waiters: state.interval_waiters.len(),
             payment_pending_edges: payment.pending_edges,
             payment_unacknowledged: payment.unacknowledged_terminals,
@@ -542,72 +662,64 @@ impl TerminalEvidenceCollector {
                 cause: "terminal ACK gate was abandoned".to_owned(),
             });
         }
-        let (stats, intervals) = {
+        let (stats, intervals, rich) = {
             let mut state = self.state.lock().await;
-            if let Some(cause) = &state.poisoned {
-                return Err(TerminalEvidenceError::Poisoned {
-                    cause: cause.clone(),
-                });
+            if let Some(cause) = state.poisoned.clone() {
+                return self.reject_locked(&mut state, TerminalEvidenceError::Poisoned { cause });
             }
             if state.sealed {
-                return Err(TerminalEvidenceError::AlreadySealed);
+                return self.reject_locked(&mut state, TerminalEvidenceError::AlreadySealed);
             }
             if state
                 .workers
                 .iter()
                 .any(|worker| *worker != WorkerState::Finished)
             {
-                return Err(TerminalEvidenceError::WorkersNotFinished);
+                return self.reject_locked(&mut state, TerminalEvidenceError::WorkersNotFinished);
             }
             if !state.interval_waiters.is_empty() {
-                return Err(TerminalEvidenceError::UnacknowledgedLimit {
+                let error = TerminalEvidenceError::UnacknowledgedLimit {
                     actual: state.interval_waiters.len(),
                     limit: 0,
-                });
+                };
+                return self.reject_locked(&mut state, error);
             }
-            state.stats.validate()?;
+            let pending = match self.all_root_pending(&state).await {
+                Ok(pending) => pending,
+                Err(error) => return self.reject_locked(&mut state, error),
+            };
+            if pending != 0 {
+                return self.reject_locked(
+                    &mut state,
+                    TerminalEvidenceError::NoPotentialBridge { pending },
+                );
+            }
+            if let Err(error) = state.stats.validate() {
+                return self.reject_locked(&mut state, error.into());
+            }
             let stats = std::mem::take(&mut state.stats);
-            let intervals = state
-                .intervals
-                .take()
-                .ok_or(TerminalEvidenceError::AlreadySealed)?;
+            let Some(intervals) = state.intervals.take() else {
+                return self.reject_locked(&mut state, TerminalEvidenceError::AlreadySealed);
+            };
+            let Some(rich) = state.rich.take() else {
+                return self.reject_locked(&mut state, TerminalEvidenceError::AlreadySealed);
+            };
             state.sealed = true;
-            (stats, intervals)
+            (stats, intervals, rich)
         };
 
         let intervals = intervals.seal()?;
+        let rich = rich.seal(&intervals)?;
         let payment = self.payment.seal().await?;
-        let totals = stats.totals()?;
-        let expected_customer_updates = totals
-            .payment_commits
-            .checked_add(totals.delivered_orders)
-            .ok_or(TerminalEvidenceError::CounterOverflow(
-                "customer update count",
-            ))?;
-        if intervals.customer_update_count() != expected_customer_updates {
-            return Err(TerminalEvidenceError::CrossInvariant(
-                "Customer edge count differs from Payment commits plus delivered orders",
-            ));
-        }
-        if intervals.stock_update_count() != totals.new_order_lines {
-            return Err(TerminalEvidenceError::CrossInvariant(
-                "Stock edge count differs from committed NewOrder lines",
-            ));
-        }
-        if payment.terminal_count() != totals.payment_commits
-            || payment.warehouse_edge_count() != totals.payment_commits
-            || payment.district_edge_count() != totals.payment_commits
-        {
-            return Err(TerminalEvidenceError::CrossInvariant(
-                "complete Payment endpoint counts differ from Payment commits",
-            ));
-        }
-        Ok(SealedTerminalEvidence {
+        let sealed = SealedTerminalEvidence {
             policy_version: TERMINAL_EVIDENCE_POLICY_VERSION,
             stats,
             intervals,
             payment,
-        })
+            rich,
+        };
+        validate_terminal_evidence(&sealed)?;
+        Ok(sealed)
     }
 
     #[cfg(test)]
@@ -653,6 +765,7 @@ pub struct TerminalCollectorStorage {
     pub waiting_workers: usize,
     pub finished_workers: usize,
     pub interval_pending: usize,
+    pub rich_pending: usize,
     pub interval_waiters: usize,
     pub payment_pending_edges: usize,
     pub payment_unacknowledged: usize,
@@ -665,6 +778,7 @@ pub struct SealedTerminalEvidence {
     stats: BoundedPhysicalStats,
     intervals: SealedIntervalEvidence,
     payment: SealedPaymentEvidence,
+    rich: SealedRichRecoverySamples,
 }
 
 impl SealedTerminalEvidence {
@@ -683,6 +797,100 @@ impl SealedTerminalEvidence {
     pub fn payment(&self) -> &SealedPaymentEvidence {
         &self.payment
     }
+
+    pub fn rich(&self) -> &SealedRichRecoverySamples {
+        &self.rich
+    }
+}
+
+/// Read-only terminal oracle shared by live and canonically restored evidence.
+///
+/// Recovery checks consume this surface rather than a physical `RunLedger`.
+pub trait TerminalEvidenceView {
+    fn policy_version(&self) -> u32;
+    fn stats(&self) -> &BoundedPhysicalStats;
+    fn intervals(&self) -> &SealedIntervalEvidence;
+    fn payment(&self) -> &dyn PaymentEndpointView;
+    fn rich(&self) -> &SealedRichRecoverySamples;
+}
+
+impl TerminalEvidenceView for SealedTerminalEvidence {
+    fn policy_version(&self) -> u32 {
+        self.policy_version
+    }
+
+    fn stats(&self) -> &BoundedPhysicalStats {
+        &self.stats
+    }
+
+    fn intervals(&self) -> &SealedIntervalEvidence {
+        &self.intervals
+    }
+
+    fn payment(&self) -> &dyn PaymentEndpointView {
+        &self.payment
+    }
+
+    fn rich(&self) -> &SealedRichRecoverySamples {
+        &self.rich
+    }
+}
+
+pub(crate) fn validate_terminal_evidence(
+    evidence: &dyn TerminalEvidenceView,
+) -> Result<(), TerminalEvidenceError> {
+    if evidence.policy_version() != TERMINAL_EVIDENCE_POLICY_VERSION {
+        return Err(TerminalEvidenceError::CrossInvariant(
+            "terminal evidence policy version is not supported",
+        ));
+    }
+    let intervals = evidence.intervals();
+    let payment = evidence.payment();
+    let rich = evidence.rich();
+    if intervals.warehouses() != payment.warehouses()
+        || intervals.warehouses() != rich.warehouses()
+        || intervals.sample_seed() != rich.run_seed()
+    {
+        return Err(TerminalEvidenceError::CrossInvariant(
+            "terminal evidence run bindings disagree",
+        ));
+    }
+
+    let totals = evidence.stats().totals()?;
+    let expected_customer_updates = totals
+        .payment_commits
+        .checked_add(totals.delivered_orders)
+        .ok_or(TerminalEvidenceError::CounterOverflow(
+            "customer update count",
+        ))?;
+    if intervals.customer_update_count() != expected_customer_updates {
+        return Err(TerminalEvidenceError::CrossInvariant(
+            "Customer edge count differs from Payment commits plus delivered orders",
+        ));
+    }
+    if intervals.stock_update_count() != totals.new_order_lines {
+        return Err(TerminalEvidenceError::CrossInvariant(
+            "Stock edge count differs from committed NewOrder lines",
+        ));
+    }
+    if payment.terminal_count() != totals.payment_commits
+        || payment.warehouse_edge_count() != totals.payment_commits
+        || payment.district_edge_count() != totals.payment_commits
+    {
+        return Err(TerminalEvidenceError::CrossInvariant(
+            "complete Payment endpoint counts differ from Payment commits",
+        ));
+    }
+    if rich.new_order_commit_count() != totals.new_order_commits
+        || rich.delivered_order_count() != totals.delivered_orders
+        || rich.committed_history_row_count() != totals.payment_commits
+        || rich.bad_credit_payment_count() > totals.payment_commits
+    {
+        return Err(TerminalEvidenceError::CrossInvariant(
+            "rich recovery counts differ from bounded terminal statistics",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -693,6 +901,8 @@ pub enum TerminalEvidenceError {
     Intervals(#[from] CollectorError),
     #[error("bounded Payment endpoint collector rejected evidence: {0}")]
     Payment(#[from] PaymentEndpointError),
+    #[error("bounded rich recovery collector rejected evidence: {0}")]
+    Rich(#[from] RichRecoveryError),
     #[error("invalid terminal evidence mapping: {0}")]
     InvalidMapping(&'static str),
     #[error("terminal evidence collector is poisoned by an earlier rejection: {cause}")]
@@ -865,6 +1075,7 @@ mod tests {
 
     use crate::profile::TransactionKind;
     use crate::ranking::payment_endpoints::{DISTRICT_YTD_ROOT_BITS, WAREHOUSE_YTD_ROOT_BITS};
+    use crate::ranking::rich_recovery_samples::{InitialCustomerData, InitialHistoryRow};
     use crate::ranking::runner::{PaymentEvidence, StockVersion};
     use crate::routing::{ClientSequence, OfficialRouter, StageId, WorkloadSeed};
     use crate::workload::{CustomerSelector, Final2026Workload};
@@ -882,6 +1093,21 @@ mod tests {
         })
     }
 
+    fn initial_history(_: CustomerKey) -> Option<InitialHistoryRow> {
+        Some(
+            InitialHistoryRow::new(
+                b"2026-01-01 00:00:00".to_vec(),
+                10.0_f32.to_bits(),
+                b"SETUP HISTORY".to_vec(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn initial_customer(_: CustomerKey) -> Option<InitialCustomerData> {
+        InitialCustomerData::new(*b"GC", Vec::new()).ok()
+    }
+
     fn collector(clients: u16) -> Arc<TerminalEvidenceCollector> {
         Arc::new(
             TerminalEvidenceCollector::new(
@@ -889,6 +1115,8 @@ mod tests {
                 clients,
                 TEST_SEED,
                 stock_roots,
+                initial_history,
+                initial_customer,
                 StalePaymentPreflightProof::verified_for_test(TEST_SEED, 50),
             )
             .unwrap(),
@@ -1162,12 +1390,10 @@ mod tests {
         wait_for_state(&collector, 1, 0).await;
         assert_eq!(collector.storage().await.payment_pending_edges, 2);
 
-        collector
-            .record_prepared_without_stats(1, PreparedIntervals::Empty, None)
-            .await
-            .unwrap();
         assert!(matches!(
-            collector.worker_finished(1).await,
+            collector
+                .record_prepared_without_stats(1, PreparedIntervals::Empty, None)
+                .await,
             Err(TerminalEvidenceError::NoPotentialBridge { pending: 2 })
                 | Err(TerminalEvidenceError::Poisoned { .. })
         ));
@@ -1361,6 +1587,8 @@ mod tests {
                 1,
                 TEST_SEED,
                 stock_roots,
+                initial_history,
+                initial_customer,
                 StalePaymentPreflightProof::verified_for_test(TEST_SEED ^ 1, 50),
             ),
             Err(TerminalEvidenceError::StalePaymentPreflightBinding)

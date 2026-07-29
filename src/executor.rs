@@ -26,9 +26,10 @@ use crate::phases::{
 use crate::ranking::catalog::RuntimeCatalog;
 use crate::ranking::common::install_statement_layout;
 use crate::ranking::dispatch::{self, FrozenTransaction};
-use crate::ranking::evidence_collector::StockKey;
+use crate::ranking::evidence_collector::{CustomerKey, StockKey};
 use crate::ranking::ledger::{LedgerClass, LedgerError, RunLedger};
 use crate::ranking::preflight;
+use crate::ranking::rich_recovery_samples::{InitialCustomerData, InitialHistoryRow};
 use crate::ranking::runner::{RankedTransactionOutcome, StockVersion};
 use crate::ranking::session::open_ranked_session;
 use crate::ranking::terminal_evidence::{
@@ -160,14 +161,21 @@ pub struct BenchmarkExecutor {
     config: Config,
     effective: ResolvedProfile,
     runtime_schema: RuntimeSchema,
+    setup_generator: Arc<TpccDataGen>,
 }
 
 impl BenchmarkExecutor {
-    pub fn new(config: Config, effective: ResolvedProfile, runtime_schema: RuntimeSchema) -> Self {
+    pub fn new(
+        config: Config,
+        effective: ResolvedProfile,
+        runtime_schema: RuntimeSchema,
+        setup_generator: Arc<TpccDataGen>,
+    ) -> Self {
         Self {
             config,
             effective,
             runtime_schema,
+            setup_generator,
         }
     }
 
@@ -181,6 +189,13 @@ impl BenchmarkExecutor {
                 "ranked runtime schema seed {} does not match workload seed {seed}",
                 self.runtime_schema.seed()
             )));
+        }
+        if self.setup_generator.load_seed() != seed
+            || self.setup_generator.scale_factor != i32::from(profile.warehouses)
+        {
+            return Err(TpccError::Protocol(
+                "ranked setup generator is not bound to the loaded dataset".to_owned(),
+            ));
         }
         let catalog = Arc::new(RuntimeCatalog::from_schema(&self.runtime_schema).map_err(
             |error| TpccError::Protocol(format!("invalid ranked runtime catalogue: {error}")),
@@ -245,7 +260,9 @@ impl BenchmarkExecutor {
         let stale_payment_preflight =
             preflight::run(primary_session, contender_session, seed, profile.warehouses).await?;
         info!("prepared semantic preflight passed before timing-barrier release");
-        let stock_roots = TpccDataGen::with_seed(i32::from(profile.warehouses), seed);
+        let stock_roots = Arc::clone(&self.setup_generator);
+        let history_roots = Arc::clone(&self.setup_generator);
+        let customer_roots = Arc::clone(&self.setup_generator);
         let terminal_evidence = Arc::new(
             TerminalEvidenceCollector::new(
                 profile.warehouses,
@@ -258,6 +275,32 @@ impl BenchmarkExecutor {
                         order_count: 0,
                         remote_count: 0,
                     })
+                },
+                move |key: CustomerKey| {
+                    history_roots
+                        .initial_history(key.warehouse_id, key.district_id, key.customer_id)
+                        .map(|history| {
+                            InitialHistoryRow::new(
+                                history.h_date.into_bytes(),
+                                (history.h_amount as f32).to_bits(),
+                                history.h_data.into_bytes(),
+                            )
+                            .expect("generated setup History row satisfies the final schema")
+                        })
+                },
+                move |key: CustomerKey| {
+                    customer_roots
+                        .initial_customer_profile(
+                            key.warehouse_id,
+                            key.district_id,
+                            key.customer_id,
+                        )
+                        .map(|profile| {
+                            InitialCustomerData::new(*profile.credit(), profile.data().to_vec())
+                                .expect(
+                                    "generated setup Customer profile satisfies the final schema",
+                                )
+                        })
                 },
                 stale_payment_preflight,
             )
