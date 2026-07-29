@@ -227,6 +227,7 @@ class WorkflowSafetyTests(unittest.TestCase):
             "rank_result": rank_result,
             "formal_state": {
                 "status": attestation_status,
+                "publication_policy": "state_directory_fd_flock_v1",
                 "terminal_evidence": terminal_descriptor,
                 "legacy_run_ledger": {
                     "path": str(state_dir / "run_ledger.state"),
@@ -324,6 +325,11 @@ class WorkflowSafetyTests(unittest.TestCase):
             self.assertIn(
                 "terminal_evidence.open_policy: "
                 "state_dir_fd_o_nofollow_sha256_v1",
+                result.stdout,
+            )
+            self.assertIn(
+                "formal_state.publication_policy: "
+                "state_directory_fd_flock_v1",
                 result.stdout,
             )
             self.assertIn(
@@ -895,8 +901,10 @@ while True:
             """
 import os
 import hashlib
+import subprocess
 from pathlib import Path
 import sys
+import time
 
 with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
     output.write("\\t".join(sys.argv[1:]) + "\\n")
@@ -984,6 +992,49 @@ if "--attest-formal-state" in sys.argv:
         print(receipt.upper())
     elif receipt_mode != "missing":
         raise RuntimeError(f"unknown receipt mode: {receipt_mode}")
+    lock_attack = os.environ.get("FAKE_TPCC_FINAL_LOCK_ATTACK")
+    if lock_attack:
+        marker = os.environ["FAKE_TPCC_LOCK_MARKER"]
+        done = os.environ["FAKE_TPCC_LOCK_DONE"]
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import fcntl, os, sys, time\\n"
+                "from pathlib import Path\\n"
+                "state, mode, marker, done, record_root = sys.argv[1:]\\n"
+                "fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY)\\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX)\\n"
+                "Path(marker).write_text('locked', encoding='ascii')\\n"
+                "time.sleep(0.25)\\n"
+                "if mode == 'swap':\\n"
+                "    (Path(state) / 'terminal_evidence.state').write_bytes("
+                "b'late final replacement\\\\n')\\n"
+                "elif mode == 'legacy':\\n"
+                "    (Path(state) / 'run_ledger.state').write_bytes("
+                "b'late legacy\\\\n')\\n"
+                "elif mode == 'manifest_failure':\\n"
+                "    result = next(Path(record_root).iterdir())\\n"
+                "    manifest = result / 'manifest.json'\\n"
+                "    manifest.unlink()\\n"
+                "    manifest.mkdir()\\n"
+                "Path(done).write_text('done', encoding='ascii')\\n"
+                "fcntl.flock(fd, fcntl.LOCK_UN)\\n"
+                "os.close(fd)\\n",
+                str(state_dir),
+                lock_attack,
+                marker,
+                done,
+                os.environ.get("FAKE_TPCC_RECORD_ROOT", ""),
+            ]
+        )
+        deadline = time.monotonic() + 2.0
+        while not Path(marker).exists():
+            if child.poll() is not None:
+                raise RuntimeError("final lock attack exited early")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("final lock attack did not acquire lock")
+            time.sleep(0.01)
 if "--lifecycle-event" in sys.argv:
     event = sys.argv[sys.argv.index("--lifecycle-event") + 1]
     with open(
@@ -2114,6 +2165,7 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 manifest["formal_state"],
                 {
                     "status": "verified",
+                    "publication_policy": "state_directory_fd_flock_v1",
                     "terminal_evidence": {
                         "path": str(terminal_path),
                         "status": "verified",
@@ -2422,6 +2474,148 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                     manifest["formal_state"]["status"],
                     "failed",
                 )
+
+    def test_final_manifest_publication_uses_state_directory_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            records = temp_path / "records"
+            marker = temp_path / "state-lock-acquired"
+            done = temp_path / "state-lock-released"
+            env.update(
+                FAKE_TPCC_FINAL_LOCK_ATTACK="hold",
+                FAKE_TPCC_LOCK_MARKER=str(marker),
+                FAKE_TPCC_LOCK_DONE=str(done),
+                FAKE_TPCC_RECORD_ROOT=str(records),
+            )
+            result = self.run_script(
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(marker.is_file())
+            self.assertTrue(done.is_file())
+            manifest_path = next(records.iterdir()) / "manifest.json"
+            self.assertGreaterEqual(
+                manifest_path.stat().st_mtime_ns,
+                done.stat().st_mtime_ns,
+            )
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["formal_state"]["publication_policy"],
+                "state_directory_fd_flock_v1",
+            )
+
+    def test_final_locked_revalidation_rejects_swap_and_legacy_injection(self):
+        for mode in ("swap", "legacy"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                temp_path = Path(temp)
+                root = self.make_root(temp)
+                server, tester, _, _, env, port = (
+                    self.make_lifecycle_fakes(temp_path, root)
+                )
+                records = temp_path / "records"
+                env.update(
+                    FAKE_TPCC_FINAL_LOCK_ATTACK=mode,
+                    FAKE_TPCC_LOCK_MARKER=str(
+                        temp_path / "state-lock-acquired"
+                    ),
+                    FAKE_TPCC_LOCK_DONE=str(
+                        temp_path / "state-lock-released"
+                    ),
+                    FAKE_TPCC_RECORD_ROOT=str(records),
+                )
+                result = self.run_script(
+                    "--mode",
+                    "all",
+                    "--target-dir",
+                    root,
+                    "--record-root",
+                    records,
+                    "--skip-build",
+                    "--server-bin",
+                    server,
+                    "--tpcc-bin",
+                    tester,
+                    "--port",
+                    port,
+                    env=env,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                manifest = json.loads(
+                    (
+                        next(records.iterdir()) / "manifest.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["status"], "failed")
+                self.assertFalse(manifest["ranking_eligible"])
+                self.assertEqual(
+                    manifest["formal_state"]["status"],
+                    "failed",
+                )
+                if mode == "legacy":
+                    legacy = (
+                        Path(manifest["paths"]["state"])
+                        / "run_ledger.state"
+                    )
+                    self.assertEqual(
+                        legacy.read_bytes(),
+                        b"late legacy\n",
+                    )
+
+    def test_manifest_write_failure_never_publishes_ranking_eligibility(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = self.make_root(temp)
+            server, tester, _, _, env, port = self.make_lifecycle_fakes(
+                temp_path,
+                root,
+            )
+            records = temp_path / "records"
+            env.update(
+                FAKE_TPCC_FINAL_LOCK_ATTACK="manifest_failure",
+                FAKE_TPCC_LOCK_MARKER=str(temp_path / "state-lock-acquired"),
+                FAKE_TPCC_LOCK_DONE=str(temp_path / "state-lock-released"),
+                FAKE_TPCC_RECORD_ROOT=str(records),
+            )
+            result = self.run_script(
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--record-root",
+                records,
+                "--skip-build",
+                "--server-bin",
+                server,
+                "--tpcc-bin",
+                tester,
+                "--port",
+                port,
+                env=env,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            manifest_path = next(records.iterdir()) / "manifest.json"
+            self.assertTrue(manifest_path.is_dir())
+            self.assertFalse(manifest_path.is_file())
 
     def test_any_legacy_run_ledger_shape_is_preserved_and_fail_closed(self):
         for mode in ("file", "directory", "symlink", "dangling_symlink"):

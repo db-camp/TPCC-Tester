@@ -579,7 +579,12 @@ def validate_formal_state(
     if (
         not isinstance(formal, dict)
         or set(formal)
-        != {"status", "terminal_evidence", "legacy_run_ledger"}
+        != {
+            "status",
+            "publication_policy",
+            "terminal_evidence",
+            "legacy_run_ledger",
+        }
     ):
         raise ManifestError("manifest.json has invalid formal-state metadata")
     terminal = formal.get("terminal_evidence")
@@ -616,7 +621,9 @@ def validate_formal_state(
             "manifest.json legacy ledger path is not exact"
         )
     if (
-        terminal.get("open_policy")
+        formal.get("publication_policy")
+        != "state_directory_fd_flock_v1"
+        or terminal.get("open_policy")
         != "state_dir_fd_o_nofollow_sha256_v1"
         or terminal.get("max_size_bytes")
         != MAX_TERMINAL_EVIDENCE_STATE_BYTES
@@ -1103,6 +1110,7 @@ def render_manifest(summary: list[str], manifest: dict[str, Any]) -> None:
     legacy = formal["legacy_run_ledger"]
     summary.extend(
         [
+            f"- formal_state.publication_policy: {formal['publication_policy']}",
             f"- terminal_evidence.path: `{terminal['path']}`",
             f"- terminal_evidence.status: {terminal['status']}",
             f"- terminal_evidence.file_type: {terminal['file_type']}",

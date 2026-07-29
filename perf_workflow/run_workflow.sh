@@ -1725,6 +1725,7 @@ if [[ "${MODE}" == "tools" ]]; then
 fi
 
 write_manifest() {
+  local writer_rc=0
   python3 - "${RESULT_DIR}/manifest.json" \
     "${WORKFLOW_STATUS}" "${MODE}" "${RUN_ID}" "${DATASET_RUN_ID}" "${PROFILE}" \
     "${RANKED_CONFIGURATION}" "${SEED}" "${SEED_CALLER_SUPPLIED}" \
@@ -1752,7 +1753,8 @@ write_manifest() {
     "${TESTER_BINARY_INODE}" "${TESTER_BINARY_SIZE}" \
     "${TESTER_SOURCE_MATCHES_WORKFLOW}" \
     "${TESTER_BINARY_OVERRIDE_ACTIVE}" \
-    "${SKIP_BUILD}" <<'PY'
+    "${SKIP_BUILD}" <<'PY' || writer_rc=$?
+import fcntl
 import json
 import hashlib
 import os
@@ -2225,6 +2227,120 @@ terminal_evidence_verified = (
     and terminal_evidence_size_value is not None
     and terminal_evidence_sha256_value is not None
 )
+state_lock_descriptor = -1
+publication_revalidation_failed = False
+if formal_attestation_status == "verified" and terminal_evidence_verified:
+    try:
+        if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+            raise OSError("safe directory open is unavailable")
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            directory_flags |= os.O_CLOEXEC
+        state_lock_descriptor = os.open(state_dir, directory_flags)
+        fcntl.flock(state_lock_descriptor, fcntl.LOCK_EX)
+
+        try:
+            os.stat(
+                "run_ledger.state",
+                dir_fd=state_lock_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            safe_terminal_evidence_status = "legacy_present"
+            safe_legacy_run_ledger_status = "present"
+            raise RuntimeError("legacy run ledger is present")
+
+        before = os.stat(
+            "terminal_evidence.state",
+            dir_fd=state_lock_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > int(terminal_evidence_max_bytes)
+        ):
+            raise RuntimeError("terminal evidence is not a bounded regular file")
+        file_flags = os.O_RDONLY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            file_flags |= os.O_CLOEXEC
+        descriptor = os.open(
+            "terminal_evidence.state",
+            file_flags,
+            dir_fd=state_lock_descriptor,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+                or opened.st_size != before.st_size
+                or opened.st_mtime_ns != before.st_mtime_ns
+            ):
+                raise RuntimeError("terminal evidence changed while opening")
+            digest = hashlib.sha256()
+            remaining = opened.st_size
+            while remaining:
+                chunk = os.read(
+                    descriptor,
+                    min(1024 * 1024, remaining),
+                )
+                if not chunk:
+                    break
+                digest.update(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            current = os.stat(
+                "terminal_evidence.state",
+                dir_fd=state_lock_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                remaining != 0
+                or after.st_dev != opened.st_dev
+                or after.st_ino != opened.st_ino
+                or after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or current.st_dev != opened.st_dev
+                or current.st_ino != opened.st_ino
+                or current.st_size != opened.st_size
+                or current.st_mtime_ns != opened.st_mtime_ns
+            ):
+                raise RuntimeError("terminal evidence changed while hashing")
+            try:
+                os.stat(
+                    "run_ledger.state",
+                    dir_fd=state_lock_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                safe_terminal_evidence_status = "legacy_present"
+                safe_legacy_run_ledger_status = "present"
+                raise RuntimeError("legacy run ledger appeared while hashing")
+            if (
+                opened.st_size != terminal_evidence_size_value
+                or digest.hexdigest() != terminal_evidence_sha256_value
+            ):
+                safe_terminal_evidence_status = "changed"
+                raise RuntimeError(
+                    "terminal evidence differs from the Rust receipt"
+                )
+        finally:
+            os.close(descriptor)
+    except (OSError, RuntimeError):
+        publication_revalidation_failed = True
+        if safe_terminal_evidence_status == "verified":
+            safe_terminal_evidence_status = "changed"
+        if safe_legacy_run_ledger_status != "present":
+            safe_legacy_run_ledger_status = "inspection_failed"
+        terminal_evidence_size_value = None
+        terminal_evidence_sha256_value = None
+        terminal_evidence_verified = False
 if formal_attestation_status == "verified" and not terminal_evidence_verified:
     formal_attestation_status = "failed"
 tester_attestation_status = required_status(
@@ -2360,6 +2476,7 @@ payload = {
     "rank_result": rank_result,
     "formal_state": {
         "status": formal_attestation_status,
+        "publication_policy": "state_directory_fd_flock_v1",
         "terminal_evidence": {
             "path": str(Path(state_dir) / "terminal_evidence.state"),
             "status": safe_terminal_evidence_status,
@@ -2425,8 +2542,19 @@ temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
 if hasattr(os, "O_NOFOLLOW"):
     flags |= os.O_NOFOLLOW
-descriptor = os.open(temporary, flags, 0o600)
+descriptor = -1
+result_directory_descriptor = -1
 try:
+    result_directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        result_directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        result_directory_flags |= os.O_NOFOLLOW
+    result_directory_descriptor = os.open(
+        path.parent,
+        result_directory_flags,
+    )
+    descriptor = os.open(temporary, flags, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         descriptor = -1
         json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
@@ -2434,14 +2562,34 @@ try:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+    os.fsync(result_directory_descriptor)
 finally:
     if descriptor >= 0:
         os.close(descriptor)
+    if result_directory_descriptor >= 0:
+        os.close(result_directory_descriptor)
     try:
         os.unlink(temporary)
     except FileNotFoundError:
         pass
+    if state_lock_descriptor >= 0:
+        try:
+            fcntl.flock(state_lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(state_lock_descriptor)
+if publication_revalidation_failed:
+    raise SystemExit(42)
 PY
+  if [[ "${writer_rc}" == "42" ]]; then
+    FORMAL_STATE_ATTESTATION_STATUS="failed"
+    TERMINAL_EVIDENCE_STATUS="inspection_failed"
+    TERMINAL_EVIDENCE_SIZE=""
+    TERMINAL_EVIDENCE_SHA256=""
+    LEGACY_RUN_LEDGER_STATUS="inspection_failed"
+    MANIFEST_READY=1
+    return 42
+  fi
+  [[ "${writer_rc}" == "0" ]] || return "${writer_rc}"
   MANIFEST_READY=1
 }
 
