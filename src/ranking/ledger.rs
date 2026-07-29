@@ -2677,7 +2677,9 @@ mod tests {
         assert_eq!(merged.payments(), 1);
         assert_eq!(merged.delivered_orders(), 1);
         assert_eq!(merged.events().len(), 4);
-        assert_eq!(merged.to_committed_ledger().delivered_order_lines, 6);
+        let committed = merged.to_committed_ledger();
+        assert_eq!(committed.delivered_order_lines, 6);
+        assert_eq!(committed.stock_ytd_delta, merged.stock_ytd_delta());
     }
 
     #[test]
