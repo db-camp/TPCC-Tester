@@ -838,6 +838,20 @@ fn median_of_three(mut values: [f64; FORMAL_WINDOW_COUNT]) -> f64 {
     values[1]
 }
 
+fn rank_report_configuration_lines(ranked: bool) -> [&'static str; 2] {
+    if ranked {
+        [
+            "conformance_candidate=public_spec_candidate",
+            "ranked_configuration=1",
+        ]
+    } else {
+        [
+            "conformance_candidate=non_ranked_deviation",
+            "ranked_configuration=0",
+        ]
+    }
+}
+
 pub struct Final2026RunResult {
     ranked: bool,
     windows: [WindowStats; FORMAL_WINDOW_COUNT],
@@ -861,14 +875,9 @@ impl Final2026RunResult {
 
     pub fn print_report(&self) {
         println!("=== TPCC final2026 public-spec measurement ===");
-        println!(
-            "conformance={}",
-            if self.ranked {
-                "public_spec_aligned"
-            } else {
-                "non_ranked_deviation"
-            }
-        );
+        for line in rank_report_configuration_lines(self.ranked) {
+            println!("{line}");
+        }
         println!(
             "local_safety=response_timeout:{}s,phase_tail_grace:{}s (official values unpublished)",
             self.response_timeout.as_secs(),
@@ -938,6 +947,27 @@ mod tests {
     fn latency_report_preserves_fractional_milliseconds_and_empty_samples() {
         assert_eq!(format_latency(Some(Duration::from_micros(1_234))), "1.234");
         assert_eq!(format_latency(None), "unavailable");
+    }
+
+    #[test]
+    fn rank_report_uses_candidate_configuration_labels() {
+        assert_eq!(
+            rank_report_configuration_lines(true),
+            [
+                "conformance_candidate=public_spec_candidate",
+                "ranked_configuration=1"
+            ]
+        );
+        assert_eq!(
+            rank_report_configuration_lines(false),
+            [
+                "conformance_candidate=non_ranked_deviation",
+                "ranked_configuration=0"
+            ]
+        );
+        assert!(rank_report_configuration_lines(true)
+            .iter()
+            .all(|line| *line != "conformance=public_spec_aligned"));
     }
 
     #[test]
