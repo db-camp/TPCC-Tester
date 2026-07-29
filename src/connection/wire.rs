@@ -5,6 +5,7 @@
 //! loop by Tokio's `read_exact`/`write_all`, and response ordering is checked
 //! before typed cells are exposed to callers.
 
+use std::collections::BTreeMap;
 use std::io;
 
 use thiserror::Error;
@@ -134,9 +135,15 @@ pub enum StreamResponse {
 }
 
 #[derive(Debug)]
-struct Frame {
-    tag: FrameTag,
-    payload: Vec<u8>,
+pub(crate) struct Frame {
+    pub(crate) tag: FrameTag,
+    pub(crate) payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedDefinition {
+    pub(crate) parameter_types: Vec<SqlType>,
+    pub(crate) columns: Option<Vec<Column>>,
 }
 
 /// A sequential RMDB Wire Protocol connection.
@@ -146,6 +153,7 @@ struct Frame {
 pub struct WireConnection<S> {
     io: S,
     handshaken: bool,
+    pub(crate) prepared: BTreeMap<u16, PreparedDefinition>,
 }
 
 impl WireConnection<TcpStream> {
@@ -168,6 +176,7 @@ where
         Self {
             io,
             handshaken: false,
+            prepared: BTreeMap::new(),
         }
     }
 
@@ -210,6 +219,11 @@ where
         if sql.is_empty() {
             return Err(WireError::Protocol(
                 "EXEC_STREAM SQL payload must not be empty".to_owned(),
+            ));
+        }
+        if sql.as_bytes().contains(&0) {
+            return Err(WireError::Protocol(
+                "EXEC_STREAM SQL payload must not contain NUL".to_owned(),
             ));
         }
         if sql.len() > MAX_FRAME_PAYLOAD {
@@ -295,7 +309,22 @@ where
         }
     }
 
-    async fn write_frame(&mut self, tag: FrameTag, flags: u8, payload: &[u8]) -> WireResult<()> {
+    pub(crate) fn ensure_handshaken(&self, request_name: &str) -> WireResult<()> {
+        if self.handshaken {
+            Ok(())
+        } else {
+            Err(WireError::Protocol(format!(
+                "{request_name} requires a completed handshake"
+            )))
+        }
+    }
+
+    pub(crate) async fn write_frame(
+        &mut self,
+        tag: FrameTag,
+        flags: u8,
+        payload: &[u8],
+    ) -> WireResult<()> {
         if payload.len() > MAX_FRAME_PAYLOAD {
             return Err(WireError::Protocol(format!(
                 "frame payload exceeds {MAX_FRAME_PAYLOAD} bytes"
@@ -315,7 +344,7 @@ where
         Ok(())
     }
 
-    async fn read_response_frame(&mut self) -> WireResult<Frame> {
+    pub(crate) async fn read_response_frame(&mut self) -> WireResult<Frame> {
         let mut header = [0_u8; 8];
         self.io.read_exact(&mut header).await?;
 
@@ -451,7 +480,7 @@ fn parse_result_end(payload: &[u8]) -> WireResult<u64> {
     Ok(row_count)
 }
 
-fn parse_diagnostic(payload: &[u8], frame_name: &str) -> WireResult<String> {
+pub(crate) fn parse_diagnostic(payload: &[u8], frame_name: &str) -> WireResult<String> {
     if payload.len() > MAX_DIAGNOSTIC_BYTES {
         return Err(WireError::Protocol(format!(
             "{frame_name} diagnostic exceeds {MAX_DIAGNOSTIC_BYTES} bytes"
@@ -472,45 +501,45 @@ fn ensure_empty(payload: &[u8], frame_name: &str) -> WireResult<()> {
     }
 }
 
-struct PayloadReader<'a> {
+pub(crate) struct PayloadReader<'a> {
     payload: &'a [u8],
     offset: usize,
 }
 
 impl<'a> PayloadReader<'a> {
-    fn new(payload: &'a [u8]) -> Self {
+    pub(crate) fn new(payload: &'a [u8]) -> Self {
         Self { payload, offset: 0 }
     }
 
-    fn read_u8(&mut self, field: &str) -> WireResult<u8> {
+    pub(crate) fn read_u8(&mut self, field: &str) -> WireResult<u8> {
         Ok(self.take(1, field)?[0])
     }
 
-    fn read_u16(&mut self, field: &str) -> WireResult<u16> {
+    pub(crate) fn read_u16(&mut self, field: &str) -> WireResult<u16> {
         Ok(u16::from_be_bytes(
             self.take(2, field)?.try_into().expect("two-byte field"),
         ))
     }
 
-    fn read_u32(&mut self, field: &str) -> WireResult<u32> {
+    pub(crate) fn read_u32(&mut self, field: &str) -> WireResult<u32> {
         Ok(u32::from_be_bytes(
             self.take(4, field)?.try_into().expect("four-byte field"),
         ))
     }
 
-    fn read_i32(&mut self, field: &str) -> WireResult<i32> {
+    pub(crate) fn read_i32(&mut self, field: &str) -> WireResult<i32> {
         Ok(i32::from_be_bytes(
             self.take(4, field)?.try_into().expect("four-byte field"),
         ))
     }
 
-    fn read_u64(&mut self, field: &str) -> WireResult<u64> {
+    pub(crate) fn read_u64(&mut self, field: &str) -> WireResult<u64> {
         Ok(u64::from_be_bytes(
             self.take(8, field)?.try_into().expect("eight-byte field"),
         ))
     }
 
-    fn take(&mut self, byte_count: usize, field: &str) -> WireResult<&'a [u8]> {
+    pub(crate) fn take(&mut self, byte_count: usize, field: &str) -> WireResult<&'a [u8]> {
         let end = self.offset.checked_add(byte_count).ok_or_else(|| {
             WireError::Protocol(format!("{field} length overflows address space"))
         })?;
@@ -525,7 +554,7 @@ impl<'a> PayloadReader<'a> {
         Ok(bytes)
     }
 
-    fn finish(&self, frame_name: &str) -> WireResult<()> {
+    pub(crate) fn finish(&self, frame_name: &str) -> WireResult<()> {
         if self.offset == self.payload.len() {
             Ok(())
         } else {
@@ -534,6 +563,10 @@ impl<'a> PayloadReader<'a> {
                 self.payload.len() - self.offset
             )))
         }
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.payload.len() - self.offset
     }
 }
 
@@ -786,5 +819,25 @@ mod tests {
         let command_payload = frame(FrameTag::CommandOk, 0, 0, &[0]);
         let trailing_error = exchange(command_payload).await.unwrap_err().to_string();
         assert!(trailing_error.contains("COMMAND_OK payload must be empty"));
+    }
+
+    #[tokio::test]
+    async fn rejects_exec_stream_sql_containing_nul() {
+        let (client_io, mut server_io) = duplex(16);
+        let server = tokio::spawn(async move {
+            let mut handshake = [0_u8; 8];
+            server_io.read_exact(&mut handshake).await.unwrap();
+            server_io.write_all(&handshake).await.unwrap();
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        let error = connection
+            .exec_stream("show\0tables;")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not contain NUL"));
+        server.await.unwrap();
     }
 }
