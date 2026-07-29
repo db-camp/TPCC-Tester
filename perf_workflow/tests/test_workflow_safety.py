@@ -6,6 +6,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -165,6 +166,53 @@ with open(os.environ["FAKE_TPCC_CALLS"], "a", encoding="utf-8") as output:
             stderr=subprocess.PIPE,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "Darwin ps uses -E to expose a process environment",
+    )
+    def test_darwin_cleanup_owner_probe_reads_process_environment(self):
+        token = f"workflow-owner-test-{os.getpid()}"
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env={
+                **os.environ,
+                "RMDB_WORKFLOW_PROCESS_OWNER": token,
+            },
+        )
+        try:
+            result = subprocess.run(
+                [
+                    "ps",
+                    "-E",
+                    "-ww",
+                    "-o",
+                    "command=",
+                    "-p",
+                    str(process.pid),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                f"RMDB_WORKFLOW_PROCESS_OWNER={token}",
+                result.stdout.split(),
+            )
+            script_text = SCRIPT.read_text(encoding="utf-8")
+            self.assertIn(
+                '["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)]',
+                script_text,
+            )
+            self.assertNotIn(
+                '["ps", "eww", "-o", "command=", "-p", str(pid)]',
+                script_text,
+            )
+        finally:
+            process.terminate()
+            process.wait(timeout=2)
 
     def test_diagnostic_metrics_collect_delta_and_parse_strace(self):
         with tempfile.TemporaryDirectory() as temp:

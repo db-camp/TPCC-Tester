@@ -922,7 +922,7 @@ if sys.platform != "darwin":
     raise SystemExit(1)
 try:
     result = subprocess.run(
-        ["ps", "eww", "-o", "command=", "-p", str(pid)],
+        ["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
