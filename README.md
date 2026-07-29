@@ -43,7 +43,7 @@
 
 ### FLOAT32 与一致性状态
 
-装载、绑定和相对更新遵循 IEEE-754 binary32 round-to-nearest-even。CSV 装载使用可往返同一 binary32 位模式的十进制文本；ranked typed Wire 路径则直接传 raw bits。Payment 和 Delivery 的逐事务相对更新保留更新前后 raw bits，并按 0 ULP 检查。跨阶段的版本化 `state-dir` 保存装载形状、已确认提交 ledger 和崩溃前基线，供在线与恢复校验复用。
+装载、绑定和相对更新遵循 IEEE-754 binary32 round-to-nearest-even。CSV 装载使用可往返同一 binary32 位模式的十进制文本；ranked typed Wire 路径则直接传 raw bits。Payment 和 Delivery 的逐事务相对更新保留更新前后 raw bits，并按 0 ULP 检查。跨阶段的版本化 `state-dir` 保存装载形状、密封的有界终态证据和崩溃前基线，供在线与恢复校验复用。
 
 公开赛题只给出校验规模与语义边界，没有公开官方的具体 SQL、答案或采样标识。本框架的校验计划验证同一类公开不变量，但不能声称与隐藏查询逐字相同。
 

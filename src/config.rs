@@ -191,7 +191,7 @@ pub struct Config {
     )]
     pub recovery_ready_budget_seconds: u64,
 
-    /// Run-owned directory for dataset, commit-ledger, and crash baselines
+    /// Run-owned directory for dataset, sealed terminal evidence, and crash baselines
     #[arg(long = "state-dir")]
     pub state_dir: Option<PathBuf>,
 

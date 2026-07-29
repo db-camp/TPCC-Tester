@@ -45,7 +45,7 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 8. 原数据库目录重启，并在 90 秒内通过同一个精确 readiness probe；
 9. 载入同一个 `state-dir` 执行恢复校验；
 10. 汇总两代 RMDB 的最大 RSS、数据库峰值/最终占用，并按 Rust 发布的正式三窗口边界计算 server 进程树 CPU；
-11. 由 Rust tester 只读重放并校验 dataset/contract、setup、rank ledger、online baseline、四个 crash transition 和 recovery receipt 的完整状态链；
+11. 由 Rust tester 只读重放并校验 dataset/contract、setup、rank receipt、有界终态证据、online baseline、四个 crash transition 和 recovery receipt 的完整状态链；
 12. 写出结果；成功时默认仅清理本次创建且所有权标记匹配的数据库。
 
 需要保留成功后的数据库时添加：
@@ -61,7 +61,7 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 
 ## `state-dir` 与拆分运行
 
-`state-dir` 是数据库状态的一部分，保存版本化的装载形状、确认提交 ledger、崩溃前校验基线和 `database.identity`。setup 完成后，
+`state-dir` 是数据库状态的一部分，保存版本化的装载形状、密封的有界终态证据、崩溃前校验基线和 `database.identity`。setup 完成后，
 `database.identity` 会同时绑定 dataset run id、seed、不透明库名、数据库路径指纹、
 文件系统 device/inode、完整 `dataset.state` SHA-256 和 runtime schema 指纹；数据库
 目录内保存一份字节一致的 marker。它必须与同一个数据库一起保留，不能编辑、

@@ -642,7 +642,7 @@ fn print_effective_profile(config: &Config, effective: &ResolvedProfile) {
     if config.diagnostic_workload_seconds.is_some() {
         info!(
             "Effective execution conformance: explicit non_ranked diagnostic workload \
-             (ranking ledger/baseline disabled)"
+             (ranking terminal evidence/baseline disabled)"
         );
     } else if effective.is_ranked_configuration() {
         info!("Effective profile conformance: public-spec ranked configuration");
