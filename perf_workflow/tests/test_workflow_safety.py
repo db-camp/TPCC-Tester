@@ -79,6 +79,109 @@ class WorkflowSafetyTests(unittest.TestCase):
             stderr,
         )
 
+    def database_identity_helper_source(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+        prefix = (
+            'database_identity_helper() {\n'
+            '  python3 - "$@" <<\'PY\'\n'
+        )
+        start = script.index(prefix) + len(prefix)
+        end = script.index(
+            "\nPY\n}\n\nnormalize_numeric_host() {",
+            start,
+        )
+        return script[start:end]
+
+    def run_database_identity_helper(self, *args, source=None):
+        return subprocess.run(
+            [sys.executable, "-", *map(str, args)],
+            input=source or self.database_identity_helper_source(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+    def write_identity_test_dataset(self, state, run_id, seed):
+        dataset = state / "dataset.state"
+        dataset.write_text(
+            "\n".join(
+                (
+                    "version=4",
+                    f"run_id={run_id}",
+                    f"seed={seed}",
+                    "warehouses=50",
+                    "order_line_rows=1",
+                    "undelivered_order_line_rows=1",
+                    "order_line_amount_terms=1",
+                    "order_line_amount_words=0000000000000000",
+                    "runtime_schema_begin",
+                    "version=1",
+                    "mode=local_seed_opaque_v1",
+                    f"seed={seed}",
+                    "fingerprint=0123456789abcdef",
+                    "runtime_schema_end",
+                    "setup_evidence=00",
+                    "partition=1,1,1,1",
+                )
+            )
+            + "\n",
+            encoding="ascii",
+        )
+        return dataset
+
+    def provision_identity_fixture(self, temp):
+        root = Path(temp).resolve() / "rmdb"
+        state = Path(temp).resolve() / "state"
+        run_id = "identity.test:1"
+        seed = "2026"
+        derived = self.run_database_identity_helper(
+            "derive",
+            run_id,
+            seed,
+        )
+        self.assertEqual(derived.returncode, 0, derived.stderr)
+        database = root / derived.stdout.strip()
+        database.mkdir(parents=True)
+        state.mkdir()
+        owner = f"tpcc-final2026:{run_id}:{database}"
+        state_identity = state / "database.identity"
+        created = self.run_database_identity_helper(
+            "create",
+            state_identity,
+            database,
+            run_id,
+            seed,
+            "derived_opaque",
+            owner,
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        provisioned = (
+            database / ".tpcc-workflow-database-identity"
+        ).read_bytes()
+        dataset = self.write_identity_test_dataset(state, run_id, seed)
+        sealed = self.run_database_identity_helper(
+            "seal",
+            state_identity,
+            database,
+            run_id,
+            seed,
+            dataset,
+        )
+        self.assertEqual(sealed.returncode, 0, sealed.stderr)
+        return {
+            "root": root,
+            "database": database,
+            "state": state,
+            "state_identity": state_identity,
+            "dataset": dataset,
+            "run_id": run_id,
+            "seed": seed,
+            "owner": owner,
+            "provisioned": provisioned,
+            "sealed": state_identity.read_bytes(),
+        }
+
     def make_root(self, parent):
         root = Path(parent) / "rmdb"
         (root / "deps" / "TPCC-Tester").mkdir(parents=True)
@@ -151,6 +254,8 @@ if "--lifecycle-event" in sys.argv:
         output.write(f"lifecycle {event}\\n")
 if "--create-schema" in sys.argv:
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    if (state_dir / "database.identity").exists():
+        raise SystemExit(41)
     run_id = os.environ["RMDB_TPCC_RUN_ID"]
     seed = sys.argv[sys.argv.index("--seed") + 1]
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -1545,6 +1650,291 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                 replacement.stderr,
             )
 
+    def test_database_identity_sealing_resumes_only_safe_partial_states(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = self.provision_identity_fixture(temp)
+            marker = (
+                fixture["database"]
+                / ".tpcc-workflow-database-identity"
+            )
+
+            marker.write_bytes(fixture["provisioned"])
+            readonly_state = fixture["state_identity"].read_bytes()
+            readonly_marker = marker.read_bytes()
+            workflow_dry_run = self.run_script(
+                "--plan-only",
+                "--mode",
+                "recovery",
+                "--target-dir",
+                fixture["root"],
+                "--state-dir",
+                fixture["state"],
+                "--seed",
+                fixture["seed"],
+            )
+            self.assertNotEqual(workflow_dry_run.returncode, 0)
+            self.assertEqual(
+                fixture["state_identity"].read_bytes(),
+                readonly_state,
+            )
+            self.assertEqual(marker.read_bytes(), readonly_marker)
+            dry_run = self.run_database_identity_helper(
+                "inspect-existing",
+                fixture["state_identity"],
+                fixture["root"],
+                fixture["run_id"],
+                fixture["seed"],
+                "",
+                "0",
+            )
+            self.assertNotEqual(dry_run.returncode, 0)
+            self.assertEqual(
+                fixture["state_identity"].read_bytes(),
+                readonly_state,
+            )
+            self.assertEqual(marker.read_bytes(), readonly_marker)
+
+            resumed_database_marker = self.run_database_identity_helper(
+                "inspect-existing",
+                fixture["state_identity"],
+                fixture["root"],
+                fixture["run_id"],
+                fixture["seed"],
+                "",
+                "1",
+            )
+            self.assertEqual(
+                resumed_database_marker.returncode,
+                0,
+                resumed_database_marker.stderr,
+            )
+            self.assertEqual(marker.read_bytes(), fixture["sealed"])
+
+            fixture["state_identity"].unlink()
+            resumed_state_marker = self.run_database_identity_helper(
+                "inspect-existing",
+                fixture["state_identity"],
+                fixture["root"],
+                fixture["run_id"],
+                fixture["seed"],
+                "",
+                "1",
+            )
+            self.assertEqual(
+                resumed_state_marker.returncode,
+                0,
+                resumed_state_marker.stderr,
+            )
+            self.assertEqual(
+                fixture["state_identity"].read_bytes(),
+                fixture["sealed"],
+            )
+
+            invalid_source_values = dict(
+                line.split("=", 1)
+                for line in fixture["sealed"]
+                .decode("ascii")
+                .splitlines()
+            )
+            invalid_source_values["name_source"] = "explicit_deviation"
+            identity_fields = (
+                "version",
+                "dataset_run_id",
+                "seed",
+                "db_name",
+                "name_source",
+                "binding_status",
+                "runtime_schema_fingerprint",
+                "dataset_state_fingerprint",
+                "db_device",
+                "db_inode",
+                "db_path_fingerprint",
+            )
+            invalid_source_prefix = "".join(
+                f"{field}={invalid_source_values[field]}\n"
+                for field in identity_fields
+            )
+            invalid_source_values["identity_fingerprint"] = hashlib.sha256(
+                b"rmdb-final2026-database-identity-v1\0"
+                + invalid_source_prefix.encode("ascii")
+            ).hexdigest()
+            invalid_source_marker = (
+                invalid_source_prefix
+                + "identity_fingerprint="
+                + invalid_source_values["identity_fingerprint"]
+                + "\n"
+            ).encode("ascii")
+            fixture["state_identity"].unlink()
+            marker.write_bytes(invalid_source_marker)
+            rejected_before_mutation = self.run_database_identity_helper(
+                "inspect-existing",
+                fixture["state_identity"],
+                fixture["root"],
+                fixture["run_id"],
+                fixture["seed"],
+                "",
+                "1",
+            )
+            self.assertNotEqual(rejected_before_mutation.returncode, 0)
+            self.assertFalse(fixture["state_identity"].exists())
+            self.assertEqual(marker.read_bytes(), invalid_source_marker)
+            marker.write_bytes(fixture["sealed"])
+            fixture["state_identity"].write_bytes(fixture["sealed"])
+
+            values = dict(
+                line.split("=", 1)
+                for line in fixture["sealed"]
+                .decode("ascii")
+                .splitlines()
+            )
+            values["runtime_schema_fingerprint"] = "fedcba9876543210"
+            prefix = "".join(
+                f"{field}={values[field]}\n"
+                for field in identity_fields
+            )
+            values["identity_fingerprint"] = hashlib.sha256(
+                b"rmdb-final2026-database-identity-v1\0"
+                + prefix.encode("ascii")
+            ).hexdigest()
+            mismatched = (
+                prefix
+                + "identity_fingerprint="
+                + values["identity_fingerprint"]
+                + "\n"
+            ).encode("ascii")
+            fixture["state_identity"].write_bytes(mismatched)
+            rejected = self.run_database_identity_helper(
+                "inspect-existing",
+                fixture["state_identity"],
+                fixture["root"],
+                fixture["run_id"],
+                fixture["seed"],
+                "",
+                "1",
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn(
+                "cannot resume sealing",
+                rejected.stderr,
+            )
+            self.assertEqual(marker.read_bytes(), fixture["sealed"])
+
+    def test_database_identity_creation_rejects_linked_markers(self):
+        for marker_name in (
+            ".tpcc-workflow-owner",
+            ".tpcc-workflow-database-identity",
+        ):
+            for link_kind in ("symlink", "hardlink"):
+                with self.subTest(
+                    marker=marker_name,
+                    link_kind=link_kind,
+                ), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp).resolve()
+                    database = (
+                        root
+                        / "d_0123456789abcdef0123456789abcdef"
+                    )
+                    state = root / "state"
+                    database.mkdir()
+                    state.mkdir()
+                    victim = root / "victim"
+                    victim.write_bytes(b"do-not-truncate")
+                    marker = database / marker_name
+                    if link_kind == "symlink":
+                        marker.symlink_to(victim)
+                    else:
+                        os.link(victim, marker)
+                    created = self.run_database_identity_helper(
+                        "create",
+                        state / "database.identity",
+                        database,
+                        "identity.test:links",
+                        "2026",
+                        "derived_opaque",
+                        "owner-token",
+                    )
+                    self.assertNotEqual(created.returncode, 0)
+                    self.assertEqual(
+                        victim.read_bytes(),
+                        b"do-not-truncate",
+                    )
+                    self.assertTrue(marker.exists())
+
+    def test_database_cleanup_wrong_quarantine_inode_is_not_deleted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = self.provision_identity_fixture(temp)
+            database = fixture["database"]
+            protected = database / "protected.data"
+            protected.write_bytes(b"owned-database")
+            identity = dict(
+                line.split("=", 1)
+                for line in fixture["sealed"]
+                .decode("ascii")
+                .splitlines()
+            )
+            source = self.database_identity_helper_source()
+            rename_call = """        os.rename(
+            db_name,
+            quarantine_name,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+"""
+            injected = """        os.rename(
+            db_name,
+            "identity-test-saved",
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+        os.mkdir(db_name, dir_fd=root_fd)
+        replacement_dir_fd = os.open(
+            db_name,
+            root_flags,
+            dir_fd=root_fd,
+        )
+        replacement_fd = os.open(
+            "replacement-sentinel",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=replacement_dir_fd,
+        )
+        os.write(replacement_fd, b"replacement")
+        os.close(replacement_fd)
+        os.close(replacement_dir_fd)
+""" + rename_call
+            self.assertEqual(source.count(rename_call), 1)
+            fault_source = source.replace(rename_call, injected)
+            removed = self.run_database_identity_helper(
+                "remove-owned",
+                fixture["state_identity"],
+                database,
+                fixture["run_id"],
+                fixture["seed"],
+                identity["db_device"],
+                identity["db_inode"],
+                identity["identity_fingerprint"],
+                fixture["owner"],
+                source=fault_source,
+            )
+            self.assertNotEqual(removed.returncode, 0)
+            self.assertIn(
+                "captured a different directory",
+                removed.stderr,
+            )
+            self.assertEqual(
+                (database / "replacement-sentinel").read_bytes(),
+                b"replacement",
+            )
+            saved = fixture["root"] / "identity-test-saved"
+            self.assertEqual(
+                (saved / "protected.data").read_bytes(),
+                b"owned-database",
+            )
+            self.assertEqual(
+                list(fixture["root"].glob(".tpcc-delete-*")),
+                [],
+            )
+
     def test_tools_mode_preserves_existing_database_and_source_csv(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)
@@ -1959,6 +2349,8 @@ if "--probe-ready" in sys.argv:
         raise SystemExit(124)
 if "--create-schema" in sys.argv:
     state_dir = Path(sys.argv[sys.argv.index("--state-dir") + 1])
+    if (state_dir / "database.identity").exists():
+        raise SystemExit(41)
     run_id = os.environ["RMDB_TPCC_RUN_ID"]
     seed = int(sys.argv[sys.argv.index("--seed") + 1])
     (state_dir / "dataset.state").write_text(
@@ -2743,6 +3135,11 @@ while :; do sleep 0.05; done
                 self.assertGreaterEqual(len(new_pids), 2)
                 for child_pid in new_pids:
                     self.assert_pid_gone(child_pid)
+                self.assertEqual(
+                    list(root.glob(".tpcc-delete-*")),
+                    [],
+                    "verified cleanup must not leave a quarantine directory",
+                )
                 rebound = socket.socket()
                 try:
                     rebound.bind(("127.0.0.1", 8765))

@@ -73,8 +73,6 @@ CSV_DIR=""
 LOAD_DIR=""
 STATE_DIR=""
 RUN_MARKER=""
-DB_MARKER=""
-DB_IDENTITY_MARKER=""
 DATABASE_IDENTITY_FILE=""
 OWNER_TOKEN=""
 PROCESS_OWNER_TOKEN=""
@@ -238,7 +236,6 @@ database_identity_helper() {
   python3 - "$@" <<'PY'
 import hashlib
 import os
-from pathlib import Path
 import re
 import stat
 import sys
@@ -306,18 +303,28 @@ def encode_identity(values):
 
 
 def read_regular(path, label, maximum_bytes=MAX_IDENTITY_BYTES):
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        fail(f"{label} is missing")
-    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        fail(f"{label} must be a real regular file")
-    if info.st_size <= 0 or info.st_size > maximum_bytes:
-        fail(f"{label} has an invalid size")
+        parent_fd = os.open(parent, flags)
+    except OSError as error:
+        fail(f"could not open {label} parent: {error}")
     try:
-        return Path(path).read_bytes()
+        return read_regular_at(
+            parent_fd,
+            name,
+            label,
+            maximum_bytes,
+        )
     except OSError as error:
         fail(f"could not read {label}: {error}")
+    finally:
+        os.close(parent_fd)
 
 
 def parse_identity(raw, label):
@@ -406,8 +413,26 @@ def database_stat(db_path):
     return info, path_fingerprint
 
 
-def validate_identity_against_path(values, db_path):
+def open_database_directory(db_path):
     info, path_fingerprint = database_stat(db_path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(db_path, flags)
+    if not os.path.samestat(info, os.fstat(descriptor)):
+        os.close(descriptor)
+        fail("database changed while opening its directory")
+    return descriptor, info, path_fingerprint
+
+
+def validate_identity_against_open(
+    values,
+    db_path,
+    info,
+    path_fingerprint,
+):
     if os.path.basename(db_path) != values["db_name"]:
         fail("database name does not match its state identity")
     if int(values["db_device"]) != info.st_dev:
@@ -444,13 +469,37 @@ def print_identity(values):
     )
 
 
+def derive_database_name(run_id, seed_text):
+    validate_run_id(run_id)
+    seed = parse_seed(seed_text)
+    digest = hashlib.sha256()
+    digest.update(b"rmdb-final2026-opaque-database-name-v1\0")
+    for value in (run_id.encode("ascii"), str(seed).encode("ascii")):
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    return "d_" + digest.hexdigest()[:32]
+
+
 def load_and_verify(state_file, db_path, dataset_run_id, seed):
     state_raw = read_regular(state_file, "state database.identity")
     values = parse_identity(state_raw, "state database.identity")
     validate_expected(values, dataset_run_id, seed)
-    validate_identity_against_path(values, db_path)
-    marker = os.path.join(db_path, IDENTITY_MARKER_NAME)
-    marker_raw = read_regular(marker, "database identity marker")
+    database_fd, info, path_fingerprint = open_database_directory(db_path)
+    try:
+        validate_identity_against_open(
+            values,
+            db_path,
+            info,
+            path_fingerprint,
+        )
+        marker_raw = read_regular_at(
+            database_fd,
+            IDENTITY_MARKER_NAME,
+            "database identity marker",
+            MAX_IDENTITY_BYTES,
+        )
+    finally:
+        os.close(database_fd)
     marker_values = parse_identity(marker_raw, "database identity marker")
     if marker_raw != state_raw or marker_values != values:
         fail("state and database identity markers differ")
@@ -467,21 +516,29 @@ def load_and_verify(state_file, db_path, dataset_run_id, seed):
     return values
 
 
-def write_exclusive(path, payload, label):
-    parent = os.path.dirname(path)
+def write_exclusive_at(directory_fd, name, payload, label):
+    if "/" in name or name in ("", ".", ".."):
+        fail(f"{label} has an unsafe filename")
     try:
-        parent_info = os.lstat(parent)
+        os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
-        fail(f"{label} parent directory is missing")
-    if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
-        fail(f"{label} parent must be a real directory")
-    if os.path.lexists(path):
+        pass
+    else:
         fail(f"{label} already exists")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = os.open(
+            name,
+            flags,
+            0o600,
+            dir_fd=directory_fd,
+        )
         try:
             view = memoryview(payload)
             while view:
@@ -492,53 +549,64 @@ def write_exclusive(path, payload, label):
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        directory_fd = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.fsync(directory_fd)
     except OSError as error:
         fail(f"could not create {label}: {error}")
 
 
-def replace_regular(path, expected, payload, label):
-    if read_regular(path, label) != expected:
-        fail(f"{label} changed before dataset identity sealing")
+def write_exclusive(path, payload, label):
     parent = os.path.dirname(path)
-    temporary = os.path.join(
-        parent,
-        f".{os.path.basename(path)}.{os.getpid()}.tmp",
-    )
-    if os.path.lexists(temporary):
-        fail(f"temporary {label} path already exists")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    name = os.path.basename(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(temporary, flags, 0o600)
-        try:
-            view = memoryview(payload)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    fail(f"could not write temporary {label}")
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        if read_regular(path, label) != expected:
+        parent_fd = os.open(parent, flags)
+    except OSError as error:
+        fail(f"could not open {label} parent: {error}")
+    try:
+        write_exclusive_at(parent_fd, name, payload, label)
+    finally:
+        os.close(parent_fd)
+
+
+def replace_regular_at(directory_fd, name, expected, payload, label):
+    if read_regular_at(
+        directory_fd,
+        name,
+        label,
+        MAX_IDENTITY_BYTES,
+    ) != expected:
+        fail(f"{label} changed before dataset identity sealing")
+    temporary = f".{name}.{os.getpid()}.tmp"
+    try:
+        write_exclusive_at(
+            directory_fd,
+            temporary,
+            payload,
+            f"temporary {label}",
+        )
+        if read_regular_at(
+            directory_fd,
+            name,
+            label,
+            MAX_IDENTITY_BYTES,
+        ) != expected:
             fail(f"{label} changed during dataset identity sealing")
-        os.replace(temporary, path)
-        directory_fd = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
     except OSError as error:
         fail(f"could not replace {label}: {error}")
     finally:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary, dir_fd=directory_fd)
         except FileNotFoundError:
             pass
 
@@ -577,6 +645,268 @@ def inspect_dataset_state(path, dataset_run_id, seed):
     )
 
 
+def read_regular_at(directory_fd, name, label, maximum_bytes):
+    try:
+        before = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        fail(f"{label} is missing")
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        fail(f"{label} must be a real regular file")
+    if before.st_nlink != 1:
+        fail(f"{label} must not be hard-linked")
+    if before.st_size <= 0 or before.st_size > maximum_bytes:
+        fail(f"{label} has an invalid size")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        after = os.fstat(descriptor)
+        if not os.path.samestat(before, after):
+            fail(f"{label} changed while opening it")
+        if after.st_nlink != 1:
+            fail(f"{label} must not be hard-linked")
+        chunks = []
+        remaining = maximum_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if not payload or len(payload) > maximum_bytes:
+            fail(f"{label} has an invalid size")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def linux_mount_id_for_fd(descriptor):
+    mountinfo = "/proc/self/mountinfo"
+    descriptor_path = f"/proc/self/fd/{descriptor}"
+    if not os.path.isfile(mountinfo) or not os.path.exists(descriptor_path):
+        return None
+    try:
+        resolved = os.path.realpath(descriptor_path)
+        entries = []
+        with open(mountinfo, "r", encoding="ascii") as stream:
+            for line in stream:
+                fields = line.split()
+                if len(fields) < 6:
+                    continue
+                mountpoint = re.sub(
+                    r"\\([0-7]{3})",
+                    lambda match: chr(int(match.group(1), 8)),
+                    fields[4],
+                )
+                if resolved == mountpoint or resolved.startswith(
+                    mountpoint.rstrip("/") + "/"
+                ):
+                    entries.append((len(mountpoint), int(fields[0])))
+        return max(entries)[1] if entries else None
+    except (OSError, ValueError):
+        fail("could not establish Linux mount identity for database cleanup")
+
+
+def securely_clear_directory(directory_fd, root_device, root_mount_id):
+    open_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        open_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
+    for name in os.listdir(directory_fd):
+        entry = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if stat.S_ISDIR(entry.st_mode):
+            if entry.st_dev != root_device:
+                fail("refusing to cross a filesystem mount during cleanup")
+            child_fd = os.open(
+                name,
+                open_flags,
+                dir_fd=directory_fd,
+            )
+            try:
+                child_stat = os.fstat(child_fd)
+                if not os.path.samestat(entry, child_stat):
+                    fail("database directory entry changed while opening it")
+                if child_stat.st_dev != root_device:
+                    fail("refusing to cross a filesystem mount during cleanup")
+                child_mount_id = linux_mount_id_for_fd(child_fd)
+                if (
+                    root_mount_id is not None
+                    and child_mount_id is not None
+                    and child_mount_id != root_mount_id
+                ):
+                    fail("refusing to cross a bind mount during cleanup")
+                securely_clear_directory(
+                    child_fd,
+                    root_device,
+                    root_mount_id,
+                )
+                os.fsync(child_fd)
+            finally:
+                os.close(child_fd)
+            current = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if not os.path.samestat(entry, current):
+                fail("database directory entry changed before removal")
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def seal_database_identity(
+    state_file,
+    db_path,
+    dataset_run_id,
+    seed_text,
+    dataset_file,
+    expected_name_source=None,
+    expected_name=None,
+):
+    database_fd, info, path_fingerprint = open_database_directory(db_path)
+    try:
+        marker_raw = read_regular_at(
+            database_fd,
+            IDENTITY_MARKER_NAME,
+            "database identity marker",
+            MAX_IDENTITY_BYTES,
+        )
+        marker_values = parse_identity(
+            marker_raw,
+            "database identity marker",
+        )
+        validate_expected(marker_values, dataset_run_id, seed_text)
+        validate_identity_against_open(
+            marker_values,
+            db_path,
+            info,
+            path_fingerprint,
+        )
+        if (
+            expected_name_source is not None
+            and marker_values["name_source"] != expected_name_source
+        ):
+            fail("database marker name source violates repair policy")
+        if (
+            expected_name is not None
+            and marker_values["db_name"] != expected_name
+        ):
+            fail("database marker name violates repair policy")
+        runtime_fingerprint, dataset_fingerprint = inspect_dataset_state(
+            dataset_file,
+            dataset_run_id,
+            seed_text,
+        )
+        if os.path.lexists(state_file):
+            state_raw = read_regular(state_file, "state database.identity")
+            state_values = parse_identity(
+                state_raw,
+                "state database.identity",
+            )
+            validate_expected(state_values, dataset_run_id, seed_text)
+            validate_identity_against_open(
+                state_values,
+                db_path,
+                info,
+                path_fingerprint,
+            )
+            if state_raw == marker_raw:
+                if state_values["binding_status"] != "sealed":
+                    fail("matching database identity markers are not sealed")
+                if (
+                    state_values["runtime_schema_fingerprint"]
+                    != runtime_fingerprint
+                    or state_values["dataset_state_fingerprint"]
+                    != dataset_fingerprint
+                ):
+                    fail(
+                        "sealed database identity does not match dataset.state"
+                    )
+                return state_values
+            stable_fields = (
+                "version",
+                "dataset_run_id",
+                "seed",
+                "db_name",
+                "name_source",
+                "db_device",
+                "db_inode",
+                "db_path_fingerprint",
+            )
+            if (
+                state_values["binding_status"] == "sealed"
+                and marker_values["binding_status"] == "provisioned"
+                and all(
+                    state_values[field] == marker_values[field]
+                    for field in stable_fields
+                )
+                and state_values["runtime_schema_fingerprint"]
+                == runtime_fingerprint
+                and state_values["dataset_state_fingerprint"]
+                == dataset_fingerprint
+            ):
+                replace_regular_at(
+                    database_fd,
+                    IDENTITY_MARKER_NAME,
+                    marker_raw,
+                    state_raw,
+                    "database identity marker",
+                )
+                return state_values
+            fail("state and database identities cannot resume sealing")
+        if marker_values["binding_status"] == "sealed":
+            if (
+                marker_values["runtime_schema_fingerprint"]
+                != runtime_fingerprint
+                or marker_values["dataset_state_fingerprint"]
+                != dataset_fingerprint
+            ):
+                fail("sealed database marker does not match dataset.state")
+            write_exclusive(
+                state_file,
+                marker_raw,
+                "state database.identity",
+            )
+            return marker_values
+        if marker_values["binding_status"] != "provisioned":
+            fail("database marker cannot be sealed from its current state")
+        values = marker_values
+        values["binding_status"] = "sealed"
+        values["runtime_schema_fingerprint"] = runtime_fingerprint
+        values["dataset_state_fingerprint"] = dataset_fingerprint
+        payload = encode_identity(values)
+        values["identity_fingerprint"] = identity_fingerprint(
+            identity_prefix(values)
+        )
+        write_exclusive(
+            state_file,
+            payload,
+            "state database.identity",
+        )
+        replace_regular_at(
+            database_fd,
+            IDENTITY_MARKER_NAME,
+            marker_raw,
+            payload,
+            "database identity marker",
+        )
+        return values
+    finally:
+        os.close(database_fd)
+
+
 if len(sys.argv) < 2:
     fail("database identity helper action is missing")
 action = sys.argv[1]
@@ -584,19 +914,21 @@ action = sys.argv[1]
 if action == "derive":
     if len(sys.argv) != 4:
         fail("derive expects run_id and seed")
-    run_id, seed_text = sys.argv[2:]
-    validate_run_id(run_id)
-    seed = parse_seed(seed_text)
-    digest = hashlib.sha256()
-    digest.update(b"rmdb-final2026-opaque-database-name-v1\0")
-    for value in (run_id.encode("ascii"), str(seed).encode("ascii")):
-        digest.update(len(value).to_bytes(8, "big"))
-        digest.update(value)
-    print("d_" + digest.hexdigest()[:32])
+    print(derive_database_name(*sys.argv[2:]))
 elif action == "create":
-    if len(sys.argv) != 7:
-        fail("create expects state file, database path, run_id, seed, source")
-    state_file, db_path, dataset_run_id, seed_text, source = sys.argv[2:]
+    if len(sys.argv) != 8:
+        fail(
+            "create expects state file, database path, run_id, seed, "
+            "source, and owner token"
+        )
+    (
+        state_file,
+        db_path,
+        dataset_run_id,
+        seed_text,
+        source,
+        owner_token,
+    ) = sys.argv[2:]
     validate_run_id(dataset_run_id)
     seed = parse_seed(seed_text)
     if source not in ("derived_opaque", "explicit_deviation"):
@@ -621,27 +953,105 @@ elif action == "create":
     values["identity_fingerprint"] = identity_fingerprint(
         identity_prefix(values)
     )
-    marker = os.path.join(db_path, IDENTITY_MARKER_NAME)
-    write_exclusive(marker, payload, "database identity marker")
-    write_exclusive(state_file, payload, "state database.identity")
+    if os.path.lexists(state_file):
+        fail("state database.identity already exists before setup")
+    if not owner_token or "\x00" in owner_token or "\n" in owner_token:
+        fail("database owner token is invalid")
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    database_fd = os.open(db_path, directory_flags)
+    try:
+        if not os.path.samestat(info, os.fstat(database_fd)):
+            fail("database changed while provisioning its identity")
+        write_exclusive_at(
+            database_fd,
+            ".tpcc-workflow-owner",
+            (owner_token + "\n").encode("utf-8"),
+            "database ownership marker",
+        )
+        write_exclusive_at(
+            database_fd,
+            IDENTITY_MARKER_NAME,
+            payload,
+            "database identity marker",
+        )
+    finally:
+        os.close(database_fd)
     print_identity(values)
 elif action == "inspect-existing":
-    if len(sys.argv) != 7:
+    if len(sys.argv) != 8:
         fail(
             "inspect-existing expects state file, RMDB root, run_id, seed, "
-            "asserted name"
+            "asserted name, and repair flag"
         )
-    state_file, rmdb_root, dataset_run_id, seed_text, asserted_name = (
-        sys.argv[2:]
+    (
+        state_file,
+        rmdb_root,
+        dataset_run_id,
+        seed_text,
+        asserted_name,
+        repair_allowed,
+    ) = sys.argv[2:]
+    if repair_allowed not in ("0", "1"):
+        fail("inspect-existing repair flag must be 0 or 1")
+    dataset_file = os.path.join(
+        os.path.dirname(state_file),
+        "dataset.state",
     )
-    state_raw = read_regular(state_file, "state database.identity")
-    values = parse_identity(state_raw, "state database.identity")
-    validate_expected(values, dataset_run_id, seed_text)
-    if values["binding_status"] != "sealed":
-        fail("existing database identity is not sealed to dataset.state")
-    if asserted_name and asserted_name != values["db_name"]:
+    state_present = os.path.lexists(state_file)
+    expected_source = None
+    if os.path.lexists(state_file):
+        state_raw = read_regular(state_file, "state database.identity")
+        values = parse_identity(state_raw, "state database.identity")
+        validate_expected(values, dataset_run_id, seed_text)
+        if values["binding_status"] != "sealed":
+            fail("existing database identity is not sealed to dataset.state")
+        db_path = os.path.join(rmdb_root, values["db_name"])
+        expected_source = values["name_source"]
+        expected_name = values["db_name"]
+    else:
+        recovery_name = asserted_name or derive_database_name(
+            dataset_run_id,
+            seed_text,
+        )
+        validate_name(recovery_name)
+        db_path = os.path.join(rmdb_root, recovery_name)
+        if repair_allowed == "0":
+            fail("partial database identity requires a non-dry-run repair")
+        expected_source = None if asserted_name else "derived_opaque"
+        expected_name = recovery_name
+        values = seal_database_identity(
+            state_file,
+            db_path,
+            dataset_run_id,
+            seed_text,
+            dataset_file,
+            expected_source,
+            expected_name,
+        )
+    if values["name_source"] == "derived_opaque":
+        if values["db_name"] != derive_database_name(
+            dataset_run_id,
+            seed_text,
+        ):
+            fail("derived database name does not match setup identity")
+        if asserted_name and asserted_name != values["db_name"]:
+            fail("explicit database name does not match setup state")
+    elif asserted_name and asserted_name != values["db_name"]:
         fail("explicit database name does not match setup state")
-    db_path = os.path.join(rmdb_root, values["db_name"])
+    if repair_allowed == "1" and state_present:
+        values = seal_database_identity(
+            state_file,
+            db_path,
+            dataset_run_id,
+            seed_text,
+            dataset_file,
+            expected_source,
+            expected_name,
+        )
     verified = load_and_verify(
         state_file,
         db_path,
@@ -649,6 +1059,36 @@ elif action == "inspect-existing":
         seed_text,
     )
     print_identity(verified)
+elif action == "verify-provisioned":
+    if len(sys.argv) != 6:
+        fail(
+            "verify-provisioned expects database path, run_id, seed, "
+            "state identity path"
+        )
+    db_path, dataset_run_id, seed_text, state_file = sys.argv[2:]
+    if os.path.lexists(state_file):
+        fail("provisioned database unexpectedly has a state identity")
+    database_fd, info, path_fingerprint = open_database_directory(db_path)
+    try:
+        marker_raw = read_regular_at(
+            database_fd,
+            IDENTITY_MARKER_NAME,
+            "database identity marker",
+            MAX_IDENTITY_BYTES,
+        )
+        values = parse_identity(marker_raw, "database identity marker")
+        validate_expected(values, dataset_run_id, seed_text)
+        validate_identity_against_open(
+            values,
+            db_path,
+            info,
+            path_fingerprint,
+        )
+        if values["binding_status"] != "provisioned":
+            fail("database marker is not in the provisioned state")
+    finally:
+        os.close(database_fd)
+    print_identity(values)
 elif action == "seal":
     if len(sys.argv) != 7:
         fail(
@@ -658,50 +1098,170 @@ elif action == "seal":
     state_file, db_path, dataset_run_id, seed_text, dataset_file = (
         sys.argv[2:]
     )
-    state_raw = read_regular(state_file, "state database.identity")
+    print_identity(
+        seal_database_identity(
+            state_file,
+            db_path,
+            dataset_run_id,
+            seed_text,
+            dataset_file,
+        )
+    )
+elif action == "remove-owned":
+    if len(sys.argv) != 10:
+        fail(
+            "remove-owned expects state file, database path, run_id, seed, "
+            "device, inode, identity fingerprint, and owner token"
+        )
+    (
+        state_file,
+        db_path,
+        dataset_run_id,
+        seed_text,
+        expected_device,
+        expected_inode,
+        expected_identity_fingerprint,
+        owner_token,
+    ) = sys.argv[2:]
     values = load_and_verify(
         state_file,
         db_path,
         dataset_run_id,
         seed_text,
     )
-    runtime_fingerprint, dataset_fingerprint = inspect_dataset_state(
-        dataset_file,
-        dataset_run_id,
-        seed_text,
+    if values["binding_status"] != "sealed":
+        fail("refusing to remove a database with an unsealed identity")
+    if (
+        values["db_device"] != expected_device
+        or values["db_inode"] != expected_inode
+        or values["identity_fingerprint"]
+        != expected_identity_fingerprint
+    ):
+        fail("database removal identity does not match the workflow")
+    root = os.path.dirname(db_path)
+    db_name = os.path.basename(db_path)
+    validate_name(db_name)
+    quarantine_name = (
+        ".tpcc-delete-"
+        + hashlib.sha256(owner_token.encode("utf-8")).hexdigest()[:24]
     )
-    if values["binding_status"] == "sealed":
+    root_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        root_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        root_flags |= os.O_NOFOLLOW
+    root_fd = os.open(root, root_flags)
+    renamed = False
+    deletion_started = False
+    database_fd = None
+    try:
+        before = os.stat(
+            db_name,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
         if (
-            values["runtime_schema_fingerprint"] != runtime_fingerprint
-            or values["dataset_state_fingerprint"] != dataset_fingerprint
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_dev != int(expected_device)
+            or before.st_ino != int(expected_inode)
         ):
-            fail("sealed database identity does not match dataset.state")
-        print_identity(values)
-        raise SystemExit(0)
-    values["binding_status"] = "sealed"
-    values["runtime_schema_fingerprint"] = runtime_fingerprint
-    values["dataset_state_fingerprint"] = dataset_fingerprint
-    payload = encode_identity(values)
-    values["identity_fingerprint"] = identity_fingerprint(
-        identity_prefix(values)
-    )
-    marker = os.path.join(db_path, IDENTITY_MARKER_NAME)
-    marker_raw = read_regular(marker, "database identity marker")
-    if marker_raw != state_raw:
-        fail("state and database identity markers differ before sealing")
-    replace_regular(
-        marker,
-        marker_raw,
-        payload,
-        "database identity marker",
-    )
-    replace_regular(
-        state_file,
-        state_raw,
-        payload,
-        "state database.identity",
-    )
-    print_identity(values)
+            fail("database changed before atomic cleanup quarantine")
+        try:
+            os.stat(
+                quarantine_name,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            fail("database cleanup quarantine already exists")
+        os.rename(
+            db_name,
+            quarantine_name,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+        renamed = True
+        quarantined = os.stat(
+            quarantine_name,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        if not os.path.samestat(before, quarantined):
+            fail("atomic cleanup quarantine captured a different directory")
+        database_fd = os.open(
+            quarantine_name,
+            root_flags,
+            dir_fd=root_fd,
+        )
+        if not os.path.samestat(quarantined, os.fstat(database_fd)):
+            fail("cleanup quarantine changed while opening it")
+        root_device = quarantined.st_dev
+        root_mount_id = linux_mount_id_for_fd(database_fd)
+        owner_raw = read_regular_at(
+            database_fd,
+            ".tpcc-workflow-owner",
+            "database cleanup owner marker",
+            MAX_IDENTITY_BYTES,
+        )
+        if owner_raw != (owner_token + "\n").encode("utf-8"):
+            fail("database cleanup owner marker mismatch")
+        identity_raw = read_regular_at(
+            database_fd,
+            IDENTITY_MARKER_NAME,
+            "database identity marker",
+            MAX_IDENTITY_BYTES,
+        )
+        identity_values = parse_identity(
+            identity_raw,
+            "database identity marker",
+        )
+        if (
+            identity_values["identity_fingerprint"]
+            != expected_identity_fingerprint
+            or identity_values["db_device"] != expected_device
+            or identity_values["db_inode"] != expected_inode
+        ):
+            fail("quarantined database identity mismatch")
+        deletion_started = True
+        securely_clear_directory(
+            database_fd,
+            root_device,
+            root_mount_id,
+        )
+        os.fsync(database_fd)
+        os.close(database_fd)
+        database_fd = None
+        final_entry = os.stat(
+            quarantine_name,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        if not os.path.samestat(quarantined, final_entry):
+            fail("cleanup quarantine changed before final removal")
+        os.rmdir(quarantine_name, dir_fd=root_fd)
+        os.fsync(root_fd)
+    except BaseException:
+        if database_fd is not None:
+            os.close(database_fd)
+        if renamed and not deletion_started:
+            try:
+                os.stat(
+                    db_name,
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                os.rename(
+                    quarantine_name,
+                    db_name,
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                )
+        raise
+    finally:
+        os.close(root_fd)
 elif action == "verify":
     if len(sys.argv) != 6:
         fail("verify expects state file, database path, run_id, seed")
@@ -926,10 +1486,12 @@ if [[ "${USES_EXISTING_DATABASE}" == "1" ]]; then
 fi
 DATABASE_IDENTITY_FILE="${STATE_DIR}/database.identity"
 if [[ "${USES_EXISTING_DATABASE}" == "1" ]]; then
+  IDENTITY_REPAIR_ALLOWED=1
+  [[ "${PLAN_ONLY}" != "1" ]] || IDENTITY_REPAIR_ALLOWED=0
   EXISTING_IDENTITY="$(
     database_identity_helper inspect-existing \
       "${DATABASE_IDENTITY_FILE}" "${RMDB_DIR}" "${DATASET_RUN_ID}" \
-      "${SEED}" "${DB_NAME}"
+      "${SEED}" "${DB_NAME}" "${IDENTITY_REPAIR_ALLOWED}"
   )" || die "existing database identity verification failed"
   IFS=$'\t' read -r DB_NAME DB_IDENTITY_SOURCE \
     DB_IDENTITY_BINDING_STATUS DB_DEVICE DB_INODE DB_PATH_FINGERPRINT \
@@ -957,8 +1519,6 @@ else
 fi
 
 DB_PATH="${RMDB_DIR}/${DB_NAME}"
-DB_MARKER="${DB_PATH}/.tpcc-workflow-owner"
-DB_IDENTITY_MARKER="${DB_PATH}/.tpcc-workflow-database-identity"
 OWNER_TOKEN="tpcc-final2026:${RUN_ID}:${DB_PATH}"
 PROCESS_OWNER_TOKEN="tpcc-process:${RUN_ID}:$$"
 
@@ -3139,11 +3699,15 @@ remove_current_owned_database() {
   [[ "${DB_OWNED}" == "1" ]] || return 0
   [[ "${DB_PATH}" == "${RMDB_DIR}/${DB_NAME}" ]] \
     || die "internal database path invariant failed"
-  [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] || return 0
-  owned_marker_matches "${DB_MARKER}" \
-    || die "refusing to remove database without the current run ownership marker"
+  [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] \
+    || die "owned database disappeared before cleanup"
+  verify_database_identity
   log "removing current run-owned database ${DB_PATH}"
-  rm -rf -- "${DB_PATH}"
+  database_identity_helper remove-owned \
+    "${DATABASE_IDENTITY_FILE}" "${DB_PATH}" "${DATASET_RUN_ID}" "${SEED}" \
+    "${DB_DEVICE}" "${DB_INODE}" "${DB_IDENTITY_FINGERPRINT}" \
+    "${OWNER_TOKEN}" \
+    || die "database cleanup identity verification failed"
   DB_OWNED=0
 }
 
@@ -3537,10 +4101,18 @@ verify_database_identity() {
   local verified_dataset_state_fingerprint=""
   local verified_identity_fingerprint=""
   local extra=""
-  record="$(
-    database_identity_helper verify \
-      "${DATABASE_IDENTITY_FILE}" "${DB_PATH}" "${DATASET_RUN_ID}" "${SEED}"
-  )" || die "database identity verification failed"
+  if [[ "${DB_IDENTITY_BINDING_STATUS}" == "provisioned" ]]; then
+    record="$(
+      database_identity_helper verify-provisioned \
+        "${DB_PATH}" "${DATASET_RUN_ID}" "${SEED}" \
+        "${DATABASE_IDENTITY_FILE}"
+    )" || die "provisioned database identity verification failed"
+  else
+    record="$(
+      database_identity_helper verify \
+        "${DATABASE_IDENTITY_FILE}" "${DB_PATH}" "${DATASET_RUN_ID}" "${SEED}"
+    )" || die "database identity verification failed"
+  fi
   IFS=$'\t' read -r verified_name verified_source verified_binding_status \
     verified_device verified_inode verified_path_fingerprint \
     verified_runtime_schema_fingerprint verified_dataset_state_fingerprint \
@@ -3577,7 +4149,6 @@ seal_database_identity() {
   set_database_identity_record "${record}"
   [[ "${DB_IDENTITY_BINDING_STATUS}" == "sealed" ]] \
     || die "database identity sealing did not reach the sealed state"
-  verify_database_identity
   write_manifest
 }
 
@@ -3585,22 +4156,13 @@ claim_new_database() {
   local identity_record=""
   [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] \
     || die "RMDB did not create the expected database directory: ${DB_PATH}"
-  [[ ! -e "${DB_MARKER}" && ! -L "${DB_MARKER}" ]] \
-    || die "new database unexpectedly already contains an ownership marker"
-  [[ ! -e "${DB_IDENTITY_MARKER}" && ! -L "${DB_IDENTITY_MARKER}" ]] \
-    || die "new database unexpectedly already contains an identity marker"
-  [[ ! -e "${DATABASE_IDENTITY_FILE}" \
-    && ! -L "${DATABASE_IDENTITY_FILE}" ]] \
-    || die "state directory unexpectedly already contains database.identity"
-  printf '%s\n' "${OWNER_TOKEN}" >"${DB_MARKER}"
-  DB_OWNED=1
   identity_record="$(
     database_identity_helper create \
       "${DATABASE_IDENTITY_FILE}" "${DB_PATH}" "${DATASET_RUN_ID}" \
-      "${SEED}" "${DB_IDENTITY_SOURCE}"
+      "${SEED}" "${DB_IDENTITY_SOURCE}" "${OWNER_TOKEN}"
   )" || die "could not persist the database identity"
+  DB_OWNED=1
   set_database_identity_record "${identity_record}"
-  verify_database_identity
   write_manifest
 }
 
