@@ -2054,10 +2054,7 @@ trap - EXIT
             group_start,
         )
         group_text = helper_text[group_start:group_end]
-        self.assertLess(
-            group_text.index("running = any("),
-            group_text.index('if status == "reused" and running:'),
-        )
+        self.assertNotIn('status == "reused"', group_text)
         self.assertIn(
             "raise SystemExit(0 if running else 1)",
             group_text,

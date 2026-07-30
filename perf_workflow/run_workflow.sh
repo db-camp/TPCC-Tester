@@ -3421,17 +3421,15 @@ if action == "root-running":
     raise SystemExit(0)
 
 if action == "group-running":
+    # This action only polls after a signal was sent with full identity and
+    # ownership validation. A dying process may stop exposing its start
+    # identity before Darwin removes it from the process table, so wait on the
+    # already-registered PGID without sending another signal.
     running = any(
         item["pgrp"] == registered_pgid
         and not item["state"].upper().startswith("Z")
         for item in table.values()
     )
-    if status == "reused" and running:
-        print(
-            "registered RMDB pid was reused while its process group remained",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
     raise SystemExit(0 if running else 1)
 
 if action == "listener":
