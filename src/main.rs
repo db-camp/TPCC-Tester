@@ -171,6 +171,14 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         return run_diagnose(&config).await;
     }
 
+    if config.preliminary {
+        info!("启动 final2026 NON-RANKED preliminary：30s warmup + 1x60s measurement");
+        let exec = diagnostic_executor::DiagnosticExecutor::new(config, effective);
+        let result = exec.run_preliminary().await?;
+        result.print_report();
+        return Ok(());
+    }
+
     if config.diagnostic_workload_seconds.is_some() {
         let (store, dataset, contract) = load_bound_state(&config, &effective)?;
         let segment = config
@@ -197,15 +205,17 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         || config.check
         || config.stats
         || config.benchmark
+        || config.preliminary
         || config.post_crash_response_probe;
 
     if !needs_connection {
-        info!("用法: tpcc-tester --create-schema | --init | --check | --stats | --benchmark | --diagnostic-workload-seconds N --diagnostic-segment warmup|observation | --diagnose");
+        info!("用法: tpcc-tester --create-schema | --init | --check | --stats | --benchmark | --preliminary | --diagnostic-workload-seconds N --diagnostic-segment warmup|observation | --diagnose");
         info!("  --create-schema 创建 TPC-C 表和索引");
         info!("  --init          加载 TPC-C 初始数据");
         info!("  --check         运行一致性检查");
         info!("  --stats         显示各表行数统计");
         info!("  --benchmark     运行并发基准测试");
+        info!("  --preliminary   运行 NON-RANKED 30s + 1x60s 初步测试");
         info!("  --diagnostic-workload-seconds N --diagnostic-segment warmup|observation");
         info!("  --diagnose      运行数据库兼容性诊断");
         info!("  -v / -vv        详细日志");
@@ -652,7 +662,12 @@ fn print_effective_profile(config: &Config, effective: &ResolvedProfile) {
         seed
     );
 
-    if config.diagnostic_workload_seconds.is_some() {
+    if config.preliminary {
+        info!(
+            "Effective execution conformance: NON-RANKED preliminary \
+             (30s warmup + 1x60s measurement; no ranking state artifacts)"
+        );
+    } else if config.diagnostic_workload_seconds.is_some() {
         info!(
             "Effective execution conformance: explicit non_ranked diagnostic workload \
              (ranking terminal evidence/baseline disabled)"

@@ -6,17 +6,24 @@
 //! hotspot routing, prepared sessions, retry classification, and no-think-time
 //! dispatch contract.
 
+use std::ffi::OsStr;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::Local;
 use tokio::sync::{watch, Barrier};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::config::{Config, DiagnosticSegment, ResolvedProfile};
+use crate::config::{
+    Config, DiagnosticSegment, ResolvedProfile, PRELIMINARY_MEASUREMENT_SECONDS,
+    PRELIMINARY_WARMUP_SECONDS,
+};
 use crate::connection::client::RmdbClient;
 use crate::error::TpccError;
 use crate::profile::{TransactionKind, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES};
@@ -35,6 +42,8 @@ use crate::workload::Final2026Workload;
 // domains rather than replaying the same deterministic transaction prefix.
 const DIAGNOSTIC_WARMUP_STAGE: StageId = StageId::custom(0x6469_6167_7761_726d);
 const DIAGNOSTIC_OBSERVATION_STAGE: StageId = StageId::custom(0x6469_6167_6f62_7376);
+const PRELIMINARY_STAGE: StageId = StageId::custom(0x7072_656c_696d_3031);
+const RESOURCE_TIMELINE_ENV: &str = "RMDB_TPCC_RESOURCE_TIMELINE_FILE";
 const DIAGNOSTIC_FAMILIES: [(TransactionKind, &str); 5] = [
     (TransactionKind::NewOrder, "new_order"),
     (TransactionKind::Payment, "payment"),
@@ -48,6 +57,81 @@ const fn diagnostic_stage(segment: DiagnosticSegment) -> StageId {
         DiagnosticSegment::Warmup => DIAGNOSTIC_WARMUP_STAGE,
         DiagnosticSegment::Observation => DIAGNOSTIC_OBSERVATION_STAGE,
     }
+}
+
+fn publish_preliminary_resource_timeline(
+    _phase_start: Instant,
+    warmup: Duration,
+    measurement: Duration,
+) {
+    let Some(output) = std::env::var_os(RESOURCE_TIMELINE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    let origin_unix_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(value) => value.as_nanos(),
+        Err(error) => {
+            warn!("preliminary resource timeline clock is invalid: {error}");
+            return;
+        }
+    };
+    let payload = format!(
+        "schema_version=1\n\
+         kind=final2026_rank_timeline\n\
+         origin_unix_ns={origin_unix_ns}\n\
+         warmup_ns={}\n\
+         measurement_windows=1\n\
+         measurement_window_ns={}\n",
+        warmup.as_nanos(),
+        measurement.as_nanos(),
+    );
+    if let Err(error) = publish_resource_timeline(&output, payload.as_bytes()) {
+        warn!(
+            "could not publish non-ranked preliminary resource timeline {}: {error}",
+            output.display()
+        );
+    }
+}
+
+fn publish_resource_timeline(output: &Path, payload: &[u8]) -> io::Result<()> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = output
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| OsStr::new("preliminary_timeline"));
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(payload)?;
+        file.sync_all()?;
+        match fs::symlink_metadata(output) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "resource timeline already exists",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(&temporary, output)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub struct DiagnosticExecutor {
@@ -65,6 +149,35 @@ impl DiagnosticExecutor {
             TpccError::Protocol("diagnostic executor requires an explicit segment".to_owned())
         })?;
         let duration_seconds = segment.duration_seconds();
+        self.run_timed(
+            segment,
+            diagnostic_stage(segment),
+            Duration::ZERO,
+            Duration::from_secs(duration_seconds),
+            false,
+        )
+        .await
+    }
+
+    pub async fn run_preliminary(&self) -> Result<DiagnosticRunResult, TpccError> {
+        self.run_timed(
+            DiagnosticSegment::Observation,
+            PRELIMINARY_STAGE,
+            Duration::from_secs(PRELIMINARY_WARMUP_SECONDS),
+            Duration::from_secs(PRELIMINARY_MEASUREMENT_SECONDS),
+            true,
+        )
+        .await
+    }
+
+    async fn run_timed(
+        &self,
+        segment: DiagnosticSegment,
+        stage: StageId,
+        warmup: Duration,
+        measurement: Duration,
+        preliminary: bool,
+    ) -> Result<DiagnosticRunResult, TpccError> {
         let seed = self.effective.seed.ok_or_else(|| {
             TpccError::Protocol("diagnostic workload requires an explicit seed".to_owned())
         })?;
@@ -80,9 +193,9 @@ impl DiagnosticExecutor {
 
         let response_timeout = Duration::from_secs(self.config.response_timeout_seconds);
         let phase_tail_grace = Duration::from_secs(self.config.phase_tail_grace_seconds);
-        let duration = Duration::from_secs(duration_seconds);
+        let duration = warmup.saturating_add(measurement);
         let router = OfficialRouter::new(WorkloadSeed(seed));
-        let wheel = router.wheel(diagnostic_stage(segment));
+        let wheel = router.wheel(stage);
         let router = Arc::new(DiagnosticRouting { router, wheel });
 
         info!(
@@ -124,13 +237,18 @@ impl DiagnosticExecutor {
         // Sample the shared origin only after the start barrier has actually
         // released. Workers wait on this one-shot timing value before dispatch.
         let phase_start = Instant::now();
-        let phase_timing = DiagnosticTimeline::new(phase_start, duration, phase_tail_grace)?;
+        let phase_timing =
+            DiagnosticTimeline::new(phase_start, warmup, measurement, phase_tail_grace)?;
+        if preliminary {
+            publish_preliminary_resource_timeline(phase_start, warmup, measurement);
+        }
         timeline_sender.send(Some(phase_timing)).map_err(|_| {
             TpccError::Protocol("diagnostic workers left before timing release".to_owned())
         })?;
         info!(
             "mode=non_ranked_diagnostic; all {} clients released for {}s with no think time",
-            OFFICIAL_CLIENTS, duration_seconds
+            OFFICIAL_CLIENTS,
+            duration.as_secs()
         );
 
         let mut aggregate = DiagnosticStats::default();
@@ -160,7 +278,9 @@ impl DiagnosticExecutor {
 
         Ok(DiagnosticRunResult {
             segment,
-            duration,
+            warmup,
+            measurement,
+            preliminary,
             response_timeout,
             phase_tail_grace,
             stats: aggregate,
@@ -273,19 +393,29 @@ struct DiagnosticRouting {
 
 #[derive(Clone, Copy, Debug)]
 struct DiagnosticTimeline {
+    measurement_start: Instant,
     stop_at: Instant,
     drain_deadline: Instant,
 }
 
 impl DiagnosticTimeline {
-    fn new(start: Instant, duration: Duration, grace: Duration) -> Result<Self, TpccError> {
-        let stop_at = start.checked_add(duration).ok_or_else(|| {
+    fn new(
+        start: Instant,
+        warmup: Duration,
+        measurement: Duration,
+        grace: Duration,
+    ) -> Result<Self, TpccError> {
+        let measurement_start = start.checked_add(warmup).ok_or_else(|| {
+            TpccError::Protocol("diagnostic workload deadline overflow".to_owned())
+        })?;
+        let stop_at = measurement_start.checked_add(measurement).ok_or_else(|| {
             TpccError::Protocol("diagnostic workload deadline overflow".to_owned())
         })?;
         let drain_deadline = stop_at
             .checked_add(grace)
             .ok_or_else(|| TpccError::Protocol("diagnostic grace deadline overflow".to_owned()))?;
         Ok(Self {
+            measurement_start,
             stop_at,
             drain_deadline,
         })
@@ -328,6 +458,7 @@ async fn run_worker(
         let selected = workload
             .select(&mut sequence)
             .map_err(|error| TpccError::Protocol(error.to_string()))?;
+        let selected_at = Instant::now();
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let frozen = FrozenTransaction::new(selected, timestamp)
             .map_err(|message| TpccError::Protocol(message.to_owned()))?;
@@ -338,7 +469,10 @@ async fn run_worker(
         if !timeline.may_start(Instant::now()) {
             break;
         }
-        stats.selected += 1;
+        let measured = selected_at >= timeline.measurement_start;
+        if measured {
+            stats.selected += 1;
+        }
 
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -349,7 +483,9 @@ async fn run_worker(
                 stats.abandoned += 1;
                 break;
             }
-            stats.record_attempt(kind);
+            if measured {
+                stats.record_attempt(kind);
+            }
             let attempt_deadline = timeline.attempt_deadline();
             let response =
                 tokio::time::timeout_at(attempt_deadline, dispatch::execute(&mut client, &frozen))
@@ -376,15 +512,27 @@ async fn run_worker(
                     });
                 }
                 Ok(Ok(outcome)) => {
-                    stats.record_terminal(kind, &outcome, completed_at >= timeline.stop_at);
+                    if measured {
+                        stats.record_terminal(
+                            kind,
+                            frozen.ticket().route().home_warehouse,
+                            &outcome,
+                            completed_at >= timeline.stop_at,
+                            completed_at.saturating_duration_since(selected_at),
+                        );
+                    }
                     break;
                 }
                 Ok(Err(error)) if error.is_retryable_abort() => {
-                    stats.retryable_aborts += 1;
+                    if measured {
+                        stats.retryable_aborts += 1;
+                    }
                     // A retry preserves `frozen`, but it may only start before
                     // the workload cutoff just like the ranked scheduler.
                     if !timeline.may_start(Instant::now()) {
-                        stats.abandoned += 1;
+                        if measured {
+                            stats.abandoned += 1;
+                        }
                         break;
                     }
                 }
@@ -428,7 +576,7 @@ impl DiagnosticFamilyStats {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DiagnosticStats {
     selected: u64,
     physical_attempts: u64,
@@ -437,7 +585,28 @@ struct DiagnosticStats {
     retryable_aborts: u64,
     abandoned: u64,
     grace_tail: u64,
+    delivery_processed: u64,
+    warehouses: [u64; 50],
+    new_order_latencies: Vec<Duration>,
     families: [DiagnosticFamilyStats; DIAGNOSTIC_FAMILIES.len()],
+}
+
+impl Default for DiagnosticStats {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            physical_attempts: 0,
+            committed: 0,
+            expected_rollbacks: 0,
+            retryable_aborts: 0,
+            abandoned: 0,
+            grace_tail: 0,
+            delivery_processed: 0,
+            warehouses: [0; 50],
+            new_order_latencies: Vec::new(),
+            families: [DiagnosticFamilyStats::default(); DIAGNOSTIC_FAMILIES.len()],
+        }
+    }
 }
 
 impl DiagnosticStats {
@@ -450,8 +619,10 @@ impl DiagnosticStats {
     fn record_terminal(
         &mut self,
         kind: TransactionKind,
+        warehouse: u16,
         outcome: &RankedTransactionOutcome,
         grace_tail: bool,
+        latency: Duration,
     ) {
         let family = &mut self.families[diagnostic_family_index(kind)];
         family.terminals = family.terminals.saturating_add(1);
@@ -461,10 +632,27 @@ impl DiagnosticStats {
                 family.committed = family.committed.saturating_add(1);
                 if grace_tail {
                     family.grace_tail_committed = family.grace_tail_committed.saturating_add(1);
+                } else {
+                    if let Some(slot) = self.warehouses.get_mut(usize::from(warehouse - 1)) {
+                        *slot = slot.saturating_add(1);
+                    }
+                    if kind == TransactionKind::NewOrder {
+                        self.new_order_latencies.push(latency);
+                    }
+                    if let RankedTransactionOutcome::Committed(commit) = outcome {
+                        self.delivery_processed = self
+                            .delivery_processed
+                            .saturating_add(commit.delivery_processed());
+                    }
                 }
             }
             RankedTransactionOutcome::ExpectedRollback => {
                 self.expected_rollbacks = self.expected_rollbacks.saturating_add(1);
+                if !grace_tail {
+                    if let Some(slot) = self.warehouses.get_mut(usize::from(warehouse - 1)) {
+                        *slot = slot.saturating_add(1);
+                    }
+                }
             }
         }
         if grace_tail {
@@ -484,6 +672,13 @@ impl DiagnosticStats {
         self.retryable_aborts = self.retryable_aborts.saturating_add(other.retryable_aborts);
         self.abandoned = self.abandoned.saturating_add(other.abandoned);
         self.grace_tail = self.grace_tail.saturating_add(other.grace_tail);
+        self.delivery_processed = self
+            .delivery_processed
+            .saturating_add(other.delivery_processed);
+        for (slot, incoming) in self.warehouses.iter_mut().zip(other.warehouses) {
+            *slot = slot.saturating_add(incoming);
+        }
+        self.new_order_latencies.extend(other.new_order_latencies);
         for (family, incoming) in self.families.iter_mut().zip(other.families) {
             family.merge(incoming);
         }
@@ -517,7 +712,9 @@ const fn diagnostic_family_index(kind: TransactionKind) -> usize {
 
 pub struct DiagnosticRunResult {
     segment: DiagnosticSegment,
-    duration: Duration,
+    warmup: Duration,
+    measurement: Duration,
+    preliminary: bool,
     response_timeout: Duration,
     phase_tail_grace: Duration,
     stats: DiagnosticStats,
@@ -526,12 +723,20 @@ pub struct DiagnosticRunResult {
 impl DiagnosticRunResult {
     pub fn print_report(&self) {
         println!("=== TPCC final2026 diagnostic workload ===");
-        println!("mode=non_ranked_diagnostic");
+        println!(
+            "mode={}",
+            if self.preliminary {
+                "non_ranked_preliminary"
+            } else {
+                "non_ranked_diagnostic"
+            }
+        );
         println!("segment={}", self.segment.as_str());
         println!(
-            "clients={},duration_seconds={},mix=45/43/4/4/4,no_think_time=true",
+            "clients={},warmup_seconds={},measurement_windows=1,measurement_seconds={},mix=45/43/4/4/4,no_think_time=true",
             OFFICIAL_CLIENTS,
-            self.duration.as_secs()
+            self.warmup.as_secs(),
+            self.measurement.as_secs()
         );
         println!(
             "local_safety=response_timeout:{}s,phase_tail_grace:{}s (official values unpublished)",
@@ -562,8 +767,46 @@ impl DiagnosticRunResult {
         for (kind, label) in DIAGNOSTIC_FAMILIES {
             println!("{}", self.stats.family_report_line(kind, label));
         }
-        println!("state_artifacts_written=append_only_phase_claim_and_receipt");
+        let new_order_family = self.stats.family(TransactionKind::NewOrder);
+        let new_orders = new_order_family
+            .committed
+            .saturating_sub(new_order_family.grace_tail_committed);
+        let mut latencies = self.stats.new_order_latencies.clone();
+        latencies.sort_unstable();
+        println!(
+            "new_order_per_min={:.3},delivery_processed={},warehouses={}/50",
+            new_orders as f64 * 60.0 / self.measurement.as_secs_f64(),
+            self.stats.delivery_processed,
+            self.stats
+                .warehouses
+                .iter()
+                .filter(|&&count| count > 0)
+                .count()
+        );
+        println!(
+            "new_order_latency_ms=p50:{},p99:{}",
+            format_latency(nearest_rank(&latencies, 50)),
+            format_latency(nearest_rank(&latencies, 99))
+        );
+        println!(
+            "state_artifacts_written={}",
+            if self.preliminary {
+                "none"
+            } else {
+                "append_only_phase_claim_and_receipt"
+            }
+        );
     }
+}
+
+fn nearest_rank(samples: &[Duration], percentile: usize) -> Option<Duration> {
+    (!samples.is_empty()).then(|| samples[(percentile * samples.len()).div_ceil(100) - 1])
+}
+
+fn format_latency(value: Option<Duration>) -> String {
+    value
+        .map(|duration| format!("{:.3}", duration.as_secs_f64() * 1_000.0))
+        .unwrap_or_else(|| "unavailable".to_owned())
 }
 
 #[cfg(test)]
@@ -599,9 +842,13 @@ mod tests {
     #[test]
     fn absolute_attempt_deadline_is_the_phase_drain_deadline() {
         let start = Instant::now();
-        let timeline =
-            DiagnosticTimeline::new(start, Duration::from_secs(10), Duration::from_secs(5))
-                .unwrap();
+        let timeline = DiagnosticTimeline::new(
+            start,
+            Duration::ZERO,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        )
+        .unwrap();
 
         assert_eq!(timeline.attempt_deadline(), start + Duration::from_secs(15));
     }
@@ -609,9 +856,13 @@ mod tests {
     #[test]
     fn transaction_start_is_forbidden_at_and_after_cutoff() {
         let start = Instant::now();
-        let timeline =
-            DiagnosticTimeline::new(start, Duration::from_secs(10), Duration::from_secs(5))
-                .unwrap();
+        let timeline = DiagnosticTimeline::new(
+            start,
+            Duration::ZERO,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        )
+        .unwrap();
 
         assert!(timeline.may_start(start + Duration::from_secs(9)));
         assert!(!timeline.may_start(start + Duration::from_secs(10)));
@@ -630,13 +881,17 @@ mod tests {
         stats.record_attempt(TransactionKind::NewOrder);
         stats.record_terminal(
             TransactionKind::Payment,
+            1,
             &RankedTransactionOutcome::Committed(crate::ranking::runner::RankedCommit::OrderStatus),
             false,
+            Duration::ZERO,
         );
         stats.record_terminal(
             TransactionKind::NewOrder,
+            1,
             &RankedTransactionOutcome::ExpectedRollback,
             true,
+            Duration::ZERO,
         );
 
         assert_eq!(
@@ -670,10 +925,12 @@ mod tests {
         stats.record_attempt(TransactionKind::Delivery);
         stats.record_terminal(
             TransactionKind::Delivery,
+            1,
             &RankedTransactionOutcome::Committed(crate::ranking::runner::RankedCommit::Delivery(
                 Vec::new(),
             )),
             true,
+            Duration::ZERO,
         );
 
         let family = stats.family(TransactionKind::Delivery);
@@ -703,8 +960,10 @@ mod tests {
         right.record_attempt(TransactionKind::OrderStatus);
         right.record_terminal(
             TransactionKind::OrderStatus,
+            1,
             &RankedTransactionOutcome::Committed(crate::ranking::runner::RankedCommit::OrderStatus),
             false,
+            Duration::ZERO,
         );
 
         left.merge(right);

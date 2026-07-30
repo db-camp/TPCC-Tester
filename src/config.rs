@@ -57,6 +57,8 @@ impl LifecycleEvent {
 
 pub const DIAGNOSTIC_WARMUP_SECONDS: u64 = 10;
 pub const DIAGNOSTIC_OBSERVATION_SECONDS: u64 = 60;
+pub const PRELIMINARY_WARMUP_SECONDS: u64 = 30;
+pub const PRELIMINARY_MEASUREMENT_SECONDS: u64 = 60;
 /// Local replay ceiling selected from the public elapsed time in the supplied
 /// grader report. The final statement deliberately does not publish the
 /// official socket-response deadline, so this must not be treated as one.
@@ -142,6 +144,10 @@ pub struct Config {
     /// 运行并发基准测试
     #[arg(long)]
     pub benchmark: bool,
+
+    /// Run one non-ranked 30s warmup plus one 60s measurement window
+    #[arg(long)]
+    pub preliminary: bool,
 
     /// Run one explicitly non-ranked final2026 diagnostic workload phase
     #[arg(long = "diagnostic-workload-seconds")]
@@ -290,6 +296,12 @@ pub enum ConfigError {
     #[error("--diagnostic-workload-seconds must be used by itself")]
     DiagnosticWorkloadMustBeExclusive,
 
+    #[error("--preliminary must be used by itself")]
+    PreliminaryMustBeExclusive,
+
+    #[error("preliminary final2026 requires exactly 50 warehouses and 32 clients")]
+    PreliminaryRequiresOfficialShape,
+
     #[error("--diagnostic-workload-seconds and --diagnostic-segment must be supplied together")]
     DiagnosticSegmentMustMatchWorkload,
 
@@ -313,6 +325,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_raw()?;
         let diagnostic_workload = self.diagnostic_workload_seconds.is_some();
+        let preliminary = self.preliminary;
         if diagnostic_workload != self.diagnostic_segment.is_some() {
             return Err(ConfigError::DiagnosticSegmentMustMatchWorkload);
         }
@@ -334,6 +347,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
+                || preliminary
                 || diagnostic_workload
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
@@ -357,6 +371,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
+                || preliminary
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
                 || self.attest_formal_state
@@ -376,6 +391,34 @@ impl Config {
         {
             return Err(ConfigError::DiagnosticWorkloadRequiresOfficialShape);
         }
+        if preliminary
+            && (self.create_schema
+                || self.init
+                || self.check
+                || self.stats
+                || self.benchmark
+                || diagnostic_workload
+                || self.probe_ready
+                || self.lifecycle_event.is_some()
+                || self.attest_formal_state
+                || self.post_crash_response_probe
+                || self.diagnose
+                || self.allow_deviation
+                || self.canonical_schema
+                || self.expected_new_orders.is_some()
+                || self.warmup_seconds.is_some()
+                || self.window_seconds.is_some()
+                || self.diagnostic_segment.is_some()
+                || self.check_scope != CheckScope::Setup)
+        {
+            return Err(ConfigError::PreliminaryMustBeExclusive);
+        }
+        if preliminary
+            && (self.scale_factor != i32::from(crate::profile::OFFICIAL_WAREHOUSES)
+                || self.threads != usize::from(crate::profile::OFFICIAL_CLIENTS))
+        {
+            return Err(ConfigError::PreliminaryRequiresOfficialShape);
+        }
 
         if self.lifecycle_event.is_some()
             && (self.create_schema
@@ -383,6 +426,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
+                || preliminary
                 || diagnostic_workload
                 || self.probe_ready
                 || self.post_crash_response_probe
@@ -399,6 +443,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
+                || preliminary
                 || diagnostic_workload
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
@@ -416,6 +461,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
+                || preliminary
                 || diagnostic_workload
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
@@ -434,6 +480,7 @@ impl Config {
         if (self.create_schema
             || self.init
             || self.benchmark
+            || preliminary
             || diagnostic_workload
             || self.lifecycle_event.is_some()
             || self.attest_formal_state
@@ -444,6 +491,7 @@ impl Config {
         }
         if (self.init
             || self.benchmark
+            || preliminary
             || self.check
             || diagnostic_workload
             || self.lifecycle_event.is_some()
@@ -461,6 +509,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
+                || preliminary
                 || diagnostic_workload
                 || self.lifecycle_event.is_some()
                 || self.attest_formal_state
@@ -1161,5 +1210,57 @@ mod tests {
                 Err(ConfigError::DiagnosticDurationMismatch { .. })
             ));
         }
+    }
+
+    #[test]
+    fn preliminary_is_fixed_shape_state_bound_and_non_composable() {
+        let valid = Config::try_parse_from([
+            "tpcc-tester",
+            "--preliminary",
+            "--seed",
+            "7",
+            "--state-dir",
+            "/tmp/tpcc-final2026-preliminary-state",
+        ])
+        .unwrap();
+        valid.validate().unwrap();
+
+        let missing_state =
+            Config::try_parse_from(["tpcc-tester", "--preliminary", "--seed", "7"]).unwrap();
+        assert!(matches!(
+            missing_state.validate(),
+            Err(ConfigError::MissingStateDir)
+        ));
+
+        let overridden = Config::try_parse_from([
+            "tpcc-tester",
+            "--preliminary",
+            "--seed",
+            "7",
+            "--state-dir",
+            "/tmp/tpcc-final2026-preliminary-state",
+            "--clients",
+            "2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            overridden.validate(),
+            Err(ConfigError::PreliminaryRequiresOfficialShape)
+        ));
+
+        let combined = Config::try_parse_from([
+            "tpcc-tester",
+            "--preliminary",
+            "--benchmark",
+            "--seed",
+            "7",
+            "--state-dir",
+            "/tmp/tpcc-final2026-preliminary-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            combined.validate(),
+            Err(ConfigError::PreliminaryMustBeExclusive)
+        ));
     }
 }
