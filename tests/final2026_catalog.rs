@@ -183,7 +183,7 @@ fn stock_level_is_one_server_side_distinct_join_with_complete_keys() {
     assert!(statement.sql.contains("order_line.ol_d_id = $2"));
     assert!(statement.sql.contains("order_line.ol_o_id < $3"));
     assert!(statement.sql.contains("order_line.ol_o_id >= $3 - 20"));
-    assert!(statement.sql.contains("stock.s_w_id = order_line.ol_w_id"));
+    assert!(statement.sql.contains("stock.s_w_id = $1"));
     assert!(statement.sql.contains("stock.s_i_id = order_line.ol_i_id"));
     assert_query_columns(statement, &[("low_stock_count", SqlType::Int32)]);
 }

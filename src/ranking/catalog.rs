@@ -899,7 +899,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
              WHERE order_line.ol_w_id = $1 AND order_line.ol_d_id = $2 \
              AND order_line.ol_o_id < $3 \
              AND order_line.ol_o_id >= $3 - 20 \
-             AND stock.s_w_id = order_line.ol_w_id \
+             AND stock.s_w_id = $1 \
              AND stock.s_i_id = order_line.ol_i_id \
              AND stock.s_quantity < $4;",
             &[("low_stock_count", Int32)],
