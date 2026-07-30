@@ -678,10 +678,17 @@ fn build_stage_two(
             .or_insert_with(|| line.initial_stock.clone());
         let stock_before = current.clone();
         let normal_update = current.quantity >= line.plan.quantity + 10;
-        current.quantity = if normal_update {
-            current.quantity - line.plan.quantity
+        // Keep each prepared SET expression to one relative operator.  The
+        // wrapped TPC-C transition is equivalent to adding 91 - order quantity.
+        let quantity_operand = if normal_update {
+            line.plan.quantity
         } else {
-            current.quantity + 91 - line.plan.quantity
+            91 - line.plan.quantity
+        };
+        current.quantity = if normal_update {
+            current.quantity - quantity_operand
+        } else {
+            current.quantity + quantity_operand
         };
         if !(MIN_STOCK_QUANTITY..=MAX_STOCK_QUANTITY).contains(&current.quantity) {
             return Err(SemanticViolation::new(format!(
@@ -716,7 +723,7 @@ fn build_stage_two(
                 StatementId::NewOrderUpdateStockWrapped
             },
             [
-                WireValue::Int32(line.plan.quantity),
+                WireValue::Int32(quantity_operand),
                 WireValue::Float32((line.plan.quantity as f32).to_bits()),
                 WireValue::Int32(remote),
                 WireValue::Int32(line.plan.supply_warehouse),
@@ -997,6 +1004,11 @@ mod tests {
         assert_eq!(
             stage.operations[6].statement_id,
             StatementId::NewOrderUpdateStockWrapped.wire_id()
+        );
+        assert_eq!(
+            stage.operations[6].parameters[0],
+            WireValue::Int32(83),
+            "wrapped stock binds the precomputed 91 - order quantity delta"
         );
         assert_eq!(stage.recovery_lines.len(), 2);
         assert_eq!(stage.recovery_lines[0].stock_before.quantity, 25);
