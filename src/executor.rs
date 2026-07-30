@@ -157,6 +157,26 @@ fn publish_resource_timeline(output: &Path, payload: &[u8]) -> io::Result<()> {
 
 type Scheduler = Final2026Scheduler<SystemMonotonicClock, ResourceTimelineRecorder>;
 
+#[derive(Clone)]
+struct RankedSessionConfig {
+    host: String,
+    port: u16,
+    response_timeout: Duration,
+    catalog: Arc<RuntimeCatalog>,
+}
+
+impl RankedSessionConfig {
+    async fn open(&self) -> Result<RmdbClient, TpccError> {
+        open_ranked_session(
+            &self.host,
+            self.port,
+            self.response_timeout,
+            Arc::clone(&self.catalog),
+        )
+        .await
+    }
+}
+
 pub struct BenchmarkExecutor {
     config: Config,
     effective: ResolvedProfile,
@@ -233,8 +253,14 @@ impl BenchmarkExecutor {
             "preparing {} persistent Wire v3 sessions before the timing barrier",
             profile.clients
         );
+        let session_config = Arc::new(RankedSessionConfig {
+            host: self.config.host.clone(),
+            port: self.config.port,
+            response_timeout,
+            catalog: Arc::clone(&catalog),
+        });
         let mut sessions = self
-            .open_sessions(profile.clients, response_timeout, Arc::clone(&catalog))
+            .open_sessions(profile.clients, Arc::clone(&session_config))
             .await?;
         info!(
             "all {} sessions completed SNAPSHOT ISOLATION and PREPARE_SET schema verification; \
@@ -330,6 +356,7 @@ impl BenchmarkExecutor {
             let start_barrier = Arc::clone(&start_barrier);
             let monotonic_clock = monotonic_clock.clone();
             let terminal_evidence = Arc::clone(&terminal_evidence);
+            let session_config = Arc::clone(&session_config);
             workers.spawn(async move {
                 run_worker(
                     worker_index as u16,
@@ -341,6 +368,7 @@ impl BenchmarkExecutor {
                     start_barrier,
                     monotonic_clock,
                     terminal_evidence,
+                    session_config,
                 )
                 .await
             });
@@ -462,20 +490,12 @@ impl BenchmarkExecutor {
     async fn open_sessions(
         &self,
         clients: u16,
-        response_timeout: Duration,
-        catalog: Arc<RuntimeCatalog>,
+        session_config: Arc<RankedSessionConfig>,
     ) -> Result<Vec<RmdbClient>, TpccError> {
         let mut tasks = JoinSet::new();
         for worker in 0..clients {
-            let host = self.config.host.clone();
-            let port = self.config.port;
-            let catalog = Arc::clone(&catalog);
-            tasks.spawn(async move {
-                (
-                    worker,
-                    open_ranked_session(&host, port, response_timeout, catalog).await,
-                )
-            });
+            let session_config = Arc::clone(&session_config);
+            tasks.spawn(async move { (worker, session_config.open().await) });
         }
 
         let mut sessions: Vec<Option<RmdbClient>> = std::iter::repeat_with(|| None)
@@ -538,7 +558,7 @@ impl RunRouting {
 
 async fn run_worker(
     worker_value: u16,
-    mut client: RmdbClient,
+    client: RmdbClient,
     scheduler: Arc<Mutex<Scheduler>>,
     routing: Arc<RunRouting>,
     cancelled: Arc<AtomicBool>,
@@ -546,13 +566,14 @@ async fn run_worker(
     start_barrier: Arc<Barrier>,
     monotonic_clock: SystemMonotonicClock,
     terminal_evidence: Arc<TerminalEvidenceCollector>,
+    session_config: Arc<RankedSessionConfig>,
 ) -> Result<u16, TpccError> {
     let failure_scheduler = Arc::clone(&scheduler);
     let failure_cancelled = Arc::clone(&cancelled);
     let failure_evidence = Arc::clone(&terminal_evidence);
     let result = run_worker_inner(
         worker_value,
-        &mut client,
+        client,
         scheduler,
         routing,
         cancelled,
@@ -560,6 +581,7 @@ async fn run_worker(
         start_barrier,
         monotonic_clock,
         terminal_evidence,
+        session_config,
     )
     .await;
     if let Err(error) = &result {
@@ -579,7 +601,7 @@ async fn run_worker(
 #[allow(clippy::too_many_arguments)]
 async fn run_worker_inner(
     worker_value: u16,
-    client: &mut RmdbClient,
+    mut client: RmdbClient,
     scheduler: Arc<Mutex<Scheduler>>,
     routing: Arc<RunRouting>,
     cancelled: Arc<AtomicBool>,
@@ -587,6 +609,7 @@ async fn run_worker_inner(
     start_barrier: Arc<Barrier>,
     monotonic_clock: SystemMonotonicClock,
     terminal_evidence: Arc<TerminalEvidenceCollector>,
+    session_config: Arc<RankedSessionConfig>,
 ) -> Result<u16, TpccError> {
     let worker = WorkerId::new(worker_value).map_err(scheduler_error)?;
     wait_for_timing_release(&ready_barrier, &start_barrier).await;
@@ -671,21 +694,59 @@ async fn run_worker_inner(
                     .map_err(scheduler_error)?,
             );
             let result =
-                tokio::time::timeout_at(deadline, dispatch::execute(client, &frozen)).await;
+                tokio::time::timeout_at(deadline, dispatch::execute(&mut client, &frozen)).await;
             let completed_at = monotonic_clock.now();
             match result {
                 Err(_) => {
-                    return fail_worker(
-                        &scheduler,
-                        &cancelled,
-                        worker,
-                        format!(
-                            "physical attempt {} exceeded absolute local deadline {:?}; \
-                             connection state is unknown and will not be reused",
-                            phase_ticket.id(),
-                            attempt_deadline
-                        ),
+                    if !unknown_outcome_is_safe_to_abandon(frozen.transaction_type()) {
+                        return fail_worker(
+                            &scheduler,
+                            &cancelled,
+                            worker,
+                            format!(
+                                "write attempt {} exceeded absolute local deadline {:?}; \
+                                 commit state is unknown and recovery evidence cannot continue",
+                                phase_ticket.id(),
+                                attempt_deadline
+                            ),
+                        );
+                    }
+                    let timeline_complete = {
+                        let mut state = lock_scheduler(&scheduler)?;
+                        state
+                            .abandon_read_only_inflight_at(phase_ticket, completed_at)
+                            .map_err(scheduler_error)?;
+                        state.timeline_complete()
+                    };
+                    warn!(
+                        worker = worker_value,
+                        attempt = phase_ticket.id(),
+                        transaction = ?frozen.transaction_type(),
+                        "abandoned timed-out read-only attempt; rebuilding ranked session"
                     );
+                    if timeline_complete {
+                        terminal_evidence
+                            .worker_finished(worker_value)
+                            .await
+                            .map_err(terminal_evidence_error)?;
+                        return Ok(worker_value);
+                    }
+                    drop(client);
+                    client = match session_config.open().await {
+                        Ok(replacement) => replacement,
+                        Err(error) => {
+                            return fail_worker(
+                                &scheduler,
+                                &cancelled,
+                                worker,
+                                format!(
+                                    "worker {worker_value} could not rebuild a timed-out \
+                                     read-only ranked session: {error}"
+                                ),
+                            );
+                        }
+                    };
+                    break;
                 }
                 Ok(Ok(outcome)) => {
                     let attempt = match &outcome {
@@ -704,11 +765,12 @@ async fn run_worker_inner(
                     };
                     let class = match disposition {
                         AttemptDisposition::Finished => {
-                            LedgerClass::normal_for_stage(frozen.ticket().route().stage)
+                            Some(LedgerClass::normal_for_stage(frozen.ticket().route().stage))
                         }
                         AttemptDisposition::GraceTail => {
-                            LedgerClass::tail_for_stage(frozen.ticket().route().stage)
+                            Some(LedgerClass::tail_for_stage(frozen.ticket().route().stage))
                         }
+                        AttemptDisposition::Abandoned => None,
                         other => {
                             return fail_worker(
                                 &scheduler,
@@ -721,16 +783,18 @@ async fn run_worker_inner(
                             );
                         }
                     };
-                    if let Err(error) = terminal_evidence
-                        .record_terminal(worker_value, class, frozen.ticket(), &outcome)
-                        .await
-                    {
-                        return fail_worker(
-                            &scheduler,
-                            &cancelled,
-                            worker,
-                            format!("bounded terminal evidence rejected terminal: {error}"),
-                        );
+                    if let Some(class) = class {
+                        if let Err(error) = terminal_evidence
+                            .record_terminal(worker_value, class, frozen.ticket(), &outcome)
+                            .await
+                        {
+                            return fail_worker(
+                                &scheduler,
+                                &cancelled,
+                                worker,
+                                format!("bounded terminal evidence rejected terminal: {error}"),
+                            );
+                        }
                     }
                     break;
                 }
@@ -772,6 +836,13 @@ async fn run_worker_inner(
             }
         }
     }
+}
+
+const fn unknown_outcome_is_safe_to_abandon(transaction_type: TransactionType) -> bool {
+    matches!(
+        transaction_type,
+        TransactionType::OrderStatus | TransactionType::StockLevel
+    )
 }
 
 async fn wait_for_timing_release(ready_barrier: &Barrier, start_barrier: &Barrier) {
@@ -938,6 +1009,25 @@ mod tests {
         assert!(rank_report_configuration_lines(true)
             .iter()
             .all(|line| *line != "conformance=public_spec_aligned"));
+    }
+
+    #[test]
+    fn only_read_only_unknown_outcomes_can_be_abandoned() {
+        assert!(unknown_outcome_is_safe_to_abandon(
+            TransactionType::OrderStatus
+        ));
+        assert!(unknown_outcome_is_safe_to_abandon(
+            TransactionType::StockLevel
+        ));
+        assert!(!unknown_outcome_is_safe_to_abandon(
+            TransactionType::NewOrder
+        ));
+        assert!(!unknown_outcome_is_safe_to_abandon(
+            TransactionType::Payment
+        ));
+        assert!(!unknown_outcome_is_safe_to_abandon(
+            TransactionType::Delivery
+        ));
     }
 
     #[test]

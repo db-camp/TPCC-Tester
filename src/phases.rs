@@ -310,6 +310,7 @@ pub enum AttemptDisposition {
     Finished,
     RetrySameParameters,
     GraceTail,
+    Abandoned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +432,8 @@ pub enum SchedulerError {
     InvalidRuntimeLimit(&'static str),
     #[error("the retry's phase deadline has passed")]
     RetryDeadlinePassed,
+    #[error("cannot abandon {0:?} with an unknown write outcome")]
+    UnsafeUnknownWriteOutcome(TransactionType),
     #[error(
         "terminal completion timestamp {completed_at:?} precedes attempt start {attempt_started_at:?}"
     )]
@@ -444,6 +447,13 @@ pub enum SchedulerError {
     WorkersNotDrained,
     #[error("scheduler failed: {0:?}")]
     RunFailed(SchedulerFailure),
+}
+
+const fn is_read_only(transaction_type: TransactionType) -> bool {
+    matches!(
+        transaction_type,
+        TransactionType::OrderStatus | TransactionType::StockLevel
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -809,6 +819,18 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         }
         let attempt_deadline = checked_add(ticket.phase_deadline(), self.limits.phase_tail_grace)?;
         if completed_at >= attempt_deadline {
+            if is_read_only(ticket.identity.transaction_type()) {
+                self.workers[worker_index].selection = None;
+                if let Some(index) = ticket.phase().formal_index() {
+                    self.windows[index].record_abandoned();
+                }
+                self.recorder.record(SchedulerEvent::TransactionFinished {
+                    ticket,
+                    class: CompletionClass::Abandoned,
+                    at: completed_at,
+                });
+                return Ok(AttemptDisposition::Abandoned);
+            }
             self.fail_worker_at(
                 ticket.worker(),
                 Some(ticket.phase()),
@@ -902,6 +924,54 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             at: completed_at,
         });
         Ok(disposition)
+    }
+
+    /// Abandons an in-flight transaction whose connection outcome is unknown.
+    ///
+    /// Callers must restrict this to read-only transactions. A timed-out write
+    /// may have committed after the client stopped reading, so treating that
+    /// result as a normal abandonment would make the recovery ledger unsound.
+    pub fn abandon_read_only_inflight_at(
+        &mut self,
+        ticket: TransactionTicket,
+        abandoned_at: Duration,
+    ) -> Result<(), SchedulerError> {
+        let worker_index = self.worker_index(ticket.worker())?;
+        self.sync_to(abandoned_at)?;
+        self.ensure_not_failed()?;
+        if !is_read_only(ticket.identity.transaction_type()) {
+            return Err(SchedulerError::UnsafeUnknownWriteOutcome(
+                ticket.identity.transaction_type(),
+            ));
+        }
+        let attempt_started_at = match self.workers[worker_index].selection {
+            Some(SelectionState::InFlight {
+                ticket: current,
+                attempt_started_at,
+            }) if current == ticket => attempt_started_at,
+            _ => return Err(SchedulerError::TicketMismatch(ticket.worker())),
+        };
+        if abandoned_at < attempt_started_at {
+            return Err(SchedulerError::CompletionBeforeAttempt {
+                completed_at: abandoned_at,
+                attempt_started_at,
+            });
+        }
+
+        self.workers[worker_index].selection = None;
+        if let Some(index) = ticket.phase().formal_index() {
+            self.windows[index].record_abandoned();
+        }
+        self.recorder.record(SchedulerEvent::TransactionFinished {
+            ticket,
+            class: CompletionClass::Abandoned,
+            at: abandoned_at,
+        });
+        Ok(())
+    }
+
+    pub const fn timeline_complete(&self) -> bool {
+        self.timeline_complete
     }
 
     /// Abandons a selected transaction after a retry cap or local policy.
@@ -1790,6 +1860,60 @@ mod tests {
         };
         assert!(failure.reason.contains("not an official timeout"));
         assert_eq!(scheduler.windows()[0].abandoned, 1);
+    }
+
+    #[test]
+    fn read_only_attempt_at_tail_deadline_is_abandoned_without_failing_run() {
+        let (clock, mut scheduler) =
+            ready_scheduler_with_limits(LocalRuntimeLimits::new(Duration::from_secs(10)).unwrap());
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(30));
+        let worker = WorkerId::new(5).unwrap();
+        let reservation = scheduler.reserve_transaction(worker).unwrap();
+        let identity =
+            TransactionIdentity::new(TransactionType::StockLevel, 1, 0x64, false).unwrap();
+        let ticket = scheduler.start_transaction(reservation, identity).unwrap();
+
+        assert_eq!(
+            scheduler
+                .finish_attempt_at(
+                    ticket,
+                    AttemptOutcome::Commit {
+                        delivery_processed: 0,
+                    },
+                    Duration::from_secs(190),
+                )
+                .unwrap(),
+            AttemptDisposition::Abandoned
+        );
+        assert_eq!(scheduler.windows()[0].abandoned, 1);
+        assert_eq!(scheduler.windows()[0].committed, 0);
+        let next = start_payment(&mut scheduler, worker, 0x65);
+        assert_eq!(next.phase(), PhaseId::FormalWindow(1));
+    }
+
+    #[test]
+    fn unknown_read_only_timeout_can_be_abandoned_but_unknown_write_cannot() {
+        let (clock, mut scheduler) = ready_scheduler(Duration::from_secs(5));
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(30));
+        let worker = WorkerId::new(6).unwrap();
+        let reservation = scheduler.reserve_transaction(worker).unwrap();
+        let identity =
+            TransactionIdentity::new(TransactionType::OrderStatus, 1, 0x66, false).unwrap();
+        let read_only = scheduler.start_transaction(reservation, identity).unwrap();
+        scheduler
+            .abandon_read_only_inflight_at(read_only, Duration::from_secs(185))
+            .unwrap();
+        assert_eq!(scheduler.windows()[0].abandoned, 1);
+
+        let write = start_payment(&mut scheduler, worker, 0x67);
+        assert_eq!(
+            scheduler.abandon_read_only_inflight_at(write, Duration::from_secs(186)),
+            Err(SchedulerError::UnsafeUnknownWriteOutcome(
+                TransactionType::Payment
+            ))
+        );
     }
 
     #[test]
