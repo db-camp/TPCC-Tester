@@ -22,6 +22,7 @@ use super::common::{
     BatchResults,
 };
 use super::runner::StockVersion;
+use super::stock_level::stock_level_count_parameters;
 
 const PREFLIGHT_VALID_LINES: usize = 5;
 const STOCK_LEVEL_RECENT_ORDERS: i32 = 20;
@@ -231,12 +232,12 @@ async fn verify_stock_level(
     // COUNT(DISTINCT ...) operation, with no client-side substitute.
     let aggregate = [operation(
         StatementId::StockLevelCount,
-        [
-            WireValue::Int32(selection.warehouse_id),
-            WireValue::Int32(selection.district_id),
-            WireValue::Int32(next_order_id),
-            WireValue::Int32(selection.stock_threshold),
-        ],
+        stock_level_count_parameters(
+            selection.warehouse_id,
+            selection.district_id,
+            next_order_id,
+            selection.stock_threshold,
+        ),
     )];
     debug_assert_eq!(aggregate.len(), 1);
     let aggregate_results =
@@ -1760,12 +1761,12 @@ mod tests {
         let selection = test_selection();
         let aggregate = [operation(
             StatementId::StockLevelCount,
-            [
-                WireValue::Int32(selection.warehouse_id),
-                WireValue::Int32(selection.district_id),
-                WireValue::Int32(3_001),
-                WireValue::Int32(selection.stock_threshold),
-            ],
+            stock_level_count_parameters(
+                selection.warehouse_id,
+                selection.district_id,
+                3_001,
+                selection.stock_threshold,
+            ),
         )];
         assert_eq!(aggregate.len(), 1);
         assert_eq!(

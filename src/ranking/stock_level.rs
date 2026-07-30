@@ -20,6 +20,7 @@ use super::runner::{
 };
 
 const MAX_DISTINCT_ITEMS: i32 = 100_000;
+const RECENT_ORDER_COUNT: i32 = 20;
 
 pub async fn execute(
     client: &mut RmdbClient,
@@ -74,14 +75,29 @@ fn stage_two_operations(
     [
         operation(
             StatementId::StockLevelCount,
-            [
-                WireValue::Int32(i32::from(home_warehouse)),
-                WireValue::Int32(i32::from(home_district)),
-                WireValue::Int32(next_order_id),
-                WireValue::Int32(i32::from(threshold)),
-            ],
+            stock_level_count_parameters(
+                i32::from(home_warehouse),
+                i32::from(home_district),
+                next_order_id,
+                i32::from(threshold),
+            ),
         ),
         operation(StatementId::Commit, []),
+    ]
+}
+
+pub(super) fn stock_level_count_parameters(
+    home_warehouse: i32,
+    home_district: i32,
+    next_order_id: i32,
+    threshold: i32,
+) -> [WireValue; 5] {
+    [
+        WireValue::Int32(home_warehouse),
+        WireValue::Int32(home_district),
+        WireValue::Int32(next_order_id - RECENT_ORDER_COUNT),
+        WireValue::Int32(next_order_id),
+        WireValue::Int32(threshold),
     ]
 }
 
@@ -143,6 +159,7 @@ mod tests {
                 [
                     WireValue::Int32(47),
                     WireValue::Int32(9),
+                    WireValue::Int32(2_997),
                     WireValue::Int32(3_017),
                     WireValue::Int32(14),
                 ]

@@ -893,15 +893,15 @@ pub fn final2026_catalog() -> Vec<Statement> {
         ),
         query(
             StatementId::StockLevelCount,
-            &[Int32, Int32, Int32, Int32],
+            &[Int32, Int32, Int32, Int32, Int32],
             "SELECT COUNT(DISTINCT order_line.ol_i_id) AS low_stock_count \
              FROM order_line, stock \
              WHERE order_line.ol_w_id = $1 AND order_line.ol_d_id = $2 \
-             AND order_line.ol_o_id < $3 \
-             AND order_line.ol_o_id >= $3 - 20 \
+             AND order_line.ol_o_id >= $3 \
+             AND order_line.ol_o_id < $4 \
              AND stock.s_w_id = $1 \
              AND stock.s_i_id = order_line.ol_i_id \
-             AND stock.s_quantity < $4;",
+             AND stock.s_quantity < $5;",
             &[("low_stock_count", Int32)],
         ),
     ]
@@ -1284,6 +1284,24 @@ mod runtime_tests {
         assert_eq!(statement.param_types.len(), 5);
         assert!(statement.sql.contains("s_quantity = s_quantity + $1"));
         assert!(!statement.sql.contains("s_quantity + 91 -"));
+        assert_eq!(
+            parameter_ordinals(&statement.sql).unwrap(),
+            BTreeSet::from([1, 2, 3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn stock_level_binds_both_order_bounds_without_sql_arithmetic() {
+        let statement = final2026_catalog()
+            .into_iter()
+            .find(|statement| statement.id == StatementId::StockLevelCount.wire_id())
+            .unwrap();
+
+        assert_eq!(statement.param_types.len(), 5);
+        assert!(statement.sql.contains("ol_o_id >= $3"));
+        assert!(statement.sql.contains("ol_o_id < $4"));
+        assert!(statement.sql.contains("s_quantity < $5"));
+        assert!(!statement.sql.contains("$3 - 20"));
         assert_eq!(
             parameter_ordinals(&statement.sql).unwrap(),
             BTreeSet::from([1, 2, 3, 4, 5])
