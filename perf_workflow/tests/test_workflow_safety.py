@@ -2351,6 +2351,84 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             )
             self.assertEqual(strace_payload["derived"]["sync"]["calls"], 5)
 
+            fs_usage = temp_path / "fs_usage.txt"
+            fs_metrics = temp_path / "fs_usage.json"
+            fs_usage.write_text(
+                """14:11:22.437405  write F=5 B=0x18 0.000024 rmdb.100
+14:11:22.437436  close F=5 0.000030 rmdb.100
+14:11:22.437442    WrData[A] D=0x1 B=0x1000 /dev/disk 0.000027 W rmdb.100
+14:11:22.437456  open F=5 (R______________) db.meta 0.000019 rmdb.100
+14:11:22.437456  fsync F=5 0.000001 rmdb.100
+14:11:22.437763    RdData[S] D=0x2 B=0x2000 /dev/disk 0.000206 W rmdb.100
+14:11:22.437794  open [  2] /missing 0.000338 rmdb.100
+""",
+                encoding="utf-8",
+            )
+            parsed_fs_usage = subprocess.run(
+                [
+                    "python3",
+                    str(METRICS_HELPER),
+                    "fs-usage",
+                    "--input",
+                    str(fs_usage),
+                    "--output",
+                    str(fs_metrics),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(
+                parsed_fs_usage.returncode,
+                0,
+                parsed_fs_usage.stderr,
+            )
+            fs_payload = json.loads(fs_metrics.read_text(encoding="utf-8"))
+            self.assertEqual(fs_payload["status"], "available")
+            self.assertEqual(fs_payload["backend"], "darwin_fs_usage")
+            self.assertFalse(fs_payload["official_strace_equivalent"])
+            self.assertEqual(fs_payload["derived"]["write"]["calls"], 1)
+            self.assertEqual(fs_payload["derived"]["write"]["bytes"], 24)
+            self.assertEqual(fs_payload["derived"]["sync"]["calls"], 1)
+            self.assertEqual(
+                fs_payload["derived"]["physical_read"]["bytes"],
+                8192,
+            )
+            self.assertEqual(
+                fs_payload["derived"]["physical_write"]["bytes"],
+                4096,
+            )
+            self.assertEqual(fs_payload["derived"]["open_close"]["errors"], 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS libproc")
+    def test_diagnostic_metrics_capture_darwin_libproc(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "darwin.json"
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(METRICS_HELPER),
+                    "capture",
+                    "--pid",
+                    str(os.getpid()),
+                    "--output",
+                    str(output),
+                    "--require-available",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "available")
+            self.assertEqual(payload["backend"], "darwin_libproc_rusage_v4")
+            self.assertGreater(payload["identity"]["start_abstime"], 0)
+            self.assertGreaterEqual(
+                payload["metrics"]["io"]["diskio_bytesread"],
+                0,
+            )
+
     def test_default_root_is_three_levels_above_workflow(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)

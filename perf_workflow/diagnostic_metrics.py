@@ -2,6 +2,7 @@
 """Collect non-ranked process diagnostics for the final2026 workflow."""
 
 import argparse
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -82,6 +83,66 @@ STRACE_ROW = re.compile(
     r"(?:\s+(?P<errors>[0-9]+))?\s+"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*$"
 )
+FS_USAGE_ROW = re.compile(
+    r"^(?P<timestamp>[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+)\s+"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:\[[A-Z]\])?)"
+    r"(?P<body>.*?)\s+"
+    r"(?P<seconds>[0-9]+\.[0-9]+)"
+    r"(?:\s+W)?\s+"
+    r"(?P<process>.+?)\s*$"
+)
+FS_USAGE_BYTES = re.compile(r"(?:^|\s)B=0x(?P<bytes>[0-9A-Fa-f]+)(?:\s|$)")
+FS_USAGE_ERRNO = re.compile(r"(?:^|\s)\[\s*(?P<errno>[0-9]+)\](?:\s|$)")
+FS_USAGE_GROUPS = {
+    "read": {"read", "pread", "readv", "preadv"},
+    "write": {"write", "pwrite", "writev", "pwritev"},
+    "open_close": {"open", "openat", "creat", "close"},
+    "truncate_allocate": {"truncate", "ftruncate"},
+    "sync": {"fsync", "msync", "sync"},
+    "physical_read": {"RdData", "RdMeta", "PgIn"},
+    "physical_write": {"WrData", "WrMeta", "PgOut"},
+}
+
+
+class DarwinRusageInfoV4(ctypes.Structure):
+    _fields_ = [
+        ("ri_uuid", ctypes.c_uint8 * 16),
+        ("ri_user_time", ctypes.c_uint64),
+        ("ri_system_time", ctypes.c_uint64),
+        ("ri_pkg_idle_wkups", ctypes.c_uint64),
+        ("ri_interrupt_wkups", ctypes.c_uint64),
+        ("ri_pageins", ctypes.c_uint64),
+        ("ri_wired_size", ctypes.c_uint64),
+        ("ri_resident_size", ctypes.c_uint64),
+        ("ri_phys_footprint", ctypes.c_uint64),
+        ("ri_proc_start_abstime", ctypes.c_uint64),
+        ("ri_proc_exit_abstime", ctypes.c_uint64),
+        ("ri_child_user_time", ctypes.c_uint64),
+        ("ri_child_system_time", ctypes.c_uint64),
+        ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
+        ("ri_child_interrupt_wkups", ctypes.c_uint64),
+        ("ri_child_pageins", ctypes.c_uint64),
+        ("ri_child_elapsed_abstime", ctypes.c_uint64),
+        ("ri_diskio_bytesread", ctypes.c_uint64),
+        ("ri_diskio_byteswritten", ctypes.c_uint64),
+        ("ri_cpu_time_qos_default", ctypes.c_uint64),
+        ("ri_cpu_time_qos_maintenance", ctypes.c_uint64),
+        ("ri_cpu_time_qos_background", ctypes.c_uint64),
+        ("ri_cpu_time_qos_utility", ctypes.c_uint64),
+        ("ri_cpu_time_qos_legacy", ctypes.c_uint64),
+        ("ri_cpu_time_qos_user_initiated", ctypes.c_uint64),
+        ("ri_cpu_time_qos_user_interactive", ctypes.c_uint64),
+        ("ri_billed_system_time", ctypes.c_uint64),
+        ("ri_serviced_system_time", ctypes.c_uint64),
+        ("ri_logical_writes", ctypes.c_uint64),
+        ("ri_lifetime_max_phys_footprint", ctypes.c_uint64),
+        ("ri_instructions", ctypes.c_uint64),
+        ("ri_cycles", ctypes.c_uint64),
+        ("ri_billed_energy", ctypes.c_uint64),
+        ("ri_serviced_energy", ctypes.c_uint64),
+        ("ri_interval_max_phys_footprint", ctypes.c_uint64),
+        ("ri_runnable_time", ctypes.c_uint64),
+    ]
 
 
 class MetricError(Exception):
@@ -203,6 +264,84 @@ def capture_proc_snapshot(pid, output, proc_root):
             },
             "identity": {
                 "starttime_ticks": starttime_ticks,
+            },
+        }
+    )
+    atomic_write_json(output, payload)
+    return True
+
+
+def capture_darwin_snapshot(pid, output):
+    captured_at_ns = time.time_ns()
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "proc_snapshot",
+        "status": "unavailable",
+        "pid": pid,
+        "captured_at_unix_ns": captured_at_ns,
+        "source": f"libproc:{pid}",
+        "backend": "darwin_libproc_rusage_v4",
+    }
+    if sys.platform != "darwin":
+        payload["reason"] = "Darwin libproc is unavailable on this platform"
+        atomic_write_json(output, payload)
+        return False
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    except OSError as error:
+        payload["reason"] = f"cannot load macOS libproc: {error}"
+        atomic_write_json(output, payload)
+        return False
+    libproc.proc_pid_rusage.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    libproc.proc_pid_rusage.restype = ctypes.c_int
+    usage = DarwinRusageInfoV4()
+    if libproc.proc_pid_rusage(pid, 4, ctypes.byref(usage)) != 0:
+        error_number = ctypes.get_errno()
+        payload["reason"] = (
+            f"proc_pid_rusage failed for pid {pid}"
+            + (f": errno {error_number}" if error_number else "")
+        )
+        atomic_write_json(output, payload)
+        return False
+    payload.update(
+        {
+            "status": "available",
+            "metrics": {
+                "io": {
+                    "diskio_bytesread": usage.ri_diskio_bytesread,
+                    "diskio_byteswritten": usage.ri_diskio_byteswritten,
+                    "logical_writes": usage.ri_logical_writes,
+                },
+                "stat": {
+                    "pageins": usage.ri_pageins,
+                    "child_pageins": usage.ri_child_pageins,
+                    "user_time_ns": usage.ri_user_time,
+                    "system_time_ns": usage.ri_system_time,
+                    "child_user_time_ns": usage.ri_child_user_time,
+                    "child_system_time_ns": usage.ri_child_system_time,
+                    "instructions": usage.ri_instructions,
+                    "cycles": usage.ri_cycles,
+                },
+                "status": {
+                    "pkg_idle_wakeups": usage.ri_pkg_idle_wkups,
+                    "interrupt_wakeups": usage.ri_interrupt_wkups,
+                    "child_pkg_idle_wakeups": usage.ri_child_pkg_idle_wkups,
+                    "child_interrupt_wakeups": usage.ri_child_interrupt_wkups,
+                },
+            },
+            "identity": {
+                "start_abstime": usage.ri_proc_start_abstime,
+            },
+            "instantaneous": {
+                "resident_bytes": usage.ri_resident_size,
+                "physical_footprint_bytes": usage.ri_phys_footprint,
+                "lifetime_max_physical_footprint_bytes": (
+                    usage.ri_lifetime_max_phys_footprint
+                ),
             },
         }
     )
@@ -386,6 +525,85 @@ def parse_strace_summary(input_path, output):
     return True
 
 
+def parse_fs_usage(input_path, output):
+    path = Path(input_path)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise MetricError(f"cannot read {path}: {error}") from error
+    rows_by_name = {}
+    for line in text.splitlines():
+        match = FS_USAGE_ROW.match(line)
+        if match is None:
+            continue
+        raw_name = match.group("name")
+        name = raw_name.split("[", 1)[0]
+        body = match.group("body")
+        bytes_match = FS_USAGE_BYTES.search(body)
+        errno_match = FS_USAGE_ERRNO.search(body)
+        row = rows_by_name.setdefault(
+            name,
+            {
+                "name": name,
+                "calls": 0,
+                "errors": 0,
+                "seconds": 0.0,
+                "bytes": 0,
+            },
+        )
+        row["calls"] += 1
+        row["errors"] += int(errno_match is not None)
+        row["seconds"] += float(match.group("seconds"))
+        if bytes_match is not None:
+            row["bytes"] += int(bytes_match.group("bytes"), 16)
+    if not rows_by_name:
+        raise MetricError(f"{path} contains no parseable fs_usage rows")
+    rows = sorted(rows_by_name.values(), key=lambda row: row["name"])
+    total_seconds = sum(row["seconds"] for row in rows)
+    for row in rows:
+        row["seconds"] = round(row["seconds"], 9)
+        row["microseconds_per_call"] = round(
+            row["seconds"] * 1_000_000 / row["calls"],
+            3,
+        )
+        row["percent_time"] = round(
+            100.0 * row["seconds"] / total_seconds if total_seconds else 0.0,
+            6,
+        )
+    derived = {}
+    for group_name, event_names in FS_USAGE_GROUPS.items():
+        matched = [row for row in rows if row["name"] in event_names]
+        derived[group_name] = {
+            "matched_events": sorted(row["name"] for row in matched),
+            "calls": sum(row["calls"] for row in matched),
+            "errors": sum(row["errors"] for row in matched),
+            "seconds": round(sum(row["seconds"] for row in matched), 9),
+            "bytes": sum(row["bytes"] for row in matched),
+            "percent_time": round(
+                sum(row["percent_time"] for row in matched),
+                6,
+            ),
+        }
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "fs_usage_summary",
+        "status": "available",
+        "source": str(path),
+        "backend": "darwin_fs_usage",
+        "official_strace_equivalent": False,
+        "events": rows,
+        "totals": {
+            "calls": sum(row["calls"] for row in rows),
+            "errors": sum(row["errors"] for row in rows),
+            "seconds": round(total_seconds, 9),
+            "bytes": sum(row["bytes"] for row in rows),
+        },
+        "derived": derived,
+    }
+    atomic_write_json(output, payload)
+    return True
+
+
 def positive_pid(value):
     try:
         pid = int(value)
@@ -415,6 +633,12 @@ def build_parser():
     strace = subparsers.add_parser("strace", help="parse a strace -c summary")
     strace.add_argument("--input", required=True, type=Path)
     strace.add_argument("--output", required=True, type=Path)
+    fs_usage = subparsers.add_parser(
+        "fs-usage",
+        help="parse a macOS fs_usage event stream",
+    )
+    fs_usage.add_argument("--input", required=True, type=Path)
+    fs_usage.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -422,19 +646,33 @@ def main():
     arguments = build_parser().parse_args()
     try:
         if arguments.command == "capture":
-            available = capture_proc_snapshot(
-                arguments.pid,
-                arguments.output,
-                arguments.proc_root,
-            )
+            if arguments.proc_root.is_dir() or sys.platform != "darwin":
+                available = capture_proc_snapshot(
+                    arguments.pid,
+                    arguments.output,
+                    arguments.proc_root,
+                )
+            elif arguments.proc_root == Path("/proc"):
+                available = capture_darwin_snapshot(
+                    arguments.pid,
+                    arguments.output,
+                )
+            else:
+                available = capture_proc_snapshot(
+                    arguments.pid,
+                    arguments.output,
+                    arguments.proc_root,
+                )
         elif arguments.command == "delta":
             available = calculate_proc_delta(
                 arguments.before,
                 arguments.after,
                 arguments.output,
             )
-        else:
+        elif arguments.command == "strace":
             available = parse_strace_summary(arguments.input, arguments.output)
+        else:
+            available = parse_fs_usage(arguments.input, arguments.output)
     except (MetricError, OSError, ValueError) as error:
         print(f"diagnostic_metrics: {error}", file=sys.stderr)
         return 2
