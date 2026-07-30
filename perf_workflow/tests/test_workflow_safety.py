@@ -2048,6 +2048,20 @@ trap - EXIT
             'status in {"absent", "zombie"}',
             helper_text,
         )
+        group_start = helper_text.index('if action == "group-running":')
+        group_end = helper_text.index(
+            '\n\nif action == "listener":',
+            group_start,
+        )
+        group_text = helper_text[group_start:group_end]
+        self.assertLess(
+            group_text.index("running = any("),
+            group_text.index('if status == "reused" and running:'),
+        )
+        self.assertIn(
+            "raise SystemExit(0 if running else 1)",
+            group_text,
+        )
 
     def test_registration_timeout_kills_stalled_pre_group_launcher(self):
         with tempfile.TemporaryDirectory() as temp:
