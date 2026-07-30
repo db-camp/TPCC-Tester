@@ -47,9 +47,9 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 sudo ticket 缺失时 diagnostic 明确标记为 `unavailable`，排名和正式语义结果
 不受影响。macOS 结果的 backend 为 `darwin_fs_usage`，输出
 `diagnostic_fs_usage_summary.txt`、`diagnostic_fs_usage_metrics.json` 以及
-同名的 process snapshot/delta 工件。`fs_usage` 是原生文件系统事件流，不是
-Linux `strace` 的逐系统调用等价物；manifest 会保留这一差异，禁止混用两套
-耗时百分比作跨平台排名比较。
+`diagnostic_proc_{before,after,delta}.json`。`fs_usage` 是原生文件系统事件流，
+不是 Linux `strace` 的逐系统调用等价物；manifest 会保留这一差异，禁止混用
+两套耗时百分比作跨平台排名比较。
 
 默认数据库名不是公开固定名称。工作流使用带域分隔的
 `SHA-256(run_id, seed)` 为本次 setup 确定性生成安全的不透明名称，并把该名称和

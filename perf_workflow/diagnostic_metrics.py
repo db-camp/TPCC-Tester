@@ -527,35 +527,36 @@ def parse_strace_summary(input_path, output):
 
 def parse_fs_usage(input_path, output):
     path = Path(input_path)
+    rows_by_name = {}
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        stream = path.open(encoding="utf-8", errors="replace")
     except OSError as error:
         raise MetricError(f"cannot read {path}: {error}") from error
-    rows_by_name = {}
-    for line in text.splitlines():
-        match = FS_USAGE_ROW.match(line)
-        if match is None:
-            continue
-        raw_name = match.group("name")
-        name = raw_name.split("[", 1)[0]
-        body = match.group("body")
-        bytes_match = FS_USAGE_BYTES.search(body)
-        errno_match = FS_USAGE_ERRNO.search(body)
-        row = rows_by_name.setdefault(
-            name,
-            {
-                "name": name,
-                "calls": 0,
-                "errors": 0,
-                "seconds": 0.0,
-                "bytes": 0,
-            },
-        )
-        row["calls"] += 1
-        row["errors"] += int(errno_match is not None)
-        row["seconds"] += float(match.group("seconds"))
-        if bytes_match is not None:
-            row["bytes"] += int(bytes_match.group("bytes"), 16)
+    with stream:
+        for line in stream:
+            match = FS_USAGE_ROW.match(line)
+            if match is None:
+                continue
+            raw_name = match.group("name")
+            name = raw_name.split("[", 1)[0]
+            body = match.group("body")
+            bytes_match = FS_USAGE_BYTES.search(body)
+            errno_match = FS_USAGE_ERRNO.search(body)
+            row = rows_by_name.setdefault(
+                name,
+                {
+                    "name": name,
+                    "calls": 0,
+                    "errors": 0,
+                    "seconds": 0.0,
+                    "bytes": 0,
+                },
+            )
+            row["calls"] += 1
+            row["errors"] += int(errno_match is not None)
+            row["seconds"] += float(match.group("seconds"))
+            if bytes_match is not None:
+                row["bytes"] += int(bytes_match.group("bytes"), 16)
     if not rows_by_name:
         raise MetricError(f"{path} contains no parseable fs_usage rows")
     rows = sorted(rows_by_name.values(), key=lambda row: row["name"])
