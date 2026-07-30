@@ -39,6 +39,7 @@ SEED_CALLER_SUPPLIED=0
 STARTUP_READY_TIMEOUT_SECONDS="90"
 RECOVERY_READY_TIMEOUT_SECONDS="90"
 SKIP_BUILD=0
+SKIP_RMDB_BUILD=0
 PLAN_ONLY=0
 INIT_BEFORE_RUN=0
 CLEAN_DB_ON_EXIT="auto"
@@ -155,6 +156,7 @@ Paths/build:
   --server-bin <path>
   --tpcc-bin <path>
   --skip-build
+  --skip-rmdb-build          Fresh-build and trust the tester, but reuse RMDB.
 
 Lifecycle:
   --init-db                    Initialize before --mode rank
@@ -1356,6 +1358,8 @@ while [[ $# -gt 0 ]]; do
       need_value "$1" "${2-}"; TPCC_BIN_OVERRIDE="$2"; shift 2 ;;
     --skip-build)
       SKIP_BUILD=1; shift ;;
+    --skip-rmdb-build)
+      SKIP_RMDB_BUILD=1; shift ;;
     --init-db)
       INIT_BEFORE_RUN=1; shift ;;
     --diagnostics)
@@ -1655,6 +1659,7 @@ rmdb_sha=${RMDB_SHA}
 tpcc_tester_sha=${TPCC_SHA}
 tester_binary_provenance=${TESTER_BINARY_PROVENANCE_STATUS}
 tester_binary_trusted_build_requested=${TESTER_TRUSTED_BUILD_REQUESTED}
+skip_rmdb_build=${SKIP_RMDB_BUILD}
 build_dir=${RMDB_DIR}/${BUILD_DIR}
 server_bin=${SERVER_BIN}
 tpcc_bin=${TPCC_BIN}
@@ -4551,7 +4556,9 @@ ensure_binaries() {
       cargo build --release --manifest-path "${TPCC_DIR}/Cargo.toml" \
         >"${RESULT_DIR}/tpcc_build.log" 2>&1
     fi
+  fi
 
+  if [[ "${SKIP_BUILD}" != "1" && "${SKIP_RMDB_BUILD}" != "1" ]]; then
     check_cmake_cache_source
     log "configuring RMDB"
     cmake -S "${RMDB_DIR}" -B "${RMDB_DIR}/${BUILD_DIR}" \

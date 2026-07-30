@@ -47,6 +47,26 @@ SUMMARY_SPEC.loader.exec_module(SUMMARY_VALIDATOR)
 
 
 class WorkflowSafetyTests(unittest.TestCase):
+    def test_skip_rmdb_build_preserves_fresh_tester_attestation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            result = self.run_script(
+                "--plan-only",
+                "--target-dir",
+                root,
+                "--skip-rmdb-build",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "tester_binary_provenance=pending_fresh_build\n",
+                result.stdout,
+            )
+            self.assertIn(
+                "tester_binary_trusted_build_requested=1\n",
+                result.stdout,
+            )
+            self.assertIn("skip_rmdb_build=1\n", result.stdout)
+
     def write_formal_chain_fixture(self, state_dir):
         state_dir.mkdir()
         for name in FORMAL_STATE_CHAIN.FORMAL_CHAIN_FILES:

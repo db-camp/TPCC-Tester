@@ -183,6 +183,11 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 当前工作流源码根在本次调用中 fresh build tester；工作流会密封其
 device/inode/size/SHA-256，并在每次执行前复核。
 
+若 RMDB 分支需要复用预先构建的本机兼容二进制，可使用
+`--skip-rmdb-build --server-bin /absolute/path/to/rmdb`。该选项只跳过
+RMDB 的 CMake 构建，tester 仍由当前工作流 fresh build 并完成上述信任封存，
+因此它不会像 `--skip-build` 一样取消 tester 的排名资格。
+
 ## 安全边界
 
 - 默认 RMDB 根目录是 `perf_workflow/` 向上三级；可用 `--target-dir` 显式覆盖。
