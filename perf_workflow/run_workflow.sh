@@ -96,6 +96,7 @@ MANIFEST_READY=0
 RMDB_SHA="unavailable"
 TPCC_SHA="unavailable"
 PHASE_SETUP="not_applicable"
+PHASE_PRELIMINARY="not_applicable"
 PHASE_RANK="not_applicable"
 PHASE_ONLINE="not_applicable"
 PHASE_CRASH_RESTART="not_applicable"
@@ -115,6 +116,8 @@ PUBLIC_CLIENTS=32
 PUBLIC_WARMUP_SECONDS=30
 PUBLIC_WINDOWS=3
 PUBLIC_WINDOW_SECONDS=150
+PRELIMINARY_WINDOWS=1
+PRELIMINARY_WINDOW_SECONDS=60
 PUBLIC_READY_TIMEOUT_SECONDS=90
 DIAGNOSTIC_WARMUP_SECONDS=10
 DIAGNOSTIC_OBSERVATION_SECONDS=60
@@ -133,6 +136,7 @@ Usage:
 
 Lifecycle modes:
   --mode all         Create/load, rank, online-check, SIGKILL, restart, recovery-check
+  --mode preliminary Create/load, then run a non-ranked 30s + 1x60s measurement
   --mode init        Create/load a new database and retain it
   --mode rank        Rank an existing database and run the online checks
   --mode recovery    Start an existing database and run the recovery checks
@@ -1394,11 +1398,15 @@ if [[ "${MODE}" == "benchmark" ]]; then
   MODE="rank"
 fi
 case "${MODE}" in
-  all|init|rank|recovery|tools) ;;
+  all|preliminary|init|rank|recovery|tools) ;;
   *) die "unsupported mode: ${MODE}" ;;
 esac
 if [[ "${DIAGNOSTICS_REQUESTED}" == "1" && "${MODE}" != "all" ]]; then
   die "--diagnostics requires --mode all so rank, online, and recovery gates complete first"
+fi
+if [[ "${MODE}" == "preliminary" \
+  && -n "${SCALE}${CLIENTS}${WARMUP_SECONDS}${WINDOW_SECONDS}" ]]; then
+  die "--mode preliminary fixes SF50, 32 clients, 30s warmup, and one 60s window; sizing and timing overrides are not accepted"
 fi
 USES_EXISTING_DATABASE=0
 if [[ "${MODE}" == "recovery" ]] \
@@ -1443,9 +1451,17 @@ fi
 EFFECTIVE_SCALE="${SCALE:-${PUBLIC_SCALE}}"
 EFFECTIVE_CLIENTS="${CLIENTS:-${PUBLIC_CLIENTS}}"
 EFFECTIVE_WARMUP_SECONDS="${WARMUP_SECONDS:-${PUBLIC_WARMUP_SECONDS}}"
+EFFECTIVE_WINDOWS="${PUBLIC_WINDOWS}"
 EFFECTIVE_WINDOW_SECONDS="${WINDOW_SECONDS:-${PUBLIC_WINDOW_SECONDS}}"
 RANKED_CONFIGURATION=1
-if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
+if [[ "${MODE}" == "preliminary" ]]; then
+  EFFECTIVE_SCALE="${PUBLIC_SCALE}"
+  EFFECTIVE_CLIENTS="${PUBLIC_CLIENTS}"
+  EFFECTIVE_WARMUP_SECONDS="${PUBLIC_WARMUP_SECONDS}"
+  EFFECTIVE_WINDOWS="${PRELIMINARY_WINDOWS}"
+  EFFECTIVE_WINDOW_SECONDS="${PRELIMINARY_WINDOW_SECONDS}"
+  RANKED_CONFIGURATION=0
+elif [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_CLIENTS}" != "${PUBLIC_CLIENTS}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
   || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
@@ -1453,7 +1469,9 @@ if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
-if [[ "${RANKED_CONFIGURATION}" == "1" && "${MODE}" == "all" ]]; then
+if [[ "${MODE}" == "preliminary" ]]; then
+  CONFORMANCE="non_ranked_preliminary"
+elif [[ "${RANKED_CONFIGURATION}" == "1" && "${MODE}" == "all" ]]; then
   CONFORMANCE="public_spec_candidate"
 elif [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
   CONFORMANCE="non_ranked_split_mode"
@@ -1569,9 +1587,17 @@ PROCESS_OWNER_TOKEN="tpcc-process:${RUN_ID}:$$"
 EFFECTIVE_SCALE="${SCALE:-${PUBLIC_SCALE}}"
 EFFECTIVE_CLIENTS="${CLIENTS:-${PUBLIC_CLIENTS}}"
 EFFECTIVE_WARMUP_SECONDS="${WARMUP_SECONDS:-${PUBLIC_WARMUP_SECONDS}}"
+EFFECTIVE_WINDOWS="${PUBLIC_WINDOWS}"
 EFFECTIVE_WINDOW_SECONDS="${WINDOW_SECONDS:-${PUBLIC_WINDOW_SECONDS}}"
 RANKED_CONFIGURATION=1
-if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
+if [[ "${MODE}" == "preliminary" ]]; then
+  EFFECTIVE_SCALE="${PUBLIC_SCALE}"
+  EFFECTIVE_CLIENTS="${PUBLIC_CLIENTS}"
+  EFFECTIVE_WARMUP_SECONDS="${PUBLIC_WARMUP_SECONDS}"
+  EFFECTIVE_WINDOWS="${PRELIMINARY_WINDOWS}"
+  EFFECTIVE_WINDOW_SECONDS="${PRELIMINARY_WINDOW_SECONDS}"
+  RANKED_CONFIGURATION=0
+elif [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_CLIENTS}" != "${PUBLIC_CLIENTS}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
   || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
@@ -1579,7 +1605,9 @@ if [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
-if [[ "${RANKED_CONFIGURATION}" == "1" && "${MODE}" == "all" ]]; then
+if [[ "${MODE}" == "preliminary" ]]; then
+  CONFORMANCE="non_ranked_preliminary"
+elif [[ "${RANKED_CONFIGURATION}" == "1" && "${MODE}" == "all" ]]; then
   CONFORMANCE="public_spec_candidate"
 elif [[ "${RANKED_CONFIGURATION}" == "1" ]]; then
   CONFORMANCE="non_ranked_split_mode"
@@ -1588,7 +1616,7 @@ else
 fi
 
 if [[ "${CLEAN_DB_ON_EXIT}" == "auto" ]]; then
-  if [[ "${MODE}" == "all" ]]; then
+  if [[ "${MODE}" == "all" || "${MODE}" == "preliminary" ]]; then
     CLEAN_DB_ON_EXIT=1
   else
     CLEAN_DB_ON_EXIT=0
@@ -1605,6 +1633,10 @@ case "${MODE}" in
     FORMAL_STATE_ATTESTATION_STATUS="pending"
     TERMINAL_EVIDENCE_STATUS="pending"
     LEGACY_RUN_LEDGER_STATUS="pending"
+    ;;
+  preliminary)
+    PHASE_SETUP="pending"
+    PHASE_PRELIMINARY="pending"
     ;;
   init)
     PHASE_SETUP="pending"
@@ -1688,8 +1720,10 @@ schedule_owner=rust
 effective_scale=${EFFECTIVE_SCALE}
 effective_clients=${EFFECTIVE_CLIENTS}
 effective_warmup_seconds=${EFFECTIVE_WARMUP_SECONDS}
-effective_windows=${PUBLIC_WINDOWS}
+effective_windows=${EFFECTIVE_WINDOWS}
 effective_window_seconds=${EFFECTIVE_WINDOW_SECONDS}
+preliminary_ranked=false
+preliminary_artifact=$([[ "${MODE}" == "preliminary" ]] && printf '%s' preliminary.log || printf '%s' not_applicable)
 diagnostics_requested=${DIAGNOSTICS_REQUESTED}
 diagnostics_phase=${PHASE_DIAGNOSTICS}
 resource_sampler=${RESOURCE_HELPER}
@@ -1727,6 +1761,10 @@ SERVER_LOG="${RESULT_DIR}/server.log"
 RESOURCE_SEGMENT_LIST="${RUN_TEMP_DIR}/resource_segments.list"
 RESOURCE_TIMELINE="${RESULT_DIR}/rank_timeline.state"
 RESOURCE_RANK_COMPLETE="${RESULT_DIR}/rank_completion.json"
+if [[ "${MODE}" == "preliminary" ]]; then
+  RESOURCE_TIMELINE="${RESULT_DIR}/preliminary_timeline.state"
+  RESOURCE_RANK_COMPLETE="${RESULT_DIR}/preliminary_completion.json"
+fi
 RESOURCE_METRICS="${RESULT_DIR}/resource_metrics.json"
 : >"${RESOURCE_SEGMENT_LIST}"
 if [[ "${MODE}" == "tools" ]]; then
@@ -1739,7 +1777,7 @@ write_manifest() {
     "${WORKFLOW_STATUS}" "${MODE}" "${RUN_ID}" "${DATASET_RUN_ID}" "${PROFILE}" \
     "${RANKED_CONFIGURATION}" "${SEED}" "${SEED_CALLER_SUPPLIED}" \
     "${ALLOW_DEVIATION}" "${EFFECTIVE_SCALE}" "${EFFECTIVE_CLIENTS}" \
-    "${EFFECTIVE_WARMUP_SECONDS}" "${PUBLIC_WINDOWS}" \
+    "${EFFECTIVE_WARMUP_SECONDS}" "${EFFECTIVE_WINDOWS}" \
     "${EFFECTIVE_WINDOW_SECONDS}" "${RECOVERY_READY_TIMEOUT_SECONDS}" \
     "${RMDB_SHA}" "${TPCC_SHA}" \
     "${RMDB_DIR}" "${TPCC_DIR}" "${DB_PATH}" "${RESULT_DIR}" "${STATE_DIR}" \
@@ -1748,7 +1786,7 @@ write_manifest() {
     "${DB_IDENTITY_BINDING_STATUS}" "${DB_DEVICE}" "${DB_INODE}" \
     "${DB_PATH_FINGERPRINT}" "${RUNTIME_SCHEMA_FINGERPRINT}" \
     "${DATASET_STATE_FINGERPRINT}" "${DB_IDENTITY_FINGERPRINT}" \
-    "${PHASE_SETUP}" "${PHASE_RANK}" "${PHASE_ONLINE}" \
+    "${PHASE_SETUP}" "${PHASE_PRELIMINARY}" "${PHASE_RANK}" "${PHASE_ONLINE}" \
     "${PHASE_CRASH_RESTART}" "${PHASE_RECOVERY}" "${PHASE_DIAGNOSTICS}" \
     "${DIAGNOSTICS_REQUESTED}" "${DIAGNOSTIC_WARMUP_SECONDS}" \
     "${DIAGNOSTIC_OBSERVATION_SECONDS}" "${RESOURCE_STATUS}" \
@@ -1813,6 +1851,7 @@ import sys
     dataset_state_fingerprint,
     db_identity_fingerprint,
     phase_setup,
+    phase_preliminary,
     phase_rank,
     phase_online,
     phase_crash_restart,
@@ -2509,6 +2548,8 @@ ranking_eligible = workflow_status == "success" and all(
 ) and terminal_evidence_verified
 if ranking_eligible:
     conformance = "public_spec_aligned"
+elif mode == "preliminary":
+    conformance = "non_ranked_preliminary"
 elif ranked_configuration != "1":
     conformance = "non_ranked_deviation"
 else:
@@ -2645,6 +2686,7 @@ payload = {
     },
     "phases": {
         "setup": phase_setup,
+        "preliminary": phase_preliminary,
         "rank": phase_rank,
         "online": phase_online,
         "crash_restart": phase_crash_restart,
@@ -2675,6 +2717,13 @@ payload = {
             key: describe_artifact(name)
             for key, name in artifact_names.items()
         },
+    },
+    "preliminary_result": {
+        "path": "preliminary.log",
+        "status": phase_preliminary,
+        "ranked": False,
+        "score_effect": "none",
+        "artifact": describe_artifact("preliminary.log"),
     },
     "resources": {
         "observation_only": True,
@@ -2761,6 +2810,7 @@ set_phase_status() {
   local status="$2"
   case "${phase}" in
     setup) PHASE_SETUP="${status}" ;;
+    preliminary) PHASE_PRELIMINARY="${status}" ;;
     rank) PHASE_RANK="${status}" ;;
     online) PHASE_ONLINE="${status}" ;;
     crash_restart) PHASE_CRASH_RESTART="${status}" ;;
@@ -2773,6 +2823,7 @@ set_phase_status() {
 
 mark_unfinished_phases_after_failure() {
   [[ "${PHASE_SETUP}" != "running" ]] || PHASE_SETUP="failed"
+  [[ "${PHASE_PRELIMINARY}" != "running" ]] || PHASE_PRELIMINARY="failed"
   [[ "${PHASE_RANK}" != "running" ]] || PHASE_RANK="failed"
   [[ "${PHASE_ONLINE}" != "running" ]] || PHASE_ONLINE="failed"
   [[ "${PHASE_CRASH_RESTART}" != "running" ]] \
@@ -2783,6 +2834,8 @@ mark_unfinished_phases_after_failure() {
 
   [[ "${PHASE_SETUP}" != "pending" ]] \
     || PHASE_SETUP="skipped_due_to_failure"
+  [[ "${PHASE_PRELIMINARY}" != "pending" ]] \
+    || PHASE_PRELIMINARY="skipped_due_to_failure"
   [[ "${PHASE_RANK}" != "pending" ]] \
     || PHASE_RANK="skipped_due_to_failure"
   [[ "${PHASE_ONLINE}" != "pending" ]] \
@@ -4175,6 +4228,7 @@ finalize_resource_metrics() {
     --timeline "${RESOURCE_TIMELINE}"
     --rank-complete "${RESOURCE_RANK_COMPLETE}"
     --expected-warmup-seconds "${EFFECTIVE_WARMUP_SECONDS}"
+    --expected-windows "${EFFECTIVE_WINDOWS}"
     --expected-window-seconds "${EFFECTIVE_WINDOW_SECONDS}"
     --mode "${MODE}"
     --interval-ms "${RESOURCE_INTERVAL_MS}"
@@ -5018,7 +5072,7 @@ run_profile_tester() {
   shift
   local -a command
   command=("$@")
-  if [[ "${ALLOW_DEVIATION}" == "1" ]]; then
+  if [[ "${ALLOW_DEVIATION}" == "1" && "${MODE}" != "preliminary" ]]; then
     command+=(--allow-deviation)
     [[ -z "${SCALE}" ]] || command+=(--scale "${SCALE}")
     [[ -z "${CLIENTS}" ]] || command+=(--clients "${CLIENTS}")
@@ -5073,6 +5127,26 @@ run_rank() {
   else
     set_phase_status rank failed
     die "TPC-C ranking failed; see ${RESULT_DIR}/rank.log"
+  fi
+}
+
+run_preliminary() {
+  local preliminary_rc=0
+  verify_database_identity
+  log "running non-ranked 30s warmup + one 60s preliminary window"
+  set_phase_status preliminary running
+  TESTER_RESOURCE_TIMELINE="${RESOURCE_TIMELINE}"
+  run_profile_tester "${RESULT_DIR}/preliminary.log" \
+      --preliminary --profile "${PROFILE}" --seed "${SEED}" \
+      --state-dir "${STATE_DIR}" \
+      --host "${HOST}" --port "${PORT}" || preliminary_rc=$?
+  TESTER_RESOURCE_TIMELINE=""
+  if [[ "${preliminary_rc}" == "0" ]]; then
+    publish_rank_completion
+    set_phase_status preliminary passed
+  else
+    set_phase_status preliminary failed
+    die "TPC-C preliminary run failed; see ${RESULT_DIR}/preliminary.log"
   fi
 }
 
@@ -5552,6 +5626,12 @@ fi
 ensure_binaries
 
 case "${MODE}" in
+  preliminary)
+    start_new_database
+    run_setup
+    run_preliminary
+    stop_server
+    ;;
   init)
     record_lifecycle_event setup-intent
     start_new_database
@@ -5596,6 +5676,8 @@ if [[ "${CLEAN_DB_ON_EXIT}" == "1" ]]; then
 fi
 WORKFLOW_STATUS="success"
 write_manifest
-write_summary
+if [[ "${MODE}" != "preliminary" ]]; then
+  write_summary
+fi
 WORKFLOW_SUCCEEDED=1
 log "results written to ${RESULT_DIR}"

@@ -886,7 +886,7 @@ def parse_timeline_bytes(content):
     if (
         parsed["origin_unix_ns"] <= 0
         or parsed["warmup_ns"] < 0
-        or parsed["measurement_windows"] != 3
+        or parsed["measurement_windows"] not in {1, 3}
         or parsed["measurement_window_ns"] <= 0
     ):
         raise ResourceError("rank timeline values are outside the final2026 contract")
@@ -1543,7 +1543,7 @@ def aggregate_segments(arguments):
     ]
     final_disk = max(final_candidates, default=(0, None))[1]
 
-    if arguments.mode in {"all", "rank"}:
+    if arguments.mode in {"all", "rank", "preliminary"}:
         try:
             timeline_content, timeline_metadata = read_stable_file(
                 arguments.timeline,
@@ -1553,6 +1553,8 @@ def aggregate_segments(arguments):
             if (
                 timeline["warmup_ns"]
                 != arguments.expected_warmup_seconds * 1_000_000_000
+                or timeline["measurement_windows"]
+                != getattr(arguments, "expected_windows", 3)
                 or timeline["measurement_window_ns"]
                 != arguments.expected_window_seconds * 1_000_000_000
             ):
@@ -1751,9 +1753,14 @@ def build_parser():
         type=positive_integer,
     )
     aggregate.add_argument(
+        "--expected-windows",
+        type=positive_integer,
+        default=3,
+    )
+    aggregate.add_argument(
         "--mode",
         required=True,
-        choices=("all", "init", "rank", "recovery"),
+        choices=("all", "init", "rank", "recovery", "preliminary"),
     )
     aggregate.add_argument("--output", required=True, type=Path)
     aggregate.add_argument(

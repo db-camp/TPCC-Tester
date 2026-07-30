@@ -4168,6 +4168,27 @@ if "--benchmark" in sys.argv:
                 0.0,
             )
 
+    def test_resource_sampler_accepts_one_preliminary_window_only_explicitly(self):
+        one_window = (
+            "schema_version=1\n"
+            "kind=final2026_rank_timeline\n"
+            "origin_unix_ns=1\n"
+            "warmup_ns=30000000000\n"
+            "measurement_windows=1\n"
+            "measurement_window_ns=60000000000\n"
+        ).encode("ascii")
+        parsed = RESOURCE_SAMPLER.parse_timeline_bytes(one_window)
+        self.assertEqual(parsed["warmup_ns"], 30_000_000_000)
+        self.assertEqual(parsed["measurement_windows"], 1)
+        self.assertEqual(parsed["measurement_window_ns"], 60_000_000_000)
+
+        invalid = one_window.replace(
+            b"measurement_windows=1\n",
+            b"measurement_windows=2\n",
+        )
+        with self.assertRaises(RESOURCE_SAMPLER.ResourceError):
+            RESOURCE_SAMPLER.parse_timeline_bytes(invalid)
+
     def test_refuses_to_adopt_symlinked_workflow_state_root(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)
@@ -5493,6 +5514,7 @@ while :; do sleep 0.05; done
                 manifest["phases"],
                 {
                     "setup": "passed",
+                    "preliminary": "not_applicable",
                     "rank": "passed",
                     "online": "passed",
                     "crash_restart": "passed",
@@ -5774,6 +5796,7 @@ while :; do sleep 0.05; done
                 failed_manifest["phases"],
                 {
                     "setup": "passed",
+                    "preliminary": "not_applicable",
                     "rank": "passed",
                     "online": "passed",
                     "crash_restart": "passed",
