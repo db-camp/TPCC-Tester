@@ -1855,6 +1855,8 @@ artifact_names = {
     "proc_delta": "diagnostic_proc_delta.json",
     "strace_summary": "diagnostic_strace_summary.txt",
     "strace_metrics": "diagnostic_strace_metrics.json",
+    "fs_usage_summary": "diagnostic_fs_usage_summary.txt",
+    "fs_usage_metrics": "diagnostic_fs_usage_metrics.json",
 }
 
 
@@ -2647,6 +2649,19 @@ payload = {
     "diagnostics": {
         "requested": diagnostics_requested == "1",
         "ranked": False,
+        "backend": (
+            "darwin_fs_usage"
+            if (
+                Path(result_dir) / artifact_names["fs_usage_metrics"]
+            ).is_file()
+            else (
+                "linux_strace"
+                if (
+                    Path(result_dir) / artifact_names["strace_metrics"]
+                ).is_file()
+                else "unavailable"
+            )
+        ),
         "public_warmup_seconds": int(diagnostic_warmup),
         "public_observation_seconds": int(diagnostic_observation),
         "native_single_observation_supported": True,
@@ -5082,6 +5097,11 @@ run_crash_restart() {
 }
 
 run_final_diagnostics() {
+  local trace_backend=""
+  local trace_output=""
+  local trace_metrics=""
+  local trace_parser=""
+  local trace_attach_log=""
   [[ "${DIAGNOSTICS_REQUESTED}" == "1" ]] || return 0
   if [[ "${PHASE_RANK}" != "passed" \
     || "${PHASE_ONLINE}" != "passed" \
@@ -5090,8 +5110,25 @@ run_final_diagnostics() {
   fi
 
   set_phase_status diagnostics running
-  if ! command -v strace >/dev/null 2>&1; then
-    warn "strace is unavailable; skipping non-ranked 10s warmup + 60s observation"
+  if command -v strace >/dev/null 2>&1; then
+    trace_backend="linux_strace"
+    trace_output="${RESULT_DIR}/diagnostic_strace_summary.txt"
+    trace_metrics="${RESULT_DIR}/diagnostic_strace_metrics.json"
+    trace_parser="strace"
+    trace_attach_log="${RESULT_DIR}/strace_attach.log"
+  elif [[ "$(uname -s)" == "Darwin" && -x "/usr/bin/fs_usage" ]]; then
+    if (( EUID != 0 )) && ! sudo -n true >/dev/null 2>&1; then
+      warn "macOS native diagnostics require a current sudo ticket; run 'sudo -v' in this terminal before the workflow"
+      set_phase_status diagnostics unavailable
+      return 0
+    fi
+    trace_backend="darwin_fs_usage"
+    trace_output="${RESULT_DIR}/diagnostic_fs_usage_summary.txt"
+    trace_metrics="${RESULT_DIR}/diagnostic_fs_usage_metrics.json"
+    trace_parser="fs-usage"
+    trace_attach_log="${RESULT_DIR}/fs_usage_attach.log"
+  else
+    warn "neither strace nor the macOS fs_usage backend is available; skipping non-ranked 10s warmup + 60s observation"
     set_phase_status diagnostics unavailable
     return 0
   fi
@@ -5113,16 +5150,25 @@ run_final_diagnostics() {
     return 0
   fi
 
-  log "attaching strace to registered RMDB pid ${SERVER_PID}"
-  LC_ALL=C strace -c -f -p "${SERVER_PID}" \
-    -o "${RESULT_DIR}/diagnostic_strace_summary.txt" \
-    >"${RESULT_DIR}/strace_attach.log" 2>&1 &
+  log "attaching ${trace_backend} to registered RMDB pid ${SERVER_PID}"
+  if [[ "${trace_backend}" == "linux_strace" ]]; then
+    LC_ALL=C strace -c -f -p "${SERVER_PID}" \
+      -o "${trace_output}" \
+      >"${trace_attach_log}" 2>&1 &
+  elif (( EUID == 0 )); then
+    LC_ALL=C /usr/bin/fs_usage -w -f filesys "${SERVER_PID}" \
+      >"${trace_output}" 2>"${trace_attach_log}" &
+  else
+    sudo -n -- /usr/bin/env LC_ALL=C \
+      /usr/bin/fs_usage -w -f filesys "${SERVER_PID}" \
+      >"${trace_output}" 2>"${trace_attach_log}" &
+  fi
   TRACE_PID=$!
   sleep 0.20
   if ! kill -0 "${TRACE_PID}" 2>/dev/null; then
     wait "${TRACE_PID}" 2>/dev/null || true
     TRACE_PID=""
-    warn "strace could not attach; see ${RESULT_DIR}/strace_attach.log"
+    warn "${trace_backend} could not attach; see ${trace_attach_log}"
     set_phase_status diagnostics unavailable
     return 0
   fi
@@ -5159,10 +5205,10 @@ run_final_diagnostics() {
     tracer_survived_observation=0
     wait "${TRACE_PID}" 2>/dev/null || TRACE_EXIT_STATUS=$?
     TRACE_PID=""
-    warn "strace exited before the diagnostic observation completed"
+    warn "${trace_backend} exited before the diagnostic observation completed"
     diagnostics_failed=1
   elif ! stop_trace; then
-    warn "strace exited abnormally with status ${TRACE_EXIT_STATUS}"
+    warn "${trace_backend} exited abnormally with status ${TRACE_EXIT_STATUS}"
     diagnostics_failed=1
   fi
 
@@ -5181,15 +5227,15 @@ run_final_diagnostics() {
   fi
 
   if [[ "${tracer_survived_observation}" == "1" \
-    && -s "${RESULT_DIR}/diagnostic_strace_summary.txt" ]]; then
-    if ! python3 "${DIAGNOSTIC_METRICS_HELPER}" strace \
-        --input "${RESULT_DIR}/diagnostic_strace_summary.txt" \
-        --output "${RESULT_DIR}/diagnostic_strace_metrics.json"; then
-      warn "could not parse the strace -c summary"
+    && -s "${trace_output}" ]]; then
+    if ! python3 "${DIAGNOSTIC_METRICS_HELPER}" "${trace_parser}" \
+        --input "${trace_output}" \
+        --output "${trace_metrics}"; then
+      warn "could not parse the ${trace_backend} summary"
       diagnostics_failed=1
     fi
   else
-    warn "strace did not produce a non-empty summary"
+    warn "${trace_backend} did not produce a non-empty summary"
     diagnostics_failed=1
   fi
 

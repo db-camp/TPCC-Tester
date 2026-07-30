@@ -28,6 +28,29 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --seed 2026
 ```
 
+在 Linux 上，非排名 I/O observation 使用 `strace -c -f` 和 `/proc/<pid>`
+计数器。在 macOS 上无需容器或虚拟机：工作流会改用系统自带的
+`fs_usage -w -f filesys <RMDB_PID>`，并通过 `libproc.proc_pid_rusage`
+采集进程累计读写字节、page-in、CPU 和 wakeup。`fs_usage` 需要管理员权限，
+但不要求关闭 SIP；在启动工作流的同一个终端先刷新一次 sudo ticket：
+
+```bash
+sudo -v
+
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+  --mode all \
+  --seed 2026
+```
+
+工作流只以 root 身份启动 `/usr/bin/fs_usage`，RMDB、tester 和其余生命周期
+仍使用当前用户运行；它使用 `sudo -n`，不会在无人值守运行中卡在密码提示。
+sudo ticket 缺失时 diagnostic 明确标记为 `unavailable`，排名和正式语义结果
+不受影响。macOS 结果的 backend 为 `darwin_fs_usage`，输出
+`diagnostic_fs_usage_summary.txt`、`diagnostic_fs_usage_metrics.json` 以及
+同名的 process snapshot/delta 工件。`fs_usage` 是原生文件系统事件流，不是
+Linux `strace` 的逐系统调用等价物；manifest 会保留这一差异，禁止混用两套
+耗时百分比作跨平台排名比较。
+
 默认数据库名不是公开固定名称。工作流使用带域分隔的
 `SHA-256(run_id, seed)` 为本次 setup 确定性生成安全的不透明名称，并把该名称和
 数据库目录身份密封到状态工件中。对新库显式指定 `--db-name` 属于本地偏差，必须

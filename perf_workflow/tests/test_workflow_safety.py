@@ -5485,6 +5485,10 @@ while :; do sleep 0.05; done
                 expected_diagnostics,
             )
             self.assertEqual(
+                manifest["diagnostics"]["backend"],
+                "linux_strace",
+            )
+            self.assertEqual(
                 {
                     key: manifest["diagnostics"][key]
                     for key in (
@@ -5525,6 +5529,14 @@ while :; do sleep 0.05; done
                     "strace_metrics": {
                         "path": "diagnostic_strace_metrics.json",
                         "status": "available",
+                    },
+                    "fs_usage_summary": {
+                        "path": "diagnostic_fs_usage_summary.txt",
+                        "status": "missing",
+                    },
+                    "fs_usage_metrics": {
+                        "path": "diagnostic_fs_usage_metrics.json",
+                        "status": "missing",
                     },
                 },
             )
