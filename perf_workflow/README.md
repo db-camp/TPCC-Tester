@@ -128,6 +128,21 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 
 ## 明确非排名的 smoke
 
+性能优化迭代可使用固定的 preliminary 流程。它仍新建并装载完整 SF50
+数据集，使用 32 个持久 prepared 客户端和正式事务路由，但只执行连续
+`30s warmup + 1×60s measurement`：
+
+```bash
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+  --mode preliminary \
+  --seed 2026
+```
+
+该模式拒绝 scale、clients、warmup 和 window 覆盖，结果始终为
+`NON-RANKED`。它只写 `preliminary.log`、非排名 manifest 和资源 observation，
+不会创建 `rank.started`、`terminal_evidence.state`，也不会执行在线校验、
+崩溃恢复或正式状态证明。正式结论仍必须来自完整 `--mode all`。
+
 任何规模、并发或时间覆盖都需要 `--allow-deviation`，否则脚本直接拒绝。
 本地 smoke 的有效范围为 `scale=1..50`、`clients=1..32`：
 
@@ -150,6 +165,7 @@ smoke 保留三窗口、Wire、事务与校验路径，但 profile 和结果会�
 | 模式 | 行为 |
 | --- | --- |
 | `all` | 新建/装载、rank、在线检查、`SIGKILL`、同库重启、恢复检查 |
+| `preliminary` | 新建/装载后执行 NON-RANKED `30s + 1×60s` 性能初测 |
 | `init` | 新建并装载数据库，成功后保留 |
 | `rank` | 对已有数据库 rank 并执行在线检查；`--init-db` 可先新建/装载 |
 | `recovery` | 启动已有数据库并执行恢复检查 |

@@ -76,6 +76,17 @@ performance_test_record/<UTC-run-id>_final2026/
 
 完整参数、安全约束及拆分运行方式见 [`perf_workflow/README.md`](perf_workflow/README.md)。
 
+优化迭代时可先运行固定 SF50/32-client 的非排名初测：
+
+```bash
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+  --mode preliminary \
+  --seed 2026
+```
+
+它使用同一 prepared transaction/session/router/dispatch 路径，执行 30 秒预热和
+一个 60 秒测量窗口，但不发布任何正式 rank claim 或 terminal evidence。
+
 ## 直接运行 tester
 
 以下示例假定 RMDB 已在 `127.0.0.1:8765` 运行，并且状态目录属于这一数据库与 seed：
