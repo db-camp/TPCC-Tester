@@ -1439,7 +1439,7 @@ mod tests {
     use crate::ranking::evidence_collector::{
         CustomerKey as EvidenceCustomerKey, SealedIntervalEvidence, StockKey,
     };
-    use crate::ranking::preflight::StalePaymentPreflightProof;
+    use crate::ranking::preflight::PreparedPathPreflightProof;
     use crate::ranking::rich_recovery_samples::{
         InitialCustomerData, InitialHistoryRow, SealedRichRecoverySamples,
     };
@@ -1579,7 +1579,7 @@ mod tests {
             stock_roots,
             initial_history,
             initial_customer,
-            StalePaymentPreflightProof::verified_for_test(dataset.seed, warehouses),
+            PreparedPathPreflightProof::verified_for_test(dataset.seed, warehouses),
         )
         .unwrap();
         collector.worker_finished(0).await.unwrap();

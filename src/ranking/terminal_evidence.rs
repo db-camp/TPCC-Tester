@@ -26,7 +26,7 @@ use super::payment_endpoints::{
     PaymentAckReceipt, PaymentEndpointCollector, PaymentEndpointError, PaymentEndpointView,
     PaymentFloatEdge, PaymentTerminalEvidence, SealedPaymentEvidence,
 };
-use super::preflight::StalePaymentPreflightProof;
+use super::preflight::PreparedPathPreflightProof;
 use super::rich_recovery_samples::{
     InitialCustomerDataProvider, InitialHistoryProvider, RichRecoveryCollector, RichRecoveryError,
     SealedRichRecoverySamples,
@@ -177,8 +177,8 @@ pub struct TerminalEvidenceCollector {
 }
 
 impl TerminalEvidenceCollector {
-    /// Construct the shared gate only after the controlled stale-Writer
-    /// Payment preflight has succeeded.
+    /// Construct the shared gate only after the prepared-path semantic
+    /// preflight has succeeded.
     ///
     pub fn new<P, H, C>(
         warehouses: u16,
@@ -187,15 +187,15 @@ impl TerminalEvidenceCollector {
         stock_roots: P,
         initial_history: H,
         initial_customers: C,
-        stale_payment_preflight: StalePaymentPreflightProof,
+        prepared_path_preflight: PreparedPathPreflightProof,
     ) -> Result<Self, TerminalEvidenceError>
     where
         P: StockRootProvider + 'static,
         H: InitialHistoryProvider + 'static,
         C: InitialCustomerDataProvider + 'static,
     {
-        if !stale_payment_preflight.matches(sample_seed, warehouses) {
-            return Err(TerminalEvidenceError::StalePaymentPreflightBinding);
+        if !prepared_path_preflight.matches(sample_seed, warehouses) {
+            return Err(TerminalEvidenceError::PreparedPathPreflightBinding);
         }
         let intervals = IntervalCollector::new(warehouses, clients, sample_seed, stock_roots)?;
         let rich = RichRecoveryCollector::new(
@@ -927,8 +927,8 @@ pub enum TerminalEvidenceError {
     WorkersNotFinished,
     #[error("terminal evidence collector is already sealed")]
     AlreadySealed,
-    #[error("controlled stale-Writer Payment preflight proof has the wrong run binding")]
-    StalePaymentPreflightBinding,
+    #[error("prepared-path semantic preflight proof has the wrong run binding")]
+    PreparedPathPreflightBinding,
 }
 
 fn prepare_terminal(
@@ -1118,7 +1118,7 @@ mod tests {
                 stock_roots,
                 initial_history,
                 initial_customer,
-                StalePaymentPreflightProof::verified_for_test(TEST_SEED, 50),
+                PreparedPathPreflightProof::verified_for_test(TEST_SEED, 50),
             )
             .unwrap(),
         )
@@ -1581,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_payment_preflight_is_bound_to_the_collector_configuration() {
+    fn prepared_path_preflight_is_bound_to_the_collector_configuration() {
         assert!(matches!(
             TerminalEvidenceCollector::new(
                 50,
@@ -1590,9 +1590,9 @@ mod tests {
                 stock_roots,
                 initial_history,
                 initial_customer,
-                StalePaymentPreflightProof::verified_for_test(TEST_SEED ^ 1, 50),
+                PreparedPathPreflightProof::verified_for_test(TEST_SEED ^ 1, 50),
             ),
-            Err(TerminalEvidenceError::StalePaymentPreflightBinding)
+            Err(TerminalEvidenceError::PreparedPathPreflightBinding)
         ));
     }
 }

@@ -4005,7 +4005,7 @@ mod tests {
 
     use super::*;
     use crate::ranking::evidence_collector::StockKey;
-    use crate::ranking::preflight::StalePaymentPreflightProof;
+    use crate::ranking::preflight::PreparedPathPreflightProof;
     use crate::ranking::runner::StockVersion;
     use crate::ranking::terminal_evidence::TerminalEvidenceCollector;
     use crate::sample_evidence::setup_evidence_fixture;
@@ -4231,7 +4231,7 @@ mod tests {
             stock_roots,
             initial_history,
             initial_customer,
-            StalePaymentPreflightProof::verified_for_test(dataset.seed, warehouses),
+            PreparedPathPreflightProof::verified_for_test(dataset.seed, warehouses),
         )
         .unwrap();
         tokio::runtime::Builder::new_current_thread()

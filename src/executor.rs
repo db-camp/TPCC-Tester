@@ -267,24 +267,18 @@ impl BenchmarkExecutor {
              running untimed prepared semantic preflight",
             profile.clients
         );
-        if sessions.len() < 2 {
+        if sessions.is_empty() {
             return Err(TpccError::Protocol(
-                "ranked semantic preflight requires at least two prepared sessions".to_owned(),
+                "ranked semantic preflight requires a prepared session".to_owned(),
             ));
         }
-        let (primary_sessions, contender_sessions) = sessions.split_at_mut(1);
-        let primary_session = primary_sessions.first_mut().ok_or_else(|| {
+        let primary_session = sessions.first_mut().ok_or_else(|| {
             TpccError::Protocol(
                 "ranked semantic preflight lost its primary prepared session".to_owned(),
             )
         })?;
-        let contender_session = contender_sessions.first_mut().ok_or_else(|| {
-            TpccError::Protocol(
-                "ranked semantic preflight lost its contender prepared session".to_owned(),
-            )
-        })?;
-        let stale_payment_preflight =
-            preflight::run(primary_session, contender_session, seed, profile.warehouses).await?;
+        let prepared_path_preflight =
+            preflight::run(primary_session, seed, profile.warehouses).await?;
         info!("prepared semantic preflight passed before timing-barrier release");
         let stock_roots = Arc::clone(&self.setup_generator);
         let history_roots = Arc::clone(&self.setup_generator);
@@ -328,7 +322,7 @@ impl BenchmarkExecutor {
                                 )
                         })
                 },
-                stale_payment_preflight,
+                prepared_path_preflight,
             )
             .map_err(terminal_evidence_error)?,
         );

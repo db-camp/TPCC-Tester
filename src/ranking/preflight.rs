@@ -36,16 +36,16 @@ const STALE_PAYMENT_QUERY_INDEX: u16 = 0;
 const STALE_PAYMENT_UPDATE_INDEX: u16 = 1;
 const STALE_PAYMENT_COMMIT_INDEX: u16 = 2;
 
-/// Proof that the controlled stale-Writer Payment probe passed.
+/// Proof that the prepared-path semantic preflight passed.
 ///
 /// Private fields bind the proof to one workload seed and warehouse domain.
 /// Production code can obtain this value only by completing `run`.
-pub struct StalePaymentPreflightProof {
+pub struct PreparedPathPreflightProof {
     seed: u64,
     warehouses: u16,
 }
 
-impl StalePaymentPreflightProof {
+impl PreparedPathPreflightProof {
     pub(crate) fn matches(&self, seed: u64, warehouses: u16) -> bool {
         self.seed == seed && self.warehouses == warehouses
     }
@@ -56,22 +56,20 @@ impl StalePaymentPreflightProof {
     }
 }
 
-/// Run the deterministic, non-measured semantic preflight on two already
-/// configured and prepared ranked connections.
+/// Run the deterministic, non-measured semantic preflight on an already
+/// configured and prepared ranked connection.
 pub async fn run(
     primary: &mut RmdbClient,
-    contender: &mut RmdbClient,
     seed: u64,
     warehouses: u16,
-) -> Result<StalePaymentPreflightProof, TpccError> {
+) -> Result<PreparedPathPreflightProof, TpccError> {
     let selection = PreflightSelection::derive(seed, warehouses)?;
     verify_stock_level(primary, &selection).await?;
     verify_new_order_rollback(primary, &selection).await?;
     // Do not inject a synthetic duplicate-key failure before measurement.
     // Ranked batches still carry AUTO_ABORT, while this non-TPC-C probe would
     // make entry depend on an extra error-response surface.
-    verify_payment_stale_write(primary, contender, selection.warehouse_id).await?;
-    Ok(StalePaymentPreflightProof { seed, warehouses })
+    Ok(PreparedPathPreflightProof { seed, warehouses })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
