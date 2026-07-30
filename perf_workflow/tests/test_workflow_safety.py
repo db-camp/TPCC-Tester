@@ -2025,6 +2025,30 @@ trap - EXIT
         self.assertLess(group_proof, second_identity)
         self.assertLess(second_identity, equality_proof)
 
+    def test_server_exit_classifies_zombie_before_identity_probe(self):
+        script_text = SCRIPT.read_text(encoding="utf-8")
+        helper_start = script_text.index("server_process_helper() {")
+        helper_end = script_text.index(
+            "\n}\n\nport_is_available() {",
+            helper_start,
+        )
+        helper_text = script_text[helper_start:helper_end]
+        status_start = helper_text.index("def root_status(table):")
+        status_end = helper_text.index(
+            "\n\ndef listener_owners_linux():",
+            status_start,
+        )
+        status_text = helper_text[status_start:status_end]
+        self.assertLess(
+            status_text.index('item["state"].upper().startswith("Z")'),
+            status_text.index("current_identity(root_pid)"),
+        )
+        self.assertIn('return "zombie"', status_text)
+        self.assertIn(
+            'status in {"absent", "zombie"}',
+            helper_text,
+        )
+
     def test_registration_timeout_kills_stalled_pre_group_launcher(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)

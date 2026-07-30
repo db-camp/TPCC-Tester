@@ -3218,6 +3218,11 @@ def root_status(table):
     item = table.get(root_pid)
     if item is None:
         return "absent"
+    # A zombie still reserves its PID, but Darwin's libproc may no longer
+    # expose its start time. Classify it before consulting that identity so
+    # process-group exit cannot be mistaken for PID reuse.
+    if item["state"].upper().startswith("Z"):
+        return "zombie"
     if current_identity(root_pid) != expected_identity:
         return "reused"
     return "owned"
@@ -3401,13 +3406,17 @@ except RuntimeError as error:
     raise SystemExit(2)
 
 if action == "root-alive":
-    raise SystemExit(0 if status == "owned" else (1 if status == "absent" else 2))
+    raise SystemExit(
+        0 if status == "owned" else (
+            1 if status in {"absent", "zombie"} else 2
+        )
+    )
 
 if action == "root-running":
     if status == "reused":
         print("registered RMDB pid was reused", file=sys.stderr)
         raise SystemExit(2)
-    if status == "absent" or table[root_pid]["state"].upper().startswith("Z"):
+    if status in {"absent", "zombie"}:
         raise SystemExit(1)
     raise SystemExit(0)
 
