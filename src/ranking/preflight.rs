@@ -67,7 +67,9 @@ pub async fn run(
     let selection = PreflightSelection::derive(seed, warehouses)?;
     verify_stock_level(primary, &selection).await?;
     verify_new_order_rollback(primary, &selection).await?;
-    verify_new_order_auto_abort(primary, &selection).await?;
+    // Do not inject a synthetic duplicate-key failure before measurement.
+    // Ranked batches still carry AUTO_ABORT, while this non-TPC-C probe would
+    // make entry depend on an extra error-response surface.
     verify_payment_stale_write(primary, contender, selection.warehouse_id).await?;
     Ok(StalePaymentPreflightProof { seed, warehouses })
 }
