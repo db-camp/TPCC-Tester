@@ -132,7 +132,8 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 
 性能优化迭代可使用固定的 preliminary 流程。它仍新建并装载完整 SF50
 数据集，使用 32 个持久 prepared 客户端和正式事务路由，但只执行连续
-`30s warmup + 1×60s measurement`：
+`30s warmup + 1×60s measurement`。预热与测量使用独立阶段轮盘，每个客户端
+在测量阶段重新从 `txn_no=0` 开始，重试仍只复用原阶段的冻结参数：
 
 ```bash
 deps/TPCC-Tester/perf_workflow/run_workflow.sh \

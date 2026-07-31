@@ -84,8 +84,9 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   --seed 2026
 ```
 
-它使用同一 prepared transaction/session/router/dispatch 路径，执行 30 秒预热和
-一个 60 秒测量窗口，但不发布任何正式 rank claim 或 terminal evidence。
+它使用同一 prepared transaction/session/router/dispatch 路径；预热和 60 秒测量
+使用独立阶段轮盘，测量阶段各客户端从 `txn_no=0` 重新开始，但不发布任何正式
+rank claim 或 terminal evidence。
 
 ## 直接运行 tester
 

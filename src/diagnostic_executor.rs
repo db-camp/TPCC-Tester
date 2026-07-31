@@ -42,7 +42,8 @@ use crate::workload::Final2026Workload;
 // domains rather than replaying the same deterministic transaction prefix.
 const DIAGNOSTIC_WARMUP_STAGE: StageId = StageId::custom(0x6469_6167_7761_726d);
 const DIAGNOSTIC_OBSERVATION_STAGE: StageId = StageId::custom(0x6469_6167_6f62_7376);
-const PRELIMINARY_STAGE: StageId = StageId::custom(0x7072_656c_696d_3031);
+const PRELIMINARY_WARMUP_STAGE: StageId = StageId::custom(0x7072_656c_7761_726d);
+const PRELIMINARY_MEASUREMENT_STAGE: StageId = StageId::custom(0x7072_656c_6d65_6173);
 const RESOURCE_TIMELINE_ENV: &str = "RMDB_TPCC_RESOURCE_TIMELINE_FILE";
 const DIAGNOSTIC_FAMILIES: [(TransactionKind, &str); 5] = [
     (TransactionKind::NewOrder, "new_order"),
@@ -152,6 +153,7 @@ impl DiagnosticExecutor {
         self.run_timed(
             segment,
             diagnostic_stage(segment),
+            diagnostic_stage(segment),
             Duration::ZERO,
             Duration::from_secs(duration_seconds),
             false,
@@ -162,7 +164,8 @@ impl DiagnosticExecutor {
     pub async fn run_preliminary(&self) -> Result<DiagnosticRunResult, TpccError> {
         self.run_timed(
             DiagnosticSegment::Observation,
-            PRELIMINARY_STAGE,
+            PRELIMINARY_WARMUP_STAGE,
+            PRELIMINARY_MEASUREMENT_STAGE,
             Duration::from_secs(PRELIMINARY_WARMUP_SECONDS),
             Duration::from_secs(PRELIMINARY_MEASUREMENT_SECONDS),
             true,
@@ -173,7 +176,8 @@ impl DiagnosticExecutor {
     async fn run_timed(
         &self,
         segment: DiagnosticSegment,
-        stage: StageId,
+        warmup_stage: StageId,
+        measurement_stage: StageId,
         warmup: Duration,
         measurement: Duration,
         preliminary: bool,
@@ -195,8 +199,13 @@ impl DiagnosticExecutor {
         let phase_tail_grace = Duration::from_secs(self.config.phase_tail_grace_seconds);
         let duration = warmup.saturating_add(measurement);
         let router = OfficialRouter::new(WorkloadSeed(seed));
-        let wheel = router.wheel(stage);
-        let router = Arc::new(DiagnosticRouting { router, wheel });
+        let warmup_wheel = router.wheel(warmup_stage);
+        let measurement_wheel = router.wheel(measurement_stage);
+        let router = Arc::new(DiagnosticRouting {
+            router,
+            warmup_wheel,
+            measurement_wheel,
+        });
 
         info!(
             "preparing {} diagnostic Wire v3 sessions with SNAPSHOT ISOLATION and PREPARE_SET",
@@ -388,12 +397,29 @@ impl DiagnosticExecutor {
 
 struct DiagnosticRouting {
     router: OfficialRouter,
-    wheel: WarehouseWheel,
+    warmup_wheel: WarehouseWheel,
+    measurement_wheel: WarehouseWheel,
+}
+
+impl DiagnosticRouting {
+    fn wheel(&self, phase: DiagnosticPhase) -> &WarehouseWheel {
+        match phase {
+            DiagnosticPhase::Warmup => &self.warmup_wheel,
+            DiagnosticPhase::Measurement => &self.measurement_wheel,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticPhase {
+    Warmup,
+    Measurement,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct DiagnosticTimeline {
     measurement_start: Instant,
+    warmup_drain_deadline: Instant,
     stop_at: Instant,
     drain_deadline: Instant,
 }
@@ -408,6 +434,9 @@ impl DiagnosticTimeline {
         let measurement_start = start.checked_add(warmup).ok_or_else(|| {
             TpccError::Protocol("diagnostic workload deadline overflow".to_owned())
         })?;
+        let warmup_drain_deadline = measurement_start
+            .checked_add(grace)
+            .ok_or_else(|| TpccError::Protocol("diagnostic grace deadline overflow".to_owned()))?;
         let stop_at = measurement_start.checked_add(measurement).ok_or_else(|| {
             TpccError::Protocol("diagnostic workload deadline overflow".to_owned())
         })?;
@@ -416,17 +445,27 @@ impl DiagnosticTimeline {
             .ok_or_else(|| TpccError::Protocol("diagnostic grace deadline overflow".to_owned()))?;
         Ok(Self {
             measurement_start,
+            warmup_drain_deadline,
             stop_at,
             drain_deadline,
         })
     }
 
-    fn may_start(self, now: Instant) -> bool {
-        now < self.stop_at
+    fn phase(self, now: Instant) -> Option<DiagnosticPhase> {
+        if now < self.measurement_start {
+            Some(DiagnosticPhase::Warmup)
+        } else if now < self.stop_at {
+            Some(DiagnosticPhase::Measurement)
+        } else {
+            None
+        }
     }
 
-    fn attempt_deadline(self) -> Instant {
-        self.drain_deadline
+    fn attempt_deadline(self, phase: DiagnosticPhase) -> Instant {
+        match phase {
+            DiagnosticPhase::Warmup => self.warmup_drain_deadline,
+            DiagnosticPhase::Measurement => self.drain_deadline,
+        }
     }
 }
 
@@ -451,25 +490,37 @@ async fn run_worker(
     };
     let mut sequence =
         ClientSequence::new(worker).map_err(|error| TpccError::Protocol(error.to_string()))?;
-    let workload = Final2026Workload::new(&routing.router, &routing.wheel);
+    let mut active_phase = None;
     let mut stats = DiagnosticStats::default();
 
-    while !cancelled.load(Ordering::Acquire) && timeline.may_start(Instant::now()) {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+        let Some(phase) = timeline.phase(Instant::now()) else {
+            break;
+        };
+        if active_phase != Some(phase) {
+            sequence = ClientSequence::new(worker)
+                .map_err(|error| TpccError::Protocol(error.to_string()))?;
+            active_phase = Some(phase);
+        }
+        let workload = Final2026Workload::new(&routing.router, routing.wheel(phase));
         let selected = workload
             .select(&mut sequence)
             .map_err(|error| TpccError::Protocol(error.to_string()))?;
         let selected_at = Instant::now();
+        // Selection is local and may race a phase boundary. Discard an old
+        // phase selection instead of dispatching it in the next phase; the
+        // next loop resets that phase's sequence to txn_no zero.
+        if timeline.phase(selected_at) != Some(phase) {
+            continue;
+        }
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let frozen = FrozenTransaction::new(selected, timestamp)
             .map_err(|message| TpccError::Protocol(message.to_owned()))?;
         let kind = frozen.ticket().kind();
-
-        // Selection is local and may race the cutoff.  Recheck immediately
-        // before the first request so no transaction begins after stop_at.
-        if !timeline.may_start(Instant::now()) {
-            break;
-        }
-        let measured = selected_at >= timeline.measurement_start;
+        let measured = phase == DiagnosticPhase::Measurement;
         if measured {
             stats.selected += 1;
         }
@@ -479,14 +530,13 @@ async fn run_worker(
                 return Ok(stats);
             }
             let attempt_started = Instant::now();
-            if !timeline.may_start(attempt_started) {
-                stats.abandoned += 1;
+            if timeline.phase(attempt_started) != Some(phase) {
                 break;
             }
             if measured {
                 stats.record_attempt(kind);
             }
-            let attempt_deadline = timeline.attempt_deadline();
+            let attempt_deadline = timeline.attempt_deadline(phase);
             let response =
                 tokio::time::timeout_at(attempt_deadline, dispatch::execute(&mut client, &frozen))
                     .await;
@@ -528,11 +578,8 @@ async fn run_worker(
                         stats.retryable_aborts += 1;
                     }
                     // A retry preserves `frozen`, but it may only start before
-                    // the workload cutoff just like the ranked scheduler.
-                    if !timeline.may_start(Instant::now()) {
-                        if measured {
-                            stats.abandoned += 1;
-                        }
+                    // the current phase cutoff just like the ranked scheduler.
+                    if timeline.phase(Instant::now()) != Some(phase) {
                         break;
                     }
                 }
@@ -840,33 +887,76 @@ mod tests {
     }
 
     #[test]
-    fn absolute_attempt_deadline_is_the_phase_drain_deadline() {
-        let start = Instant::now();
-        let timeline = DiagnosticTimeline::new(
-            start,
-            Duration::ZERO,
-            Duration::from_secs(10),
-            Duration::from_secs(5),
-        )
-        .unwrap();
+    fn preliminary_stages_restart_at_zero_in_distinct_routing_domains() {
+        let router = OfficialRouter::new(WorkloadSeed(0x2026_0731));
+        assert_ne!(PRELIMINARY_WARMUP_STAGE, PRELIMINARY_MEASUREMENT_STAGE);
 
-        assert_eq!(timeline.attempt_deadline(), start + Duration::from_secs(15));
+        let warmup_wheel = router.wheel(PRELIMINARY_WARMUP_STAGE);
+        let measurement_wheel = router.wheel(PRELIMINARY_MEASUREMENT_STAGE);
+        let mut warmup_sequence = ClientSequence::new(31).unwrap();
+        let mut measurement_sequence = ClientSequence::new(31).unwrap();
+        let warmup_ticket = Final2026Workload::new(&router, &warmup_wheel)
+            .select(&mut warmup_sequence)
+            .unwrap();
+        let measurement_ticket = Final2026Workload::new(&router, &measurement_wheel)
+            .select(&mut measurement_sequence)
+            .unwrap();
+
+        assert_eq!(warmup_ticket.route().txn_no, 0);
+        assert_eq!(measurement_ticket.route().txn_no, 0);
+        assert_eq!(warmup_ticket.route().stage, PRELIMINARY_WARMUP_STAGE);
+        assert_eq!(
+            measurement_ticket.route().stage,
+            PRELIMINARY_MEASUREMENT_STAGE
+        );
     }
 
     #[test]
-    fn transaction_start_is_forbidden_at_and_after_cutoff() {
+    fn absolute_attempt_deadlines_are_bounded_per_phase() {
         let start = Instant::now();
         let timeline = DiagnosticTimeline::new(
             start,
-            Duration::ZERO,
-            Duration::from_secs(10),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
             Duration::from_secs(5),
         )
         .unwrap();
 
-        assert!(timeline.may_start(start + Duration::from_secs(9)));
-        assert!(!timeline.may_start(start + Duration::from_secs(10)));
-        assert!(!timeline.may_start(start + Duration::from_secs(11)));
+        assert_eq!(
+            timeline.attempt_deadline(DiagnosticPhase::Warmup),
+            start + Duration::from_secs(35)
+        );
+        assert_eq!(
+            timeline.attempt_deadline(DiagnosticPhase::Measurement),
+            start + Duration::from_secs(95)
+        );
+    }
+
+    #[test]
+    fn timeline_uses_half_open_warmup_and_measurement_intervals() {
+        let start = Instant::now();
+        let timeline = DiagnosticTimeline::new(
+            start,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(
+            timeline.phase(start + Duration::from_secs(29)),
+            Some(DiagnosticPhase::Warmup)
+        );
+        assert_eq!(
+            timeline.phase(start + Duration::from_secs(30)),
+            Some(DiagnosticPhase::Measurement)
+        );
+        assert_eq!(
+            timeline.phase(start + Duration::from_secs(89)),
+            Some(DiagnosticPhase::Measurement)
+        );
+        assert_eq!(timeline.phase(start + Duration::from_secs(90)), None);
+        assert_eq!(timeline.phase(start + Duration::from_secs(91)), None);
     }
 
     #[test]

@@ -1248,6 +1248,22 @@ mod tests {
             Err(ConfigError::PreliminaryRequiresOfficialShape)
         ));
 
+        let wrong_scale = Config::try_parse_from([
+            "tpcc-tester",
+            "--preliminary",
+            "--seed",
+            "7",
+            "--state-dir",
+            "/tmp/tpcc-final2026-preliminary-state",
+            "--scale",
+            "49",
+        ])
+        .unwrap();
+        assert!(matches!(
+            wrong_scale.validate(),
+            Err(ConfigError::PreliminaryRequiresOfficialShape)
+        ));
+
         let combined = Config::try_parse_from([
             "tpcc-tester",
             "--preliminary",
