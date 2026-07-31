@@ -521,9 +521,7 @@ async fn run_worker(
             .map_err(|message| TpccError::Protocol(message.to_owned()))?;
         let kind = frozen.ticket().kind();
         let measured = phase == DiagnosticPhase::Measurement;
-        if measured {
-            stats.record_selection(kind);
-        }
+        let mut logical_attempt_recorded = false;
 
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -534,6 +532,10 @@ async fn run_worker(
                 break;
             }
             if measured {
+                if !logical_attempt_recorded {
+                    stats.record_selection(kind);
+                    logical_attempt_recorded = true;
+                }
                 stats.record_physical_attempt();
             }
             let attempt_deadline = timeline.attempt_deadline(phase);
