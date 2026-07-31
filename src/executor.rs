@@ -17,7 +17,9 @@ use crate::config::{Config, ResolvedProfile};
 use crate::connection::client::RmdbClient;
 use crate::data_gen::TpccDataGen;
 use crate::error::TpccError;
-use crate::measurement::{MeasurementSummary, WindowStats, FORMAL_WINDOW_COUNT};
+use crate::measurement::{
+    transaction_completion_summary, MeasurementSummary, WindowStats, FORMAL_WINDOW_COUNT,
+};
 use crate::phases::{
     AttemptDisposition, AttemptOutcome, EventRecorder, Final2026Scheduler, LocalRuntimeLimits,
     MonotonicClock, PhaseId, PhaseScheduleConfig, PreparedSessionId, SchedulerError,
@@ -921,10 +923,15 @@ impl Final2026RunResult {
         for index in 0..FORMAL_WINDOW_COUNT {
             let window = &self.windows[index];
             let gate = &self.summary.window_gates[index];
+            let new_order = transaction_completion_summary(
+                std::slice::from_ref(window),
+                TransactionType::NewOrder,
+            );
             println!(
-                "window{}: new_order_per_min={:.3}, committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, retry_abort={}, abandoned={}, grace_tail={}, delivery_processed={}, warehouses={}/{}, gate={}",
+                "window{}: new_order_per_min={:.3}, attempted={}, committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, abandoned={}, physical_attempts={}, retry_abort={}, cutoff_stopped={}, grace_tail={}, new_order_latency_ms=avg:{},p50:{},p99:{},max:{}, delivery_processed={}, warehouses={}/{}, gate={}",
                 index + 1,
                 self.window_rates[index],
+                window.attempted,
                 window.committed,
                 window.transaction_commits(TransactionType::NewOrder),
                 window.transaction_commits(TransactionType::Payment),
@@ -932,9 +939,15 @@ impl Final2026RunResult {
                 window.transaction_commits(TransactionType::Delivery),
                 window.transaction_commits(TransactionType::StockLevel),
                 window.expected_rollbacks,
-                window.retry_aborts,
                 window.abandoned,
+                window.physical_attempts,
+                window.retry_aborts,
+                window.cutoff_stopped,
                 window.grace_tail,
+                format_latency(new_order.latency_average),
+                format_latency(new_order.latency_p50),
+                format_latency(new_order.latency_p99),
+                format_latency(new_order.latency_max),
                 window.delivery_processed,
                 gate.coverage.covered_warehouses,
                 gate.coverage.required_warehouses,
@@ -949,6 +962,67 @@ impl Final2026RunResult {
             "new_order_latency_ms=p50:{},p99:{}",
             format_latency(self.summary.new_order_latency_p50),
             format_latency(self.summary.new_order_latency_p99)
+        );
+        let transaction_families = [
+            (TransactionType::NewOrder, "NewOrder"),
+            (TransactionType::Payment, "Payment"),
+            (TransactionType::OrderStatus, "OrderStatus"),
+            (TransactionType::Delivery, "Delivery"),
+            (TransactionType::StockLevel, "StockLevel"),
+        ];
+        let mut total_attempted = 0_u64;
+        let mut total_committed = 0_u64;
+        let mut total_expected_rollbacks = 0_u64;
+        let mut total_abandoned = 0_u64;
+        for (transaction_type, label) in transaction_families {
+            let completion = transaction_completion_summary(&self.windows, transaction_type);
+            total_attempted = total_attempted.saturating_add(completion.attempted);
+            total_committed = total_committed.saturating_add(completion.committed);
+            total_expected_rollbacks =
+                total_expected_rollbacks.saturating_add(completion.expected_rollbacks);
+            total_abandoned = total_abandoned.saturating_add(completion.abandoned);
+            println!(
+                "transaction_completion={label},attempted={},committed={},expected_rollback={},abandoned={},completion_percent={:.3},abort_percent={:.3},latency_ms=avg:{},p50:{},p99:{},max:{}",
+                completion.attempted,
+                completion.committed,
+                completion.expected_rollbacks,
+                completion.abandoned,
+                completion.completion_percent(),
+                completion.abort_percent(),
+                format_latency(completion.latency_average),
+                format_latency(completion.latency_p50),
+                format_latency(completion.latency_p99),
+                format_latency(completion.latency_max),
+            );
+        }
+        let completion_percent = if total_attempted == 0 {
+            0.0
+        } else {
+            total_committed.saturating_add(total_expected_rollbacks) as f64 * 100.0
+                / total_attempted as f64
+        };
+        let abort_percent = if total_attempted == 0 {
+            0.0
+        } else {
+            total_abandoned as f64 * 100.0 / total_attempted as f64
+        };
+        println!(
+            "transaction_completion_total=attempted:{total_attempted},committed:{total_committed},expected_rollback:{total_expected_rollbacks},abandoned:{total_abandoned},completion_percent:{completion_percent:.3},abort_percent:{abort_percent:.3}"
+        );
+        println!(
+            "physical_attempt_diagnostics=attempts:{},retry_abort:{},cutoff_stopped:{},grace_tail:{}",
+            self.windows
+                .iter()
+                .fold(0_u64, |total, window| total.saturating_add(window.physical_attempts)),
+            self.windows
+                .iter()
+                .fold(0_u64, |total, window| total.saturating_add(window.retry_aborts)),
+            self.windows
+                .iter()
+                .fold(0_u64, |total, window| total.saturating_add(window.cutoff_stopped)),
+            self.windows
+                .iter()
+                .fold(0_u64, |total, window| total.saturating_add(window.grace_tail)),
         );
         println!(
             "combined_coverage={}/{}, combined_gate={}",

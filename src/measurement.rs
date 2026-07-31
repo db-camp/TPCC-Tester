@@ -19,21 +19,35 @@ pub const COMBINED_FULL_COVERAGE: usize = 50;
 
 const TRANSACTION_TYPE_COUNT: usize = 5;
 
+#[derive(Debug, Clone, Default)]
+pub struct TransactionWindowStats {
+    pub attempted: u64,
+    pub committed: u64,
+    pub expected_rollbacks: u64,
+    pub abandoned: u64,
+    pub committed_latencies: Vec<Duration>,
+}
+
 /// Counters and ranked samples for one formal measurement window.
 ///
-/// `attempted` counts requests sent to the server, including requests that
-/// return a retryable abort or finish outside the ranked window.  In contrast,
-/// [`Self::completed`] counts only an in-window commit or a business-expected
-/// rollback, exactly as the coverage gate requires.
+/// `attempted` follows the official transaction-completion table: every
+/// physical attempt that reaches an in-window terminal appears exactly once as
+/// committed, expected rollback, or abandoned. A retryable
+/// `TRANSACTION_ABORT` is therefore one abandoned attempt; its later retry is a
+/// separate physical attempt with the same immutable transaction parameters.
+/// Unsent cutoff stops and grace-tail terminals are reported separately.
 #[derive(Debug, Clone)]
 pub struct WindowStats {
     pub attempted: u64,
+    pub physical_attempts: u64,
     pub committed: u64,
     pub retry_aborts: u64,
     pub expected_rollbacks: u64,
     pub abandoned: u64,
+    pub cutoff_stopped: u64,
     pub grace_tail: u64,
     pub committed_by_type: [u64; TRANSACTION_TYPE_COUNT],
+    pub transactions_by_type: [TransactionWindowStats; TRANSACTION_TYPE_COUNT],
     pub delivery_processed: u64,
     pub warehouse_completions: [u64; OFFICIAL_WAREHOUSE_COUNT],
     pub hot_warehouses: BTreeSet<u16>,
@@ -44,12 +58,15 @@ impl WindowStats {
     pub fn new(hot_warehouses: impl IntoIterator<Item = u16>) -> Self {
         Self {
             attempted: 0,
+            physical_attempts: 0,
             committed: 0,
             retry_aborts: 0,
             expected_rollbacks: 0,
             abandoned: 0,
+            cutoff_stopped: 0,
             grace_tail: 0,
             committed_by_type: [0; TRANSACTION_TYPE_COUNT],
+            transactions_by_type: std::array::from_fn(|_| TransactionWindowStats::default()),
             delivery_processed: 0,
             warehouse_completions: [0; OFFICIAL_WAREHOUSE_COUNT],
             hot_warehouses: hot_warehouses.into_iter().collect(),
@@ -70,9 +87,14 @@ impl WindowStats {
         delivery_processed: u64,
     ) {
         self.attempted = self.attempted.saturating_add(1);
+        self.physical_attempts = self.physical_attempts.saturating_add(1);
         self.committed = self.committed.saturating_add(1);
         let index = transaction_index(transaction_type);
         self.committed_by_type[index] = self.committed_by_type[index].saturating_add(1);
+        let family = &mut self.transactions_by_type[index];
+        family.attempted = family.attempted.saturating_add(1);
+        family.committed = family.committed.saturating_add(1);
+        family.committed_latencies.push(latency);
         self.record_completion_warehouse(home_warehouse);
 
         if transaction_type == TransactionType::NewOrder {
@@ -89,34 +111,47 @@ impl WindowStats {
     /// successful NewOrder nor a latency/ranking sample.
     pub fn record_expected_rollback(&mut self, home_warehouse: u16) {
         self.attempted = self.attempted.saturating_add(1);
+        self.physical_attempts = self.physical_attempts.saturating_add(1);
         self.expected_rollbacks = self.expected_rollbacks.saturating_add(1);
+        let family = &mut self.transactions_by_type[transaction_index(TransactionType::NewOrder)];
+        family.attempted = family.attempted.saturating_add(1);
+        family.expected_rollbacks = family.expected_rollbacks.saturating_add(1);
         self.record_completion_warehouse(home_warehouse);
     }
 
-    /// Records an attempt that returned a retryable transaction abort.
-    pub fn record_retry_abort(&mut self) {
+    /// Records an in-window attempt that returned a retryable transaction
+    /// abort. The next attempt reuses the same logical transaction parameters,
+    /// but this terminal remains an abandoned physical attempt in the report.
+    pub fn record_retry_abort(&mut self, transaction_type: TransactionType) {
         self.attempted = self.attempted.saturating_add(1);
+        self.physical_attempts = self.physical_attempts.saturating_add(1);
         self.retry_aborts = self.retry_aborts.saturating_add(1);
+        self.abandoned = self.abandoned.saturating_add(1);
+        let family = &mut self.transactions_by_type[transaction_index(transaction_type)];
+        family.attempted = family.attempted.saturating_add(1);
+        family.abandoned = family.abandoned.saturating_add(1);
     }
 
-    /// Records a selected transaction that was ultimately abandoned.
-    pub fn record_abandoned(&mut self) {
+    /// Records an in-window physical attempt that was abandoned without a
+    /// normal response terminal, for example a read-only response timeout.
+    pub fn record_abandoned(&mut self, transaction_type: TransactionType) {
         self.attempted = self.attempted.saturating_add(1);
+        self.physical_attempts = self.physical_attempts.saturating_add(1);
         self.abandoned = self.abandoned.saturating_add(1);
+        let family = &mut self.transactions_by_type[transaction_index(transaction_type)];
+        family.attempted = family.attempted.saturating_add(1);
+        family.abandoned = family.abandoned.saturating_add(1);
     }
 
-    /// Records a selected transaction abandoned before another request was sent.
-    ///
-    /// This is used for an expired reservation and for a retry that cannot be
-    /// started before the phase deadline. The transaction still counts as
-    /// abandoned, but there is no additional physical attempt to report.
-    pub fn record_unsent_abandoned(&mut self) {
-        self.abandoned = self.abandoned.saturating_add(1);
+    /// Records a reservation that reached the phase cutoff before any request
+    /// was sent. It is neither attempted nor abandoned in the official table.
+    pub fn record_cutoff_stop(&mut self) {
+        self.cutoff_stopped = self.cutoff_stopped.saturating_add(1);
     }
 
     /// Records a response completed only after the formal window deadline.
-    pub fn record_grace_tail(&mut self) {
-        self.attempted = self.attempted.saturating_add(1);
+    pub fn record_grace_tail(&mut self, _transaction_type: TransactionType) {
+        self.physical_attempts = self.physical_attempts.saturating_add(1);
         self.grace_tail = self.grace_tail.saturating_add(1);
     }
 
@@ -127,6 +162,51 @@ impl WindowStats {
 
     pub fn transaction_commits(&self, transaction_type: TransactionType) -> u64 {
         self.committed_by_type[transaction_index(transaction_type)]
+    }
+
+    pub fn transaction_stats(&self, transaction_type: TransactionType) -> &TransactionWindowStats {
+        &self.transactions_by_type[transaction_index(transaction_type)]
+    }
+
+    pub fn accounting_is_consistent(&self) -> bool {
+        let mut attempted = 0_u64;
+        let mut committed = 0_u64;
+        let mut expected_rollbacks = 0_u64;
+        let mut abandoned = 0_u64;
+
+        for transaction_type in TransactionType::all() {
+            let index = transaction_index(*transaction_type);
+            let family = &self.transactions_by_type[index];
+            if family.attempted
+                != family
+                    .committed
+                    .saturating_add(family.expected_rollbacks)
+                    .saturating_add(family.abandoned)
+                || family.committed != self.committed_by_type[index]
+                || u64::try_from(family.committed_latencies.len()).ok() != Some(family.committed)
+            {
+                return false;
+            }
+            attempted = attempted.saturating_add(family.attempted);
+            committed = committed.saturating_add(family.committed);
+            expected_rollbacks = expected_rollbacks.saturating_add(family.expected_rollbacks);
+            abandoned = abandoned.saturating_add(family.abandoned);
+        }
+
+        attempted == self.attempted
+            && committed == self.committed
+            && expected_rollbacks == self.expected_rollbacks
+            && abandoned == self.abandoned
+            && self.attempted
+                == self
+                    .committed
+                    .saturating_add(self.expected_rollbacks)
+                    .saturating_add(self.abandoned)
+            && self.physical_attempts == self.attempted.saturating_add(self.grace_tail)
+            && self
+                .transaction_stats(TransactionType::NewOrder)
+                .committed_latencies
+                == self.new_order_latencies
     }
 
     pub fn covered_warehouses(&self) -> usize {
@@ -292,6 +372,69 @@ pub struct MeasurementSummary {
     pub new_order_latency_p99: Option<Duration>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionCompletionSummary {
+    pub attempted: u64,
+    pub committed: u64,
+    pub expected_rollbacks: u64,
+    pub abandoned: u64,
+    pub latency_average: Option<Duration>,
+    pub latency_p50: Option<Duration>,
+    pub latency_p99: Option<Duration>,
+    pub latency_max: Option<Duration>,
+}
+
+impl TransactionCompletionSummary {
+    pub fn completion_percent(&self) -> f64 {
+        if self.attempted == 0 {
+            0.0
+        } else {
+            self.committed.saturating_add(self.expected_rollbacks) as f64 * 100.0
+                / self.attempted as f64
+        }
+    }
+
+    pub fn abort_percent(&self) -> f64 {
+        if self.attempted == 0 {
+            0.0
+        } else {
+            self.abandoned as f64 * 100.0 / self.attempted as f64
+        }
+    }
+}
+
+pub fn transaction_completion_summary(
+    windows: &[WindowStats],
+    transaction_type: TransactionType,
+) -> TransactionCompletionSummary {
+    let mut attempted = 0_u64;
+    let mut committed = 0_u64;
+    let mut expected_rollbacks = 0_u64;
+    let mut abandoned = 0_u64;
+    let mut latencies = Vec::new();
+    for window in windows {
+        let family = window.transaction_stats(transaction_type);
+        attempted = attempted.saturating_add(family.attempted);
+        committed = committed.saturating_add(family.committed);
+        expected_rollbacks = expected_rollbacks.saturating_add(family.expected_rollbacks);
+        abandoned = abandoned.saturating_add(family.abandoned);
+        latencies.extend(family.committed_latencies.iter().copied());
+    }
+    latencies.sort_unstable();
+    let latency_average = average_duration(&latencies);
+    let latency_max = latencies.last().copied();
+    TransactionCompletionSummary {
+        attempted,
+        committed,
+        expected_rollbacks,
+        abandoned,
+        latency_average,
+        latency_p50: nearest_rank(&latencies, 50),
+        latency_p99: nearest_rank(&latencies, 99),
+        latency_max,
+    }
+}
+
 impl MeasurementSummary {
     pub fn from_windows(windows: &[WindowStats; FORMAL_WINDOW_COUNT]) -> Self {
         let window_gates = std::array::from_fn(|index| windows[index].gate());
@@ -392,6 +535,19 @@ fn nearest_rank(sorted_samples: &[Duration], percentile: usize) -> Option<Durati
     sorted_samples.get(rank - 1).copied()
 }
 
+fn average_duration(samples: &[Duration]) -> Option<Duration> {
+    if samples.is_empty() {
+        return None;
+    }
+    let total_nanos = samples.iter().fold(0_u128, |total, sample| {
+        total.saturating_add(sample.as_nanos())
+    });
+    let average_nanos = total_nanos / samples.len() as u128;
+    Some(Duration::from_nanos(
+        u64::try_from(average_nanos).unwrap_or(u64::MAX),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,17 +639,30 @@ mod tests {
         let mut stats = WindowStats::new([1, 2, 3, 4]);
         stats.record_commit(TransactionType::Payment, 1, Duration::from_millis(10), 0);
         stats.record_expected_rollback(2);
-        stats.record_retry_abort();
-        stats.record_abandoned();
-        stats.record_unsent_abandoned();
-        stats.record_grace_tail();
+        stats.record_retry_abort(TransactionType::Payment);
+        stats.record_abandoned(TransactionType::Payment);
+        stats.record_cutoff_stop();
+        stats.record_grace_tail(TransactionType::Payment);
 
-        assert_eq!(stats.attempted, 5);
+        assert_eq!(stats.attempted, 4);
+        assert_eq!(stats.physical_attempts, 5);
         assert_eq!(stats.abandoned, 2);
+        assert_eq!(stats.cutoff_stopped, 1);
         assert_eq!(stats.completed(), 2);
         assert_eq!(stats.covered_warehouses(), 2);
         assert_eq!(stats.warehouse_completions[0], 1);
         assert_eq!(stats.warehouse_completions[1], 1);
+        assert_eq!(
+            stats.transaction_stats(TransactionType::Payment).attempted,
+            3
+        );
+        assert_eq!(
+            stats
+                .transaction_stats(TransactionType::NewOrder)
+                .expected_rollbacks,
+            1
+        );
+        assert!(stats.accounting_is_consistent());
     }
 
     #[test]
@@ -582,5 +751,59 @@ mod tests {
             summary.new_order_latency_p99,
             Some(Duration::from_millis(99))
         );
+
+        let new_order = transaction_completion_summary(&windows, TransactionType::NewOrder);
+        assert_eq!(new_order.attempted, 100);
+        assert_eq!(new_order.committed, 100);
+        assert_eq!(new_order.expected_rollbacks, 0);
+        assert_eq!(new_order.abandoned, 0);
+        assert_eq!(
+            new_order.latency_average,
+            Some(Duration::from_millis(50) + Duration::from_micros(500))
+        );
+        assert_eq!(new_order.latency_p50, Some(Duration::from_millis(50)));
+        assert_eq!(new_order.latency_p99, Some(Duration::from_millis(99)));
+        assert_eq!(new_order.latency_max, Some(Duration::from_millis(100)));
+        assert_eq!(new_order.completion_percent(), 100.0);
+        assert_eq!(new_order.abort_percent(), 0.0);
+    }
+
+    #[test]
+    fn retry_terminals_are_abandoned_attempts_but_tail_is_excluded() {
+        let mut stats = WindowStats::new([1, 2, 3, 4]);
+        stats.record_retry_abort(TransactionType::Payment);
+        stats.record_retry_abort(TransactionType::Payment);
+        stats.record_commit(TransactionType::Payment, 1, Duration::from_millis(20), 0);
+        stats.record_grace_tail(TransactionType::Payment);
+
+        let payment = stats.transaction_stats(TransactionType::Payment);
+        assert_eq!(stats.attempted, 3);
+        assert_eq!(stats.physical_attempts, 4);
+        assert_eq!(stats.retry_aborts, 2);
+        assert_eq!(stats.abandoned, 2);
+        assert_eq!(stats.grace_tail, 1);
+        assert_eq!(payment.attempted, 3);
+        assert_eq!(payment.committed, 1);
+        assert_eq!(payment.abandoned, 2);
+        assert_eq!(
+            payment.attempted,
+            payment
+                .committed
+                .saturating_add(payment.expected_rollbacks)
+                .saturating_add(payment.abandoned)
+        );
+        assert!(stats.accounting_is_consistent());
+    }
+
+    #[test]
+    fn accounting_consistency_rejects_counter_and_latency_drift() {
+        let mut stats = WindowStats::new([1, 2, 3, 4]);
+        stats.record_commit(TransactionType::Delivery, 1, Duration::from_millis(12), 1);
+        assert!(stats.accounting_is_consistent());
+
+        stats.transactions_by_type[transaction_index(TransactionType::Delivery)]
+            .committed_latencies
+            .clear();
+        assert!(!stats.accounting_is_consistent());
     }
 }

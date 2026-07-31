@@ -445,6 +445,8 @@ pub enum SchedulerError {
     TimelineIncomplete,
     #[error("at least one worker still has an in-flight transaction")]
     WorkersNotDrained,
+    #[error("ranked transaction accounting is internally inconsistent")]
+    InconsistentMeasurementAccounting,
     #[error("scheduler failed: {0:?}")]
     RunFailed(SchedulerFailure),
 }
@@ -822,14 +824,14 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             if is_read_only(ticket.identity.transaction_type()) {
                 self.workers[worker_index].selection = None;
                 if let Some(index) = ticket.phase().formal_index() {
-                    self.windows[index].record_abandoned();
+                    self.windows[index].record_grace_tail(ticket.identity.transaction_type());
                 }
                 self.recorder.record(SchedulerEvent::TransactionFinished {
                     ticket,
-                    class: CompletionClass::Abandoned,
+                    class: CompletionClass::GraceTail,
                     at: completed_at,
                 });
-                return Ok(AttemptDisposition::Abandoned);
+                return Ok(AttemptDisposition::GraceTail);
             }
             self.fail_worker_at(
                 ticket.worker(),
@@ -872,7 +874,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         if completed_at >= ticket.phase_deadline() {
             self.workers[worker_index].selection = None;
             if let Some(index) = ticket.phase().formal_index() {
-                self.windows[index].record_grace_tail();
+                self.windows[index].record_grace_tail(ticket.identity.transaction_type());
             }
             self.recorder.record(SchedulerEvent::TransactionFinished {
                 ticket,
@@ -910,7 +912,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             AttemptOutcome::RetryableAbort => {
                 worker_state.selection = Some(SelectionState::RetryPending(ticket));
                 if let Some(index) = ticket.phase().formal_index() {
-                    self.windows[index].record_retry_abort();
+                    self.windows[index].record_retry_abort(ticket.identity.transaction_type());
                 }
                 (
                     CompletionClass::RetryableAbort,
@@ -960,7 +962,11 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
 
         self.workers[worker_index].selection = None;
         if let Some(index) = ticket.phase().formal_index() {
-            self.windows[index].record_abandoned();
+            if abandoned_at < ticket.phase_deadline() {
+                self.windows[index].record_abandoned(ticket.identity.transaction_type());
+            } else {
+                self.windows[index].record_grace_tail(ticket.identity.transaction_type());
+            }
         }
         self.recorder.record(SchedulerEvent::TransactionFinished {
             ticket,
@@ -989,7 +995,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             None => return Err(SchedulerError::RetryNotPending(ticket.worker())),
         }
         if let Some(index) = ticket.phase().formal_index() {
-            self.windows[index].record_unsent_abandoned();
+            self.windows[index].record_cutoff_stop();
         }
         self.recorder.record(SchedulerEvent::TransactionFinished {
             ticket,
@@ -1034,6 +1040,13 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         }
         if self.workers.iter().any(|worker| worker.selection.is_some()) {
             return Err(SchedulerError::WorkersNotDrained);
+        }
+        if self
+            .windows
+            .iter()
+            .any(|window| !window.accounting_is_consistent())
+        {
+            return Err(SchedulerError::InconsistentMeasurementAccounting);
         }
         Ok(MeasurementSummary::from_windows(&self.windows))
     }
@@ -1115,15 +1128,18 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             }
         }
         for selection in abandoned {
-            if let Some(index) = phase.formal_index() {
-                self.windows[index].record_unsent_abandoned();
-            }
             match selection {
                 AbandonedSelection::Reservation(reservation) => {
+                    if let Some(index) = phase.formal_index() {
+                        self.windows[index].record_cutoff_stop();
+                    }
                     self.recorder
                         .record(SchedulerEvent::ReservationAbandoned { reservation, at });
                 }
                 AbandonedSelection::Retry(ticket) => {
+                    if let Some(index) = phase.formal_index() {
+                        self.windows[index].record_cutoff_stop();
+                    }
                     self.recorder.record(SchedulerEvent::TransactionFinished {
                         ticket,
                         class: CompletionClass::Abandoned,
@@ -1177,10 +1193,17 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         if let Some(selection) = state.selection.take() {
             if let Some(index) = selection.formal_index() {
                 match selection {
-                    SelectionState::InFlight { .. } => self.windows[index].record_abandoned(),
-                    SelectionState::Reserved(_) | SelectionState::RetryPending(_) => {
-                        self.windows[index].record_unsent_abandoned()
+                    SelectionState::InFlight { ticket, .. } => {
+                        if at < ticket.phase_deadline() {
+                            self.windows[index]
+                                .record_abandoned(ticket.identity.transaction_type());
+                        } else {
+                            self.windows[index]
+                                .record_grace_tail(ticket.identity.transaction_type());
+                        }
                     }
+                    SelectionState::RetryPending(_) => self.windows[index].record_cutoff_stop(),
+                    SelectionState::Reserved(_) => self.windows[index].record_cutoff_stop(),
                 }
             }
         }
@@ -1680,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn reservation_crossing_a_boundary_is_abandoned_before_any_request() {
+    fn reservation_crossing_a_boundary_is_a_cutoff_before_any_request() {
         let (clock, mut scheduler) = ready_scheduler(Duration::from_secs(5));
         scheduler.start().unwrap();
         clock.set(Duration::from_secs(30));
@@ -1693,7 +1716,8 @@ mod tests {
             scheduler.start_transaction(reservation, identity),
             Err(SchedulerError::ReservationDeadlinePassed)
         );
-        assert_eq!(scheduler.windows()[0].abandoned, 1);
+        assert_eq!(scheduler.windows()[0].abandoned, 0);
+        assert_eq!(scheduler.windows()[0].cutoff_stopped, 1);
         assert_eq!(scheduler.windows()[0].attempted, 0);
         let next = start_payment(&mut scheduler, worker, 61);
         assert_eq!((next.phase(), next.txn_no()), (PhaseId::FormalWindow(1), 0));
@@ -1744,6 +1768,8 @@ mod tests {
         assert_eq!(scheduler.windows()[0].retry_aborts, 1);
         assert_eq!(scheduler.windows()[0].abandoned, 1);
         assert_eq!(scheduler.windows()[0].attempted, 1);
+        assert_eq!(scheduler.windows()[0].physical_attempts, 1);
+        assert_eq!(scheduler.windows()[0].cutoff_stopped, 1);
     }
 
     #[test]
@@ -1760,6 +1786,8 @@ mod tests {
             AttemptDisposition::GraceTail
         );
         assert_eq!(scheduler.windows()[0].grace_tail, 1);
+        assert_eq!(scheduler.windows()[0].attempted, 0);
+        assert_eq!(scheduler.windows()[0].physical_attempts, 1);
         assert_eq!(scheduler.windows()[0].committed, 0);
         assert_eq!(scheduler.windows()[0].completed(), 0);
 
@@ -1859,11 +1887,12 @@ mod tests {
             panic!("expected absolute attempt deadline failure");
         };
         assert!(failure.reason.contains("not an official timeout"));
-        assert_eq!(scheduler.windows()[0].abandoned, 1);
+        assert_eq!(scheduler.windows()[0].abandoned, 0);
+        assert_eq!(scheduler.windows()[0].grace_tail, 1);
     }
 
     #[test]
-    fn read_only_attempt_at_tail_deadline_is_abandoned_without_failing_run() {
+    fn read_only_attempt_at_tail_deadline_is_excluded_as_grace_tail() {
         let (clock, mut scheduler) =
             ready_scheduler_with_limits(LocalRuntimeLimits::new(Duration::from_secs(10)).unwrap());
         scheduler.start().unwrap();
@@ -1884,9 +1913,11 @@ mod tests {
                     Duration::from_secs(190),
                 )
                 .unwrap(),
-            AttemptDisposition::Abandoned
+            AttemptDisposition::GraceTail
         );
-        assert_eq!(scheduler.windows()[0].abandoned, 1);
+        assert_eq!(scheduler.windows()[0].attempted, 0);
+        assert_eq!(scheduler.windows()[0].abandoned, 0);
+        assert_eq!(scheduler.windows()[0].grace_tail, 1);
         assert_eq!(scheduler.windows()[0].committed, 0);
         let next = start_payment(&mut scheduler, worker, 0x65);
         assert_eq!(next.phase(), PhaseId::FormalWindow(1));
@@ -1905,7 +1936,8 @@ mod tests {
         scheduler
             .abandon_read_only_inflight_at(read_only, Duration::from_secs(185))
             .unwrap();
-        assert_eq!(scheduler.windows()[0].abandoned, 1);
+        assert_eq!(scheduler.windows()[0].abandoned, 0);
+        assert_eq!(scheduler.windows()[0].grace_tail, 1);
 
         let write = start_payment(&mut scheduler, worker, 0x67);
         assert_eq!(
@@ -1933,8 +1965,8 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, SchedulerError::RunFailed(_)));
-        assert_eq!(scheduler.windows()[0].grace_tail, 0);
-        assert_eq!(scheduler.windows()[0].abandoned, 1);
+        assert_eq!(scheduler.windows()[0].grace_tail, 1);
+        assert_eq!(scheduler.windows()[0].abandoned, 0);
     }
 
     #[test]
