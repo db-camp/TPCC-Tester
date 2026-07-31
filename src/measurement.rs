@@ -255,6 +255,7 @@ impl WindowStats {
                 == self
                     .abandoned_physical_attempts
                     .saturating_add(self.retry_abandoned)
+            && self.retry_abandoned <= self.retry_aborts
             && self
                 .transaction_stats(TransactionType::NewOrder)
                 .committed_latencies
@@ -913,6 +914,14 @@ mod tests {
         stats.transactions_by_type[transaction_index(TransactionType::Delivery)]
             .committed_latencies
             .clear();
+        assert!(!stats.accounting_is_consistent());
+    }
+
+    #[test]
+    fn retry_policy_abandon_requires_an_observed_retry_terminal() {
+        let mut stats = WindowStats::new([1, 2, 3, 4]);
+        stats.record_retry_abandoned(TransactionType::Payment);
+
         assert!(!stats.accounting_is_consistent());
     }
 

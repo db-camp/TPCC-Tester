@@ -939,7 +939,7 @@ impl Final2026RunResult {
             );
             let stability = window.new_order_stability();
             println!(
-                "window{}: new_order_per_min={:.3}, attempted={}, total_committed={}, new_order_committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, abandoned={}, physical_attempts={}, retry_abort={}, cutoff_stopped={}, grace_tail={}, new_order_latency_ms=avg:{},p50:{},p99:{},max:{}, new_order_5s=avg_per_min:{:.3},cv_percent:{:.3},min_per_min:{:.3},max_per_min:{:.3},zero_buckets:{}, delivery_processed={}, warehouses={}/{}, required_warehouses={}, gate={}",
+                "window{}: new_order_per_min={:.3}, attempted={}, total_committed={}, new_order_committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, abandoned={}, physical_attempts={}, retry_abort={}, abandoned_physical_attempts={}, retry_policy_abandoned={}, cutoff_stopped={}, grace_tail={}, new_order_latency_ms=avg:{},p50:{},p99:{},max:{}, new_order_5s=avg_per_min:{:.3},cv_percent:{:.3},min_per_min:{:.3},max_per_min:{:.3},zero_buckets:{}, delivery_processed={}, warehouses={}/{}, required_warehouses={}, gate={}",
                 index + 1,
                 self.window_rates[index],
                 window.attempted,
@@ -954,6 +954,8 @@ impl Final2026RunResult {
                 window.abandoned,
                 window.physical_attempts,
                 window.retry_aborts,
+                window.abandoned_physical_attempts,
+                window.retry_abandoned,
                 window.cutoff_stopped,
                 window.grace_tail,
                 format_latency(new_order.latency_average),
@@ -1028,13 +1030,19 @@ impl Final2026RunResult {
             "transaction_completion_total=attempted:{total_attempted},committed:{total_committed},expected_rollback:{total_expected_rollbacks},abandoned:{total_abandoned},completion_percent:{completion_percent:.3},abort_percent:{abort_percent:.3}"
         );
         println!(
-            "physical_attempt_diagnostics=attempts:{},retry_abort:{},cutoff_stopped:{},grace_tail:{}",
+            "physical_attempt_diagnostics=attempts:{},retry_abort:{},abandoned_physical_attempts:{},retry_policy_abandoned:{},cutoff_stopped:{},grace_tail:{}",
             self.windows
                 .iter()
                 .fold(0_u64, |total, window| total.saturating_add(window.physical_attempts)),
             self.windows
                 .iter()
                 .fold(0_u64, |total, window| total.saturating_add(window.retry_aborts)),
+            self.windows.iter().fold(0_u64, |total, window| {
+                total.saturating_add(window.abandoned_physical_attempts)
+            }),
+            self.windows
+                .iter()
+                .fold(0_u64, |total, window| total.saturating_add(window.retry_abandoned)),
             self.windows
                 .iter()
                 .fold(0_u64, |total, window| total.saturating_add(window.cutoff_stopped)),
