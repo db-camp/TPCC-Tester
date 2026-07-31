@@ -2463,6 +2463,54 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"rmdb_dir={root.resolve()}\n", result.stdout)
 
+    def test_default_all_plan_matches_public_final2026_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self.make_root(temp)
+            result = self.run_script(
+                "--plan-only",
+                "--mode",
+                "all",
+                "--target-dir",
+                root,
+                "--seed",
+                "2026",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            plan = dict(
+                line.split("=", 1)
+                for line in result.stdout.splitlines()
+                if "=" in line
+            )
+            self.assertEqual(
+                {
+                    key: plan[key]
+                    for key in (
+                        "mode",
+                        "profile",
+                        "ranked_configuration",
+                        "effective_scale",
+                        "effective_clients",
+                        "effective_warmup_seconds",
+                        "effective_windows",
+                        "effective_window_seconds",
+                        "recovery_ready_budget_seconds",
+                        "diagnostics_requested",
+                    )
+                },
+                {
+                    "mode": "all",
+                    "profile": "final2026",
+                    "ranked_configuration": "1",
+                    "effective_scale": "50",
+                    "effective_clients": "32",
+                    "effective_warmup_seconds": "30",
+                    "effective_windows": "3",
+                    "effective_window_seconds": "150",
+                    "recovery_ready_budget_seconds": "90",
+                    "diagnostics_requested": "1",
+                },
+            )
+
     def test_rejects_dangerous_database_names(self):
         with tempfile.TemporaryDirectory() as temp:
             root = self.make_root(temp)
