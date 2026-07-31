@@ -19,6 +19,7 @@ use crate::data_gen::TpccDataGen;
 use crate::error::TpccError;
 use crate::measurement::{
     transaction_completion_summary, MeasurementSummary, WindowStats, FORMAL_WINDOW_COUNT,
+    OFFICIAL_WAREHOUSE_COUNT,
 };
 use crate::phases::{
     AttemptDisposition, AttemptOutcome, EventRecorder, Final2026Scheduler, LocalRuntimeLimits,
@@ -938,11 +939,12 @@ impl Final2026RunResult {
             );
             let stability = window.new_order_stability();
             println!(
-                "window{}: new_order_per_min={:.3}, attempted={}, committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, abandoned={}, physical_attempts={}, retry_abort={}, cutoff_stopped={}, grace_tail={}, new_order_latency_ms=avg:{},p50:{},p99:{},max:{}, new_order_5s=avg_per_min:{:.3},cv_percent:{:.3},min_per_min:{:.3},max_per_min:{:.3},zero_buckets:{}, delivery_processed={}, warehouses={}/{}, gate={}",
+                "window{}: new_order_per_min={:.3}, attempted={}, total_committed={}, new_order_committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, abandoned={}, physical_attempts={}, retry_abort={}, cutoff_stopped={}, grace_tail={}, new_order_latency_ms=avg:{},p50:{},p99:{},max:{}, new_order_5s=avg_per_min:{:.3},cv_percent:{:.3},min_per_min:{:.3},max_per_min:{:.3},zero_buckets:{}, delivery_processed={}, warehouses={}/{}, required_warehouses={}, gate={}",
                 index + 1,
                 self.window_rates[index],
                 window.attempted,
                 window.committed,
+                window.transaction_commits(TransactionType::NewOrder),
                 window.transaction_commits(TransactionType::NewOrder),
                 window.transaction_commits(TransactionType::Payment),
                 window.transaction_commits(TransactionType::OrderStatus),
@@ -965,6 +967,7 @@ impl Final2026RunResult {
                 stability.zero_buckets,
                 window.delivery_processed,
                 gate.coverage.covered_warehouses,
+                OFFICIAL_WAREHOUSE_COUNT,
                 gate.coverage.required_warehouses,
                 if gate.passed() { "pass" } else { "fail" }
             );
