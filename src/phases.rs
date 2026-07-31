@@ -441,6 +441,13 @@ pub enum SchedulerError {
         completed_at: Duration,
         attempt_started_at: Duration,
     },
+    #[error(
+        "terminal completion timestamp {completed_at:?} precedes phase start {phase_started_at:?}"
+    )]
+    CompletionBeforePhase {
+        completed_at: Duration,
+        phase_started_at: Duration,
+    },
     #[error("the timeline has not reached its final absolute deadline")]
     TimelineIncomplete,
     #[error("at least one worker still has an in-flight transaction")]
@@ -885,16 +892,28 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         }
 
         let latency = completed_at.saturating_sub(ticket.selected_at());
+        let completion_offset = if ticket.phase().formal_index().is_some() {
+            let (phase_start, _) = self.phase_bounds(ticket.phase())?;
+            Some(completed_at.checked_sub(phase_start).ok_or(
+                SchedulerError::CompletionBeforePhase {
+                    completed_at,
+                    phase_started_at: phase_start,
+                },
+            )?)
+        } else {
+            None
+        };
         let worker_state = &mut self.workers[worker_index];
         let (class, disposition) = match outcome {
             AttemptOutcome::Commit { delivery_processed } => {
                 worker_state.selection = None;
                 if let Some(index) = ticket.phase().formal_index() {
-                    self.windows[index].record_commit(
+                    self.windows[index].record_commit_at_offset(
                         ticket.identity.transaction_type(),
                         ticket.identity.home_warehouse(),
                         latency,
                         delivery_processed,
+                        completion_offset,
                     );
                 }
                 (CompletionClass::Committed, AttemptDisposition::Finished)
@@ -1618,6 +1637,33 @@ mod tests {
             (PhaseId::FormalWindow(1), 0)
         );
         assert_eq!(scheduler.prepared_session(worker), session);
+    }
+
+    #[test]
+    fn new_order_stability_bucket_uses_the_terminal_completion_offset() {
+        let (clock, mut scheduler) = ready_scheduler(Duration::from_secs(5));
+        scheduler.start().unwrap();
+        clock.set(Duration::from_secs(30));
+        let worker = WorkerId::new(0).unwrap();
+        let reservation = scheduler.reserve_transaction(worker).unwrap();
+        let identity =
+            TransactionIdentity::new(TransactionType::NewOrder, 1, 0x5000, false).unwrap();
+        let ticket = scheduler.start_transaction(reservation, identity).unwrap();
+
+        clock.set(Duration::from_secs(35));
+        assert_eq!(
+            scheduler
+                .finish_attempt(
+                    ticket,
+                    AttemptOutcome::Commit {
+                        delivery_processed: 0,
+                    },
+                )
+                .unwrap(),
+            AttemptDisposition::Finished
+        );
+        assert_eq!(scheduler.windows()[0].new_order_stability_buckets[0], 0);
+        assert_eq!(scheduler.windows()[0].new_order_stability_buckets[1], 1);
     }
 
     #[test]

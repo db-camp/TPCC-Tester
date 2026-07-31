@@ -457,6 +457,15 @@ impl BenchmarkExecutor {
             let summary = state.measurement_summary().map_err(scheduler_error)?;
             (state.windows().clone(), summary)
         };
+        if self.effective.is_ranked_configuration()
+            && windows
+                .iter()
+                .any(|window| !window.stability_samples_complete())
+        {
+            return Err(TpccError::Protocol(
+                "ranked NewOrder five-second stability samples are incomplete".to_owned(),
+            ));
+        }
         let window_rates = std::array::from_fn(|index| {
             windows[index]
                 .new_order_per_minute_for(profile.measurement_window)
@@ -927,8 +936,9 @@ impl Final2026RunResult {
                 std::slice::from_ref(window),
                 TransactionType::NewOrder,
             );
+            let stability = window.new_order_stability();
             println!(
-                "window{}: new_order_per_min={:.3}, attempted={}, committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, abandoned={}, physical_attempts={}, retry_abort={}, cutoff_stopped={}, grace_tail={}, new_order_latency_ms=avg:{},p50:{},p99:{},max:{}, delivery_processed={}, warehouses={}/{}, gate={}",
+                "window{}: new_order_per_min={:.3}, attempted={}, committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, abandoned={}, physical_attempts={}, retry_abort={}, cutoff_stopped={}, grace_tail={}, new_order_latency_ms=avg:{},p50:{},p99:{},max:{}, new_order_5s=avg_per_min:{:.3},cv_percent:{:.3},min_per_min:{:.3},max_per_min:{:.3},zero_buckets:{}, delivery_processed={}, warehouses={}/{}, gate={}",
                 index + 1,
                 self.window_rates[index],
                 window.attempted,
@@ -948,6 +958,11 @@ impl Final2026RunResult {
                 format_latency(new_order.latency_p50),
                 format_latency(new_order.latency_p99),
                 format_latency(new_order.latency_max),
+                stability.average_per_minute,
+                stability.cv_percent,
+                stability.min_per_minute,
+                stability.max_per_minute,
+                stability.zero_buckets,
                 window.delivery_processed,
                 gate.coverage.covered_warehouses,
                 gate.coverage.required_warehouses,

@@ -16,6 +16,8 @@ pub const OFFICIAL_HOT_WAREHOUSE_COUNT: usize = 4;
 pub const COVERAGE_FULL_SAMPLE_SIZE: u64 = 400;
 pub const WINDOW_FULL_COVERAGE: usize = 45;
 pub const COMBINED_FULL_COVERAGE: usize = 50;
+pub const STABILITY_BUCKET_DURATION: Duration = Duration::from_secs(5);
+pub const STABILITY_BUCKET_COUNT: usize = 30;
 
 const TRANSACTION_TYPE_COUNT: usize = 5;
 
@@ -52,6 +54,7 @@ pub struct WindowStats {
     pub warehouse_completions: [u64; OFFICIAL_WAREHOUSE_COUNT],
     pub hot_warehouses: BTreeSet<u16>,
     pub new_order_latencies: Vec<Duration>,
+    pub new_order_stability_buckets: [u64; STABILITY_BUCKET_COUNT],
 }
 
 impl WindowStats {
@@ -71,6 +74,7 @@ impl WindowStats {
             warehouse_completions: [0; OFFICIAL_WAREHOUSE_COUNT],
             hot_warehouses: hot_warehouses.into_iter().collect(),
             new_order_latencies: Vec::new(),
+            new_order_stability_buckets: [0; STABILITY_BUCKET_COUNT],
         }
     }
 
@@ -86,6 +90,23 @@ impl WindowStats {
         latency: Duration,
         delivery_processed: u64,
     ) {
+        self.record_commit_at_offset(
+            transaction_type,
+            home_warehouse,
+            latency,
+            delivery_processed,
+            None,
+        );
+    }
+
+    pub fn record_commit_at_offset(
+        &mut self,
+        transaction_type: TransactionType,
+        home_warehouse: u16,
+        latency: Duration,
+        delivery_processed: u64,
+        completion_offset: Option<Duration>,
+    ) {
         self.attempted = self.attempted.saturating_add(1);
         self.physical_attempts = self.physical_attempts.saturating_add(1);
         self.committed = self.committed.saturating_add(1);
@@ -99,6 +120,14 @@ impl WindowStats {
 
         if transaction_type == TransactionType::NewOrder {
             self.new_order_latencies.push(latency);
+            if let Some(offset) = completion_offset {
+                let bucket = offset.as_nanos() / STABILITY_BUCKET_DURATION.as_nanos();
+                if let Ok(bucket) = usize::try_from(bucket) {
+                    if let Some(count) = self.new_order_stability_buckets.get_mut(bucket) {
+                        *count = count.saturating_add(1);
+                    }
+                }
+            }
         }
         if transaction_type == TransactionType::Delivery {
             self.delivery_processed = self.delivery_processed.saturating_add(delivery_processed);
@@ -207,6 +236,12 @@ impl WindowStats {
                 .transaction_stats(TransactionType::NewOrder)
                 .committed_latencies
                 == self.new_order_latencies
+            && self
+                .new_order_stability_buckets
+                .iter()
+                .copied()
+                .fold(0_u64, u64::saturating_add)
+                <= self.transaction_commits(TransactionType::NewOrder)
     }
 
     pub fn covered_warehouses(&self) -> usize {
@@ -267,6 +302,45 @@ impl WindowStats {
             .then(|| self.transaction_commits(TransactionType::NewOrder) as f64 * 60.0 / seconds)
     }
 
+    pub fn new_order_stability(&self) -> NewOrderStability {
+        let rates = self
+            .new_order_stability_buckets
+            .map(|commits| commits as f64 * 60.0 / STABILITY_BUCKET_DURATION.as_secs_f64());
+        let average_per_minute = rates.iter().sum::<f64>() / rates.len() as f64;
+        let variance = rates
+            .iter()
+            .map(|rate| {
+                let difference = *rate - average_per_minute;
+                difference * difference
+            })
+            .sum::<f64>()
+            / rates.len() as f64;
+        let cv_percent = if average_per_minute == 0.0 {
+            0.0
+        } else {
+            variance.sqrt() * 100.0 / average_per_minute
+        };
+        NewOrderStability {
+            average_per_minute,
+            cv_percent,
+            min_per_minute: rates.iter().copied().fold(f64::INFINITY, f64::min),
+            max_per_minute: rates.iter().copied().fold(0.0, f64::max),
+            zero_buckets: self
+                .new_order_stability_buckets
+                .iter()
+                .filter(|&&commits| commits == 0)
+                .count(),
+        }
+    }
+
+    pub fn stability_samples_complete(&self) -> bool {
+        self.new_order_stability_buckets
+            .iter()
+            .copied()
+            .fold(0_u64, u64::saturating_add)
+            == self.transaction_commits(TransactionType::NewOrder)
+    }
+
     fn record_completion_warehouse(&mut self, warehouse: u16) {
         if let Some(index) = warehouse_index(warehouse) {
             self.warehouse_completions[index] = self.warehouse_completions[index].saturating_add(1);
@@ -278,6 +352,15 @@ impl WindowStats {
             .map(|index| self.warehouse_completions[index] > 0)
             .unwrap_or(false)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NewOrderStability {
+    pub average_per_minute: f64,
+    pub cv_percent: f64,
+    pub min_per_minute: f64,
+    pub max_per_minute: f64,
+    pub zero_buckets: usize,
 }
 
 /// Detailed result of a single-window or combined warehouse coverage gate.
@@ -805,5 +888,79 @@ mod tests {
             .committed_latencies
             .clear();
         assert!(!stats.accounting_is_consistent());
+    }
+
+    #[test]
+    fn five_second_stability_uses_completion_time_and_population_cv() {
+        let mut stats = WindowStats::new([1, 2, 3, 4]);
+        for bucket in 0..STABILITY_BUCKET_COUNT {
+            let offset = STABILITY_BUCKET_DURATION
+                .checked_mul(bucket as u32)
+                .unwrap()
+                .saturating_add(Duration::from_millis(1));
+            let commits = if bucket < STABILITY_BUCKET_COUNT / 2 {
+                1
+            } else {
+                3
+            };
+            for _ in 0..commits {
+                stats.record_commit_at_offset(
+                    TransactionType::NewOrder,
+                    1,
+                    Duration::from_millis(20),
+                    0,
+                    Some(offset),
+                );
+            }
+        }
+
+        let stability = stats.new_order_stability();
+        assert_eq!(stats.new_order_per_minute(), 24.0);
+        assert_eq!(stability.average_per_minute, 24.0);
+        assert_eq!(stability.cv_percent, 50.0);
+        assert_eq!(stability.min_per_minute, 12.0);
+        assert_eq!(stability.max_per_minute, 36.0);
+        assert_eq!(stability.zero_buckets, 0);
+        assert!(stats.stability_samples_complete());
+        assert!(stats.accounting_is_consistent());
+    }
+
+    #[test]
+    fn five_second_bucket_boundaries_are_half_open() {
+        let mut stats = WindowStats::new([1, 2, 3, 4]);
+        stats.record_commit_at_offset(
+            TransactionType::NewOrder,
+            1,
+            Duration::from_millis(10),
+            0,
+            Some(STABILITY_BUCKET_DURATION - Duration::from_nanos(1)),
+        );
+        stats.record_commit_at_offset(
+            TransactionType::NewOrder,
+            1,
+            Duration::from_millis(10),
+            0,
+            Some(STABILITY_BUCKET_DURATION),
+        );
+
+        assert_eq!(stats.new_order_stability_buckets[0], 1);
+        assert_eq!(stats.new_order_stability_buckets[1], 1);
+        assert_eq!(
+            stats
+                .new_order_stability_buckets
+                .iter()
+                .copied()
+                .sum::<u64>(),
+            2
+        );
+    }
+
+    #[test]
+    fn stability_completeness_rejects_unbucketed_new_order_commits() {
+        let mut stats = WindowStats::new([1, 2, 3, 4]);
+        stats.record_commit(TransactionType::NewOrder, 1, Duration::from_millis(10), 0);
+
+        assert!(stats.accounting_is_consistent());
+        assert!(!stats.stability_samples_complete());
     }
 }
