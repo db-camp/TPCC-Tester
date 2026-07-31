@@ -1014,7 +1014,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
             None => return Err(SchedulerError::RetryNotPending(ticket.worker())),
         }
         if let Some(index) = ticket.phase().formal_index() {
-            self.windows[index].record_cutoff_stop();
+            self.windows[index].record_retry_abandoned(ticket.identity.transaction_type());
         }
         self.recorder.record(SchedulerEvent::TransactionFinished {
             ticket,
@@ -1815,7 +1815,9 @@ mod tests {
         assert_eq!(scheduler.windows()[0].abandoned, 1);
         assert_eq!(scheduler.windows()[0].attempted, 1);
         assert_eq!(scheduler.windows()[0].physical_attempts, 1);
-        assert_eq!(scheduler.windows()[0].cutoff_stopped, 1);
+        assert_eq!(scheduler.windows()[0].retry_abandoned, 1);
+        assert_eq!(scheduler.windows()[0].cutoff_stopped, 0);
+        assert!(scheduler.windows()[0].accounting_is_consistent());
     }
 
     #[test]

@@ -32,12 +32,12 @@ pub struct TransactionWindowStats {
 
 /// Counters and ranked samples for one formal measurement window.
 ///
-/// `attempted` follows the official transaction-completion table: every
-/// physical attempt that reaches an in-window terminal appears exactly once as
-/// committed, expected rollback, or abandoned. A retryable
-/// `TRANSACTION_ABORT` is therefore one abandoned attempt; its later retry is a
-/// separate physical attempt with the same immutable transaction parameters.
-/// Unsent cutoff stops and grace-tail terminals are reported separately.
+/// `attempted` follows the official transaction-completion table and counts
+/// logical transactions with an in-window final outcome. A retryable
+/// `TRANSACTION_ABORT` is an intermediate physical terminal, not a final
+/// abandoned transaction; its retry keeps the same immutable identity and
+/// parameters. Physical attempts, retry terminals, cutoff stops, and
+/// grace-tail terminals are reported independently.
 #[derive(Debug, Clone)]
 pub struct WindowStats {
     pub attempted: u64,
@@ -46,6 +46,8 @@ pub struct WindowStats {
     pub retry_aborts: u64,
     pub expected_rollbacks: u64,
     pub abandoned: u64,
+    pub abandoned_physical_attempts: u64,
+    pub retry_abandoned: u64,
     pub cutoff_stopped: u64,
     pub grace_tail: u64,
     pub committed_by_type: [u64; TRANSACTION_TYPE_COUNT],
@@ -66,6 +68,8 @@ impl WindowStats {
             retry_aborts: 0,
             expected_rollbacks: 0,
             abandoned: 0,
+            abandoned_physical_attempts: 0,
+            retry_abandoned: 0,
             cutoff_stopped: 0,
             grace_tail: 0,
             committed_by_type: [0; TRANSACTION_TYPE_COUNT],
@@ -148,17 +152,12 @@ impl WindowStats {
         self.record_completion_warehouse(home_warehouse);
     }
 
-    /// Records an in-window attempt that returned a retryable transaction
-    /// abort. The next attempt reuses the same logical transaction parameters,
-    /// but this terminal remains an abandoned physical attempt in the report.
-    pub fn record_retry_abort(&mut self, transaction_type: TransactionType) {
-        self.attempted = self.attempted.saturating_add(1);
+    /// Records an in-window physical attempt that returned a retryable
+    /// transaction abort. The logical transaction remains pending, so this
+    /// method must not create a final attempted/abandoned outcome.
+    pub fn record_retry_abort(&mut self, _transaction_type: TransactionType) {
         self.physical_attempts = self.physical_attempts.saturating_add(1);
         self.retry_aborts = self.retry_aborts.saturating_add(1);
-        self.abandoned = self.abandoned.saturating_add(1);
-        let family = &mut self.transactions_by_type[transaction_index(transaction_type)];
-        family.attempted = family.attempted.saturating_add(1);
-        family.abandoned = family.abandoned.saturating_add(1);
     }
 
     /// Records an in-window physical attempt that was abandoned without a
@@ -167,13 +166,27 @@ impl WindowStats {
         self.attempted = self.attempted.saturating_add(1);
         self.physical_attempts = self.physical_attempts.saturating_add(1);
         self.abandoned = self.abandoned.saturating_add(1);
+        self.abandoned_physical_attempts = self.abandoned_physical_attempts.saturating_add(1);
         let family = &mut self.transactions_by_type[transaction_index(transaction_type)];
         family.attempted = family.attempted.saturating_add(1);
         family.abandoned = family.abandoned.saturating_add(1);
     }
 
-    /// Records a reservation that reached the phase cutoff before any request
-    /// was sent. It is neither attempted nor abandoned in the official table.
+    /// Records a pending logical transaction that a bounded local retry policy
+    /// finally abandons. Its last physical attempt was already counted by
+    /// `record_retry_abort`, so this method records only the logical outcome.
+    pub fn record_retry_abandoned(&mut self, transaction_type: TransactionType) {
+        self.attempted = self.attempted.saturating_add(1);
+        self.abandoned = self.abandoned.saturating_add(1);
+        self.retry_abandoned = self.retry_abandoned.saturating_add(1);
+        let family = &mut self.transactions_by_type[transaction_index(transaction_type)];
+        family.attempted = family.attempted.saturating_add(1);
+        family.abandoned = family.abandoned.saturating_add(1);
+    }
+
+    /// Records a selection that reached the phase cutoff without an eligible
+    /// in-window final outcome. It is neither attempted nor abandoned in the
+    /// official completion table.
     pub fn record_cutoff_stop(&mut self) {
         self.cutoff_stopped = self.cutoff_stopped.saturating_add(1);
     }
@@ -231,7 +244,17 @@ impl WindowStats {
                     .committed
                     .saturating_add(self.expected_rollbacks)
                     .saturating_add(self.abandoned)
-            && self.physical_attempts == self.attempted.saturating_add(self.grace_tail)
+            && self.physical_attempts
+                == self
+                    .committed
+                    .saturating_add(self.expected_rollbacks)
+                    .saturating_add(self.retry_aborts)
+                    .saturating_add(self.abandoned_physical_attempts)
+                    .saturating_add(self.grace_tail)
+            && self.abandoned
+                == self
+                    .abandoned_physical_attempts
+                    .saturating_add(self.retry_abandoned)
             && self
                 .transaction_stats(TransactionType::NewOrder)
                 .committed_latencies
@@ -724,12 +747,15 @@ mod tests {
         stats.record_expected_rollback(2);
         stats.record_retry_abort(TransactionType::Payment);
         stats.record_abandoned(TransactionType::Payment);
+        stats.record_retry_abandoned(TransactionType::Payment);
         stats.record_cutoff_stop();
         stats.record_grace_tail(TransactionType::Payment);
 
         assert_eq!(stats.attempted, 4);
         assert_eq!(stats.physical_attempts, 5);
         assert_eq!(stats.abandoned, 2);
+        assert_eq!(stats.abandoned_physical_attempts, 1);
+        assert_eq!(stats.retry_abandoned, 1);
         assert_eq!(stats.cutoff_stopped, 1);
         assert_eq!(stats.completed(), 2);
         assert_eq!(stats.covered_warehouses(), 2);
@@ -852,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_terminals_are_abandoned_attempts_but_tail_is_excluded() {
+    fn retry_terminals_are_physical_attempts_but_not_logical_outcomes() {
         let mut stats = WindowStats::new([1, 2, 3, 4]);
         stats.record_retry_abort(TransactionType::Payment);
         stats.record_retry_abort(TransactionType::Payment);
@@ -860,14 +886,14 @@ mod tests {
         stats.record_grace_tail(TransactionType::Payment);
 
         let payment = stats.transaction_stats(TransactionType::Payment);
-        assert_eq!(stats.attempted, 3);
+        assert_eq!(stats.attempted, 1);
         assert_eq!(stats.physical_attempts, 4);
         assert_eq!(stats.retry_aborts, 2);
-        assert_eq!(stats.abandoned, 2);
+        assert_eq!(stats.abandoned, 0);
         assert_eq!(stats.grace_tail, 1);
-        assert_eq!(payment.attempted, 3);
+        assert_eq!(payment.attempted, 1);
         assert_eq!(payment.committed, 1);
-        assert_eq!(payment.abandoned, 2);
+        assert_eq!(payment.abandoned, 0);
         assert_eq!(
             payment.attempted,
             payment
