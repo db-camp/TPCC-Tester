@@ -522,7 +522,7 @@ async fn run_worker(
         let kind = frozen.ticket().kind();
         let measured = phase == DiagnosticPhase::Measurement;
         if measured {
-            stats.selected += 1;
+            stats.record_selection(kind);
         }
 
         loop {
@@ -534,7 +534,7 @@ async fn run_worker(
                 break;
             }
             if measured {
-                stats.record_attempt(kind);
+                stats.record_physical_attempt();
             }
             let attempt_deadline = timeline.attempt_deadline(phase);
             let response =
@@ -657,10 +657,14 @@ impl Default for DiagnosticStats {
 }
 
 impl DiagnosticStats {
-    fn record_attempt(&mut self, kind: TransactionKind) {
-        self.physical_attempts = self.physical_attempts.saturating_add(1);
+    fn record_selection(&mut self, kind: TransactionKind) {
+        self.selected = self.selected.saturating_add(1);
         let family = &mut self.families[diagnostic_family_index(kind)];
         family.attempted = family.attempted.saturating_add(1);
+    }
+
+    fn record_physical_attempt(&mut self) {
+        self.physical_attempts = self.physical_attempts.saturating_add(1);
     }
 
     fn record_terminal(
@@ -960,15 +964,16 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_stats_classify_every_dispatch_and_only_successful_commits() {
+    fn diagnostic_stats_separate_logical_selection_from_physical_retries() {
         let mut stats = DiagnosticStats {
-            selected: 2,
             retryable_aborts: 1,
             ..DiagnosticStats::default()
         };
-        stats.record_attempt(TransactionKind::Payment);
-        stats.record_attempt(TransactionKind::Payment);
-        stats.record_attempt(TransactionKind::NewOrder);
+        stats.record_selection(TransactionKind::Payment);
+        stats.record_selection(TransactionKind::NewOrder);
+        stats.record_physical_attempt();
+        stats.record_physical_attempt();
+        stats.record_physical_attempt();
         stats.record_terminal(
             TransactionKind::Payment,
             1,
@@ -987,7 +992,7 @@ mod tests {
         assert_eq!(
             stats.family(TransactionKind::Payment),
             DiagnosticFamilyStats {
-                attempted: 2,
+                attempted: 1,
                 committed: 1,
                 terminals: 1,
                 grace_tail_committed: 0,
@@ -1007,12 +1012,14 @@ mod tests {
         assert_eq!(stats.expected_rollbacks, 1);
         assert_eq!(stats.retryable_aborts, 1);
         assert_eq!(stats.grace_tail, 1);
+        assert_eq!(stats.selected, 2);
     }
 
     #[test]
     fn grace_tail_commit_remains_a_physical_diagnostic_commit() {
         let mut stats = DiagnosticStats::default();
-        stats.record_attempt(TransactionKind::Delivery);
+        stats.record_selection(TransactionKind::Delivery);
+        stats.record_physical_attempt();
         stats.record_terminal(
             TransactionKind::Delivery,
             1,
@@ -1044,10 +1051,12 @@ mod tests {
     #[test]
     fn merge_preserves_per_family_attempt_and_commit_totals() {
         let mut left = DiagnosticStats::default();
-        left.record_attempt(TransactionKind::OrderStatus);
+        left.record_selection(TransactionKind::OrderStatus);
+        left.record_physical_attempt();
 
         let mut right = DiagnosticStats::default();
-        right.record_attempt(TransactionKind::OrderStatus);
+        right.record_selection(TransactionKind::OrderStatus);
+        right.record_physical_attempt();
         right.record_terminal(
             TransactionKind::OrderStatus,
             1,
