@@ -58,7 +58,9 @@ sudo ticket 缺失时 diagnostic 明确标记为 `unavailable`，排名和正式
 
 `all` 是唯一执行完整 crash transition 的模式，顺序固定为：
 
-1. 校验路径和端口，构建 release tester 与 `RelWithDebInfo` RMDB；
+1. 校验路径和端口，以锁定依赖构建 release tester，并以
+   `Release -O2 -DNDEBUG -g0` 构建 RMDB；x86-64 主机还固定使用
+   `-march=x86-64 -mtune=generic`，非 x86-64 本地主机会在计划中明确标记平台差异；
 2. 创建一个此前不存在的数据库并登记所有权；
 3. 通过 Wire v3 handshake 与完整 `show tables;` 确认 readiness；
 4. 在同一个 900 秒 setup 预算内建表、建索引、装载并校验；

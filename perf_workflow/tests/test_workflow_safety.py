@@ -2495,6 +2495,10 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                         "effective_window_seconds",
                         "recovery_ready_budget_seconds",
                         "diagnostics_requested",
+                        "rmdb_build_type",
+                        "rmdb_build_machine",
+                        "rmdb_build_platform_alignment",
+                        "rmdb_release_flags",
                     )
                 },
                 {
@@ -2508,6 +2512,18 @@ exec "${REAL_WORKFLOW_PYTHON}" "$@"
                     "effective_window_seconds": "150",
                     "recovery_ready_budget_seconds": "90",
                     "diagnostics_requested": "1",
+                    "rmdb_build_type": "Release",
+                    "rmdb_build_machine": os.uname().machine,
+                    "rmdb_build_platform_alignment": (
+                        "official_x86_64"
+                        if os.uname().machine in {"x86_64", "amd64"}
+                        else "local_non_x86_64"
+                    ),
+                    "rmdb_release_flags": (
+                        "-O2 -DNDEBUG -g0 -march=x86-64 -mtune=generic"
+                        if os.uname().machine in {"x86_64", "amd64"}
+                        else "-O2 -DNDEBUG -g0"
+                    ),
                 },
             )
 

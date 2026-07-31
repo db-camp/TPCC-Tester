@@ -124,6 +124,16 @@ DIAGNOSTIC_OBSERVATION_SECONDS=60
 RESOURCE_INTERVAL_MS=1000
 TERMINAL_EVIDENCE_FILE="terminal_evidence.state"
 LEGACY_RUN_LEDGER_FILE="run_ledger.state"
+RMDB_BUILD_TYPE="Release"
+RMDB_BUILD_MACHINE="$(uname -m)"
+RMDB_BUILD_PLATFORM_ALIGNMENT="local_non_x86_64"
+RMDB_RELEASE_FLAGS="-O2 -DNDEBUG -g0"
+case "${RMDB_BUILD_MACHINE}" in
+  x86_64|amd64)
+    RMDB_BUILD_PLATFORM_ALIGNMENT="official_x86_64"
+    RMDB_RELEASE_FLAGS="${RMDB_RELEASE_FLAGS} -march=x86-64 -mtune=generic"
+    ;;
+esac
 # The canonical codec emits at most 16 MiB of lower-hex payload. The
 # dataset/contract binding has 128 bytes of fixed headroom and the StateStore
 # envelope is bounded by 4 KiB. Keep this below the 32 MiB artifact ceiling.
@@ -1692,6 +1702,10 @@ tpcc_tester_sha=${TPCC_SHA}
 tester_binary_provenance=${TESTER_BINARY_PROVENANCE_STATUS}
 tester_binary_trusted_build_requested=${TESTER_TRUSTED_BUILD_REQUESTED}
 skip_rmdb_build=${SKIP_RMDB_BUILD}
+rmdb_build_type=${RMDB_BUILD_TYPE}
+rmdb_build_machine=${RMDB_BUILD_MACHINE}
+rmdb_build_platform_alignment=${RMDB_BUILD_PLATFORM_ALIGNMENT}
+rmdb_release_flags=${RMDB_RELEASE_FLAGS}
 build_dir=${RMDB_DIR}/${BUILD_DIR}
 server_bin=${SERVER_BIN}
 tpcc_bin=${TPCC_BIN}
@@ -4607,17 +4621,17 @@ ensure_binaries() {
       [[ -f "${TPCC_DIR}/Cargo.toml" ]] \
         || die "Cargo.toml not found in TPCC-Tester root: ${TPCC_DIR}"
       log "building TPCC-Tester"
-      cargo build --release --manifest-path "${TPCC_DIR}/Cargo.toml" \
+      cargo build --release --locked --manifest-path "${TPCC_DIR}/Cargo.toml" \
         >"${RESULT_DIR}/tpcc_build.log" 2>&1
     fi
   fi
 
   if [[ "${SKIP_BUILD}" != "1" && "${SKIP_RMDB_BUILD}" != "1" ]]; then
     check_cmake_cache_source
-    log "configuring RMDB"
+    log "configuring RMDB ${RMDB_BUILD_TYPE} (${RMDB_RELEASE_FLAGS})"
     cmake -S "${RMDB_DIR}" -B "${RMDB_DIR}/${BUILD_DIR}" \
-      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-      -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O2 -g -fno-omit-frame-pointer" \
+      -DCMAKE_BUILD_TYPE="${RMDB_BUILD_TYPE}" \
+      -DCMAKE_CXX_FLAGS_RELEASE="${RMDB_RELEASE_FLAGS}" \
       >"${RESULT_DIR}/cmake_configure.log" 2>&1
     log "building RMDB"
     cmake --build "${RMDB_DIR}/${BUILD_DIR}" --target rmdb \
