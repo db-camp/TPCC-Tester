@@ -577,7 +577,7 @@ impl Config {
                 effective: "canonical".to_owned(),
             });
         }
-        if self.rtt_sim_ms > 0 {
+        if self.rtt_sim_ms > 0 && !self.is_environment_alignment_diagnostic() {
             extra_deviations.push(EffectiveDeviation {
                 field: "rtt_sim_ms",
                 official: "0 (loopback; public no-think-time saturation)".to_owned(),
@@ -605,6 +605,14 @@ impl Config {
             seed: self.seed,
             extra_deviations,
         })
+    }
+
+    /// Explicitly non-ranked diagnostic modes may apply environment-alignment
+    /// knobs (e.g. `--rtt-sim-ms`) without treating them as opt-in deviations:
+    /// those modes are already excluded from ranking, and the knob models the
+    /// official cross-host network rather than altering the public shape.
+    pub const fn is_environment_alignment_diagnostic(&self) -> bool {
+        self.preliminary || self.diagnostic_workload_seconds.is_some()
     }
 
     fn validate_raw(&self) -> Result<(), ConfigError> {
@@ -842,6 +850,49 @@ mod tests {
         .unwrap();
         zero_rtt.validate().unwrap();
         assert!(zero_rtt.resolved_profile().unwrap().is_ranked_configuration());
+    }
+
+    #[test]
+    fn rtt_sim_is_free_on_non_ranked_diagnostic_modes() {
+        let preliminary = Config::try_parse_from([
+            "tpcc-tester",
+            "--preliminary",
+            "--seed",
+            "1",
+            "--rtt-sim-ms",
+            "20",
+            "--state-dir",
+            "/tmp/tpcc-final2026-rtt-preliminary-state",
+        ])
+        .unwrap();
+        preliminary.validate().unwrap();
+        let resolved = preliminary.resolved_profile().unwrap();
+        assert!(resolved
+            .extra_deviations()
+            .iter()
+            .all(|deviation| deviation.field != "rtt_sim_ms"));
+
+        let diagnostic = Config::try_parse_from([
+            "tpcc-tester",
+            "--diagnostic-workload-seconds",
+            "60",
+            "--diagnostic-segment",
+            "observation",
+            "--seed",
+            "1",
+            "--rtt-sim-ms",
+            "20",
+            "--state-dir",
+            "/tmp/tpcc-final2026-rtt-diagnostic-state",
+        ])
+        .unwrap();
+        diagnostic.validate().unwrap();
+        assert!(diagnostic
+            .resolved_profile()
+            .unwrap()
+            .extra_deviations()
+            .iter()
+            .all(|deviation| deviation.field != "rtt_sim_ms"));
     }
 
     #[test]

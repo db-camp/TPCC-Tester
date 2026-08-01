@@ -483,6 +483,7 @@ impl BenchmarkExecutor {
             median_new_order_per_minute,
             response_timeout,
             phase_tail_grace: limits.phase_tail_grace,
+            rtt_sim_ms: self.config.rtt_sim_ms,
             terminal_evidence,
         };
 
@@ -946,6 +947,7 @@ pub struct Final2026RunResult {
     median_new_order_per_minute: f64,
     response_timeout: Duration,
     phase_tail_grace: Duration,
+    rtt_sim_ms: u64,
     terminal_evidence: SealedTerminalEvidence,
 }
 
@@ -963,6 +965,10 @@ impl Final2026RunResult {
             "local_safety=response_timeout:{}s,phase_tail_grace:{}s (official values unpublished)",
             self.response_timeout.as_secs(),
             self.phase_tail_grace.as_secs()
+        );
+        println!(
+            "environment_alignment=rtt_sim_ms:{} (0 = loopback; non-zero is a non-ranked diagnostic)",
+            self.rtt_sim_ms
         );
         for index in 0..FORMAL_WINDOW_COUNT {
             let window = &self.windows[index];
