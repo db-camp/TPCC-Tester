@@ -713,6 +713,26 @@ async fn run_worker_inner(
                     .instant_at(effective_deadline)
                     .map_err(scheduler_error)?,
             );
+            // Local loopback has no cross-host RTT, so the client's attempt
+            // rate is bounded only by the server's service rate (retry storm);
+            // the official client is RTT-limited (~733 completed txns/s across
+            // 32 clients). Simulate the official round trip per attempt to
+            // align the local attempt rate (RMDB_RTT_SIM_MS; 0 = off).
+            {
+                static RTT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let rtt_ms = *RTT_MS.get_or_init(|| {
+                    std::env::var("RMDB_RTT_SIM_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0)
+                });
+                if rtt_ms > 0 {
+                    let rtt = std::time::Duration::from_millis(rtt_ms);
+                    if let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+                        tokio::time::sleep(rtt.min(remaining)).await;
+                    }
+                }
+            }
             let result =
                 tokio::time::timeout_at(deadline, dispatch::execute(&mut client, &frozen)).await;
             let completed_at = monotonic_clock.now();
