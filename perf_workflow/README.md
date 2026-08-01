@@ -128,6 +128,37 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 
 `--mode benchmark` 是 `rank` 的兼容别名。`--mode rank --init-db` 可在一次诊断调用中先创建/装载新数据库，再执行 rank 与在线检查。
 
+## 环境对齐与工具链要求
+
+本地测试与官方测评存在机器/客户端因素差异，以下项已在测试端对齐（服务器
+侧不包含任何网络特殊处理，与官方服务器行为一致）：
+
+- **机器核数**：官方测评机为 16 核。本地机器核数更多时，用 `taskset` 把
+  整个工作流（服务器 + 32 客户端）固定在 16 个核上，以对齐官方 CPU 规模：
+
+  ```bash
+  taskset -c 0-15 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+    --mode preliminary --seed 2026
+  ```
+
+- **客户端网络**：本地 tester 在连接建立时对每个 socket 设置 `TCP_NODELAY`
+  （`WireConnection::connect`），与官方隐藏客户端一致；本地不再依赖服务器
+  侧的 NODELAY/QUICKACK（官方客户端自带 NODELAY，服务器侧这些设置在官方
+  无收益，故不包含）。
+
+- **响应 deadline 放弃**：官方未公开 socket response deadline，从官方轮次
+  数据（均匀 22-27% abandoned、Delivery p99 ~2.2s）校准为 3s 端到端事务
+  预算（`LOCAL_RESPONSE_TIMEOUT_SECONDS`）；超时尝试（含写事务）被放弃并
+  重建会话（关闭旧连接 → 服务器回滚在途事务），与官方 abandoned 行为一致。
+  一致性查询使用独立 300s 超时（大 SUM 扫描不是排名流量）。
+
+- **Rust 工具链**：tester 的 `Cargo.lock` 为 lockfile v4，需要 cargo ≥ 1.78
+  （建议 rustup stable ≥ 1.97，走 rsproxy.cn 镜像安装）。系统包管理器自带
+  的旧 cargo（如 Ubuntu 的 1.75）无法解析 lockfile v4，会导致 tester 构建
+  失败、conformance 校验不通过。确保 `cargo --version` 返回 ≥ 1.78 后再
+  运行工作流；若默认 PATH 仍是旧版本，把 rustup 的 cargo/rustc 软链到
+  `/usr/local/bin`（位于 `/usr/bin` 之前）。
+
 ## 明确非排名的 smoke
 
 性能优化迭代可使用固定的 preliminary 流程。它仍新建并装载完整 SF50
