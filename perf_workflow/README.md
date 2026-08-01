@@ -146,6 +146,27 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   侧的 NODELAY/QUICKACK（官方客户端自带 NODELAY，服务器侧这些设置在官方
   无收益，故不包含）。
 
+- **跨主机 RTT（`--rtt-sim-ms`）**：官方客户端跨主机，每次物理 attempt 受
+  网络往返约束；本地 loopback 无 RTT，客户端 attempt 率只受服务器服务率
+  约束，会形成重试风暴（本地实测约 81% 的物理尝试是重试、物理尝试率约
+  2440/s，而官方约 733/s），使吞吐被无效冲突回滚拖累。`--rtt-sim-ms` 在每个
+  attempt（含重试）前插入模拟 RTT，把本地 attempt 率对齐到官方水平。
+  本地 preliminary 实测：`rtt=0` → NewOrder/min ≈12400（物理 2440/s），
+  `rtt=30ms` → ≈17700（物理 ~820/s，重试占比降到 ~19%），`rtt=43ms` →
+  ≈14450（物理 ~630/s，被过度限速）。因此 30ms 附近的校准最接近官方
+  attempt 时序。默认 `0`（loopback）保持公开无思考时间饱和负载契约不变；
+  非零值在 ranked 模式下需 `--allow-deviation`，在 preliminary/诊断模式下
+  免费：
+
+  ```bash
+  taskset -c 0-15 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+    --mode preliminary --seed 2026 --rtt-sim-ms 30
+  ```
+
+  该 knob 是环境对齐诊断项：它模拟官方网络距离，不改动公开数据形状、
+  客户端数、窗口或隔离语义，但会给每 attempt 增加等效 think time，
+  因此开启时的结果始终为非排名诊断。
+
 - **响应 deadline 放弃**：官方未公开 socket response deadline，从官方轮次
   数据（均匀 22-27% abandoned、Delivery p99 ~2.2s）校准为 3s 端到端事务
   预算（`LOCAL_RESPONSE_TIMEOUT_SECONDS`）；超时尝试（含写事务）被放弃并

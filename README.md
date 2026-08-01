@@ -88,6 +88,21 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 使用独立阶段轮盘，测量阶段各客户端从 `txn_no=0` 重新开始，但不发布任何正式
 rank claim 或 terminal evidence。
 
+### 环境对齐：`--rtt-sim-ms`
+
+官方客户端跨主机、受网络往返约束；本地 loopback 无 RTT，客户端无限速发送会
+形成重试风暴（本地实测约 81% 的物理尝试是重试，物理尝试率约 2440/s，官方约
+733/s），掩盖服务器真实能力。`--rtt-sim-ms <ms>` 在每个 attempt（含重试）前
+插入模拟 RTT，把本地 attempt 率对齐到官方水平；preliminary 实测最优约 30ms
+（物理 ~820/s，重试占比降到 ~19%，NewOrder/min 相对 rtt=0 提升约 40%）。
+默认 `0` 保持公开饱和负载契约；非零值在 ranked 模式需 `--allow-deviation`，
+在 preliminary/诊断模式免费，结果始终为非排名诊断。
+
+```bash
+deps/TPCC-Tester/perf_workflow/run_workflow.sh \
+  --mode preliminary --seed 2026 --rtt-sim-ms 30
+```
+
 ## 直接运行 tester
 
 以下示例假定 RMDB 已在 `127.0.0.1:8765` 运行，并且状态目录属于这一数据库与 seed：
