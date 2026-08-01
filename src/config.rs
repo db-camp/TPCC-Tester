@@ -207,6 +207,18 @@ pub struct Config {
     #[arg(long = "phase-tail-grace-seconds", default_value_t = 5)]
     pub phase_tail_grace_seconds: u64,
 
+    /// Simulated cross-host round trip in milliseconds inserted before each
+    /// ranked physical attempt (0 = local loopback, the public saturation
+    /// contract). The official socket/network distance is unpublished; the
+    /// local loopback has no per-request RTT, so this knob models that delay
+    /// to align the local attempt rate and end-to-end latency distribution
+    /// with the official cross-host client. A non-zero value is an explicit
+    /// environment-alignment deviation (effectively adds per-attempt think
+    /// time, which the published contract forbids), so it requires
+    /// `--allow-deviation` and never produces a ranked configuration.
+    #[arg(long = "rtt-sim-ms", default_value_t = 0)]
+    pub rtt_sim_ms: u64,
+
     /// Public recovery restart/readiness budget; workflow must pass its effective value
     #[arg(
         long = "recovery-ready-budget-seconds",
@@ -563,6 +575,13 @@ impl Config {
                 field: "runtime_schema",
                 official: "local_seed_opaque_v1".to_owned(),
                 effective: "canonical".to_owned(),
+            });
+        }
+        if self.rtt_sim_ms > 0 {
+            extra_deviations.push(EffectiveDeviation {
+                field: "rtt_sim_ms",
+                official: "0 (loopback; public no-think-time saturation)".to_owned(),
+                effective: format!("{} ms per physical attempt", self.rtt_sim_ms),
             });
         }
 
