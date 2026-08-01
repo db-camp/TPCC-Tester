@@ -801,6 +801,50 @@ mod tests {
     }
 
     #[test]
+    fn rtt_sim_requires_opt_in_and_is_non_ranked() {
+        let rejected = Config::try_parse_from([
+            "tpcc-tester",
+            "--benchmark",
+            "--seed",
+            "1",
+            "--rtt-sim-ms",
+            "20",
+            "--state-dir",
+            "/tmp/tpcc-final2026-rtt-state",
+        ])
+        .unwrap();
+        assert!(matches!(
+            rejected.validate(),
+            Err(ConfigError::DeviationRequiresOptIn { .. })
+        ));
+
+        let accepted = Config {
+            allow_deviation: true,
+            ..rejected
+        };
+        accepted.validate().unwrap();
+        let resolved = accepted.resolved_profile().unwrap();
+        assert!(!resolved.is_ranked_configuration());
+        assert_eq!(resolved.final2026.warehouses, OFFICIAL_WAREHOUSES);
+        assert!(resolved
+            .extra_deviations()
+            .iter()
+            .any(|deviation| deviation.field == "rtt_sim_ms"));
+
+        let zero_rtt = Config::try_parse_from([
+            "tpcc-tester",
+            "--benchmark",
+            "--seed",
+            "1",
+            "--state-dir",
+            "/tmp/tpcc-final2026-rtt-zero-state",
+        ])
+        .unwrap();
+        zero_rtt.validate().unwrap();
+        assert!(zero_rtt.resolved_profile().unwrap().is_ranked_configuration());
+    }
+
+    #[test]
     fn threads_alias_and_check_scope_are_supported() {
         let config = Config::try_parse_from([
             "tpcc-tester",
