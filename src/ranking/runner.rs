@@ -146,6 +146,14 @@ impl RankedTransactionError {
             Self::Batch(BatchExecutionError::RetryableAbort { .. })
         )
     }
+
+    /// A response-read deadline exceeded on a ranked request. The official
+    /// client abandons such attempts (uniform ~22-27% abandoned across
+    /// transaction families) instead of failing the worker, so the local
+    /// runner treats them like a retryable abort and rebuilds the session.
+    pub fn is_response_timeout(&self) -> bool {
+        matches!(self, Self::Transport(TpccError::Timeout { .. }))
+    }
 }
 
 /// Execute one AUTO_ABORT batch and preserve the server's retry classification.

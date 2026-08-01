@@ -820,7 +820,8 @@ async fn run_worker_inner(
                     }
                     break;
                 }
-                Ok(Err(error)) if error.is_retryable_abort() => {
+                Ok(Err(error))
+                    if error.is_retryable_abort() || error.is_response_timeout() => {
                     let disposition = {
                         let mut state = lock_scheduler(&scheduler)?;
                         state
