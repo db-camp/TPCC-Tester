@@ -49,6 +49,7 @@ SCALE=""
 CLIENTS=""
 WARMUP_SECONDS=""
 WINDOW_SECONDS=""
+RTT_SIM_MS=""
 SERVER_BIN_OVERRIDE=""
 TPCC_BIN_OVERRIDE=""
 STATE_DIR_OVERRIDE=""
@@ -191,6 +192,11 @@ Short local deviations (never enabled implicitly):
   --clients <n>               --threads is accepted as an alias
   --warmup-seconds <n>
   --window-seconds <n>        --measure-seconds is accepted as an alias
+  --rtt-sim-ms <n>            Simulated per-attempt cross-host round trip (ms).
+                              Models the official network distance; non-zero is
+                              an environment-alignment diagnostic that requires
+                              --allow-deviation for ranked modes and is free on
+                              --mode preliminary / diagnostic workloads.
 
 The shell deliberately has no transaction-mix, transaction-count, output-file,
 or per-window timeout controls. Those are part of the Rust final2026 contract.
@@ -1394,6 +1400,8 @@ while [[ $# -gt 0 ]]; do
       need_value "$1" "${2-}"; WARMUP_SECONDS="$2"; shift 2 ;;
     --window-seconds|--measure-seconds)
       need_value "$1" "${2-}"; WINDOW_SECONDS="$2"; shift 2 ;;
+    --rtt-sim-ms)
+      need_value "$1" "${2-}"; RTT_SIM_MS="$2"; shift 2 ;;
     --check)
       # final2026 rank/all always run the prescribed checks.
       shift ;;
@@ -1449,6 +1457,13 @@ if [[ -n "${SCALE}${CLIENTS}${WARMUP_SECONDS}${WINDOW_SECONDS}" \
   && [[ "${ALLOW_DEVIATION}" != "1" ]]; then
   die "local database-name/sizing/timing/readiness overrides require --allow-deviation"
 fi
+if [[ "${MODE}" != "preliminary" && -n "${RTT_SIM_MS}" \
+  && "${ALLOW_DEVIATION}" != "1" ]]; then
+  die "rtt-sim-ms outside --mode preliminary requires --allow-deviation"
+fi
+if [[ -n "${RTT_SIM_MS}" ]]; then
+  validate_positive_integer "--rtt-sim-ms" "${RTT_SIM_MS}"
+fi
 if [[ "${ALLOW_DEVIATION}" == "1" ]]; then
   [[ -z "${SCALE}" ]] || validate_positive_integer "--scale" "${SCALE}"
   [[ -z "${CLIENTS}" ]] || validate_positive_integer "--clients" "${CLIENTS}"
@@ -1476,6 +1491,7 @@ elif [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
   || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
   || "${DB_NAME_DEVIATION_ACTIVE}" == "1" \
+  || -n "${RTT_SIM_MS}" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
@@ -1612,6 +1628,7 @@ elif [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
   || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
   || "${DB_NAME_DEVIATION_ACTIVE}" == "1" \
+  || -n "${RTT_SIM_MS}" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
@@ -5095,6 +5112,7 @@ run_profile_tester() {
     [[ -z "${WINDOW_SECONDS}" ]] \
       || command+=(--window-seconds "${WINDOW_SECONDS}")
   fi
+  [[ -z "${RTT_SIM_MS}" ]] || command+=(--rtt-sim-ms "${RTT_SIM_MS}")
   run_tester "${log_path}" "${command[@]}"
 }
 
