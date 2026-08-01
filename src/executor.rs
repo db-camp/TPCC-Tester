@@ -742,6 +742,17 @@ async fn run_worker_inner(
                             .map_err(terminal_evidence_error)?;
                         return Ok(worker_value);
                     }
+                    // For a timed-out write attempt the server may still be
+                    // executing (or already committed) the transaction. Try to
+                    // roll it back explicitly so a late commit cannot diverge
+                    // the online/post-recovery ledger from the client's
+                    // committed count; if the attempt already committed this
+                    // ABORT is a no-op and the mismatch is the same class the
+                    // official client accepts. Best effort: the socket may be
+                    // unusable after the timeout, ignore any failure.
+                    if !crate::phases::is_read_only(frozen.transaction_type()) {
+                        let _ = client.exec_stream("ABORT;").await;
+                    }
                     drop(client);
                     client = match session_config.open().await {
                         Ok(replacement) => replacement,

@@ -458,7 +458,7 @@ pub enum SchedulerError {
     RunFailed(SchedulerFailure),
 }
 
-const fn is_read_only(transaction_type: TransactionType) -> bool {
+pub(crate) const fn is_read_only(transaction_type: TransactionType) -> bool {
     matches!(
         transaction_type,
         TransactionType::OrderStatus | TransactionType::StockLevel
