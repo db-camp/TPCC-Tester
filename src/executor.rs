@@ -862,7 +862,7 @@ async fn run_worker_inner(
                                 (ticket, deadline)
                             }
                             Err(SchedulerError::RetryDeadlinePassed) => break,
-                            Err(error) => return Err(scheduler_error(error)),
+            Err(error) => return Err(scheduler_error(error)),
                         }
                     };
                 }

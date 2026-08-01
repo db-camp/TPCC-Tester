@@ -226,6 +226,7 @@ impl DiagnosticExecutor {
             let ready_barrier = Arc::clone(&ready_barrier);
             let start_barrier = Arc::clone(&start_barrier);
             let timeline = timeline_receiver.clone();
+            let rtt_sim_ms = self.config.rtt_sim_ms;
             workers.spawn(async move {
                 run_worker(
                     worker as u16,
@@ -235,6 +236,7 @@ impl DiagnosticExecutor {
                     ready_barrier,
                     start_barrier,
                     timeline,
+                    rtt_sim_ms,
                 )
                 .await
             });
@@ -477,6 +479,7 @@ async fn run_worker(
     ready_barrier: Arc<Barrier>,
     start_barrier: Arc<Barrier>,
     mut timeline: watch::Receiver<Option<DiagnosticTimeline>>,
+    rtt_sim_ms: u64,
 ) -> Result<DiagnosticStats, TpccError> {
     ready_barrier.wait().await;
     start_barrier.wait().await;
@@ -539,6 +542,16 @@ async fn run_worker(
                 stats.record_physical_attempt();
             }
             let attempt_deadline = timeline.attempt_deadline(phase);
+            // Environment-alignment knob: simulate the official cross-host
+            // round trip before each physical attempt (0 = loopback). This is
+            // a non-ranked diagnostic option because it adds per-attempt think
+            // time the public contract forbids.
+            if rtt_sim_ms > 0 {
+                let rtt = Duration::from_millis(rtt_sim_ms);
+                if let Some(remaining) = attempt_deadline.checked_duration_since(Instant::now()) {
+                    tokio::time::sleep(rtt.min(remaining)).await;
+                }
+            }
             let response =
                 tokio::time::timeout_at(attempt_deadline, dispatch::execute(&mut client, &frozen))
                     .await;
