@@ -5112,7 +5112,6 @@ run_profile_tester() {
     [[ -z "${WINDOW_SECONDS}" ]] \
       || command+=(--window-seconds "${WINDOW_SECONDS}")
   fi
-  [[ -z "${RTT_SIM_MS}" ]] || command+=(--rtt-sim-ms "${RTT_SIM_MS}")
   run_tester "${log_path}" "${command[@]}"
 }
 
@@ -5148,8 +5147,10 @@ run_rank() {
   log "running one Rust-owned final2026 benchmark"
   set_phase_status rank running
   TESTER_RESOURCE_TIMELINE="${RESOURCE_TIMELINE}"
+  local -a rank_command=(--benchmark --profile "${PROFILE}" --seed "${SEED}")
+  [[ -z "${RTT_SIM_MS}" ]] || rank_command+=(--rtt-sim-ms "${RTT_SIM_MS}")
   run_profile_tester "${RESULT_DIR}/rank.log" \
-      --benchmark --profile "${PROFILE}" --seed "${SEED}" \
+      "${rank_command[@]}" \
       --state-dir "${STATE_DIR}" \
       --host "${HOST}" --port "${PORT}" || rank_rc=$?
   TESTER_RESOURCE_TIMELINE=""
@@ -5168,8 +5169,10 @@ run_preliminary() {
   log "running non-ranked 30s warmup + one 60s preliminary window"
   set_phase_status preliminary running
   TESTER_RESOURCE_TIMELINE="${RESOURCE_TIMELINE}"
+  local -a preliminary_command=(--preliminary --profile "${PROFILE}" --seed "${SEED}")
+  [[ -z "${RTT_SIM_MS}" ]] || preliminary_command+=(--rtt-sim-ms "${RTT_SIM_MS}")
   run_profile_tester "${RESULT_DIR}/preliminary.log" \
-      --preliminary --profile "${PROFILE}" --seed "${SEED}" \
+      "${preliminary_command[@]}" \
       --state-dir "${STATE_DIR}" \
       --host "${HOST}" --port "${PORT}" || preliminary_rc=$?
   TESTER_RESOURCE_TIMELINE=""
