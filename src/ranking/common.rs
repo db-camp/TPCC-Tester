@@ -140,12 +140,30 @@ impl BatchResults {
         match rows {
             [row] => Ok(row.as_slice()),
             [] => Err(SemanticViolation::new(format!(
-                "operation {operation_index} returned no rows; expected exactly one"
+                "operation {operation_index} returned no rows; expected exactly one \
+                 (batch map: {})",
+                self.describe_query_map()
             ))),
             _ => Err(SemanticViolation::new(format!(
-                "operation {operation_index} returned {} rows; expected exactly one",
-                rows.len()
+                "operation {operation_index} returned {} rows; expected exactly one \
+                 (batch map: {})",
+                rows.len(),
+                self.describe_query_map()
             ))),
+        }
+    }
+
+    /// Render the captured operation -> row-count map for failure diagnosis.
+    fn describe_query_map(&self) -> String {
+        let entries: Vec<String> = self
+            .query_rows
+            .iter()
+            .map(|(index, rows)| format!("{index}:{}", rows.len()))
+            .collect();
+        if entries.is_empty() {
+            "(empty)".to_string()
+        } else {
+            entries.join(",")
         }
     }
 

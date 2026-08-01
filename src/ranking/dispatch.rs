@@ -56,7 +56,7 @@ pub async fn execute(
     frozen: &FrozenTransaction,
 ) -> Result<RankedTransactionOutcome, RankedTransactionError> {
     let route = frozen.ticket.route();
-    match frozen.ticket.parameters() {
+    let result = match frozen.ticket.parameters() {
         TransactionParameters::NewOrder(input) => {
             super::new_order::execute(client, route, input, &frozen.timestamp).await
         }
@@ -72,7 +72,16 @@ pub async fn execute(
         TransactionParameters::StockLevel(input) => {
             super::stock_level::execute(client, route, input).await
         }
+    };
+    if let Err(RankedTransactionError::Semantic(semantic)) = &result {
+        eprintln!(
+            "[TDISPATCH] {:?} semantic failure: {}; route={:?}",
+            frozen.ticket.kind(),
+            semantic,
+            route
+        );
     }
+    result
 }
 
 pub const fn transaction_type(kind: TransactionKind) -> TransactionType {
