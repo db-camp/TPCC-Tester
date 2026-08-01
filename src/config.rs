@@ -62,7 +62,14 @@ pub const PRELIMINARY_MEASUREMENT_SECONDS: u64 = 60;
 /// Local replay ceiling selected from the public elapsed time in the supplied
 /// grader report. The final statement deliberately does not publish the
 /// official socket-response deadline, so this must not be treated as one.
-pub const LOCAL_RESPONSE_TIMEOUT_SECONDS: u64 = 150;
+///
+/// 150s effectively never abandons a response (local abandoned=0 while the
+/// official client abandons ~22-27% of attempts under saturation). The
+/// official deadline is unpublished; cross-checking the official round data
+/// (NewOrder p99 181ms, Delivery p99 2234ms, uniform 22-27% abandoned)
+/// constrains it to roughly 2-3s, so the local default is calibrated to 3s.
+/// Override with --response-timeout-seconds for sensitivity runs.
+pub const LOCAL_RESPONSE_TIMEOUT_SECONDS: u64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DiagnosticSegment {

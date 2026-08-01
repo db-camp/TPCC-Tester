@@ -112,8 +112,13 @@ impl RmdbClient {
     ) -> Result<StreamResponse, TpccError> {
         trace!("发送一致性 SQL: {item}");
 
+        // Consistency queries (online / post-recovery aggregations) must not
+        // inherit the ranked-load response deadline: they are large scans
+        // (e.g. SUM over order_line) that legitimately take longer than the
+        // ~3s calibrated ranked deadline, and the official client completes
+        // them with its own check timeout.
         self.connection
-            .exec_stream_with_timeout(cmd, self.response_timeout)
+            .exec_stream_with_timeout(cmd, DEFAULT_RESPONSE_TIMEOUT)
             .await
             .map_err(|error| map_consistency_wire_error(error, item))
     }

@@ -694,9 +694,23 @@ async fn run_worker_inner(
             if cancelled.load(Ordering::Acquire) {
                 return Ok(worker_value);
             }
+            // End-to-end transaction budget, calibrated to the official
+            // (unpublished) response deadline: a transaction selected at time
+            // T must commit within T + response_timeout_seconds or it is
+            // abandoned. The official client abandons ~22-27% of attempts
+            // uniformly under saturation; the local default is 3s (see
+            // LOCAL_RESPONSE_TIMEOUT_SECONDS). The phase deadline remains the
+            // upper bound so no work spills past the window.
+            let selection_at = phase_ticket.selected_at();
+            let txn_budget = session_config.response_timeout;
+            let txn_deadline = selection_at
+                .checked_add(txn_budget)
+                .ok_or(SchedulerError::ClockOverflow)
+                .map_err(scheduler_error)?;
+            let effective_deadline = std::cmp::min(txn_deadline, attempt_deadline);
             let deadline = tokio::time::Instant::from_std(
                 monotonic_clock
-                    .instant_at(attempt_deadline)
+                    .instant_at(effective_deadline)
                     .map_err(scheduler_error)?,
             );
             let result =
@@ -704,19 +718,10 @@ async fn run_worker_inner(
             let completed_at = monotonic_clock.now();
             match result {
                 Err(_) => {
-                    if !unknown_outcome_is_safe_to_abandon(frozen.transaction_type()) {
-                        return fail_worker(
-                            &scheduler,
-                            &cancelled,
-                            worker,
-                            format!(
-                                "write attempt {} exceeded absolute local deadline {:?}; \
-                                 commit state is unknown and recovery evidence cannot continue",
-                                phase_ticket.id(),
-                                attempt_deadline
-                            ),
-                        );
-                    }
+                    // Aligned with the official client: any timed-out attempt
+                    // is abandoned (the session is rebuilt, closing the old
+                    // connection so the server aborts the in-flight
+                    // transaction), instead of failing the whole worker.
                     let timeline_complete = {
                         let mut state = lock_scheduler(&scheduler)?;
                         state
@@ -728,7 +733,7 @@ async fn run_worker_inner(
                         worker = worker_value,
                         attempt = phase_ticket.id(),
                         transaction = ?frozen.transaction_type(),
-                        "abandoned timed-out read-only attempt; rebuilding ranked session"
+                        "abandoned timed-out attempt; rebuilding ranked session"
                     );
                     if timeline_complete {
                         terminal_evidence
