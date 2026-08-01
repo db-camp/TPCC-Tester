@@ -1007,6 +1007,13 @@ impl Final2026RunResult {
                 gate.coverage.required_warehouses,
                 if gate.passed() { "pass" } else { "fail" }
             );
+            let bucket_counts = window
+                .new_order_stability_buckets
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("window{}: new_order_5s_buckets={}", index + 1, bucket_counts);
         }
         println!(
             "ranked_new_order_per_min_median={:.3}",
