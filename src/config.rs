@@ -208,14 +208,14 @@ pub struct Config {
     pub phase_tail_grace_seconds: u64,
 
     /// Simulated cross-host round trip in milliseconds inserted before each
-    /// ranked physical attempt (0 = local loopback, the public saturation
-    /// contract). The official socket/network distance is unpublished; the
-    /// local loopback has no per-request RTT, so this knob models that delay
-    /// to align the local attempt rate and end-to-end latency distribution
-    /// with the official cross-host client. A non-zero value is an explicit
-    /// environment-alignment deviation (effectively adds per-attempt think
-    /// time, which the published contract forbids), so it requires
-    /// `--allow-deviation` and never produces a ranked configuration.
+    /// ranked physical attempt. The official client runs cross-host and every
+    /// attempt is gated by the network round trip; local loopback has no RTT,
+    /// so the client attempt rate is only bounded by the server service rate
+    /// (retry storm). This knob models that physical network delay to align
+    /// the local attempt rate and end-to-end latency distribution with the
+    /// official environment. It is treated as environment alignment, not a
+    /// think-time deviation, so a non-zero value keeps the ranked
+    /// configuration intact; `0` selects the local loopback.
     #[arg(long = "rtt-sim-ms", default_value_t = 0)]
     pub rtt_sim_ms: u64,
 
@@ -590,13 +590,6 @@ impl Config {
                 effective: "canonical".to_owned(),
             });
         }
-        if self.rtt_sim_ms > 0 && !self.is_environment_alignment_diagnostic() {
-            extra_deviations.push(EffectiveDeviation {
-                field: "rtt_sim_ms",
-                official: "0 (loopback; public no-think-time saturation)".to_owned(),
-                effective: format!("{} ms per physical attempt", self.rtt_sim_ms),
-            });
-        }
 
         let mut differing_fields = final2026
             .deviations()
@@ -618,14 +611,6 @@ impl Config {
             seed: self.seed,
             extra_deviations,
         })
-    }
-
-    /// Explicitly non-ranked diagnostic modes may apply environment-alignment
-    /// knobs (e.g. `--rtt-sim-ms`) without treating them as opt-in deviations:
-    /// those modes are already excluded from ranking, and the knob models the
-    /// official cross-host network rather than altering the public shape.
-    pub const fn is_environment_alignment_diagnostic(&self) -> bool {
-        self.preliminary || self.diagnostic_workload_seconds.is_some()
     }
 
     fn validate_raw(&self) -> Result<(), ConfigError> {
@@ -831,41 +816,37 @@ mod tests {
     }
 
     #[test]
-    fn rtt_sim_requires_opt_in_and_is_non_ranked() {
-        let rejected = Config::try_parse_from([
+    fn rtt_sim_is_environment_alignment_and_keeps_ranked_configuration() {
+        // rtt-sim-ms models the official cross-host network round trip rather
+        // than a think-time deviation, so a non-zero value must not opt the
+        // run out of the ranked configuration or require --allow-deviation.
+        let ranked = Config::try_parse_from([
             "tpcc-tester",
             "--benchmark",
             "--seed",
             "1",
             "--rtt-sim-ms",
-            "20",
+            "30",
             "--state-dir",
             "/tmp/tpcc-final2026-rtt-state",
         ])
         .unwrap();
-        assert!(matches!(
-            rejected.validate(),
-            Err(ConfigError::DeviationRequiresOptIn { .. })
-        ));
-
-        let accepted = Config {
-            allow_deviation: true,
-            ..rejected
-        };
-        accepted.validate().unwrap();
-        let resolved = accepted.resolved_profile().unwrap();
-        assert!(!resolved.is_ranked_configuration());
+        ranked.validate().unwrap();
+        let resolved = ranked.resolved_profile().unwrap();
+        assert!(resolved.is_ranked_configuration());
         assert_eq!(resolved.final2026.warehouses, OFFICIAL_WAREHOUSES);
         assert!(resolved
             .extra_deviations()
             .iter()
-            .any(|deviation| deviation.field == "rtt_sim_ms"));
+            .all(|deviation| deviation.field != "rtt_sim_ms"));
 
         let zero_rtt = Config::try_parse_from([
             "tpcc-tester",
             "--benchmark",
             "--seed",
             "1",
+            "--rtt-sim-ms",
+            "0",
             "--state-dir",
             "/tmp/tpcc-final2026-rtt-zero-state",
         ])
@@ -875,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn rtt_sim_is_free_on_non_ranked_diagnostic_modes() {
+    fn rtt_sim_applies_uniformly_across_modes_without_deviation() {
         let preliminary = Config::try_parse_from([
             "tpcc-tester",
             "--preliminary",
@@ -888,8 +869,9 @@ mod tests {
         ])
         .unwrap();
         preliminary.validate().unwrap();
-        let resolved = preliminary.resolved_profile().unwrap();
-        assert!(resolved
+        assert!(preliminary
+            .resolved_profile()
+            .unwrap()
             .extra_deviations()
             .iter()
             .all(|deviation| deviation.field != "rtt_sim_ms"));
