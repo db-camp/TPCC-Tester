@@ -3012,6 +3012,63 @@ mod tests {
     }
 
     #[test]
+    fn recovery_count_ranges_tolerate_abandoned_write_impact() {
+        let mut counts = BTreeMap::new();
+        counts.insert("new_orders", 100);
+        counts.insert("orders", 50);
+        counts.insert("order_line", 500);
+        counts.insert("history", 40);
+        counts.insert("warehouse", 50);
+        let abandoned = AbandonedWrites {
+            new_orders: 3,
+            payments: 2,
+            deliveries: 4,
+        };
+        let ranges = recovery_count_ranges(&counts, abandoned).unwrap();
+        // Each abandoned Delivery deletes at most 10 new_orders rows; each
+        // abandoned NewOrder inserts one new_orders/orders row and up to 15
+        // order_line rows; each abandoned Payment inserts one history row.
+        assert_eq!(
+            ranges["new_orders"],
+            CountRange::bounded(100, 60, 103)
+        );
+        assert_eq!(ranges["orders"], CountRange::bounded(50, 50, 53));
+        assert_eq!(ranges["order_line"], CountRange::bounded(500, 500, 545));
+        assert_eq!(ranges["history"], CountRange::bounded(40, 40, 42));
+        assert_eq!(ranges["warehouse"], CountRange::exact(50));
+
+        // Zero abandoned writes keep every recovery count exact.
+        let exact = recovery_count_ranges(&counts, AbandonedWrites::default()).unwrap();
+        for (_, range) in &exact {
+            assert_eq!(range.min, range.expected);
+            assert_eq!(range.max, range.expected);
+        }
+    }
+
+    #[test]
+    fn range_int_expectation_accepts_in_range_and_rejects_outside() {
+        let query = CheckQuery {
+            id: "recovery.count.new_orders".to_owned(),
+            scope: CheckScope::Recovery,
+            description: "test range gate".to_owned(),
+            sql: "SELECT COUNT(*) FROM new_orders".to_owned(),
+            expectation: ScalarExpectation::RangeInt {
+                expected: 100,
+                min: 60,
+                max: 103,
+            },
+        };
+        for value in [60_i32, 80, 103] {
+            let ok = TypedResult::scalar(TypedValue::Int32(value));
+            assert!(query.validate(&ok).is_ok(), "value {value} should pass");
+        }
+        for value in [59_i32, 104] {
+            let bad = TypedResult::scalar(TypedValue::Int32(value));
+            assert!(query.validate(&bad).is_err(), "value {value} should fail");
+        }
+    }
+
+    #[test]
     fn setup_valid_row_checks_use_and_only_predicates_and_exact_counts() {
         let plan = setup_plan(SetupExpectations::final_2026(15_123_456, 4_571_234)).unwrap();
         for (id, expected) in [
