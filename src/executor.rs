@@ -879,13 +879,6 @@ async fn run_worker_inner(
     }
 }
 
-const fn unknown_outcome_is_safe_to_abandon(transaction_type: TransactionType) -> bool {
-    matches!(
-        transaction_type,
-        TransactionType::OrderStatus | TransactionType::StockLevel
-    )
-}
-
 async fn wait_for_timing_release(ready_barrier: &Barrier, start_barrier: &Barrier) {
     ready_barrier.wait().await;
     start_barrier.wait().await;
@@ -1150,25 +1143,6 @@ mod tests {
         assert!(rank_report_configuration_lines(true)
             .iter()
             .all(|line| *line != "conformance=public_spec_aligned"));
-    }
-
-    #[test]
-    fn only_read_only_unknown_outcomes_can_be_abandoned() {
-        assert!(unknown_outcome_is_safe_to_abandon(
-            TransactionType::OrderStatus
-        ));
-        assert!(unknown_outcome_is_safe_to_abandon(
-            TransactionType::StockLevel
-        ));
-        assert!(!unknown_outcome_is_safe_to_abandon(
-            TransactionType::NewOrder
-        ));
-        assert!(!unknown_outcome_is_safe_to_abandon(
-            TransactionType::Payment
-        ));
-        assert!(!unknown_outcome_is_safe_to_abandon(
-            TransactionType::Delivery
-        ));
     }
 
     #[test]

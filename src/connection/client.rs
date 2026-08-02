@@ -394,42 +394,27 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn consistency_response_timeout_matches_observed_failure_boundary() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut handshake = [0_u8; HANDSHAKE.len()];
-            socket.read_exact(&mut handshake).await.unwrap();
-            socket.write_all(&handshake).await.unwrap();
-
-            let mut header = [0_u8; 8];
-            socket.read_exact(&mut header).await.unwrap();
-            let payload_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
-            let mut payload = vec![0_u8; payload_bytes];
-            socket.read_exact(&mut payload).await.unwrap();
-            assert!(String::from_utf8(payload)
-                .unwrap()
-                .contains("recovery_secret_613"));
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        });
-
-        let mut client =
-            RmdbClient::connect_with_timeout("127.0.0.1", port, Duration::from_millis(100))
-                .await
-                .unwrap();
-        let error = client
-            .exec_consistency_stream("SELECT recovery_secret_613;", "recovery.count.customer")
-            .await
-            .unwrap_err()
-            .to_string();
+    #[test]
+    fn consistency_response_read_timeout_maps_to_observed_failure_boundary() {
+        // Consistency requests use the dedicated DEFAULT_RESPONSE_TIMEOUT
+        // (large SUM scans are not ranked traffic), so the mapped diagnostic
+        // is verified directly here instead of through a socket whose peer
+        // would have to stay silent for that whole window.
+        let error = map_consistency_wire_error(
+            WireError::Timeout {
+                request: "EXEC_STREAM",
+                phase: WireTimeoutPhase::ResponseRead,
+                timeout: Duration::from_millis(100),
+            },
+            "recovery.count.customer",
+        )
+        .to_string();
         assert!(error.contains("post-crash consistency"), "{error}");
         assert!(error.contains("request was sent"), "{error}");
         assert!(error.contains("response frame and terminal"), "{error}");
         assert!(error.contains("100ms"), "{error}");
+        assert!(error.contains("recovery.count.customer"), "{error}");
         assert!(!error.contains("recovery_secret_613"), "{error}");
-        server.await.unwrap();
     }
 
     #[tokio::test]

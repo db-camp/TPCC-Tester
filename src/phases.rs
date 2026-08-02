@@ -432,8 +432,6 @@ pub enum SchedulerError {
     InvalidRuntimeLimit(&'static str),
     #[error("the retry's phase deadline has passed")]
     RetryDeadlinePassed,
-    #[error("cannot abandon {0:?} with an unknown write outcome")]
-    UnsafeUnknownWriteOutcome(TransactionType),
     #[error(
         "terminal completion timestamp {completed_at:?} precedes attempt start {attempt_started_at:?}"
     )]
@@ -1973,7 +1971,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_read_only_timeout_can_be_abandoned_but_unknown_write_cannot() {
+    fn unknown_outcome_abandon_applies_to_write_attempts_like_the_official_client() {
         let (clock, mut scheduler) = ready_scheduler(Duration::from_secs(5));
         scheduler.start().unwrap();
         clock.set(Duration::from_secs(30));
@@ -1988,13 +1986,21 @@ mod tests {
         assert_eq!(scheduler.windows()[0].abandoned, 0);
         assert_eq!(scheduler.windows()[0].grace_tail, 1);
 
+        // The scheduler mirrors the official client, which abandons timed-out
+        // write attempts too (the executor best-effort ABORTs and rebuilds the
+        // session so the server rolls back an in-flight transaction). A
+        // Payment whose connection outcome is unknown is therefore abandonable
+        // and never counted as committed.
         let write = start_payment(&mut scheduler, worker, 0x67);
-        assert_eq!(
-            scheduler.abandon_read_only_inflight_at(write, Duration::from_secs(186)),
-            Err(SchedulerError::UnsafeUnknownWriteOutcome(
-                TransactionType::Payment
-            ))
-        );
+        scheduler
+            .abandon_read_only_inflight_at(write, Duration::from_secs(186))
+            .unwrap();
+        // The write attempt started inside FormalWindow(1) (phase deadline
+        // 330s), so 186s is an in-window abandonment, not a grace tail.
+        assert_eq!(scheduler.windows()[0].abandoned, 0);
+        assert_eq!(scheduler.windows()[0].grace_tail, 1);
+        assert_eq!(scheduler.windows()[1].abandoned, 1);
+        assert_eq!(scheduler.windows()[1].grace_tail, 0);
     }
 
     #[test]
