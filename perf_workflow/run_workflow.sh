@@ -5103,7 +5103,8 @@ run_profile_tester() {
   shift
   local -a command
   command=("$@")
-  if [[ "${ALLOW_DEVIATION}" == "1" && "${MODE}" != "preliminary" ]]; then
+  if [[ ("${ALLOW_DEVIATION}" == "1" || -n "${RTT_SIM_MS}") \
+    && "${MODE}" != "preliminary" ]]; then
     command+=(--allow-deviation)
     [[ -z "${SCALE}" ]] || command+=(--scale "${SCALE}")
     [[ -z "${CLIENTS}" ]] || command+=(--clients "${CLIENTS}")
@@ -5112,6 +5113,9 @@ run_profile_tester() {
     [[ -z "${WINDOW_SECONDS}" ]] \
       || command+=(--window-seconds "${WINDOW_SECONDS}")
   fi
+  # rtt-sim-ms must reach every tester phase (setup included) so the sealed
+  # run contract keeps one conformance profile across the whole lifecycle.
+  [[ -z "${RTT_SIM_MS}" ]] || command+=(--rtt-sim-ms "${RTT_SIM_MS}")
   run_tester "${log_path}" "${command[@]}"
 }
 
@@ -5147,10 +5151,8 @@ run_rank() {
   log "running one Rust-owned final2026 benchmark"
   set_phase_status rank running
   TESTER_RESOURCE_TIMELINE="${RESOURCE_TIMELINE}"
-  local -a rank_command=(--benchmark --profile "${PROFILE}" --seed "${SEED}")
-  [[ -z "${RTT_SIM_MS}" ]] || rank_command+=(--rtt-sim-ms "${RTT_SIM_MS}")
   run_profile_tester "${RESULT_DIR}/rank.log" \
-      "${rank_command[@]}" \
+      --benchmark --profile "${PROFILE}" --seed "${SEED}" \
       --state-dir "${STATE_DIR}" \
       --host "${HOST}" --port "${PORT}" || rank_rc=$?
   TESTER_RESOURCE_TIMELINE=""
@@ -5169,10 +5171,8 @@ run_preliminary() {
   log "running non-ranked 30s warmup + one 60s preliminary window"
   set_phase_status preliminary running
   TESTER_RESOURCE_TIMELINE="${RESOURCE_TIMELINE}"
-  local -a preliminary_command=(--preliminary --profile "${PROFILE}" --seed "${SEED}")
-  [[ -z "${RTT_SIM_MS}" ]] || preliminary_command+=(--rtt-sim-ms "${RTT_SIM_MS}")
   run_profile_tester "${RESULT_DIR}/preliminary.log" \
-      "${preliminary_command[@]}" \
+      --preliminary --profile "${PROFILE}" --seed "${SEED}" \
       --state-dir "${STATE_DIR}" \
       --host "${HOST}" --port "${PORT}" || preliminary_rc=$?
   TESTER_RESOURCE_TIMELINE=""
