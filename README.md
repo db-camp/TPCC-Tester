@@ -90,17 +90,24 @@ rank claim 或 terminal evidence。
 
 ### 环境对齐：`--rtt-sim-ms`
 
-官方客户端跨主机、受网络往返约束；本地 loopback 无 RTT，客户端无限速发送会
-形成重试风暴（本地实测约 81% 的物理尝试是重试，物理尝试率约 2440/s，官方约
-733/s），掩盖服务器真实能力。`--rtt-sim-ms <ms>` 在每个 attempt（含重试）前
-插入模拟 RTT，把本地 attempt 率对齐到官方水平；preliminary 实测最优约 30ms
-（物理 ~820/s，重试占比降到 ~19%，NewOrder/min 相对 rtt=0 提升约 40%）。
-默认 `0` 保持公开饱和负载契约；非零值在 ranked 模式需 `--allow-deviation`，
-在 preliminary/诊断模式免费，结果始终为非排名诊断。
+官方客户端跨主机、每次物理 attempt 受网络往返约束；本地 loopback 无 RTT，
+客户端无限速发送会形成重试风暴（本地实测约 81% 的物理尝试是重试、物理尝试率
+约 2440/s，官方约 733/s），掩盖服务器真实能力。`--rtt-sim-ms <ms>` 在每个
+attempt（含重试）前插入模拟 RTT，把本地 attempt 率对齐到官方水平；本地
+preliminary 实测最优约 30ms（物理 ~820/s，重试占比降到 ~19%，NewOrder/min
+相对 rtt=0 提升约 40%）。它是环境对齐（复现官方跨主机网络的客观物理延迟），
+不是思考时间偏差，因此**默认 30ms 且不破坏排名配置**；`--rtt-sim-ms 0` 选择
+本地 loopback。
 
 ```bash
-deps/TPCC-Tester/perf_workflow/run_workflow.sh \
-  --mode preliminary --seed 2026 --rtt-sim-ms 30
+# 默认 rtt=30，保持 ranked 配置（官方对齐）
+deps/TPCC-Tester/perf_workflow/run_workflow.sh --mode all --seed 2026
+
+# 本地 loopback（公开契约 rtt=0）
+deps/TPCC-Tester/perf_workflow/run_workflow.sh --mode all --seed 2026 --rtt-sim-ms 0
+
+# 快速官方对齐初测
+deps/TPCC-Tester/perf_workflow/run_workflow.sh --mode preliminary --seed 2026
 ```
 
 ## 直接运行 tester
