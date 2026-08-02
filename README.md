@@ -110,6 +110,51 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh --mode all --seed 2026 --rtt-sim-
 deps/TPCC-Tester/perf_workflow/run_workflow.sh --mode preliminary --seed 2026
 ```
 
+### 官方对齐校验：`compare_official.py`
+
+用官方测评报告（`run_new.log`）与本地产出做多指标对比，量化每个指标的差距
+（不只 tpmC）：
+
+```bash
+python3 deps/TPCC-Tester/perf_workflow/compare_official.py \
+  run_new.log performance_test_record/<UTC-run-id>_final2026
+```
+
+对比维度：Median/R1/R2/R3 NewOrder/min、R1/R3 衰减、abandoned 率、p50/p99/avg
+latency、CPU avg、Peak RSS、Load time、5s bucket max。
+
+chen/v3 HEAD 官方 vs 本地（rtt-sim-ms=8，32 客户端 SF50）实测差异：
+
+| 指标 | 官方 | 本地 | 差距 |
+|---|---|---|---|
+| Median NewOrder/min | 24623 | 21380 | 1.15x |
+| R1 | 40582 | 24841 | 1.63x |
+| R3 | 19520 | 20752 | 0.94x |
+| R1/R3 衰减 | 2.08x | 1.20x | 官方衰减大 |
+| Abandoned | 35.0% | 0.00% | 官方跨主机超时 |
+| p50 / p99 | 25.5 / 157.6ms | 20.5 / 201.6ms | 混合 |
+| CPU avg (host%) | 35.2% | 40.3% | 本地更忙 |
+| Load time | 52.7s | 15.9s | 官方慢 |
+| 5s bucket max | 68916 | 31536 | 2.19x |
+
+差异来源：
+1. **机器 compute（主）**：官方 R1 峰值 40582/68916 vs 本地 24841/31536（约 1.6x）；
+   R3 稳态两者接近（19520 vs 20752），说明稳态能力相当，峰值受机器单核/内存带宽限制。
+2. **abandoned**：官方 35% 事务超 3s deadline 被放弃（跨主机 RTT + 官方服务器 R2/R3
+   数据增长排队）；本地 loopback + 服务器快，3s 内总能完成 → 0%。本地事务端到端
+   延迟（avg ~33ms）远小于 deadline，仅调大 rtt 会同时压低吞吐，无法单独复现官方超时。
+3. **load 时间**：官方 52.7s vs 本地 15.9s（官方校验更严格/磁盘慢；本地虚拟化 IO 快）。
+
+复现策略：本地对齐目标是**形态**（R1 高、R2/R3 衰减、吞吐/延迟/CPU 相对关系），
+绝对值受机器系数影响。校准 rtt 匹配官方 attempt 时序（官方 R1 高 → 本地 rtt 宜小，
+如 8ms；rtt15 时本地 R1 23448、rtt8 时 24841）。
+
+abandoned 复现边界（rtt 扫描实验）：rtt0（loopback 无限速）确能产生大量
+Delivery 超时 abandoned（服务器排队），但会触发重试风暴导致 NewOrder 语义失败
+（rank 不通过）；rtt8-15 语义正常但 abandoned 近 0（本地服务器快，事务 avg ~33ms
+远小于 3s deadline）。因此官方 35% abandoned 是跨主机网络 + 官方负载特征的产物，
+本地不能仅靠 rtt 复现，也不应通过人为注入超时制造（那会伪造非官方行为）。
+
 ## 直接运行 tester
 
 以下示例假定 RMDB 已在 `127.0.0.1:8765` 运行，并且状态目录属于这一数据库与 seed：
