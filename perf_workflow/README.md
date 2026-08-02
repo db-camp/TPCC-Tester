@@ -173,6 +173,17 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   重建会话（关闭旧连接 → 服务器回滚在途事务），与官方 abandoned 行为一致。
   一致性查询使用独立 300s 超时（大 SUM 扫描不是排名流量）。
 
+- **abandoned-but-committed 竞态容差**：超时放弃的写事务可能在服务器端已
+  提交（客户端从未观察到 COMMIT 响应），官方客户端接受同一类竞态。这类
+  提交会进入数据库状态但不在客户端账本中，导致恢复行数校验
+  （`recovery.count.*`）按严格账本推导时失败。workflow 在 rank 成功后从
+  `rank.log` 提取各事务族的 abandoned 写尝试数，通过
+  `--recovery-abandoned-neworder/payment/delivery` 传给 recovery check；
+  tester 据此把受影响表（new_orders、orders、order_line、history）的期望
+  行数放宽为账本推导值 ± abandoned 影响上界（每 abandoned Delivery ≤10 行
+  new_orders、每 abandoned NewOrder ≤1+15 行、每 abandoned Payment ≤1 行）。
+  无 abandoned 时保持精确校验。真实恢复错误仍由分区自洽与其它检查兜底。
+
 - **Rust 工具链**：tester 的 `Cargo.lock` 为 lockfile v4，需要 cargo ≥ 1.78
   （建议 rustup stable ≥ 1.97，走 rsproxy.cn 镜像安装）。系统包管理器自带
   的旧 cargo（如 Ubuntu 的 1.75）无法解析 lockfile v4，会导致 tester 构建
