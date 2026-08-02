@@ -50,6 +50,10 @@ CLIENTS=""
 WARMUP_SECONDS=""
 WINDOW_SECONDS=""
 RTT_SIM_MS=""
+# Local default models the official cross-host network round trip so every
+# run aligns with the official attempt timing by default; pass --rtt-sim-ms 0
+# to select the local loopback explicitly.
+DEFAULT_RTT_SIM_MS=30
 RECOVERY_ABANDONED_NEWORDER=""
 RECOVERY_ABANDONED_PAYMENT=""
 RECOVERY_ABANDONED_DELIVERY=""
@@ -195,11 +199,11 @@ Short local deviations (never enabled implicitly):
   --clients <n>               --threads is accepted as an alias
   --warmup-seconds <n>
   --window-seconds <n>        --measure-seconds is accepted as an alias
-  --rtt-sim-ms <n>            Simulated per-attempt cross-host round trip (ms).
-                              Models the official network distance; non-zero is
-                              an environment-alignment diagnostic that requires
-                              --allow-deviation for ranked modes and is free on
-                              --mode preliminary / diagnostic workloads.
+  --rtt-sim-ms <n>            Simulated per-attempt cross-host round trip (ms),
+                              default 30 to align with the official network;
+                              pass 0 for the local loopback. Environment
+                              alignment, not a think-time deviation, so it
+                              keeps the ranked configuration intact.
 
 The shell deliberately has no transaction-mix, transaction-count, output-file,
 or per-window timeout controls. Those are part of the Rust final2026 contract.
@@ -1464,13 +1468,8 @@ if [[ -n "${SCALE}${CLIENTS}${WARMUP_SECONDS}${WINDOW_SECONDS}" \
   && [[ "${ALLOW_DEVIATION}" != "1" ]]; then
   die "local database-name/sizing/timing/readiness overrides require --allow-deviation"
 fi
-if [[ "${MODE}" != "preliminary" && -n "${RTT_SIM_MS}" \
-  && "${ALLOW_DEVIATION}" != "1" ]]; then
-  die "rtt-sim-ms outside --mode preliminary requires --allow-deviation"
-fi
-if [[ -n "${RTT_SIM_MS}" ]]; then
-  validate_positive_integer "--rtt-sim-ms" "${RTT_SIM_MS}"
-fi
+EFFECTIVE_RTT_SIM_MS="${RTT_SIM_MS:-${DEFAULT_RTT_SIM_MS}}"
+validate_nonnegative_integer "--rtt-sim-ms" "${EFFECTIVE_RTT_SIM_MS}"
 if [[ "${ALLOW_DEVIATION}" == "1" ]]; then
   [[ -z "${SCALE}" ]] || validate_positive_integer "--scale" "${SCALE}"
   [[ -z "${CLIENTS}" ]] || validate_positive_integer "--clients" "${CLIENTS}"
@@ -1498,7 +1497,6 @@ elif [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
   || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
   || "${DB_NAME_DEVIATION_ACTIVE}" == "1" \
-  || -n "${RTT_SIM_MS}" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
@@ -1635,7 +1633,6 @@ elif [[ "${EFFECTIVE_SCALE}" != "${PUBLIC_SCALE}" \
   || "${EFFECTIVE_WARMUP_SECONDS}" != "${PUBLIC_WARMUP_SECONDS}" \
   || "${EFFECTIVE_WINDOW_SECONDS}" != "${PUBLIC_WINDOW_SECONDS}" \
   || "${DB_NAME_DEVIATION_ACTIVE}" == "1" \
-  || -n "${RTT_SIM_MS}" \
   || "${RECOVERY_READY_TIMEOUT_SECONDS}" != "${PUBLIC_READY_TIMEOUT_SECONDS}" ]]; then
   RANKED_CONFIGURATION=0
 fi
@@ -5110,8 +5107,7 @@ run_profile_tester() {
   shift
   local -a command
   command=("$@")
-  if [[ ("${ALLOW_DEVIATION}" == "1" || -n "${RTT_SIM_MS}") \
-    && "${MODE}" != "preliminary" ]]; then
+  if [[ "${ALLOW_DEVIATION}" == "1" && "${MODE}" != "preliminary" ]]; then
     command+=(--allow-deviation)
     [[ -z "${SCALE}" ]] || command+=(--scale "${SCALE}")
     [[ -z "${CLIENTS}" ]] || command+=(--clients "${CLIENTS}")
@@ -5120,9 +5116,9 @@ run_profile_tester() {
     [[ -z "${WINDOW_SECONDS}" ]] \
       || command+=(--window-seconds "${WINDOW_SECONDS}")
   fi
-  # rtt-sim-ms must reach every tester phase (setup included) so the sealed
-  # run contract keeps one conformance profile across the whole lifecycle.
-  [[ -z "${RTT_SIM_MS}" ]] || command+=(--rtt-sim-ms "${RTT_SIM_MS}")
+  # rtt-sim-ms reaches every tester phase (setup included) so the sealed run
+  # contract keeps one conformance profile across the whole lifecycle.
+  command+=(--rtt-sim-ms "${EFFECTIVE_RTT_SIM_MS}")
   run_tester "${log_path}" "${command[@]}"
 }
 
