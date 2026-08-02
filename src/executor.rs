@@ -853,7 +853,7 @@ async fn run_worker_inner(
                     if disposition != AttemptDisposition::RetrySameParameters {
                         break;
                     }
-                    (phase_ticket, attempt_deadline) = {
+                    let (ticket, deadline) = {
                         let mut state = lock_scheduler(&scheduler)?;
                         match state.start_retry(phase_ticket) {
                             Ok(ticket) => {
@@ -862,9 +862,19 @@ async fn run_worker_inner(
                                 (ticket, deadline)
                             }
                             Err(SchedulerError::RetryDeadlinePassed) => break,
-            Err(error) => return Err(scheduler_error(error)),
+                            Err(error) => return Err(scheduler_error(error)),
                         }
                     };
+                    // De-collide retry storms on hot rows: all workers retry
+                    // the same frozen parameters immediately, so concurrent
+                    // retries on one district/stock row collide on the row
+                    // lock. A per-ticket pseudo-random microsecond backoff
+                    // (0..2ms) staggers retries so hot-row writers serialize
+                    // instead of repeatedly aborting each other. It never
+                    // changes the frozen parameters, only the retry timing.
+                    let backoff_us = ticket.id().wrapping_mul(2654435761) % 2000;
+                    tokio::time::sleep(std::time::Duration::from_micros(backoff_us)).await;
+                    (phase_ticket, attempt_deadline) = (ticket, deadline);
                 }
                 Ok(Err(error)) => {
                     return fail_worker(
