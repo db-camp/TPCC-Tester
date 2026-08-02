@@ -45,10 +45,6 @@ use crate::workload::Final2026Workload;
 
 const RESOURCE_TIMELINE_ENV: &str = "RMDB_TPCC_RESOURCE_TIMELINE_FILE";
 
-/// Global monotonic sequence used to de-synchronize per-attempt RTT jitter
-/// across all workers and their retries.
-static GLOBAL_ATTEMPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 struct ResourceTimelineRecorder {
     output: Option<PathBuf>,
     schedule: PhaseScheduleConfig,
@@ -725,15 +721,11 @@ async fn run_worker_inner(
             // the official cross-host client is additionally gated by the
             // network round trip. --rtt-sim-ms inserts that per-attempt delay
             // to align the local attempt rate and end-to-end latency
-            // distribution with the official environment (0 = loopback).
+            // distribution with the official environment (0 = loopback). A
+            // non-zero value is an explicit non-ranked deviation because it
+            // adds per-attempt think time the public contract forbids.
             if session_config.rtt_sim_ms > 0 {
-                // Real cross-host RTT is not fixed: per-(worker, attempt)
-                // jitter models network variance and de-synchronizes the 32
-                // clients' retries on hot rows, which would otherwise align
-                // into periodic conflict peaks.
-                let seq = GLOBAL_ATTEMPT_SEQ.fetch_add(1, Ordering::Relaxed);
-                let jitter_ms = (u64::from(worker_value).wrapping_mul(3) ^ seq.wrapping_mul(7)) % 8;
-                let rtt = Duration::from_millis(session_config.rtt_sim_ms + jitter_ms);
+                let rtt = Duration::from_millis(session_config.rtt_sim_ms);
                 if let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
                 {
                     tokio::time::sleep(rtt.min(remaining)).await;
