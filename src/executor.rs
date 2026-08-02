@@ -972,7 +972,7 @@ impl Final2026RunResult {
             );
             let stability = window.new_order_stability();
             println!(
-                "window{}: new_order_per_min={:.3}, attempted={}, total_committed={}, new_order_committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, abandoned={}, physical_attempts={}, retry_abort={}, abandoned_physical_attempts={}, retry_policy_abandoned={}, cutoff_stopped={}, grace_tail={}, new_order_latency_ms=avg:{},p50:{},p99:{},max:{}, new_order_5s=avg_per_min:{:.3},cv_percent:{:.3},min_per_min:{:.3},max_per_min:{:.3},zero_buckets:{}, delivery_processed={}, warehouses={}/{}, required_warehouses={}, gate={}",
+                "window{}: new_order_per_min={:.3}, attempted={}, total_committed={}, new_order_committed={}, committed_by_family=new_order:{},payment:{},order_status:{},delivery:{},stock_level:{}, expected_rollback={}, abandoned={}, physical_attempts={}, retry_abort={}, abandoned_physical_attempts={}, retry_policy_abandoned={}, cutoff_stopped={}, grace_tail={}, new_order_latency_ms=avg:{},p50:{},p99:{},max:{}, new_order_5s=avg_per_min:{:.3},cv_percent:{:.3},min_per_min:{:.3},max_per_min:{:.3},zero_buckets:{}, peak_avg={:.2}, abort_rate={:.2}, delivery_processed={}, warehouses={}/{}, required_warehouses={}, gate={}",
                 index + 1,
                 self.window_rates[index],
                 window.attempted,
@@ -1000,6 +1000,16 @@ impl Final2026RunResult {
                 stability.min_per_minute,
                 stability.max_per_minute,
                 stability.zero_buckets,
+                if stability.average_per_minute > 0.0 {
+                    stability.max_per_minute / stability.average_per_minute
+                } else {
+                    0.0
+                },
+                if window.attempted > 0 {
+                    window.abandoned as f64 * 100.0 / window.attempted as f64
+                } else {
+                    0.0
+                },
                 window.delivery_processed,
                 gate.coverage.covered_warehouses,
                 OFFICIAL_WAREHOUSE_COUNT,
