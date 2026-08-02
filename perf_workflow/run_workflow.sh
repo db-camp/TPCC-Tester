@@ -50,6 +50,9 @@ CLIENTS=""
 WARMUP_SECONDS=""
 WINDOW_SECONDS=""
 RTT_SIM_MS=""
+RECOVERY_ABANDONED_NEWORDER=""
+RECOVERY_ABANDONED_PAYMENT=""
+RECOVERY_ABANDONED_DELIVERY=""
 SERVER_BIN_OVERRIDE=""
 TPCC_BIN_OVERRIDE=""
 STATE_DIR_OVERRIDE=""
@@ -214,6 +217,10 @@ warn() {
 die() {
   printf '[tpcc-workflow] ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+strip_ansi() {
+  sed 's/\x1b\[[0-9;]*m//g'
 }
 
 need_value() {
@@ -5159,6 +5166,26 @@ run_rank() {
   if [[ "${rank_rc}" == "0" ]]; then
     publish_rank_completion
     set_phase_status rank passed
+    # Extract per-family abandoned write attempts so the recovery row-count
+    # gate can tolerate the abandoned-but-committed race (the official client
+    # accepts the same class). The value is empty when the rank report has no
+    # transaction-completion line, which keeps the recovery check exact.
+    RECOVERY_ABANDONED_NEWORDER="$(
+      strip_ansi <"${RESULT_DIR}/rank.log" \
+        | grep -oE "transaction_completion=NewOrder,.*abandoned=[0-9]+" \
+        | tail -1 | grep -oE "abandoned=[0-9]+" | cut -d= -f2
+    )"
+    RECOVERY_ABANDONED_PAYMENT="$(
+      strip_ansi <"${RESULT_DIR}/rank.log" \
+        | grep -oE "transaction_completion=Payment,.*abandoned=[0-9]+" \
+        | tail -1 | grep -oE "abandoned=[0-9]+" | cut -d= -f2
+    )"
+    RECOVERY_ABANDONED_DELIVERY="$(
+      strip_ansi <"${RESULT_DIR}/rank.log" \
+        | grep -oE "transaction_completion=Delivery,.*abandoned=[0-9]+" \
+        | tail -1 | grep -oE "abandoned=[0-9]+" | cut -d= -f2
+    )"
+    log "rank abandoned write attempts: new_order=${RECOVERY_ABANDONED_NEWORDER:-0}, payment=${RECOVERY_ABANDONED_PAYMENT:-0}, delivery=${RECOVERY_ABANDONED_DELIVERY:-0}"
   else
     set_phase_status rank failed
     die "TPC-C ranking failed; see ${RESULT_DIR}/rank.log"
@@ -5190,8 +5217,14 @@ run_check() {
   verify_database_identity
   log "running ${scope} consistency checks"
   set_phase_status "${scope}" running
+  local -a check_command=(--check --check-scope "${scope}" --profile "${PROFILE}" --seed "${SEED}")
+  if [[ "${scope}" == "recovery" && -n "${RECOVERY_ABANDONED_DELIVERY}${RECOVERY_ABANDONED_NEWORDER}${RECOVERY_ABANDONED_PAYMENT}" ]]; then
+    check_command+=(--recovery-abandoned-neworder "${RECOVERY_ABANDONED_NEWORDER:-0}")
+    check_command+=(--recovery-abandoned-payment "${RECOVERY_ABANDONED_PAYMENT:-0}")
+    check_command+=(--recovery-abandoned-delivery "${RECOVERY_ABANDONED_DELIVERY:-0}")
+  fi
   if run_profile_tester "${RESULT_DIR}/check_${scope}.log" \
-      --check --check-scope "${scope}" --profile "${PROFILE}" --seed "${SEED}" \
+      "${check_command[@]}" \
       --state-dir "${STATE_DIR}" \
       --host "${HOST}" --port "${PORT}"; then
     set_phase_status "${scope}" passed
