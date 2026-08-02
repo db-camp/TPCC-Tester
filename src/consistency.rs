@@ -56,6 +56,13 @@ impl TypedResult {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScalarExpectation {
     ExactInt(i64),
+    /// Recovery row counts that abandoned write attempts may have applied on
+    /// the server even though the client never observed the COMMIT response
+    /// (the official client accepts the same abandoned-but-committed class).
+    /// `expected` is the ledger-derived value; the closed range [min, max]
+    /// bounds the abandoned write impact so the recovery gate stays exact when
+    /// no attempt was abandoned and only tolerates the known race otherwise.
+    RangeInt { expected: i64, min: i64, max: i64 },
     ExactFloat32 { bits: u32, max_ulps: u32 },
     FiniteFloat32,
 }
@@ -89,6 +96,25 @@ impl CheckQuery {
                         check_id: self.id.clone(),
                         expected: *expected,
                         actual: i64::from(*actual),
+                    })
+                }
+            }
+            (
+                ScalarExpectation::RangeInt {
+                    expected,
+                    min,
+                    max,
+                },
+                TypedValue::Int32(actual),
+            ) => {
+                let actual = i64::from(*actual);
+                if (*min..=*max).contains(&actual) {
+                    Ok(())
+                } else {
+                    Err(ValidationError::IntegerMismatch {
+                        check_id: self.id.clone(),
+                        expected: *expected,
+                        actual,
                     })
                 }
             }
@@ -132,7 +158,7 @@ impl CheckQuery {
 impl ScalarExpectation {
     fn type_name(&self) -> &'static str {
         match self {
-            Self::ExactInt(_) => "INT32",
+            Self::ExactInt(_) | Self::RangeInt { .. } => "INT32",
             Self::ExactFloat32 { .. } | Self::FiniteFloat32 => "FLOAT32",
         }
     }
@@ -628,6 +654,42 @@ pub struct CommittedLedger {
 pub struct RecoveryExpectations {
     pub setup: SetupExpectations,
     pub committed: CommittedLedger,
+    /// Number of write attempts abandoned after the client stopped reading
+    /// (never counted as committed). Such an attempt may still have committed
+    /// on the server, so the recovery row-count gate tolerates the abandoned
+    /// impact on the affected tables. Defaults to zero for exact checks.
+    pub abandoned: AbandonedWrites,
+}
+
+/// Abandoned write attempts whose server-side outcome is unknown.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AbandonedWrites {
+    pub new_orders: i64,
+    pub payments: i64,
+    pub deliveries: i64,
+}
+
+/// Closed integer range for one recovery row count, used to tolerate the
+/// abandoned-but-committed race while staying exact when nothing was abandoned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CountRange {
+    pub expected: i64,
+    pub min: i64,
+    pub max: i64,
+}
+
+impl CountRange {
+    pub fn exact(expected: i64) -> Self {
+        Self {
+            expected,
+            min: expected,
+            max: expected,
+        }
+    }
+
+    pub fn bounded(expected: i64, min: i64, max: i64) -> Self {
+        Self { expected, min, max }
+    }
 }
 
 /// One coherent set of logical keys selected from persisted setup evidence.
@@ -772,6 +834,65 @@ impl RecoveryExpectations {
     }
 }
 
+/// Convert exact ledger-derived row counts into closed ranges that tolerate
+/// the abandoned-but-committed race on the tables a write attempt may have
+/// mutated without the client observing its COMMIT response. Tables whose
+/// cardinality an abandoned attempt cannot change stay exact.
+pub fn recovery_count_ranges(
+    counts: &BTreeMap<&'static str, i64>,
+    abandoned: AbandonedWrites,
+) -> Result<BTreeMap<String, CountRange>, PlanError> {
+    if abandoned.new_orders < 0 || abandoned.payments < 0 || abandoned.deliveries < 0 {
+        return Err(PlanError::NegativeCount(
+            "abandoned write statistics must be non-negative",
+        ));
+    }
+    let mut ranges = BTreeMap::new();
+    for (table, &expected) in counts {
+        ranges.insert((*table).to_owned(), CountRange::exact(expected));
+    }
+    // A committed-but-abandoned NewOrder inserts one new_orders row and one
+    // orders row plus 5..=15 order_line rows; a committed-but-abandoned
+    // Payment inserts one history row; a committed-but-abandoned Delivery
+    // deletes up to one new_orders row per district (10 max).
+    if let Some(range) = ranges.get_mut("new_orders") {
+        let min = range
+            .expected
+            .checked_sub(checked_mul(abandoned.deliveries, 10, "abandoned delivery rows")?)
+            .ok_or(PlanError::ArithmeticOverflow(
+                "abandoned recovery new_orders lower bound",
+            ))?;
+        let max = range
+            .expected
+            .checked_add(abandoned.new_orders)
+            .ok_or(PlanError::ArithmeticOverflow(
+                "abandoned recovery new_orders upper bound",
+            ))?;
+        *range = CountRange::bounded(range.expected, min, max);
+    }
+    for (table, factor) in [("orders", 1), ("order_line", 15)] {
+        if let Some(range) = ranges.get_mut(table) {
+            let max = range
+                .expected
+                .checked_add(checked_mul(abandoned.new_orders, factor, "abandoned order rows")?)
+                .ok_or(PlanError::ArithmeticOverflow(
+                    "abandoned recovery order-line upper bound",
+                ))?;
+            *range = CountRange::bounded(range.expected, range.expected, max);
+        }
+    }
+    if let Some(range) = ranges.get_mut("history") {
+        let max = range
+            .expected
+            .checked_add(abandoned.payments)
+            .ok_or(PlanError::ArithmeticOverflow(
+                "abandoned recovery history upper bound",
+            ))?;
+        *range = CountRange::bounded(range.expected, range.expected, max);
+    }
+    Ok(ranges)
+}
+
 /// Generate exactly 37 public-spec integer recovery checks.
 ///
 /// This is an independently derived, replayable local gate. The official SQL,
@@ -786,16 +907,29 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
         });
     }
     let counts = input.expected_counts()?;
+    let ranges = recovery_count_ranges(&counts, input.abandoned)?;
     let mut plan = ConsistencyPlan::default();
 
-    for (table, expected) in &counts {
-        plan.queries.push(int_query(
-            CheckScope::Recovery,
-            format!("recovery.count.{table}"),
-            format!("post-recovery {table} row count from committed ledger"),
-            format!("SELECT COUNT(*) FROM {table}"),
-            *expected,
-        ));
+    for (table, range) in &ranges {
+        let expectation = if range.min == range.max {
+            ScalarExpectation::ExactInt(range.expected)
+        } else {
+            ScalarExpectation::RangeInt {
+                expected: range.expected,
+                min: range.min,
+                max: range.max,
+            }
+        };
+        plan.queries.push(CheckQuery {
+            id: format!("recovery.count.{table}"),
+            scope: CheckScope::Recovery,
+            description: format!(
+                "post-recovery {table} row count from committed ledger \
+                 (abandoned-write race tolerance applied)"
+            ),
+            sql: format!("SELECT COUNT(*) FROM {table}"),
+            expectation,
+        });
     }
 
     let order_line_rows = counts["order_line"];
@@ -1113,6 +1247,15 @@ pub fn validate_public_recovery_integer_gate(plan: &ConsistencyPlan) -> Result<(
         match query.expectation {
             ScalarExpectation::ExactInt(expected) => {
                 require_int32(&query.id, expected)?;
+            }
+            ScalarExpectation::RangeInt {
+                expected,
+                min,
+                max,
+            } => {
+                require_int32(&query.id, expected)?;
+                require_int32(&query.id, min)?;
+                require_int32(&query.id, max)?;
             }
             _ => return Err(PlanError::InvalidRecoveryIntegerCheck(query.id.clone())),
         }

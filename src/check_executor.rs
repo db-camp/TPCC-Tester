@@ -12,11 +12,11 @@ use crate::connection::wire::{FoldStreamResponse, StreamResponse, WireValue};
 use crate::consistency::{
     float32_matches, float_aggregate_plan, public_online_integer_plan,
     recovery_partition_audits_for_warehouses, recovery_plan, setup_plan, sum_f32_as_f64_once,
-    validate_crash_float_baseline, validate_public_float_ledger, CheckQuery, CheckScope,
-    ConsistencyPlan, FloatAggregateId, NonNegativeF32Accumulator, PartitionExpectation,
-    PartitionKey, PublicFloatLedgerEvidence, RecoveryExpectations, SetupExpectations, TypedResult,
-    TypedValue, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES, FLOAT_AGGREGATES,
-    NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
+    validate_crash_float_baseline, validate_public_float_ledger, AbandonedWrites, CheckQuery,
+    CheckScope, ConsistencyPlan, FloatAggregateId, NonNegativeF32Accumulator,
+    PartitionExpectation, PartitionKey, PublicFloatLedgerEvidence, RecoveryExpectations,
+    SetupExpectations, TypedResult, TypedValue, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES,
+    FLOAT_AGGREGATES, NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
 };
 use crate::error::TpccError;
 use crate::ranking::bounded_stats::BoundedPhysicalStats;
@@ -488,7 +488,12 @@ fn prepare_bounded_online(
     )?;
     bounded_payment_endpoint_expectations(dataset.warehouses, evidence.payment())?;
     let expectations =
-        bounded_recovery_expectations(dataset, evidence.stats(), initial_order_line_amounts)?;
+        bounded_recovery_expectations(
+            dataset,
+            evidence.stats(),
+            initial_order_line_amounts,
+            AbandonedWrites::default(),
+        )?;
     let float_oracle =
         bounded_online_float_oracle(dataset, evidence.stats(), initial_order_line_amounts)?;
     let sample = dataset
@@ -521,6 +526,7 @@ pub async fn run_final_recovery_from_terminal_evidence(
     evidence: &dyn TerminalEvidenceView,
     initial_order_line_amounts: &NonNegativeF32Accumulator,
     online_baseline: &FloatBaseline,
+    abandoned: AbandonedWrites,
 ) -> Result<(), TpccError> {
     warn!("{PUBLIC_SPEC_NOTICE}");
     validate_terminal_evidence(evidence).map_err(|_| {
@@ -531,8 +537,12 @@ pub async fn run_final_recovery_from_terminal_evidence(
         evidence.intervals().warehouses(),
         evidence.intervals().sample_seed(),
     )?;
-    let expectations =
-        bounded_recovery_expectations(dataset, evidence.stats(), initial_order_line_amounts)?;
+    let expectations = bounded_recovery_expectations(
+        dataset,
+        evidence.stats(),
+        initial_order_line_amounts,
+        abandoned,
+    )?;
     // Construct every bounded oracle before issuing the first query so a
     // malformed or cross-dataset artifact cannot partially execute recovery.
     bounded_payment_endpoint_expectations(dataset.warehouses, evidence.payment())?;
@@ -605,6 +615,7 @@ pub async fn probe_public_post_crash_responses(
             undelivered_order_line_rows: dataset.undelivered_order_line_rows,
         },
         committed: Default::default(),
+        abandoned: Default::default(),
     })
     .map_err(|error| protocol_error("invalid local recovery response plan", error))?;
     let mut ordinal = 0_usize;
@@ -754,6 +765,7 @@ fn bounded_recovery_expectations(
     dataset: &DatasetState,
     stats: &BoundedPhysicalStats,
     initial_order_line_amounts: &NonNegativeF32Accumulator,
+    abandoned: AbandonedWrites,
 ) -> Result<RecoveryExpectations, TpccError> {
     validate_consistency_warehouse_count(dataset.warehouses)?;
     let initial_terms = u64::try_from(dataset.order_line_rows).map_err(|_| {
@@ -774,6 +786,7 @@ fn bounded_recovery_expectations(
         committed: stats
             .to_committed_ledger()
             .map_err(|error| protocol_error("invalid bounded recovery statistics", error))?,
+        abandoned,
     })
 }
 
@@ -1624,9 +1637,13 @@ mod tests {
     fn bounded_sf1_recovery_uses_its_complete_dataset_keyspace() {
         let dataset = smoke_dataset(1);
         let stats = BoundedPhysicalStats::default();
-        let expectations =
-            bounded_recovery_expectations(&dataset, &stats, dataset.initial_order_line_amounts())
-                .unwrap();
+        let expectations = bounded_recovery_expectations(
+            &dataset,
+            &stats,
+            dataset.initial_order_line_amounts(),
+            AbandonedWrites::default(),
+        )
+        .unwrap();
         assert_eq!(expectations.setup.warehouses, 1);
 
         let partitions = bounded_partition_expectations(&dataset, &stats).unwrap();
@@ -1822,6 +1839,7 @@ mod tests {
             &dataset,
             &BoundedPhysicalStats::default(),
             dataset.initial_order_line_amounts(),
+            AbandonedWrites::default(),
         )
         .unwrap();
         let plan = recovery_plan(expectations).unwrap();

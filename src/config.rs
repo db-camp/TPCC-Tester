@@ -219,6 +219,19 @@ pub struct Config {
     #[arg(long = "rtt-sim-ms", default_value_t = 0)]
     pub rtt_sim_ms: u64,
 
+    /// Recovery row-count race tolerance: number of write attempts abandoned
+    /// by the ranked client without observing a COMMIT response. Such an
+    /// attempt may still have committed on the server (the official client
+    /// accepts this abandoned-but-committed class), so the recovery gate
+    /// tolerates its impact on the affected tables. Defaults to zero, keeping
+    /// recovery row counts exact.
+    #[arg(long = "recovery-abandoned-neworder", default_value_t = 0)]
+    pub recovery_abandoned_neworder: i64,
+    #[arg(long = "recovery-abandoned-payment", default_value_t = 0)]
+    pub recovery_abandoned_payment: i64,
+    #[arg(long = "recovery-abandoned-delivery", default_value_t = 0)]
+    pub recovery_abandoned_delivery: i64,
+
     /// Public recovery restart/readiness budget; workflow must pass its effective value
     #[arg(
         long = "recovery-ready-budget-seconds",
@@ -650,6 +663,15 @@ impl Config {
             return Err(ConfigError::OutOfRange {
                 field: "recovery-ready-budget-seconds",
                 range: "1..",
+            });
+        }
+        if self.recovery_abandoned_neworder < 0
+            || self.recovery_abandoned_payment < 0
+            || self.recovery_abandoned_delivery < 0
+        {
+            return Err(ConfigError::OutOfRange {
+                field: "recovery-abandoned-*",
+                range: "0..",
             });
         }
         if self.diagnostic_workload_seconds == Some(0) {

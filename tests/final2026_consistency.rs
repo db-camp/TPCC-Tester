@@ -3,13 +3,14 @@ mod consistency;
 
 use consistency::{
     add_f32_once, float32_matches, float_aggregate_plan, large_set_boundary,
-    large_set_boundary_from_f32, public_online_integer_plan, recovery_partition_audits,
-    recovery_plan, setup_plan, sum_f32_as_f64_once, ulp_distance, validate_crash_float_baseline,
-    validate_public_float_ledger, validate_public_recovery_integer_gate, validate_relative_add,
-    validate_relative_update_chain, CheckScope, CommittedLedger, FloatAggregateId, IdentifierMap,
-    LedgerFloatRule, OnlineKeySample, PartitionExpectation, PartitionKey, PlanError,
-    PublicFloatLedgerEvidence, RecoveryExpectations, RelativeUpdateEvidence, ScalarExpectation,
-    SetupExpectations, TypedResult, TypedValue, FINAL_WAREHOUSES, FLOAT_AGGREGATES,
+    large_set_boundary_from_f32, public_online_integer_plan, recovery_count_ranges,
+    recovery_partition_audits, recovery_plan, setup_plan, sum_f32_as_f64_once, ulp_distance,
+    validate_crash_float_baseline, validate_public_float_ledger, validate_public_recovery_integer_gate,
+    validate_relative_add, validate_relative_update_chain, AbandonedWrites, CheckScope,
+    CommittedLedger, FloatAggregateId, IdentifierMap, LedgerFloatRule, OnlineKeySample,
+    PartitionExpectation, PartitionKey, PlanError, PublicFloatLedgerEvidence,
+    RecoveryExpectations, RelativeUpdateEvidence, ScalarExpectation, SetupExpectations,
+    TypedResult, TypedValue, FINAL_WAREHOUSES, FLOAT_AGGREGATES,
     PUBLIC_RECOVERY_INTEGER_CHECK_COUNT, PUBLIC_SPEC_NOTICE,
 };
 
@@ -40,6 +41,7 @@ fn recovery_fixture() -> RecoveryExpectations {
             delivered_orders: 3,
             delivered_order_lines: 30,
         },
+        abandoned: AbandonedWrites::default(),
     }
 }
 
@@ -110,6 +112,7 @@ fn recovery_plan_rejects_impossible_committed_ledgers() {
             new_order_lines: 9,
             ..CommittedLedger::default()
         },
+        abandoned: AbandonedWrites::default(),
     };
     assert!(recovery_plan(too_few_lines).is_err());
 
@@ -121,6 +124,7 @@ fn recovery_plan_rejects_impossible_committed_ledgers() {
             remote_new_order_lines: 6,
             ..CommittedLedger::default()
         },
+        abandoned: AbandonedWrites::default(),
     };
     assert!(recovery_plan(too_many_remote).is_err());
 
@@ -130,6 +134,7 @@ fn recovery_plan_rejects_impossible_committed_ledgers() {
             delivered_orders: 450_001,
             ..CommittedLedger::default()
         },
+        abandoned: AbandonedWrites::default(),
     };
     assert!(recovery_plan(too_many_deliveries).is_err());
 }
@@ -342,6 +347,7 @@ fn recovery_quantity_evidence_is_exact_and_rejects_invalid_or_unsafe_ledgers() {
             stock_ytd_delta: 15_000_000_000,
             ..CommittedLedger::default()
         },
+        abandoned: AbandonedWrites::default(),
     };
     assert!(matches!(
         recovery_plan(unsafe_int32),
@@ -358,6 +364,7 @@ fn recovery_integer_gate_covers_sf1_and_sf50_dynamic_line_extremes() {
             undelivered_order_line_rows: 45_000,
         },
         committed: CommittedLedger::default(),
+        abandoned: AbandonedWrites::default(),
     })
     .unwrap();
     assert_eq!(sf1.queries.len(), PUBLIC_RECOVERY_INTEGER_CHECK_COUNT);
@@ -373,6 +380,7 @@ fn recovery_integer_gate_covers_sf1_and_sf50_dynamic_line_extremes() {
     let sf50_max_lines = recovery_plan(RecoveryExpectations {
         setup: SetupExpectations::final_2026(22_500_000, 6_750_000),
         committed: CommittedLedger::default(),
+        abandoned: AbandonedWrites::default(),
     })
     .unwrap();
     assert_eq!(
@@ -399,6 +407,7 @@ fn recovery_integer_gate_covers_sf1_and_sf50_dynamic_line_extremes() {
                 undelivered_order_line_rows: 2_295_000,
             },
             committed: CommittedLedger::default(),
+            abandoned: AbandonedWrites::default(),
         }),
         Err(PlanError::WarehouseCountExceedsPublicMaximum {
             actual: 51,

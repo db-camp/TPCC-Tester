@@ -418,12 +418,18 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                         recovery_check_run
                             .take()
                             .ok_or("independent recovery check lost its pre-connect claim")?;
+                    let abandoned = consistency::AbandonedWrites {
+                        new_orders: config.recovery_abandoned_neworder,
+                        payments: config.recovery_abandoned_payment,
+                        deliveries: config.recovery_abandoned_delivery,
+                    };
                     check_executor::run_final_recovery_from_terminal_evidence(
                         cursor.client_mut(),
                         &dataset,
                         &terminal_evidence,
                         dataset.initial_order_line_amounts(),
                         &baseline,
+                        abandoned,
                     )
                     .await?;
                     store.complete_recovery_check_from_terminal_evidence(
