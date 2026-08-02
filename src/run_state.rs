@@ -243,7 +243,11 @@ impl RunContract {
             && self.window_seconds == MEASUREMENT_SECONDS
             && self.load_budget_seconds == LOAD_BUDGET_SECONDS
             && self.recovery_ready_budget_seconds == RECOVERY_READY_BUDGET_SECONDS;
-        if (self.conformance == RunConformance::PublicSpecAligned) != public_shape {
+        // Public-spec-aligned claims must use the public shape. A non-ranked
+        // deviation may keep the public shape (e.g. --rtt-sim-ms models the
+        // official network without altering warehouse/client/timing), so the
+        // constraint is intentionally one-directional here.
+        if self.conformance == RunConformance::PublicSpecAligned && !public_shape {
             return Err(StateError::Invalid(
                 "run contract conformance does not match its published profile dimensions"
                     .to_owned(),
