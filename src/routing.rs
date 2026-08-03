@@ -64,7 +64,7 @@ impl NurandConstants {
         }
     }
 
-    pub fn c_last_load(self) -> u16 {
+    pub fn c_last_load(&self) -> u16 {
         self.c_last_load
     }
 

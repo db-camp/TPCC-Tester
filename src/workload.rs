@@ -384,6 +384,16 @@ fn payment_input(route: &RoutedTransaction) -> PaymentInput {
 }
 
 fn customer_selector(route: &RoutedTransaction, domain: &'static str) -> CustomerSelector {
+    // TPC-C 5.11: 1% of customer lookups (Payment/OrderStatus) target the
+    // load-time constant last name (c_last_load), exercising the hot
+    // last-name lookup path.
+    if chance(route, domain, 0, 1) {
+        let load = route.nurand_constants().c_last_load();
+        return CustomerSelector::LastName(CustomerLastName {
+            number: load,
+            value: last_name(load),
+        });
+    }
     if chance(route, domain, 0, CUSTOMER_LAST_NAME_PERCENT) {
         let number = route.customer_last_name_number(domain, 1);
         CustomerSelector::LastName(CustomerLastName {
