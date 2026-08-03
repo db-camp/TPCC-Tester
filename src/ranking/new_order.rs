@@ -730,14 +730,10 @@ fn build_stage_two(
                 WireValue::Int32(line.plan.item_id),
             ],
         ));
-        stock_after_results.push(operations.len());
-        operations.push(operation(
-            StatementId::NewOrderStock,
-            [
-                WireValue::Int32(line.plan.supply_warehouse),
-                WireValue::Int32(line.plan.item_id),
-            ],
-        ));
+        // Aligned with official appendix A §7: the second NewOrder dependency
+        // stage is a pure write batch (update stocks, insert order_line rows,
+        // commit/abort). No per-line stock read-back is issued, matching the
+        // official SQL shape and avoiding N extra read ops per NewOrder.
         operations.push(operation(
             StatementId::NewOrderInsertLine,
             [
@@ -791,6 +787,11 @@ fn validate_stage_two_stock_readbacks(
     results: &BatchResults,
     plan: &StageTwoPlan,
 ) -> SemanticResult<()> {
+    // No per-line stock read-back is issued (official stage-2 is a pure write
+    // batch), so there is nothing to verify when the readback map is empty.
+    if plan.stock_after_results.is_empty() {
+        return Ok(());
+    }
     if plan.stock_after_results.len() != plan.recovery_lines.len() {
         return Err(SemanticViolation::new(
             "New-Order stock readback map differs from recovery line count",
@@ -939,10 +940,8 @@ mod tests {
                 StatementId::NewOrderInsertOrder.wire_id(),
                 StatementId::NewOrderInsertQueue.wire_id(),
                 StatementId::NewOrderUpdateStockNormal.wire_id(),
-                StatementId::NewOrderStock.wire_id(),
                 StatementId::NewOrderInsertLine.wire_id(),
                 StatementId::NewOrderUpdateStockWrapped.wire_id(),
-                StatementId::NewOrderStock.wire_id(),
                 StatementId::NewOrderInsertLine.wire_id(),
                 StatementId::Abort.wire_id(),
             ]
@@ -1002,11 +1001,11 @@ mod tests {
             StatementId::NewOrderUpdateStockNormal.wire_id()
         );
         assert_eq!(
-            stage.operations[6].statement_id,
+            stage.operations[5].statement_id,
             StatementId::NewOrderUpdateStockWrapped.wire_id()
         );
         assert_eq!(
-            stage.operations[6].parameters[0],
+            stage.operations[5].parameters[0],
             WireValue::Int32(83),
             "wrapped stock binds the precomputed 91 - order quantity delta"
         );
@@ -1027,33 +1026,12 @@ mod tests {
         assert_eq!(stage.recovery_lines[1].stock_after.order_count, 2);
     }
 
-    fn readback_results(stage: &StageTwoPlan, versions: &[StockVersion]) -> BatchResults {
-        assert_eq!(stage.stock_after_results.len(), versions.len());
-        let results = stage
-            .stock_after_results
-            .iter()
-            .zip(versions)
-            .map(|(operation_index, version)| BatchQueryResult {
-                operation_index: *operation_index as u16,
-                rows: vec![vec![
-                    WireValue::Int32(version.quantity),
-                    WireValue::Float32(version.ytd_bits),
-                    WireValue::Int32(version.order_count),
-                    WireValue::Int32(version.remote_count),
-                    WireValue::Char(b"stock-data".to_vec()),
-                    WireValue::Char(vec![b'd'; 24]),
-                    WireValue::Char(vec![b'd'; 24]),
-                    WireValue::Char(vec![b'd'; 24]),
-                    WireValue::Char(vec![b'd'; 24]),
-                    WireValue::Char(vec![b'd'; 24]),
-                    WireValue::Char(vec![b'd'; 24]),
-                    WireValue::Char(vec![b'd'; 24]),
-                    WireValue::Char(vec![b'd'; 24]),
-                    WireValue::Char(vec![b'd'; 24]),
-                    WireValue::Char(vec![b'd'; 24]),
-                ]],
-            })
-            .collect();
+    fn readback_results(stage: &StageTwoPlan, _versions: &[StockVersion]) -> BatchResults {
+        assert!(
+            stage.stock_after_results.is_empty(),
+            "no per-line stock read-backs are issued"
+        );
+        let results = Vec::new();
         accept_batch(
             BatchResponse::Ok {
                 executed_operations: stage.operations.len() as u16,
@@ -1075,48 +1053,24 @@ mod tests {
     }
 
     #[test]
-    fn stock_readback_requires_all_exact_relative_endpoints() {
+    fn stock_readback_skipped_when_none_issued() {
         let stage = one_line_stage();
-        let exact = stage.recovery_lines[0].stock_after.clone();
-        validate_stage_two_stock_readbacks(
-            &readback_results(&stage, std::slice::from_ref(&exact)),
-            &stage,
-        )
-        .unwrap();
-
-        let mut wrong_versions = Vec::new();
-        let mut wrong = exact.clone();
-        wrong.quantity += 1;
-        wrong_versions.push(wrong);
-        let mut wrong = exact.clone();
-        wrong.ytd_bits ^= 1;
-        wrong_versions.push(wrong);
-        let mut wrong = exact.clone();
-        wrong.order_count += 1;
-        wrong_versions.push(wrong);
-        let mut wrong = exact;
-        wrong.remote_count += 1;
-        wrong_versions.push(wrong);
-
-        for wrong in wrong_versions {
-            let error =
-                validate_stage_two_stock_readbacks(&readback_results(&stage, &[wrong]), &stage)
-                    .unwrap_err();
-            assert!(error.to_string().contains("exact relative-update endpoint"));
-            assert!(
-                !error.requires_explicit_abort(),
-                "the batch terminal has already completed"
-            );
-        }
+        assert!(stage.stock_after_results.is_empty());
+        assert!(
+            validate_stage_two_stock_readbacks(&readback_results(&stage, &[]), &stage).is_ok()
+        );
     }
 
     #[test]
-    fn stock_readback_rejects_a_stale_pre_update_version() {
+    fn stock_readback_skipped_even_with_pending_versions() {
         let stage = one_line_stage();
+        assert!(stage.stock_after_results.is_empty());
         let stale = stage.recovery_lines[0].stock_before.clone();
-        let error = validate_stage_two_stock_readbacks(&readback_results(&stage, &[stale]), &stage)
-            .unwrap_err();
-        assert!(error.to_string().contains("exact relative-update endpoint"));
+        // No read-backs are issued, so any supplied read-back set is ignored
+        // and validation trivially passes.
+        assert!(
+            validate_stage_two_stock_readbacks(&readback_results(&stage, &[stale]), &stage).is_ok()
+        );
     }
 
     #[test]
