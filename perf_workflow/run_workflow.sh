@@ -4884,6 +4884,9 @@ start_server() {
     (readiness_deadline_nanos + 999999) / 1000000 ))
   (
     cd "${RMDB_DIR}"
+    # Allow core dumps so a high-concurrency server crash can be diagnosed
+    # offline with gdb instead of silently disappearing into apport.
+    ulimit -c unlimited 2>/dev/null || true
     exec env RMDB_PORT="${PORT}" \
       RMDB_WORKFLOW_PROCESS_OWNER="${PROCESS_OWNER_TOKEN}" python3 -c \
       'import os, sys
