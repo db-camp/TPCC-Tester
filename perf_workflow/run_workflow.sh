@@ -1685,7 +1685,7 @@ case "${MODE}" in
   tools)
     ;;
 esac
-if [[ "${MODE}" == "all" && "${RANKED_CONFIGURATION}" == "1" ]]; then
+if [[ "${MODE}" == "all" && "${RANKED_CONFIGURATION}" == "1" && "${DIAGNOSTICS_ENABLED:-1}" == "1" ]]; then
   DIAGNOSTICS_REQUESTED=1
 elif [[ "${MODE}" == "all" ]]; then
   DIAGNOSTICS_REQUESTED=0
