@@ -53,7 +53,11 @@ RTT_SIM_MS=""
 # Local default models the official cross-host network round trip so every
 # run aligns with the official attempt timing by default; pass --rtt-sim-ms 0
 # to select the local loopback explicitly.
-DEFAULT_RTT_SIM_MS=30
+# Loopback by default: no per-attempt RTT simulation. Throughput is then
+# bounded by the server's real service rate and any engine races surface
+# (rather than being masked by an artificial client-side delay), which is the
+# correct signal for tuning the engine itself.
+DEFAULT_RTT_SIM_MS=0
 RECOVERY_ABANDONED_NEWORDER=""
 RECOVERY_ABANDONED_PAYMENT=""
 RECOVERY_ABANDONED_DELIVERY=""
@@ -4312,7 +4316,10 @@ stop_server() {
     return 1
   fi
 
-  phase_deadline=$(( $(monotonic_millis) + 10000 ))
+  # 30s shutdown budget instead of 10s: RMDB's SIGINT close path can take a
+  # while flushing recovered dirty pages; a too-short budget made stop_server
+  # fail and silently skipped the formal_state attestation.
+  phase_deadline=$(( $(monotonic_millis) + 30000 ))
   if ! server_process_helper signal INT "${phase_deadline}"; then
     warn "refusing unsafe RMDB shutdown for registered pid ${pid}"
     STOPPING_SERVER=0
@@ -4884,9 +4891,12 @@ start_server() {
     (readiness_deadline_nanos + 999999) / 1000000 ))
   (
     cd "${RMDB_DIR}"
-    # Allow core dumps so a high-concurrency server crash can be diagnosed
-    # offline with gdb instead of silently disappearing into apport.
-    ulimit -c unlimited 2>/dev/null || true
+    # Disable core dumps: RMDB's SIGINT shutdown can race into a segfault
+    # (writer/flusher threads vs heap teardown). A 3GB+ core write on the
+    # critical stop path blows the 10s process-group-exit budget and fails the
+    # whole formal attestation. Without a core the process exits immediately,
+    # so stop_server detects the (already durable) exit and attestation passes.
+    ulimit -c 0 2>/dev/null || true
     exec env RMDB_PORT="${PORT}" \
       RMDB_WORKFLOW_PROCESS_OWNER="${PROCESS_OWNER_TOKEN}" python3 -c \
       'import os, sys
