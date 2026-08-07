@@ -893,6 +893,24 @@ pub fn recovery_count_ranges(
     Ok(ranges)
 }
 
+/// Ledger-derived expectation widened by the abandoned-but-committed race.
+///
+/// Abandoned write attempts may still have committed on the server without the
+/// client ever observing the COMMIT response; `min_extra`/`max_extra` bound
+/// their worst-case impact on the check value. Zero bounds keep the check
+/// exact.
+fn abandoned_int_expectation(expected: i64, min_extra: i64, max_extra: i64) -> ScalarExpectation {
+    if min_extra == 0 && max_extra == 0 {
+        ScalarExpectation::ExactInt(expected)
+    } else {
+        ScalarExpectation::RangeInt {
+            expected,
+            min: expected + min_extra,
+            max: expected + max_extra,
+        }
+    }
+}
+
 /// Generate exactly 37 public-spec integer recovery checks.
 ///
 /// This is an independently derived, replayable local gate. The official SQL,
@@ -934,6 +952,35 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
 
     let order_line_rows = counts["order_line"];
     let queued_orders = counts["new_orders"];
+    // Abandoned-but-committed write attempts shift the server-side values of
+    // every ledger-derived recovery check by at most the race bounds below;
+    // the row-count ranges above already tolerate the same class. A Delivery
+    // processes at most one queued order per district (10) with 5..=15 lines.
+    let abandoned_orders = checked_mul(
+        input.abandoned.new_orders,
+        1,
+        "abandoned NewOrder order rows",
+    )?;
+    let abandoned_order_lines = checked_mul(
+        input.abandoned.new_orders,
+        MAX_NEW_ORDER_OL_COUNT as i64,
+        "abandoned NewOrder order-line rows",
+    )?;
+    let abandoned_line_quantity = checked_mul(
+        input.abandoned.new_orders,
+        MAX_NEW_ORDER_STOCK_YTD,
+        "abandoned NewOrder quantity sum",
+    )?;
+    let abandoned_delivered_orders = checked_mul(
+        input.abandoned.deliveries,
+        10,
+        "abandoned Delivery processed orders",
+    )?;
+    let abandoned_delivered_lines = checked_mul(
+        input.abandoned.deliveries,
+        10 * MAX_NEW_ORDER_OL_COUNT as i64,
+        "abandoned Delivery processed order lines",
+    )?;
     let empty_delivery_rows = checked_add(
         input.setup.undelivered_order_line_rows,
         input.committed.new_order_lines,
@@ -1006,77 +1053,101 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
         require_int32(name, value)?;
     }
 
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.orders.sum_o_ol_cnt",
-        "SUM(o_ol_cnt) equals all visible order_line rows",
-        "SELECT SUM(o_ol_cnt) FROM orders",
-        order_line_rows,
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.order_line.sum_quantity",
-        "SUM(ol_quantity) equals initial quantity plus committed NewOrder quantities",
-        "SELECT SUM(ol_quantity) FROM order_line",
-        expected_line_quantity,
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.orders.open_carrier_count",
-        "carrier-id zero orders equal the visible new_orders queue",
-        "SELECT COUNT(*) FROM orders WHERE o_carrier_id = 0",
-        queued_orders,
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.order_line.empty_delivery_time_count",
-        "empty delivery timestamps match committed NewOrder and Delivery line counts",
-        "SELECT COUNT(*) FROM order_line WHERE ol_delivery_d = ''",
-        empty_delivery_rows,
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.district.sum_next_order_id",
-        "district next-order totals include every committed NewOrder",
-        "SELECT SUM(d_next_o_id) FROM district",
-        checked_add(
-            initial_next_order_sum,
-            input.committed.new_orders,
-            "recovery d_next_o_id sum",
-        )?,
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.customer.sum_payment_cnt",
-        "customer payment counts include every committed Payment",
-        "SELECT SUM(c_payment_cnt) FROM customer",
-        checked_add(
-            initial_customers,
-            input.committed.payments,
-            "recovery customer payment count",
-        )?,
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.customer.sum_delivery_cnt",
-        "customer delivery counts include every processed queued order",
-        "SELECT SUM(c_delivery_cnt) FROM customer",
-        input.committed.delivered_orders,
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.stock.sum_order_cnt",
-        "stock order counts include every committed NewOrder line",
-        "SELECT SUM(s_order_cnt) FROM stock",
-        input.committed.new_order_lines,
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.stock.sum_remote_cnt",
-        "stock remote counts include every committed remote-supply line",
-        "SELECT SUM(s_remote_cnt) FROM stock",
-        input.committed.remote_new_order_lines,
-    ));
+    plan.queries.push(CheckQuery {
+        id: "recovery.orders.sum_o_ol_cnt".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "SUM(o_ol_cnt) equals all visible order_line rows".to_owned(),
+        sql: "SELECT SUM(o_ol_cnt) FROM orders".to_owned(),
+        expectation: abandoned_int_expectation(order_line_rows, 0, abandoned_order_lines),
+    });
+    plan.queries.push(CheckQuery {
+        id: "recovery.order_line.sum_quantity".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "SUM(ol_quantity) equals initial quantity plus committed NewOrder quantities"
+            .to_owned(),
+        sql: "SELECT SUM(ol_quantity) FROM order_line".to_owned(),
+        expectation: abandoned_int_expectation(expected_line_quantity, 0, abandoned_line_quantity),
+    });
+    plan.queries.push(CheckQuery {
+        id: "recovery.orders.open_carrier_count".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "carrier-id zero orders equal the visible new_orders queue".to_owned(),
+        sql: "SELECT COUNT(*) FROM orders WHERE o_carrier_id = 0".to_owned(),
+        expectation: abandoned_int_expectation(
+            queued_orders,
+            -abandoned_delivered_orders,
+            abandoned_orders,
+        ),
+    });
+    plan.queries.push(CheckQuery {
+        id: "recovery.order_line.empty_delivery_time_count".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "empty delivery timestamps match committed NewOrder and Delivery line counts"
+            .to_owned(),
+        sql: "SELECT COUNT(*) FROM order_line WHERE ol_delivery_d = ''".to_owned(),
+        expectation: abandoned_int_expectation(
+            empty_delivery_rows,
+            -abandoned_delivered_lines,
+            abandoned_order_lines,
+        ),
+    });
+    let expected_next_sum = checked_add(
+        initial_next_order_sum,
+        input.committed.new_orders,
+        "recovery d_next_o_id sum",
+    )?;
+    plan.queries.push(CheckQuery {
+        id: "recovery.district.sum_next_order_id".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "district next-order totals include every committed NewOrder".to_owned(),
+        sql: "SELECT SUM(d_next_o_id) FROM district".to_owned(),
+        expectation: abandoned_int_expectation(expected_next_sum, 0, abandoned_orders),
+    });
+    let expected_payment_cnt = checked_add(
+        initial_customers,
+        input.committed.payments,
+        "recovery customer payment count",
+    )?;
+    plan.queries.push(CheckQuery {
+        id: "recovery.customer.sum_payment_cnt".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "customer payment counts include every committed Payment".to_owned(),
+        sql: "SELECT SUM(c_payment_cnt) FROM customer".to_owned(),
+        expectation: abandoned_int_expectation(expected_payment_cnt, 0, input.abandoned.payments),
+    });
+    plan.queries.push(CheckQuery {
+        id: "recovery.customer.sum_delivery_cnt".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "customer delivery counts include every processed queued order".to_owned(),
+        sql: "SELECT SUM(c_delivery_cnt) FROM customer".to_owned(),
+        expectation: abandoned_int_expectation(
+            input.committed.delivered_orders,
+            0,
+            abandoned_delivered_orders,
+        ),
+    });
+    plan.queries.push(CheckQuery {
+        id: "recovery.stock.sum_order_cnt".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "stock order counts include every committed NewOrder line".to_owned(),
+        sql: "SELECT SUM(s_order_cnt) FROM stock".to_owned(),
+        expectation: abandoned_int_expectation(
+            input.committed.new_order_lines,
+            0,
+            abandoned_order_lines,
+        ),
+    });
+    plan.queries.push(CheckQuery {
+        id: "recovery.stock.sum_remote_cnt".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "stock remote counts include every committed remote-supply line".to_owned(),
+        sql: "SELECT SUM(s_remote_cnt) FROM stock".to_owned(),
+        expectation: abandoned_int_expectation(
+            input.committed.remote_new_order_lines,
+            0,
+            abandoned_order_lines,
+        ),
+    });
     plan.queries.push(int_query(
         CheckScope::Recovery,
         "recovery.stock.quantity_range",
@@ -1084,34 +1155,46 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
         "SELECT COUNT(*) FROM stock WHERE s_quantity >= 10 AND s_quantity <= 100",
         counts["stock"],
     ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.orders.line_count_range",
-        "every order still has 5..=15 lines",
-        "SELECT COUNT(*) FROM orders WHERE o_ol_cnt >= 5 AND o_ol_cnt <= 15",
-        counts["orders"],
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.order_line.quantity_range",
-        "every order-line quantity remains in 1..=10",
-        "SELECT COUNT(*) FROM order_line WHERE ol_quantity >= 1 AND ol_quantity <= 10",
-        counts["order_line"],
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.orders.carrier_range",
-        "every carrier id remains in 0..=10",
-        "SELECT COUNT(*) FROM orders WHERE o_carrier_id >= 0 AND o_carrier_id <= 10",
-        counts["orders"],
-    ));
-    plan.queries.push(int_query(
-        CheckScope::Recovery,
-        "recovery.orders.all_local_range",
-        "every order all-local flag remains Boolean",
-        "SELECT COUNT(*) FROM orders WHERE o_all_local >= 0 AND o_all_local <= 1",
-        counts["orders"],
-    ));
+    plan.queries.push(CheckQuery {
+        id: "recovery.orders.line_count_range".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "every order still has 5..=15 lines".to_owned(),
+        sql: "SELECT COUNT(*) FROM orders WHERE o_ol_cnt >= 5 AND o_ol_cnt <= 15".to_owned(),
+        expectation: abandoned_int_expectation(counts["orders"], 0, abandoned_orders),
+    });
+    plan.queries.push(CheckQuery {
+        id: "recovery.order_line.quantity_range".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "every order-line quantity remains in 1..=10".to_owned(),
+        sql: "SELECT COUNT(*) FROM order_line WHERE ol_quantity >= 1 AND ol_quantity <= 10"
+            .to_owned(),
+        expectation: abandoned_int_expectation(counts["order_line"], 0, abandoned_order_lines),
+    });
+    plan.queries.push(CheckQuery {
+        id: "recovery.orders.carrier_range".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "every carrier id remains in 0..=10".to_owned(),
+        sql: "SELECT COUNT(*) FROM orders WHERE o_carrier_id >= 0 AND o_carrier_id <= 10"
+            .to_owned(),
+        expectation: abandoned_int_expectation(counts["orders"], 0, abandoned_orders),
+    });
+    plan.queries.push(CheckQuery {
+        id: "recovery.orders.all_local_range".to_owned(),
+        scope: CheckScope::Recovery,
+        description: "every order all-local flag remains Boolean".to_owned(),
+        sql: "SELECT COUNT(*) FROM orders WHERE o_all_local >= 0 AND o_all_local <= 1".to_owned(),
+        expectation: abandoned_int_expectation(counts["orders"], 0, abandoned_orders),
+    });
+    let maximum_stock_order_count = checked_add(
+        input.committed.new_order_lines,
+        abandoned_order_lines,
+        "maximum stock order count",
+    )?;
+    let maximum_stock_remote_count = checked_add(
+        input.committed.remote_new_order_lines,
+        abandoned_order_lines,
+        "maximum stock remote count",
+    )?;
     plan.queries.push(int_query(
         CheckScope::Recovery,
         "recovery.stock.counter_range",
@@ -1120,22 +1203,36 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
             "SELECT COUNT(*) FROM stock WHERE s_order_cnt >= 0 \
              AND s_order_cnt <= {} AND s_remote_cnt >= 0 \
              AND s_remote_cnt <= {} AND s_remote_cnt <= s_order_cnt",
-            input.committed.new_order_lines, input.committed.remote_new_order_lines
+            maximum_stock_order_count, maximum_stock_remote_count
         ),
         counts["stock"],
     ));
+    let maximum_customer_payment_count_total = checked_add(
+        maximum_customer_payment_count,
+        input.abandoned.payments,
+        "maximum customer payment count with abandoned race",
+    )?;
+    let maximum_customer_delivery_count = checked_add(
+        input.committed.delivered_orders,
+        abandoned_delivered_orders,
+        "maximum customer delivery count with abandoned race",
+    )?;
     plan.queries.push(int_query(
         CheckScope::Recovery,
         "recovery.customer.counter_range",
         "customer counters retain their initial lower bounds and ledger-derived upper bounds",
         format!(
             "SELECT COUNT(*) FROM customer WHERE c_payment_cnt >= 1 \
-             AND c_payment_cnt <= {maximum_customer_payment_count} \
-             AND c_delivery_cnt >= 0 AND c_delivery_cnt <= {}",
-            input.committed.delivered_orders
+             AND c_payment_cnt <= {maximum_customer_payment_count_total} \
+             AND c_delivery_cnt >= 0 AND c_delivery_cnt <= {maximum_customer_delivery_count}"
         ),
         counts["customer"],
     ));
+    let maximum_next_order_id_total = checked_add(
+        maximum_next_order_id,
+        abandoned_orders,
+        "maximum district next order id with abandoned race",
+    )?;
     plan.queries.push(int_query(
         CheckScope::Recovery,
         "recovery.district.next_order_id_range",
@@ -1144,7 +1241,7 @@ pub fn recovery_plan(input: RecoveryExpectations) -> Result<ConsistencyPlan, Pla
             "SELECT COUNT(*) FROM district WHERE d_next_o_id >= {} \
              AND d_next_o_id <= {}",
             ORDERS_PER_DISTRICT + 1,
-            maximum_next_order_id
+            maximum_next_order_id_total
         ),
         counts["district"],
     ));
@@ -1285,6 +1382,26 @@ pub fn public_online_integer_plan(
         input.committed.new_orders,
         "online d_next_o_id sum",
     )?;
+    // Abandoned write attempts may still have committed on the server even
+    // though the client never observed the COMMIT response (the official
+    // client accepts the same abandoned-but-committed race class). Each such
+    // NewOrder increments one d_next_o_id, so the online gate tolerates up to
+    // abandoned.new_orders extra next-order ids while staying exact when no
+    // attempt was abandoned.
+    let max_next_sum = checked_add(
+        expected_next_sum,
+        input.abandoned.new_orders,
+        "online d_next_o_id sum abandoned upper bound",
+    )?;
+    let next_sum_expectation = if input.abandoned.new_orders == 0 {
+        ScalarExpectation::ExactInt(expected_next_sum)
+    } else {
+        ScalarExpectation::RangeInt {
+            expected: expected_next_sum,
+            min: expected_next_sum,
+            max: max_next_sum,
+        }
+    };
 
     Ok(ConsistencyPlan {
         queries: vec![
@@ -1302,13 +1419,13 @@ pub fn public_online_integer_plan(
                 "SELECT COUNT(*) FROM district",
                 counts["district"],
             ),
-            int_query(
-                CheckScope::Online,
-                "online.public.district_next_sum",
-                "district next-order total",
-                "SELECT SUM(d_next_o_id) FROM district",
-                expected_next_sum,
-            ),
+            CheckQuery {
+                id: "online.public.district_next_sum".to_owned(),
+                scope: CheckScope::Online,
+                description: "district next-order total".to_owned(),
+                sql: "SELECT SUM(d_next_o_id) FROM district".to_owned(),
+                expectation: next_sum_expectation,
+            },
             int_query(
                 CheckScope::Online,
                 "online.public.item_key",
@@ -1750,13 +1867,13 @@ pub fn validate_crash_float_baseline(
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PublicFloatLedgerEvidence {
     pub history_amount: LargeSetBoundary,
-    pub stock_ytd_bits: u32,
+    pub stock_ytd: Float32RangeBits,
     pub order_line_amount: LargeSetBoundary,
 }
 
 /// Validate the public online ledger gate: history and order-line totals use
 /// the rank-scale endpoint rule; stock YTD is an integral-quantity ledger and
-/// is exact at 0 ULP.
+/// is exact at 0 ULP when no write attempt was abandoned.
 pub fn validate_public_float_ledger(
     history_amount_bits: u32,
     stock_ytd_bits: u32,
@@ -1774,9 +1891,9 @@ pub fn validate_public_float_ledger(
             upper_bits: evidence.history_amount.upper_bits,
         });
     }
-    if !float32_matches(evidence.stock_ytd_bits, stock_ytd_bits, 0) {
+    if !evidence.stock_ytd.accepts(stock_ytd_bits) {
         return Err(FloatError::UlpMismatch {
-            expected_bits: evidence.stock_ytd_bits,
+            expected_bits: evidence.stock_ytd.expected_bits,
             actual_bits: stock_ytd_bits,
             max_ulps: 0,
         });
@@ -2467,6 +2584,50 @@ impl LargeSetBoundary {
         let upper = ordered_f32_bits(canonical_zero(self.upper_bits));
         (lower..=upper).contains(&actual)
     }
+
+}
+
+/// Public abandoned-write race bounds for the online FLOAT ledger gate.
+///
+/// Every value is a conservative maximum over the local public-spec
+/// generator (TPC-C amounts in cents divided once into binary32):
+/// - one abandoned Payment inserts one history row with h_amount <= 5000.00;
+/// - one abandoned NewOrder inserts up to 15 order_line rows, each with
+///   ol_amount <= i_price(100.00) * ol_quantity(15) = 1500.00;
+/// - one abandoned NewOrder increments stock s_ytd by at most
+///   15 lines * 10 quantity = 150 (an integral quantity ledger).
+pub const MAX_PAYMENT_H_AMOUNT: f32 = 5000.0;
+pub const MAX_NEW_ORDER_LINE_AMOUNT: f32 = 1500.0;
+pub const MAX_NEW_ORDER_OL_COUNT: u64 = 15;
+pub const MAX_NEW_ORDER_STOCK_YTD: i64 = 150;
+
+/// Closed FLOAT32 bit range for ledger values affected by the
+/// abandoned-but-committed race.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Float32RangeBits {
+    pub expected_bits: u32,
+    pub lower_bits: u32,
+    pub upper_bits: u32,
+}
+
+impl Float32RangeBits {
+    pub fn exact(bits: u32) -> Self {
+        Self {
+            expected_bits: bits,
+            lower_bits: bits,
+            upper_bits: bits,
+        }
+    }
+
+    pub fn accepts(self, actual_bits: u32) -> bool {
+        if require_finite(actual_bits).is_err() {
+            return false;
+        }
+        let actual = ordered_f32_bits(canonical_zero(actual_bits));
+        let lower = ordered_f32_bits(canonical_zero(self.lower_bits));
+        let upper = ordered_f32_bits(canonical_zero(self.upper_bits));
+        (lower..=upper).contains(&actual)
+    }
 }
 
 const MAX_ACCUMULATOR_TERMS: u64 = 1_u64 << 53;
@@ -2550,6 +2711,36 @@ impl NonNegativeF32Accumulator {
 
     pub fn boundary(&self) -> Result<LargeSetBoundary, FloatError> {
         boundary_from_exact(&self.exact, self.term_count)
+    }
+
+    /// Boundary whose upper endpoint additionally tolerates up to
+    /// `extra_terms` unknown values, each at most `max_extra_value_bits`.
+    ///
+    /// Abandoned write attempts may still have committed on the server without
+    /// the client ever observing the COMMIT response; their aggregate value is
+    /// unknown but bounded, so the gate keeps the ledger-derived lower
+    /// endpoint and widens only the upper endpoint by the largest possible
+    /// contribution of the abandoned race.
+    pub fn boundary_with_abandoned(
+        &self,
+        extra_terms: u64,
+        max_extra_value_bits: u32,
+    ) -> Result<LargeSetBoundary, FloatError> {
+        let base = self.boundary()?;
+        if extra_terms == 0 {
+            return Ok(base);
+        }
+        require_finite(max_extra_value_bits)?;
+        let mut upper_accumulator = self.clone();
+        upper_accumulator.add_repeated_bits(max_extra_value_bits, extra_terms)?;
+        let upper_bits = upper_accumulator.boundary()?.upper_bits;
+        Ok(LargeSetBoundary {
+            sum_for_diagnostics: base.sum_for_diagnostics,
+            term_count: self.term_count,
+            error_bound_for_diagnostics: base.error_bound_for_diagnostics,
+            lower_bits: base.lower_bits,
+            upper_bits,
+        })
     }
 
     /// Return `(term_count, exact little-endian 64-bit words)`.

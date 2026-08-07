@@ -56,7 +56,7 @@ fn setup_tracing(verbose: u8) {
         .init();
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 64)]
 async fn main() {
     let config = Config::parse();
     setup_tracing(config.verbose);
@@ -398,11 +398,17 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
                     let (store, dataset, contract, claim, terminal_evidence) = online_check_run
                         .take()
                         .ok_or("independent online check lost its pre-connect claim")?;
+                    let abandoned = consistency::AbandonedWrites {
+                        new_orders: config.recovery_abandoned_neworder,
+                        payments: config.recovery_abandoned_payment,
+                        deliveries: config.recovery_abandoned_delivery,
+                    };
                     let baseline = check_executor::run_final_online_from_terminal_evidence(
                         cursor.client_mut(),
                         &dataset,
                         &terminal_evidence,
                         dataset.initial_order_line_amounts(),
+                        abandoned,
                     )
                     .await?;
                     store.complete_online_check_from_terminal_evidence(

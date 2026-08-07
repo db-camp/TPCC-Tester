@@ -13,10 +13,12 @@ use crate::consistency::{
     float32_matches, float_aggregate_plan, public_online_integer_plan,
     recovery_partition_audits_for_warehouses, recovery_plan, setup_plan, sum_f32_as_f64_once,
     validate_crash_float_baseline, validate_public_float_ledger, AbandonedWrites, CheckQuery,
-    CheckScope, ConsistencyPlan, FloatAggregateId, NonNegativeF32Accumulator,
+    CheckScope, ConsistencyPlan, Float32RangeBits, FloatAggregateId, NonNegativeF32Accumulator,
     PartitionExpectation, PartitionKey, PublicFloatLedgerEvidence, RecoveryExpectations,
-    SetupExpectations, TypedResult, TypedValue, DISTRICTS_PER_WAREHOUSE, FINAL_WAREHOUSES,
-    FLOAT_AGGREGATES, NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT, PUBLIC_SPEC_NOTICE,
+    ScalarExpectation, SetupExpectations, TypedResult, TypedValue, DISTRICTS_PER_WAREHOUSE,
+    FINAL_WAREHOUSES, FLOAT_AGGREGATES, MAX_NEW_ORDER_LINE_AMOUNT, MAX_NEW_ORDER_OL_COUNT,
+    MAX_NEW_ORDER_STOCK_YTD, MAX_PAYMENT_H_AMOUNT, NEW_ORDERS_PER_DISTRICT, ORDERS_PER_DISTRICT,
+    PUBLIC_SPEC_NOTICE,
 };
 use crate::error::TpccError;
 use crate::ranking::bounded_stats::BoundedPhysicalStats;
@@ -447,9 +449,11 @@ pub async fn run_final_online_from_terminal_evidence(
     dataset: &DatasetState,
     evidence: &dyn TerminalEvidenceView,
     initial_order_line_amounts: &NonNegativeF32Accumulator,
+    abandoned: AbandonedWrites,
 ) -> Result<FloatBaseline, TpccError> {
     warn!("{PUBLIC_SPEC_NOTICE}");
-    let prepared = prepare_bounded_online(dataset, evidence, initial_order_line_amounts)?;
+    let prepared =
+        prepare_bounded_online(dataset, evidence, initial_order_line_amounts, abandoned)?;
     run_plan(client, &prepared.integer_plan, &dataset.runtime_schema).await?;
 
     let values = read_float_aggregates(client, CheckScope::Online, &dataset.runtime_schema).await?;
@@ -477,6 +481,7 @@ fn prepare_bounded_online(
     dataset: &DatasetState,
     evidence: &dyn TerminalEvidenceView,
     initial_order_line_amounts: &NonNegativeF32Accumulator,
+    abandoned: AbandonedWrites,
 ) -> Result<PreparedBoundedOnline, TpccError> {
     validate_terminal_evidence(evidence).map_err(|_| {
         TpccError::Protocol("online terminal evidence failed validation".to_owned())
@@ -487,15 +492,18 @@ fn prepare_bounded_online(
         evidence.intervals().sample_seed(),
     )?;
     bounded_payment_endpoint_expectations(dataset.warehouses, evidence.payment())?;
-    let expectations =
-        bounded_recovery_expectations(
-            dataset,
-            evidence.stats(),
-            initial_order_line_amounts,
-            AbandonedWrites::default(),
-        )?;
-    let float_oracle =
-        bounded_online_float_oracle(dataset, evidence.stats(), initial_order_line_amounts)?;
+    let expectations = bounded_recovery_expectations(
+        dataset,
+        evidence.stats(),
+        initial_order_line_amounts,
+        abandoned,
+    )?;
+    let float_oracle = bounded_online_float_oracle(
+        dataset,
+        evidence.stats(),
+        initial_order_line_amounts,
+        abandoned,
+    )?;
     let sample = dataset
         .online_key_sample()
         .map_err(|error| protocol_error("invalid online setup-evidence binding", error))?;
@@ -819,6 +827,7 @@ fn bounded_online_float_oracle(
     dataset: &DatasetState,
     stats: &BoundedPhysicalStats,
     initial_order_line_amounts: &NonNegativeF32Accumulator,
+    abandoned: AbandonedWrites,
 ) -> Result<PublicFloatLedgerEvidence, TpccError> {
     validate_consistency_warehouse_count(dataset.warehouses)?;
     let initial_order_line_terms = u64::try_from(dataset.order_line_rows).map_err(|_| {
@@ -864,13 +873,37 @@ fn bounded_online_float_oracle(
             "bounded stock YTD total cannot be represented as finite FLOAT32".to_owned(),
         ));
     }
+    let max_stock_ytd = committed
+        .stock_ytd_delta
+        .checked_add(
+            abandoned
+                .new_orders
+                .checked_mul(MAX_NEW_ORDER_STOCK_YTD)
+                .ok_or_else(|| {
+                    TpccError::Protocol("abandoned stock YTD upper bound overflowed".to_owned())
+                })?,
+        )
+        .ok_or_else(|| TpccError::Protocol("stock YTD upper bound overflowed".to_owned()))? as f32;
+    let max_order_lines = abandoned
+        .new_orders
+        .checked_mul(MAX_NEW_ORDER_OL_COUNT as i64)
+        .ok_or_else(|| {
+            TpccError::Protocol("abandoned order-line count upper bound overflowed".to_owned())
+        })? as u64;
     Ok(PublicFloatLedgerEvidence {
         history_amount: history
-            .boundary()
+            .boundary_with_abandoned(
+                abandoned.payments as u64,
+                MAX_PAYMENT_H_AMOUNT.to_bits(),
+            )
             .map_err(|error| protocol_error("history boundary failed", error))?,
-        stock_ytd_bits: stock_ytd.to_bits(),
+        stock_ytd: Float32RangeBits {
+            expected_bits: stock_ytd.to_bits(),
+            lower_bits: stock_ytd.to_bits(),
+            upper_bits: max_stock_ytd.to_bits(),
+        },
         order_line_amount: order_line
-            .boundary()
+            .boundary_with_abandoned(max_order_lines, MAX_NEW_ORDER_LINE_AMOUNT.to_bits())
             .map_err(|error| protocol_error("order-line boundary failed", error))?,
     })
 }
@@ -1702,9 +1735,13 @@ mod tests {
     async fn bounded_online_prepares_exact_public_query_surface() {
         let dataset = smoke_dataset(1);
         let evidence = empty_terminal_evidence(&dataset).await;
-        let prepared =
-            prepare_bounded_online(&dataset, &evidence, dataset.initial_order_line_amounts())
-                .unwrap();
+        let prepared = prepare_bounded_online(
+            &dataset,
+            &evidence,
+            dataset.initial_order_line_amounts(),
+            AbandonedWrites::default(),
+        )
+        .unwrap();
 
         assert_eq!(prepared.integer_plan.queries.len(), 6);
         assert!(prepared
@@ -1712,6 +1749,14 @@ mod tests {
             .queries
             .iter()
             .all(|query| query.id.starts_with("online.public.")));
+        // No abandoned writes keep the online next-order gate exact.
+        let next_sum = prepared
+            .integer_plan
+            .queries
+            .iter()
+            .find(|query| query.id == "online.public.district_next_sum")
+            .unwrap();
+        assert!(matches!(next_sum.expectation, ScalarExpectation::ExactInt(_)));
         assert_eq!(
             float_aggregate_plan(CheckScope::Online).queries.len(),
             FLOAT_AGGREGATES.len()
@@ -1719,8 +1764,13 @@ mod tests {
         assert_eq!(FLOAT_AGGREGATES.len(), 7);
 
         assert!(
-            prepare_bounded_online(&dataset, &evidence, &NonNegativeF32Accumulator::default())
-                .is_err()
+            prepare_bounded_online(
+                &dataset,
+                &evidence,
+                &NonNegativeF32Accumulator::default(),
+                AbandonedWrites::default(),
+            )
+            .is_err()
         );
     }
 
@@ -1761,6 +1811,7 @@ mod tests {
             &dataset,
             &incomplete_evidence,
             dataset.initial_order_line_amounts(),
+            AbandonedWrites::default(),
         )
         .await
         .is_err());
@@ -1809,9 +1860,13 @@ mod tests {
         )
         .unwrap();
 
-        let oracle =
-            bounded_online_float_oracle(&dataset, &stats, dataset.initial_order_line_amounts())
-                .unwrap();
+        let oracle = bounded_online_float_oracle(
+            &dataset,
+            &stats,
+            dataset.initial_order_line_amounts(),
+            AbandonedWrites::default(),
+        )
+        .unwrap();
         let mut expected_history = NonNegativeF32Accumulator::default();
         expected_history
             .add_repeated_bits(10.0_f32.to_bits(), (DISTRICTS_PER_WAREHOUSE * 3_000) as u64)
@@ -1827,7 +1882,10 @@ mod tests {
             oracle.order_line_amount,
             expected_order_lines.boundary().unwrap()
         );
-        assert_eq!(oracle.stock_ytd_bits, 45.0_f32.to_bits());
+        assert_eq!(
+            oracle.stock_ytd,
+            Float32RangeBits::exact(45.0_f32.to_bits())
+        );
     }
 
     #[test]
