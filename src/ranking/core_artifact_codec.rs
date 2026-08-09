@@ -86,7 +86,9 @@ const MAX_RICH_HISTORY_TIMESTAMP_BYTES: usize = 19;
 const MAX_RICH_HISTORY_DATA_BYTES: usize = 24;
 const MAX_RICH_BAD_CREDIT_SUFFIX_ENTRIES: usize = 4;
 const RICH_DISTRICT_INFO_BYTES: usize = 24;
-const MIN_RICH_ORDER_LINES: usize = 5;
+// Runtime NewOrders carry 3..=10 lines while load-time orders carry 5..=15,
+// so the encoded line count spans 1..=15 (mirrors EVIDENCE_MIN_LINES).
+const MIN_RICH_ORDER_LINES: usize = 1;
 const MAX_RICH_ORDER_LINES: usize = 15;
 const SECTION_HEADER_BYTES: usize = 7;
 const RICH_HEADER_BYTES: usize = 2 + 8 + 4 + 4 + 4 * 8;
