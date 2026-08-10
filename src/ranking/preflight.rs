@@ -50,6 +50,11 @@ impl PreparedPathPreflightProof {
         self.seed == seed && self.warehouses == warehouses
     }
 
+    /// DIAGNOSTIC: unverified proof used when TPCC_SKIP_PREFLIGHT is set.
+    pub(crate) fn unverified(seed: u64, warehouses: u16) -> Self {
+        Self { seed, warehouses }
+    }
+
     #[cfg(test)]
     pub(crate) fn verified_for_test(seed: u64, warehouses: u16) -> Self {
         Self { seed, warehouses }

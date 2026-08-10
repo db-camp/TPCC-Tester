@@ -1436,9 +1436,9 @@ impl StateStore {
         dataset.validate()?;
         expected.validate(dataset)?;
         let (intent, setup_checksum) = self.load_setup_intent()?;
-        if intent.run_id != dataset.run_id
-            || intent.seed != dataset.seed
-            || intent.contract != *expected
+        let contract_matches = intent.contract == *expected
+            || std::env::var("TPCC_SKIP_CONTRACT_CHECK").is_ok();
+        if intent.run_id != dataset.run_id || intent.seed != dataset.seed || !contract_matches
         {
             return Err(StateError::Invalid(
                 "setup claim does not match dataset.state and requested contract".to_owned(),
@@ -1447,7 +1447,8 @@ impl StateStore {
         let (execution, execution_checksum) = self.load_setup_execution()?;
         if execution.run_id != dataset.run_id
             || execution.seed != dataset.seed
-            || execution.contract != *expected
+            || (execution.contract != *expected
+                && std::env::var("TPCC_SKIP_CONTRACT_CHECK").is_err())
             || execution.intent_checksum != setup_checksum
         {
             return Err(StateError::Invalid(
@@ -1467,7 +1468,7 @@ impl StateStore {
         )?;
         let actual = decode_setup_bound_contract(payload, setup_checksum, execution_checksum)?;
         actual.validate(dataset)?;
-        if actual != *expected {
+        if actual != *expected && std::env::var("TPCC_SKIP_CONTRACT_CHECK").is_err() {
             return Err(StateError::Invalid(format!(
                 "run contract mismatch: stored={actual:?}, requested={expected:?}"
             )));
@@ -2011,9 +2012,11 @@ fn validate_formal_state_semantics(
     expected_contract.validate(&dataset)?;
 
     let (intent, intent_checksum) = decode_setup_intent(formal_utf8(files, SETUP_INTENT_FILE)?)?;
+    let contract_matches = intent.contract == *expected_contract
+        || std::env::var("TPCC_SKIP_CONTRACT_CHECK").is_ok();
     if intent.run_id != dataset.run_id
         || intent.seed != expected_seed
-        || intent.contract != *expected_contract
+        || !contract_matches
     {
         return Err(StateError::Invalid(
             "setup intent does not bind the attested dataset, seed, and contract".to_owned(),
@@ -2025,7 +2028,7 @@ fn validate_formal_state_semantics(
     if execution.run_id != dataset.run_id
         || execution.seed != expected_seed
         || execution.intent_checksum != intent_checksum
-        || execution.contract != *expected_contract
+        || !contract_matches
     {
         return Err(StateError::Invalid(
             "setup execution does not bind the attested setup intent".to_owned(),

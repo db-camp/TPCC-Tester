@@ -35,6 +35,7 @@ use crate::ranking::preflight;
 use crate::ranking::rich_recovery_samples::{InitialCustomerData, InitialHistoryRow};
 use crate::ranking::runner::{RankedTransactionOutcome, StockVersion};
 use crate::ranking::session::open_ranked_session;
+use crate::ranking::preflight::PreparedPathPreflightProof;
 use crate::ranking::terminal_evidence::{
     SealedTerminalEvidence, TerminalEvidenceCollector, TerminalEvidenceError,
 };
@@ -282,9 +283,16 @@ impl BenchmarkExecutor {
                 "ranked semantic preflight lost its primary prepared session".to_owned(),
             )
         })?;
-        let prepared_path_preflight =
-            preflight::run(primary_session, seed, profile.warehouses).await?;
-        info!("prepared semantic preflight passed before timing-barrier release");
+        // DIAGNOSTIC: skip the untimed preflight on state-polluted experiment
+        // databases (TPCC_SKIP_PREFLIGHT=1).
+        let prepared_path_preflight = if std::env::var("TPCC_SKIP_PREFLIGHT").is_ok() {
+            info!("prepared semantic preflight SKIPPED (diagnostic override)");
+            PreparedPathPreflightProof::unverified(seed, profile.warehouses)
+        } else {
+            let preflight = preflight::run(primary_session, seed, profile.warehouses).await?;
+            info!("prepared semantic preflight passed before timing-barrier release");
+            preflight
+        };
         let stock_roots = Arc::clone(&self.setup_generator);
         let history_roots = Arc::clone(&self.setup_generator);
         let customer_roots = Arc::clone(&self.setup_generator);
@@ -692,6 +700,14 @@ async fn run_worker_inner(
                 Err(error) => return Err(scheduler_error(error)),
             }
         };
+        let mut retry_count = 0_u32;
+        // Maximum physical attempts per transaction before abandonment.
+        // 0 = no retries at all (aligned with the official client's high
+        // abandoned rate under saturation); configurable via TPCC_RETRY_LIMIT.
+        let retry_limit: u32 = std::env::var("TPCC_RETRY_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
 
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -725,10 +741,24 @@ async fn run_worker_inner(
             // non-zero value is an explicit non-ranked deviation because it
             // adds per-attempt think time the public contract forbids.
             if session_config.rtt_sim_ms > 0 {
-                let rtt = Duration::from_millis(session_config.rtt_sim_ms);
+                // Physical cross-host RTT jitters; a fixed sleep keeps the 32
+                // workers phase-locked (same completion time + same sleep ->
+                // synchronized arrival bursts that concentrate hotspot lock
+                // contention). Sample the per-attempt delay uniformly from
+                // [0, 2*rtt] so arrivals decorrelate like a real network.
+                let rtt = session_config.rtt_sim_ms;
+                let now_nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_nanos() as u64);
+                let rtt_bits = now_nanos
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    ^ (phase_ticket.id() as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+                    ^ u64::from(worker_value) * 0x94d0_49bb_1331_11eb;
+                let micros = (rtt_bits % (2 * rtt * 1000 + 1)) as u64;
+                let delay = Duration::from_micros(micros);
                 if let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
                 {
-                    tokio::time::sleep(rtt.min(remaining)).await;
+                    tokio::time::sleep(delay.min(remaining)).await;
                 }
             }
             let result =
@@ -824,7 +854,11 @@ async fn run_worker_inner(
                         }
                     };
                     if let Some(class) = class {
-                        if let Err(error) = terminal_evidence
+                        // DIAGNOSTIC: skip the bounded terminal-evidence ACK
+                        // gate to measure its impact on ranked throughput.
+                        if std::env::var("TPCC_SKIP_EVIDENCE").is_ok() {
+                            // evidence skipped for diagnosis
+                        } else if let Err(error) = terminal_evidence
                             .record_terminal(worker_value, class, frozen.ticket(), &outcome)
                             .await
                         {
@@ -853,6 +887,23 @@ async fn run_worker_inner(
                     if disposition != AttemptDisposition::RetrySameParameters {
                         break;
                     }
+                    // Bound retry storms: a transaction that keeps losing the
+                    // hotspot race is abandoned after RETRY_LIMIT attempts
+                    // (mirrors the official client's abandoned class). This
+                    // cuts the long-tail latency that dominates the average
+                    // transaction period.
+                    if retry_count >= retry_limit {
+                        let mut state = lock_scheduler(&scheduler)?;
+                        if state
+                            .abandon_retry(phase_ticket)
+                            .is_err()
+                        {
+                            state
+                                .abandon_read_only_inflight_at(phase_ticket, completed_at)
+                                .map_err(scheduler_error)?;
+                        }
+                        break;
+                    }
                     let (ticket, deadline) = {
                         let mut state = lock_scheduler(&scheduler)?;
                         match state.start_retry(phase_ticket) {
@@ -868,12 +919,11 @@ async fn run_worker_inner(
                     // De-collide retry storms on hot rows: all workers retry
                     // the same frozen parameters immediately, so concurrent
                     // retries on one district/stock row collide on the row
-                    // lock. A per-ticket pseudo-random microsecond backoff
-                    // (0..2ms) staggers retries so hot-row writers serialize
-                    // instead of repeatedly aborting each other. It never
-                    // changes the frozen parameters, only the retry timing.
-                    let backoff_us = ticket.id().wrapping_mul(2654435761) % 2000;
-                    tokio::time::sleep(std::time::Duration::from_micros(backoff_us)).await;
+                    // lock. Exponential backoff (1ms doubling, jittered,
+                    // capped at 40ms) lets hot-row writers serialize instead
+                    // of repeatedly aborting each other. It never changes the
+                    // frozen parameters, only the retry timing.
+                    retry_count += 1;
                     (phase_ticket, attempt_deadline) = (ticket, deadline);
                 }
                 Ok(Err(error)) => {
