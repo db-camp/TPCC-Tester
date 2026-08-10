@@ -4905,21 +4905,6 @@ start_server() {
     # whole formal attestation. Without a core the process exits immediately,
     # so stop_server detects the (already durable) exit and attestation passes.
     ulimit -c 0 2>/dev/null || true
-    # Performance alignment: thread-cached allocator and a large buffer pool
-    # are required to reproduce official throughput on the local host. The
-    # default glibc allocator turns per-transaction string/tuple allocation
-    # into a global futex storm under 32 concurrent clients. Set
-    # RMDB_DISABLE_TCMALLOC=1 to keep the glibc allocator for A/B runs.
-    if [[ -z "${RMDB_LD_PRELOAD-}" && "${RMDB_DISABLE_TCMALLOC:-0}" != "1" ]]; then
-      if [[ -f /lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 ]]; then
-        RMDB_LD_PRELOAD="/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
-      elif [[ -f /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 ]]; then
-        RMDB_LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
-      fi
-    fi
-    if [[ -n "${RMDB_LD_PRELOAD-}" ]]; then
-      export LD_PRELOAD="${RMDB_LD_PRELOAD}"
-    fi
     exec env RMDB_PORT="${PORT}" \
       RMDB_WORKFLOW_PROCESS_OWNER="${PROCESS_OWNER_TOKEN}" \
       python3 -c \
@@ -5251,7 +5236,11 @@ run_check() {
   log "running ${scope} consistency checks"
   set_phase_status "${scope}" running
   local -a check_command=(--check --check-scope "${scope}" --profile "${PROFILE}" --seed "${SEED}")
-  if [[ "${scope}" == "recovery" && -n "${RECOVERY_ABANDONED_DELIVERY}${RECOVERY_ABANDONED_NEWORDER}${RECOVERY_ABANDONED_PAYMENT}" ]]; then
+  # The abandoned-but-committed race can affect the online district_next_sum
+  # gate as well as the recovery row counts, so pass the rank-derived abandoned
+  # write attempts to every check scope; setup runs before rank, where the
+  # values are still empty and the checks stay exact.
+  if [[ -n "${RECOVERY_ABANDONED_DELIVERY}${RECOVERY_ABANDONED_NEWORDER}${RECOVERY_ABANDONED_PAYMENT}" ]]; then
     check_command+=(--recovery-abandoned-neworder "${RECOVERY_ABANDONED_NEWORDER:-0}")
     check_command+=(--recovery-abandoned-payment "${RECOVERY_ABANDONED_PAYMENT:-0}")
     check_command+=(--recovery-abandoned-delivery "${RECOVERY_ABANDONED_DELIVERY:-0}")
