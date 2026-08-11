@@ -379,6 +379,10 @@ const NEW_ORDER_STAGE_ONE_STEPS: &[PlanStep] = &[
         multiplicity: Multiplicity::Once,
     },
     PlanStep {
+        alternatives: NEW_ORDER_ADVANCE_DISTRICT,
+        multiplicity: Multiplicity::Once,
+    },
+    PlanStep {
         alternatives: NEW_ORDER_DISTRICT,
         multiplicity: Multiplicity::Once,
     },
@@ -397,10 +401,6 @@ const NEW_ORDER_STAGE_ONE_STEPS: &[PlanStep] = &[
 ];
 
 const NEW_ORDER_STAGE_TWO_STEPS: &[PlanStep] = &[
-    PlanStep {
-        alternatives: NEW_ORDER_ADVANCE_DISTRICT,
-        multiplicity: Multiplicity::Once,
-    },
     PlanStep {
         alternatives: NEW_ORDER_INSERT_ORDER,
         multiplicity: Multiplicity::Once,
@@ -1584,5 +1584,31 @@ mod runtime_tests {
         validate_runtime_catalog(&catalog, &schema).unwrap();
         assert_eq!(runtime.schema_fingerprint(), schema.fingerprint());
         assert_eq!(runtime.statement_layout(), schema.statements());
+    }
+
+    #[test]
+    fn new_order_stage_one_matches_the_official_job82_prefix() {
+        assert_eq!(
+            NEW_ORDER_STAGES[0]
+                .steps
+                .iter()
+                .take(4)
+                .map(|step| {
+                    assert_eq!(step.multiplicity, Multiplicity::Once);
+                    assert_eq!(step.alternatives.len(), 1);
+                    step.alternatives[0]
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                StatementId::Begin,
+                StatementId::NewOrderHome,
+                StatementId::NewOrderAdvanceDistrict,
+                StatementId::StockLevelNextOrder,
+            ]
+        );
+        assert!(!NEW_ORDER_STAGES[1]
+            .steps
+            .iter()
+            .any(|step| step.alternatives == NEW_ORDER_ADVANCE_DISTRICT));
     }
 }

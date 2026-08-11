@@ -1,9 +1,10 @@
 //! Public final-2026 New-Order transaction runner.
 //!
 //! A successful transaction uses exactly two `EXEC_BATCH` round trips.  The
-//! first starts the transaction, acquires stock rows in a deterministic order,
-//! and reads every item and stock row.  The second performs only relative
-//! writes and reaches either `COMMIT` or the specified invalid-item `ABORT`.
+//! first starts the transaction, advances and reads the district order number,
+//! acquires stock rows in a deterministic order, and reads every item and stock
+//! row. The second performs only relative writes and reaches either `COMMIT` or
+//! the specified invalid-item `ABORT`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -271,6 +272,13 @@ fn build_stage_one(input: &ValidatedInput) -> StageOnePlan {
             WireValue::Int32(input.customer_id),
         ],
     ));
+    operations.push(operation(
+        StatementId::NewOrderAdvanceDistrict,
+        [
+            WireValue::Int32(input.warehouse_id),
+            WireValue::Int32(input.district_id),
+        ],
+    ));
     let district_result = operations.len();
     operations.push(operation(
         StatementId::StockLevelNextOrder,
@@ -363,12 +371,8 @@ fn parse_stage_one(
 
     let district = results.single_row(plan.district_result)?;
     require_columns(district, 2, "New-Order district")?;
-    let order_id = row_int32(district, 0, "New-Order district")?;
-    if order_id <= 0 {
-        return Err(SemanticViolation::new(format!(
-            "district.d_next_o_id must be positive, got {order_id}"
-        )));
-    }
+    let advanced_next_order_id = row_int32(district, 0, "New-Order district")?;
+    let order_id = assigned_order_id(advanced_next_order_id)?;
     let district_tax_bits = row_f32_bits(district, 1, "New-Order district")?;
     require_f32_range(district_tax_bits, 0.0, 0.2, "district.d_tax")?;
 
@@ -499,6 +503,17 @@ fn parse_stage_one(
     Ok(MaterializedOrder { order_id, lines })
 }
 
+fn assigned_order_id(advanced_next_order_id: i32) -> SemanticResult<i32> {
+    advanced_next_order_id
+        .checked_sub(1)
+        .filter(|order_id| *order_id > 0)
+        .ok_or_else(|| {
+            SemanticViolation::new(format!(
+                "district.d_next_o_id after advance must exceed 1, got {advanced_next_order_id}"
+            ))
+        })
+}
+
 fn exactly_one_row<'a>(
     rows: &'a [Vec<WireValue>],
     context: &str,
@@ -584,13 +599,6 @@ fn build_stage_two(
     let total_line_count = i32::try_from(input.lines.len())
         .map_err(|_| SemanticViolation::new("New-Order line count does not fit INT32"))?;
     let mut operations = vec![
-        operation(
-            StatementId::NewOrderAdvanceDistrict,
-            [
-                WireValue::Int32(input.warehouse_id),
-                WireValue::Int32(input.district_id),
-            ],
-        ),
         operation(
             StatementId::NewOrderInsertOrder,
             [
@@ -774,6 +782,7 @@ mod tests {
             vec![
                 StatementId::Begin.wire_id(),
                 StatementId::NewOrderHome.wire_id(),
+                StatementId::NewOrderAdvanceDistrict.wire_id(),
                 StatementId::StockLevelNextOrder.wire_id(),
                 StatementId::NewOrderLockStock.wire_id(),
                 StatementId::NewOrderLockStock.wire_id(),
@@ -791,15 +800,19 @@ mod tests {
         );
         assert_eq!(
             plan.operations[3].parameters,
-            vec![WireValue::Int32(1), WireValue::Int32(70)]
+            vec![WireValue::Int32(2), WireValue::Int32(3)]
         );
         assert_eq!(
             plan.operations[4].parameters,
+            vec![WireValue::Int32(1), WireValue::Int32(70)]
+        );
+        assert_eq!(
+            plan.operations[5].parameters,
             vec![WireValue::Int32(9), WireValue::Int32(80)]
         );
-        assert_eq!(plan.operations[5].parameters, vec![WireValue::Int32(80)]);
-        assert_eq!(plan.operations[7].parameters, vec![WireValue::Int32(70)]);
-        assert_eq!(plan.operations[9].parameters, vec![WireValue::Int32(80)]);
+        assert_eq!(plan.operations[6].parameters, vec![WireValue::Int32(80)]);
+        assert_eq!(plan.operations[8].parameters, vec![WireValue::Int32(70)]);
+        assert_eq!(plan.operations[10].parameters, vec![WireValue::Int32(80)]);
     }
 
     #[test]
@@ -817,7 +830,6 @@ mod tests {
         assert_eq!(
             ids(&stage.operations),
             vec![
-                StatementId::NewOrderAdvanceDistrict.wire_id(),
                 StatementId::NewOrderInsertOrder.wire_id(),
                 StatementId::NewOrderInsertQueue.wire_id(),
                 StatementId::NewOrderUpdateStockNormal.wire_id(),
@@ -834,7 +846,7 @@ mod tests {
         assert_eq!(stage.stock_ytd_delta, 10);
         assert_eq!(stage.remote_line_count, 1);
         assert_eq!(
-            stage.operations[1].parameters[6],
+            stage.operations[0].parameters[6],
             WireValue::Int32(3),
             "rolled-back header still describes the complete attempted order"
         );
@@ -855,7 +867,7 @@ mod tests {
             StatementId::Commit.wire_id()
         );
         assert_eq!(
-            stage.operations[3].parameters,
+            stage.operations[2].parameters,
             vec![
                 WireValue::Int32(7),
                 WireValue::Float32(7.0_f32.to_bits()),
@@ -879,15 +891,15 @@ mod tests {
 
         let stage = build_stage_two(&input, &materialized).unwrap();
         assert_eq!(
-            stage.operations[3].statement_id,
+            stage.operations[2].statement_id,
             StatementId::NewOrderUpdateStockNormal.wire_id()
         );
         assert_eq!(
-            stage.operations[5].statement_id,
+            stage.operations[4].statement_id,
             StatementId::NewOrderUpdateStockWrapped.wire_id()
         );
         assert_eq!(
-            stage.operations[5].parameters,
+            stage.operations[4].parameters,
             vec![
                 WireValue::Int32(8),
                 WireValue::Float32(8.0_f32.to_bits()),
@@ -918,5 +930,12 @@ mod tests {
         );
         assert!(multiply_f32_bits(f32::INFINITY.to_bits(), 7).is_err());
         assert!(multiply_f32_bits(f32::MAX.to_bits(), 10).is_err());
+    }
+
+    #[test]
+    fn advanced_district_value_maps_to_the_previous_order_id() {
+        assert_eq!(assigned_order_id(3_002).unwrap(), 3_001);
+        assert!(assigned_order_id(1).is_err());
+        assert!(assigned_order_id(i32::MIN).is_err());
     }
 }

@@ -921,6 +921,13 @@ fn build_new_order_stage_one(selection: &PreflightSelection) -> NewOrderStageOne
     let mut operations = vec![operation(StatementId::Begin, [])];
     let home_result = operations.len();
     operations.push(new_order_home_operation(selection));
+    operations.push(operation(
+        StatementId::NewOrderAdvanceDistrict,
+        [
+            WireValue::Int32(selection.warehouse_id),
+            WireValue::Int32(selection.district_id),
+        ],
+    ));
     let district_result = operations.len();
     operations.push(new_order_district_operation(selection));
 
@@ -1006,11 +1013,20 @@ fn parse_new_order_stage_one(
             home.len()
         ));
     }
-    let order_id = parse_new_order_district_order_id(
+    let advanced_next_order_id = parse_new_order_district_order_id(
         results,
         plan.district_result,
         "NewOrder preflight district",
     )?;
+    let order_id = advanced_next_order_id
+        .checked_sub(1)
+        .filter(|order_id| *order_id > 0)
+        .ok_or_else(|| {
+            format!(
+                "NewOrder preflight district next order id after advance must exceed 1, got \
+                 {advanced_next_order_id}"
+            )
+        })?;
 
     let all_items: Vec<_> = selection.all_item_ids().collect();
     if plan.line_results.len() != all_items.len() {
@@ -1129,13 +1145,6 @@ fn build_new_order_write_stage(
     }
 
     let mut operations = vec![
-        operation(
-            StatementId::NewOrderAdvanceDistrict,
-            [
-                WireValue::Int32(selection.warehouse_id),
-                WireValue::Int32(selection.district_id),
-            ],
-        ),
         new_order_insert_order_operation(selection, materialized),
         operation(
             StatementId::NewOrderInsertQueue,
@@ -1943,6 +1952,11 @@ mod tests {
     fn new_order_preflight_pairs_business_and_version_stock_queries() {
         let selection = test_selection();
         let plan = build_new_order_stage_one(&selection);
+        assert_eq!(
+            plan.operations[2].statement_id,
+            StatementId::NewOrderAdvanceDistrict.wire_id()
+        );
+        assert_eq!(plan.district_result, 3);
         let expected_business = new_order_stock_statement(selection.district_id).unwrap();
         for indices in &plan.line_results {
             assert_eq!(
@@ -1956,13 +1970,9 @@ mod tests {
         }
 
         let valid = new_order_stage_one_results(&selection, &plan, false, false);
-        assert_eq!(
-            parse_new_order_stage_one(&selection, &plan, &valid)
-                .unwrap()
-                .lines
-                .len(),
-            PREFLIGHT_VALID_LINES
-        );
+        let materialized = parse_new_order_stage_one(&selection, &plan, &valid).unwrap();
+        assert_eq!(materialized.order_id, 3_000);
+        assert_eq!(materialized.lines.len(), PREFLIGHT_VALID_LINES);
 
         let mismatch = new_order_stage_one_results(&selection, &plan, true, false);
         assert!(parse_new_order_stage_one(&selection, &plan, &mismatch)
@@ -2139,9 +2149,9 @@ mod tests {
             .iter()
             .map(|operation| operation.statement_id)
             .collect();
-        assert_eq!(ids[0], StatementId::NewOrderAdvanceDistrict.wire_id());
-        assert_eq!(ids[1], StatementId::NewOrderInsertOrder.wire_id());
-        assert_eq!(ids[2], StatementId::NewOrderInsertQueue.wire_id());
+        assert_eq!(ids[0], StatementId::NewOrderInsertOrder.wire_id());
+        assert_eq!(ids[1], StatementId::NewOrderInsertQueue.wire_id());
+        assert!(!ids.contains(&StatementId::NewOrderAdvanceDistrict.wire_id()));
         assert_eq!(
             ids.iter()
                 .filter(|id| **id == StatementId::NewOrderInsertLine.wire_id())
