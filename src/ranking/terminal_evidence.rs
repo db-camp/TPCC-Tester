@@ -33,7 +33,7 @@ use super::rich_recovery_samples::{
 };
 use super::runner::{CustomerVersion, RankedCommit, RankedTransactionOutcome};
 
-pub const TERMINAL_EVIDENCE_POLICY_VERSION: u32 = 3;
+pub const TERMINAL_EVIDENCE_POLICY_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerState {
@@ -1042,17 +1042,15 @@ fn prepare_terminal(
                 }
                 mutations.push(StockMutation::new(
                     StockKey {
-                        warehouse_id: i32::from(line.supply_warehouse),
-                        item_id: i32::try_from(line.item_id).map_err(|_| {
+                        warehouse_id: i32::from(frozen.supply_warehouse()),
+                        item_id: i32::try_from(frozen.item_id()).map_err(|_| {
                             TerminalEvidenceError::InvalidMapping(
                                 "NewOrder item id does not fit the Stock key domain",
                             )
                         })?,
                     },
-                    line.quantity,
-                    u8::from(line.supply_warehouse != evidence.warehouse_id),
-                    line.stock_before.clone(),
-                    line.stock_after.clone(),
+                    frozen.quantity(),
+                    u8::from(frozen.supply_warehouse() != evidence.warehouse_id),
                 ));
             }
             Ok(PreparedTerminal {

@@ -4405,24 +4405,6 @@ mod tests {
             .unwrap();
 
         let stocks = [1, 2].map(|item_id| {
-            let generator = TpccDataGen::with_seed(1, TEST_LOAD_SEED);
-            let initial_quantity = generator.initial_stock_quantity(1, item_id);
-            let initial = StockVersion {
-                quantity: initial_quantity,
-                ytd_bits: 0.0_f32.to_bits(),
-                order_count: 0,
-                remote_count: 0,
-            };
-            let endpoint = StockVersion {
-                quantity: if initial_quantity >= 11 {
-                    initial_quantity - 1
-                } else {
-                    initial_quantity + 90
-                },
-                ytd_bits: 1.0_f32.to_bits(),
-                order_count: 1,
-                remote_count: 0,
-            };
             StockMutation::new(
                 StockKey {
                     warehouse_id: 1,
@@ -4430,8 +4412,6 @@ mod tests {
                 },
                 1,
                 0,
-                initial,
-                endpoint,
             )
         });
         collector

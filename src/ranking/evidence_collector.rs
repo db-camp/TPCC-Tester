@@ -1,11 +1,11 @@
 //! Bounded, order-independent validation for committed row-version evidence.
 //!
-//! Every Customer and Stock edge is checked immediately and contributes to
-//! the global counters. A seed-bound bottom-k reservoir retains complete
-//! rooted chains for at most 64 keys in each domain. Worker responses may
-//! arrive out of commit order, so selected chains join exact version
-//! intervals. Recording is terminal-atomic and any error permanently poisons
-//! the collector.
+//! Every committed Customer edge and Stock ticket is checked immediately and
+//! contributes to the global counters. A seed-bound bottom-k reservoir retains
+//! complete rooted Customer chains and order-independent Stock aggregates for
+//! at most 64 keys in each domain. Worker responses may arrive out of commit
+//! order. Recording is terminal-atomic and any error permanently poisons the
+//! collector.
 
 use std::fmt;
 use std::mem::{size_of, swap};
@@ -23,12 +23,13 @@ const CUSTOMERS_PER_DISTRICT: usize = 3_000;
 const DISTRICTS_PER_WAREHOUSE: usize = 10;
 const MAX_EDGES_PER_TERMINAL: usize = 15;
 const SAMPLE_LIMIT: usize = 64;
-pub const INTERVAL_SAMPLE_POLICY_VERSION: u32 = 2;
+pub const INTERVAL_SAMPLE_POLICY_VERSION: u32 = 3;
 const CUSTOMER_INITIAL_BALANCE_BITS: u32 = (-10.0_f32).to_bits();
 const CUSTOMER_INITIAL_YTD_BITS: u32 = 10.0_f32.to_bits();
 const CUSTOMER_INITIAL_PAYMENT_COUNT: i32 = 1;
 const CUSTOMER_INITIAL_DELIVERY_COUNT: i32 = 0;
 const STOCK_INITIAL_YTD_BITS: u32 = 0.0_f32.to_bits();
+const MAX_EXACT_STOCK_YTD: u32 = 1 << 24;
 const CUSTOMER_SAMPLE_DOMAIN: u64 = 0x4355_5354_4f4d_4552;
 const STOCK_SAMPLE_DOMAIN: u64 = 0x5354_4f43_4b5f_4b45;
 
@@ -74,24 +75,14 @@ pub struct StockMutation {
     key: StockKey,
     ordered_quantity: u8,
     remote_increment: u8,
-    before: StockVersion,
-    after: StockVersion,
 }
 
 impl StockMutation {
-    pub fn new(
-        key: StockKey,
-        ordered_quantity: u8,
-        remote_increment: u8,
-        before: StockVersion,
-        after: StockVersion,
-    ) -> Self {
+    pub fn new(key: StockKey, ordered_quantity: u8, remote_increment: u8) -> Self {
         Self {
             key,
             ordered_quantity,
             remote_increment,
-            before,
-            after,
         }
     }
 }
@@ -179,7 +170,7 @@ impl CustomerSlot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StockSlot {
     quantity: i32,
-    ytd_bits: u32,
+    quantity_delta: u32,
     order_count: i32,
     remote_count: i32,
     initial_quantity: i32,
@@ -188,7 +179,7 @@ struct StockSlot {
 impl StockSlot {
     const EMPTY: Self = Self {
         quantity: 0,
-        ytd_bits: 0,
+        quantity_delta: 0,
         order_count: 0,
         remote_count: 0,
         initial_quantity: 0,
@@ -201,7 +192,7 @@ impl StockSlot {
     fn endpoint(self) -> StockVersion {
         StockVersion {
             quantity: self.quantity,
-            ytd_bits: self.ytd_bits,
+            ytd_bits: (self.quantity_delta as f32).to_bits(),
             order_count: self.order_count,
             remote_count: self.remote_count,
         }
@@ -391,83 +382,6 @@ impl CustomerSegment {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct StockSegment {
-    start: StockState,
-    end: StockState,
-}
-
-impl StockSegment {
-    fn single(mutation: &StockMutation) -> Result<Self, CollectorError> {
-        if !(1..=10).contains(&mutation.ordered_quantity) {
-            return Err(CollectorError::InvalidStockEdge(
-                "ordered quantity is outside 1..=10",
-            ));
-        }
-        if mutation.remote_increment > 1 {
-            return Err(CollectorError::InvalidStockEdge(
-                "remote increment is outside 0..=1",
-            ));
-        }
-
-        let before = StockState::from_version(&mutation.before);
-        let after = StockState::from_version(&mutation.after);
-        validate_stock_state("before", before)?;
-        validate_stock_state("after", after)?;
-        if after.order_count
-            != before
-                .order_count
-                .checked_add(1)
-                .ok_or(CollectorError::Overflow("stock order count"))?
-        {
-            return Err(CollectorError::InvalidStockEdge(
-                "order count does not advance by one",
-            ));
-        }
-        if after.remote_count
-            != before
-                .remote_count
-                .checked_add(i32::from(mutation.remote_increment))
-                .ok_or(CollectorError::Overflow("stock remote count"))?
-        {
-            return Err(CollectorError::InvalidStockEdge(
-                "remote count transition is wrong",
-            ));
-        }
-
-        let ordered_quantity = i32::from(mutation.ordered_quantity);
-        let expected_quantity = if before.quantity >= ordered_quantity + 10 {
-            before.quantity - ordered_quantity
-        } else {
-            before.quantity + 91 - ordered_quantity
-        };
-        if after.quantity != expected_quantity {
-            return Err(CollectorError::InvalidStockEdge(
-                "quantity transition is wrong",
-            ));
-        }
-        if (f32::from_bits(before.ytd_bits) + f32::from(mutation.ordered_quantity)).to_bits()
-            != after.ytd_bits
-        {
-            return Err(CollectorError::FloatMismatch("stock YTD"));
-        }
-        Ok(Self {
-            start: before,
-            end: after,
-        })
-    }
-
-    fn then(self, next: Self) -> Result<Self, CollectorError> {
-        if self.end != next.start {
-            return Err(CollectorError::BoundaryMismatch("stock"));
-        }
-        Ok(Self {
-            start: self.start,
-            end: next.end,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 struct CustomerSample {
     rank: u64,
     key_index: u32,
@@ -511,19 +425,14 @@ struct ValidatedCustomer {
 struct ValidatedStock {
     key: StockKey,
     key_index: u32,
-    segment: StockSegment,
+    ordered_quantity: u8,
+    remote_increment: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
-enum PendingSegment {
-    Customer {
-        key_index: u32,
-        segment: CustomerSegment,
-    },
-    Stock {
-        key_index: u32,
-        segment: StockSegment,
-    },
+struct PendingSegment {
+    key_index: u32,
+    segment: CustomerSegment,
 }
 
 /// Central bounded collector. It intentionally cannot be cloned.
@@ -813,27 +722,31 @@ impl IntervalCollector {
         let mut validated = [None; MAX_EDGES_PER_TERMINAL];
         for (position, mutation) in updates.iter().enumerate() {
             let key_index = stock_index(self.warehouses, mutation.key)?;
-            let segment = StockSegment::single(mutation)?;
-            if segment.start.order_count == 0 {
-                validate_stock_root(self.stock_roots.as_ref(), mutation.key, segment.start)?;
+            if !(1..=10).contains(&mutation.ordered_quantity) {
+                return Err(CollectorError::InvalidStockEdge(
+                    "ordered quantity is outside 1..=10",
+                ));
+            }
+            if mutation.remote_increment > 1 {
+                return Err(CollectorError::InvalidStockEdge(
+                    "remote increment is outside 0..=1",
+                ));
             }
             validated[position] = Some(ValidatedStock {
                 key: mutation.key,
                 key_index,
-                segment,
+                ordered_quantity: mutation.ordered_quantity,
+                remote_increment: mutation.remote_increment,
             });
         }
         for edge in validated[..updates.len()].iter().flatten() {
             let rank = sample_rank(self.sample_seed, STOCK_SAMPLE_DOMAIN, edge.key_index);
             select_stock(
                 &mut self.stock_scratch,
-                &mut self.retired_stock_scratch,
-                &mut self.pending_scratch,
                 edge.key_index,
                 rank,
                 &mut next_rejected,
-                self.pending_limit,
-            )?;
+            );
         }
         for edge in validated[..updates.len()].iter().flatten() {
             if let Some(position) = self
@@ -841,38 +754,18 @@ impl IntervalCollector {
                 .iter()
                 .position(|sample| sample.key_index == edge.key_index)
             {
-                insert_stock(
+                apply_stock_mutation(
                     self.stock_roots.as_ref(),
                     edge.key,
-                    edge.key_index,
                     &mut self.stock_scratch[position].slot,
-                    edge.segment,
-                    &mut self.pending_scratch,
-                )?;
-            } else if let Some(position) = self
-                .retired_stock_scratch
-                .iter()
-                .position(|sample| sample.key_index == edge.key_index)
-            {
-                insert_stock(
-                    self.stock_roots.as_ref(),
-                    edge.key,
-                    edge.key_index,
-                    &mut self.retired_stock_scratch[position].slot,
-                    edge.segment,
-                    &mut self.pending_scratch,
+                    edge.ordered_quantity,
+                    edge.remote_increment,
                 )?;
             }
         }
-        prune_rooted_retired_stocks(&mut self.retired_stock_scratch, &self.pending_scratch)?;
-        validate_pending_limit(self.pending_scratch.len(), self.pending_limit)?;
 
         swap(&mut self.stocks, &mut self.stock_scratch);
-        swap(&mut self.retired_stocks, &mut self.retired_stock_scratch);
-        swap(&mut self.pending, &mut self.pending_scratch);
         self.stock_scratch.clear();
-        self.retired_stock_scratch.clear();
-        self.pending_scratch.clear();
         self.stock_updates = next_updates;
         self.stock_rejected = next_rejected;
         Ok(())
@@ -891,11 +784,6 @@ impl IntervalCollector {
     fn reset_stock_scratch(&mut self) {
         self.stock_scratch.clear();
         self.stock_scratch.extend(self.stocks.iter().copied());
-        self.retired_stock_scratch.clear();
-        self.retired_stock_scratch
-            .extend(self.retired_stocks.iter().copied());
-        self.pending_scratch.clear();
-        self.pending_scratch.extend(self.pending.iter().copied());
     }
 
     fn owned_buffer_capacity_bytes(&self) -> usize {
@@ -1212,9 +1100,7 @@ impl SealedIntervalEvidence {
             validate_stock_root(stock_roots, entry.key, initial)?;
             let endpoint = StockState::from_version(&entry.endpoint);
             validate_stock_state("after", endpoint)?;
-            if endpoint.order_count <= 0
-                || f32::from_bits(endpoint.ytd_bits) <= f32::from_bits(STOCK_INITIAL_YTD_BITS)
-            {
+            if endpoint.order_count <= 0 {
                 return Err(CollectorError::InvalidSealedEvidence(
                     "selected Stock endpoint has no committed update",
                 ));
@@ -1222,23 +1108,38 @@ impl SealedIntervalEvidence {
             let updates = u64::try_from(endpoint.order_count).map_err(|_| {
                 CollectorError::InvalidSealedEvidence("Stock update count is negative")
             })?;
-            if updates == 1 {
-                let ordered_quantity = (1_u8..=10)
-                    .find(|quantity| f32::from(*quantity).to_bits() == endpoint.ytd_bits)
-                    .ok_or(CollectorError::InvalidSealedEvidence(
-                        "single-update Stock YTD is not an exact quantity in 1..=10",
-                    ))?;
-                let ordered_quantity = i32::from(ordered_quantity);
-                let expected_quantity = if initial.quantity >= ordered_quantity + 10 {
-                    initial.quantity - ordered_quantity
-                } else {
-                    initial.quantity + 91 - ordered_quantity
-                };
-                if endpoint.quantity != expected_quantity {
-                    return Err(CollectorError::InvalidSealedEvidence(
-                        "single-update Stock quantity transition is impossible",
-                    ));
-                }
+            let ytd = f32::from_bits(endpoint.ytd_bits);
+            if ytd <= 0.0
+                || ytd > MAX_EXACT_STOCK_YTD as f32
+                || ytd.trunc() != ytd
+            {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "Stock YTD is not an exact positive integer",
+                ));
+            }
+            let quantity_delta = ytd as u32;
+            if (quantity_delta as f32).to_bits() != endpoint.ytd_bits {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "Stock YTD is not canonical FLOAT32 evidence",
+                ));
+            }
+            let minimum_delta = u32::try_from(endpoint.order_count).map_err(|_| {
+                CollectorError::InvalidSealedEvidence("Stock update count is negative")
+            })?;
+            let quantity_delta_u64 = u64::from(quantity_delta);
+            if quantity_delta < minimum_delta
+                || quantity_delta_u64 > u64::from(minimum_delta) * 10
+            {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "Stock YTD is outside committed quantity bounds",
+                ));
+            }
+            if endpoint.quantity
+                != stock_quantity_after_delta(initial.quantity, quantity_delta)
+            {
+                return Err(CollectorError::InvalidSealedEvidence(
+                    "Stock quantity does not match its committed quantity delta",
+                ));
             }
             selected_stock_updates = selected_stock_updates
                 .checked_add(updates)
@@ -1248,7 +1149,7 @@ impl SealedIntervalEvidence {
                 key_index,
                 slot: StockSlot {
                     quantity: endpoint.quantity,
-                    ytd_bits: endpoint.ytd_bits,
+                    quantity_delta,
                     order_count: endpoint.order_count,
                     remote_count: endpoint.remote_count,
                     initial_quantity: initial.quantity,
@@ -1469,21 +1370,15 @@ fn select_customer(
 
 fn select_stock(
     samples: &mut Vec<StockSample>,
-    retired: &mut Vec<StockSample>,
-    pending: &mut Vec<PendingSegment>,
     key_index: u32,
     rank: u64,
     rejected: &mut Option<CanonicalRejectedSample>,
-    pending_limit: usize,
-) -> Result<Option<usize>, CollectorError> {
+) -> Option<usize> {
     if let Some(position) = samples
         .iter()
         .position(|sample| sample.key_index == key_index)
     {
-        return Ok(Some(position));
-    }
-    if retired.iter().any(|sample| sample.key_index == key_index) {
-        return Ok(None);
+        return Some(position);
     }
     if samples.len() == SAMPLE_LIMIT {
         let worst = samples
@@ -1494,50 +1389,23 @@ fn select_stock(
             .expect("a full reservoir is nonempty");
         if (rank, key_index) >= (samples[worst].rank, samples[worst].key_index) {
             observe_rejected(rejected, rank, key_index);
-            return Ok(None);
+            return None;
         }
         let evicted = samples.swap_remove(worst);
         observe_rejected(rejected, evicted.rank, evicted.key_index);
-        if has_pending_stock(pending, evicted.key_index) {
-            if retired.len() >= pending_limit {
-                return Err(CollectorError::PendingLimit {
-                    actual: retired.len() + 1,
-                    limit: pending_limit,
-                });
-            }
-            retired.push(evicted);
-        }
     }
     samples.push(StockSample {
         rank,
         key_index,
         slot: StockSlot::EMPTY,
     });
-    Ok(Some(samples.len() - 1))
+    Some(samples.len() - 1)
 }
 
 fn has_pending_customer(pending: &[PendingSegment], key_index: u32) -> bool {
-    pending.iter().any(|entry| {
-        matches!(
-            entry,
-            PendingSegment::Customer {
-                key_index: candidate,
-                ..
-            } if *candidate == key_index
-        )
-    })
-}
-
-fn has_pending_stock(pending: &[PendingSegment], key_index: u32) -> bool {
-    pending.iter().any(|entry| {
-        matches!(
-            entry,
-            PendingSegment::Stock {
-                key_index: candidate,
-                ..
-            } if *candidate == key_index
-        )
-    })
+    pending
+        .iter()
+        .any(|entry| entry.key_index == key_index)
 }
 
 fn prune_rooted_retired_customers(
@@ -1550,19 +1418,6 @@ fn prune_rooted_retired_customers(
         }
     }
     retired.retain(|sample| has_pending_customer(pending, sample.key_index));
-    Ok(())
-}
-
-fn prune_rooted_retired_stocks(
-    retired: &mut Vec<StockSample>,
-    pending: &[PendingSegment],
-) -> Result<(), CollectorError> {
-    for sample in retired.iter() {
-        if !has_pending_stock(pending, sample.key_index) && !sample.slot.is_rooted() {
-            return Err(CollectorError::Disconnected { pending: 0 });
-        }
-    }
-    retired.retain(|sample| has_pending_stock(pending, sample.key_index));
     Ok(())
 }
 
@@ -1638,19 +1493,11 @@ fn drain_customer(
     loop {
         let endpoint = customer_slot_total(*slot)?;
         let Some(position) = pending.iter().position(|entry| {
-            matches!(
-                entry,
-                PendingSegment::Customer {
-                    key_index: candidate,
-                    segment,
-                } if *candidate == key_index && segment.start_total == endpoint
-            )
+            entry.key_index == key_index && entry.segment.start_total == endpoint
         }) else {
             return Ok(());
         };
-        let PendingSegment::Customer { segment, .. } = pending.swap_remove(position) else {
-            unreachable!("position matched Customer");
-        };
+        let segment = pending.swap_remove(position).segment;
         absorb_customer(slot, segment)?;
     }
 }
@@ -1664,14 +1511,8 @@ fn insert_customer_pending(
         let mut joined = false;
         let mut position = 0;
         while position < pending.len() {
-            let PendingSegment::Customer {
-                key_index: candidate,
-                segment: existing,
-            } = pending[position]
-            else {
-                position += 1;
-                continue;
-            };
+            let candidate = pending[position].key_index;
+            let existing = pending[position].segment;
             if candidate != key_index {
                 position += 1;
                 continue;
@@ -1698,143 +1539,63 @@ fn insert_customer_pending(
             position += 1;
         }
         if !joined {
-            pending.push(PendingSegment::Customer { key_index, segment });
+            pending.push(PendingSegment { key_index, segment });
             return Ok(());
         }
     }
 }
 
-fn insert_stock(
+fn apply_stock_mutation(
     roots: &dyn StockRootProvider,
     key: StockKey,
-    key_index: u32,
     slot: &mut StockSlot,
-    segment: StockSegment,
-    pending: &mut Vec<PendingSegment>,
+    ordered_quantity: u8,
+    remote_increment: u8,
 ) -> Result<(), CollectorError> {
-    if slot.is_rooted() {
-        if segment.start.order_count < slot.order_count {
-            return Err(CollectorError::DuplicatePredecessor {
-                domain: "stock",
-                predecessor: i64::from(segment.start.order_count),
-            });
-        }
-        if segment.start.order_count == slot.order_count {
-            absorb_stock(slot, segment)?;
-            drain_stock(key_index, slot, pending)?;
-            return Ok(());
-        }
-    } else if segment.start.order_count == 0 {
-        validate_stock_root(roots, key, segment.start)?;
+    if !slot.is_rooted() {
+        let initial = expected_stock_root(roots, key)?;
         *slot = StockSlot {
-            quantity: segment.end.quantity,
-            ytd_bits: segment.end.ytd_bits,
-            order_count: segment.end.order_count,
-            remote_count: segment.end.remote_count,
-            initial_quantity: segment.start.quantity,
+            quantity: initial.quantity,
+            quantity_delta: 0,
+            order_count: 0,
+            remote_count: 0,
+            initial_quantity: initial.quantity,
         };
-        drain_stock(key_index, slot, pending)?;
-        return Ok(());
     }
-    insert_stock_pending(key_index, segment, pending)
-}
+    let quantity_delta = slot
+        .quantity_delta
+        .checked_add(u32::from(ordered_quantity))
+        .ok_or(CollectorError::Overflow("stock quantity delta"))?;
+    if quantity_delta > MAX_EXACT_STOCK_YTD {
+        return Err(CollectorError::InvalidStockEdge(
+            "stock YTD exceeds the exact FLOAT32 integer range",
+        ));
+    }
+    let order_count = slot
+        .order_count
+        .checked_add(1)
+        .ok_or(CollectorError::Overflow("stock order count"))?;
+    let remote_count = slot
+        .remote_count
+        .checked_add(i32::from(remote_increment))
+        .ok_or(CollectorError::Overflow("stock remote count"))?;
 
-fn absorb_stock(slot: &mut StockSlot, segment: StockSegment) -> Result<(), CollectorError> {
-    let endpoint = StockState {
-        quantity: slot.quantity,
-        ytd_bits: slot.ytd_bits,
-        order_count: slot.order_count,
-        remote_count: slot.remote_count,
-    };
-    if endpoint != segment.start {
-        return Err(CollectorError::BoundaryMismatch("stock"));
-    }
-    slot.quantity = segment.end.quantity;
-    slot.ytd_bits = segment.end.ytd_bits;
-    slot.order_count = segment.end.order_count;
-    slot.remote_count = segment.end.remote_count;
+    slot.quantity = stock_quantity_after_delta(slot.initial_quantity, quantity_delta);
+    slot.quantity_delta = quantity_delta;
+    slot.order_count = order_count;
+    slot.remote_count = remote_count;
     Ok(())
 }
 
-fn drain_stock(
-    key_index: u32,
-    slot: &mut StockSlot,
-    pending: &mut Vec<PendingSegment>,
-) -> Result<(), CollectorError> {
-    loop {
-        let Some(position) = pending.iter().position(|entry| {
-            matches!(
-                entry,
-                PendingSegment::Stock {
-                    key_index: candidate,
-                    segment,
-                } if *candidate == key_index && segment.start.order_count == slot.order_count
-            )
-        }) else {
-            return Ok(());
-        };
-        let PendingSegment::Stock { segment, .. } = pending.swap_remove(position) else {
-            unreachable!("position matched Stock");
-        };
-        absorb_stock(slot, segment)?;
-    }
+fn stock_quantity_after_delta(initial_quantity: i32, quantity_delta: u32) -> i32 {
+    let wrapped_delta = i32::try_from(quantity_delta % 91).expect("remainder fits i32");
+    10 + (initial_quantity - 10 - wrapped_delta).rem_euclid(91)
 }
 
-fn insert_stock_pending(
-    key_index: u32,
-    mut segment: StockSegment,
-    pending: &mut Vec<PendingSegment>,
-) -> Result<(), CollectorError> {
-    loop {
-        let mut joined = false;
-        let mut position = 0;
-        while position < pending.len() {
-            let PendingSegment::Stock {
-                key_index: candidate,
-                segment: existing,
-            } = pending[position]
-            else {
-                position += 1;
-                continue;
-            };
-            if candidate != key_index {
-                position += 1;
-                continue;
-            }
-            if existing.end.order_count == segment.start.order_count {
-                pending.swap_remove(position);
-                segment = existing.then(segment)?;
-                joined = true;
-                break;
-            }
-            if segment.end.order_count == existing.start.order_count {
-                pending.swap_remove(position);
-                segment = segment.then(existing)?;
-                joined = true;
-                break;
-            }
-            if existing.start.order_count < segment.end.order_count
-                && segment.start.order_count < existing.end.order_count
-            {
-                return Err(CollectorError::DuplicatePredecessor {
-                    domain: "stock",
-                    predecessor: i64::from(segment.start.order_count),
-                });
-            }
-            position += 1;
-        }
-        if !joined {
-            pending.push(PendingSegment::Stock { key_index, segment });
-            return Ok(());
-        }
-    }
-}
-
-fn validate_stock_root(
+fn expected_stock_root(
     roots: &dyn StockRootProvider,
     key: StockKey,
-    actual: StockState,
-) -> Result<(), CollectorError> {
+) -> Result<StockState, CollectorError> {
     let expected = roots
         .expected_root(key)
         .ok_or(CollectorError::MissingStockRoot(key))?;
@@ -1849,6 +1610,15 @@ fn validate_stock_root(
             reason: "setup root must have +0.0 YTD and zero counters",
         });
     }
+    Ok(expected)
+}
+
+fn validate_stock_root(
+    roots: &dyn StockRootProvider,
+    key: StockKey,
+    actual: StockState,
+) -> Result<(), CollectorError> {
+    let expected = expected_stock_root(roots, key)?;
     if actual != expected {
         return Err(CollectorError::StockRootMismatch {
             key,
@@ -2305,14 +2075,8 @@ mod tests {
         }
     }
 
-    fn stock_mutation(
-        key: StockKey,
-        quantity: u8,
-        remote: u8,
-        before: StockState,
-        after: StockState,
-    ) -> StockMutation {
-        StockMutation::new(key, quantity, remote, before.version(), after.version())
+    fn stock_mutation(key: StockKey, quantity: u8, remote: u8) -> StockMutation {
+        StockMutation::new(key, quantity, remote)
     }
 
     fn stock_root(key: StockKey) -> StockState {
@@ -2323,10 +2087,7 @@ mod tests {
         for chunk in keys.chunks(MAX_EDGES_PER_TERMINAL) {
             let updates = chunk
                 .iter()
-                .map(|key| {
-                    let root = stock_root(*key);
-                    stock_mutation(*key, 1, 0, root, stock_after(root, 1, 0))
-                })
+                .map(|key| stock_mutation(*key, 1, 0))
                 .collect::<Vec<_>>();
             collector
                 .record_terminal(TerminalEvidence::stocks(&updates))
@@ -2427,35 +2188,23 @@ mod tests {
     fn equal_hash_ranks_use_the_canonical_key_tiebreak() {
         let mut forward = Vec::with_capacity(SAMPLE_LIMIT);
         let mut reverse = Vec::with_capacity(SAMPLE_LIMIT);
-        let mut forward_retired = Vec::new();
-        let mut reverse_retired = Vec::new();
-        let mut forward_pending = Vec::new();
-        let mut reverse_pending = Vec::new();
         let mut forward_rejected = None;
         let mut reverse_rejected = None;
         for key_index in 0..=SAMPLE_LIMIT as u32 {
             let _ = select_stock(
                 &mut forward,
-                &mut forward_retired,
-                &mut forward_pending,
                 key_index,
                 7,
                 &mut forward_rejected,
-                MAX_EDGES_PER_TERMINAL,
-            )
-            .unwrap();
+            );
         }
         for key_index in (0..=SAMPLE_LIMIT as u32).rev() {
             let _ = select_stock(
                 &mut reverse,
-                &mut reverse_retired,
-                &mut reverse_pending,
                 key_index,
                 7,
                 &mut reverse_rejected,
-                MAX_EDGES_PER_TERMINAL,
-            )
-            .unwrap();
+            );
         }
         let mut forward_keys = forward
             .iter()
@@ -2473,14 +2222,10 @@ mod tests {
         let before = reverse_keys;
         let _ = select_stock(
             &mut reverse,
-            &mut reverse_retired,
-            &mut reverse_pending,
             SAMPLE_LIMIT as u32,
             7,
             &mut reverse_rejected,
-            MAX_EDGES_PER_TERMINAL,
-        )
-        .unwrap();
+        );
         let mut after = reverse
             .iter()
             .map(|sample| sample.key_index)
@@ -2490,77 +2235,42 @@ mod tests {
     }
 
     #[test]
-    fn evicted_pending_stock_is_retired_until_its_missing_bridge_arrives() {
-        let keys = (1..=SAMPLE_LIMIT as i32)
+    fn stock_aggregation_is_order_independent_across_reservoir_evictions() {
+        let keys = (1..=100)
             .map(|item_id| StockKey {
                 warehouse_id: 1,
                 item_id,
             })
             .collect::<Vec<_>>();
-        let mut collector = collector(32);
-        record_stock_roots(&mut collector, &keys);
+        let mut forward = collector(32);
+        for key in &keys {
+            let updates = [
+                stock_mutation(*key, 3, 0),
+                stock_mutation(*key, 7, 1),
+            ];
+            forward
+                .record_terminal(TerminalEvidence::stocks(&updates))
+                .unwrap();
+        }
 
-        let worst = collector
-            .stocks
-            .iter()
-            .max_by_key(|sample| (sample.rank, sample.key_index))
-            .copied()
-            .unwrap();
-        let worst_key = stock_key_from_index(50, worst.key_index);
-        let initial = stock_root(worst_key);
-        let first = stock_after(initial, 1, 0);
-        let second = stock_after(first, 1, 0);
-        let third = stock_after(second, 1, 0);
-        let gap = [stock_mutation(worst_key, 1, 0, second, third)];
-        collector
-            .record_terminal(TerminalEvidence::stocks(&gap))
-            .unwrap();
-        assert_eq!(collector.storage().pending_intervals(), 1);
+        let mut reverse = collector(32);
+        for key in keys.iter().rev() {
+            let updates = [
+                stock_mutation(*key, 7, 1),
+                stock_mutation(*key, 3, 0),
+            ];
+            reverse
+                .record_terminal(TerminalEvidence::stocks(&updates))
+                .unwrap();
+        }
 
-        let replacement = (1_000..=ITEM_COUNT as i32)
-            .map(|item_id| StockKey {
-                warehouse_id: 1,
-                item_id,
-            })
-            .find(|key| {
-                let index = stock_index(50, *key).unwrap();
-                (sample_rank(TEST_SEED, STOCK_SAMPLE_DOMAIN, index), index)
-                    < (worst.rank, worst.key_index)
-                    && !collector
-                        .stocks
-                        .iter()
-                        .any(|sample| sample.key_index == index)
-            })
-            .unwrap();
-        let replacement_root = stock_root(replacement);
-        let replacement_after = stock_after(replacement_root, 1, 0);
-        let update = [stock_mutation(
-            replacement,
-            1,
-            0,
-            replacement_root,
-            replacement_after,
-        )];
-        collector
-            .record_terminal(TerminalEvidence::stocks(&update))
-            .unwrap();
-        assert_eq!(collector.storage().pending_intervals(), 1);
-        assert_eq!(collector.storage().retired_stock_count(), 1);
-        assert!(!collector
-            .stocks
-            .iter()
-            .any(|sample| sample.key_index == worst.key_index));
-
-        let missing = [stock_mutation(worst_key, 1, 0, first, second)];
-        collector
-            .record_terminal(TerminalEvidence::stocks(&missing))
-            .unwrap();
-        assert!(!collector
-            .stocks
-            .iter()
-            .any(|sample| sample.key_index == worst.key_index));
-        assert_eq!(collector.storage().pending_intervals(), 0);
-        assert_eq!(collector.storage().retired_stock_count(), 0);
+        let snapshot = |sealed: SealedIntervalEvidence| {
+            sealed
+                .stocks()
+                .map(|chain| (chain.key(), chain.initial(), chain.endpoint()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(snapshot(forward.seal().unwrap()), snapshot(reverse.seal().unwrap()));
     }
 
     #[test]
@@ -2593,27 +2303,19 @@ mod tests {
                 (sample_rank(TEST_SEED, STOCK_SAMPLE_DOMAIN, index), index) < (worst.0, worst.1)
             })
             .unwrap();
-        let replacement_root = stock_root(replacement);
-        let valid = stock_mutation(
-            replacement,
-            1,
-            0,
-            replacement_root,
-            stock_after(replacement_root, 1, 0),
-        );
+        let valid = stock_mutation(replacement, 1, 0);
 
         let bad_key = StockKey {
             warehouse_id: 1,
             item_id: 99_999,
         };
-        let bad_root = stock_root(bad_key);
-        let mut bad_after = stock_after(bad_root, 1, 0);
-        bad_after.ytd_bits ^= 1;
-        let bad = stock_mutation(bad_key, 1, 0, bad_root, bad_after);
+        let bad = StockMutation::new(bad_key, 0, 0);
         let terminal = [valid, bad];
         assert!(matches!(
             collector.record_terminal(TerminalEvidence::stocks(&terminal)),
-            Err(CollectorError::FloatMismatch("stock YTD"))
+            Err(CollectorError::InvalidStockEdge(
+                "ordered quantity is outside 1..=10"
+            ))
         ));
         let after = collector
             .stocks
@@ -2626,7 +2328,7 @@ mod tests {
     }
 
     #[test]
-    fn thirty_one_full_worker_gaps_are_legal_and_later_root() {
+    fn worker_batches_aggregate_without_stock_pending_intervals() {
         let mut collector = collector(32);
         let mut roots = Vec::new();
         for worker in 0..31 {
@@ -2637,25 +2339,16 @@ mod tests {
                     warehouse_id: 1,
                     item_id: worker * 15 + line + 1,
                 };
-                let initial = stock_root(key);
-                let first = stock_after(initial, 1, 0);
-                let second = stock_after(first, 2, 0);
-                future.push(stock_mutation(key, 2, 0, first, second));
-                root_edges.push(stock_mutation(key, 1, 0, initial, first));
+                future.push(stock_mutation(key, 2, 0));
+                root_edges.push(stock_mutation(key, 1, 0));
             }
             collector
                 .record_terminal(TerminalEvidence::stocks(&future))
                 .unwrap();
             roots.push(root_edges);
         }
-        assert!(
-            collector.storage().pending_intervals() > SAMPLE_LIMIT,
-            "evicted selected keys must retain their pending receipt-only state"
-        );
-        assert!(
-            collector.storage().pending_intervals() <= collector.storage().pending_limit(),
-            "the receipt-only retired set must remain bounded by one full terminal per worker"
-        );
+        assert_eq!(collector.storage().pending_intervals(), 0);
+        assert_eq!(collector.storage().retired_stock_count(), 0);
         assert_eq!(collector.storage().selected_stock_count(), SAMPLE_LIMIT);
         for terminal in &roots {
             collector
@@ -2668,75 +2361,45 @@ mod tests {
     }
 
     #[test]
-    fn pending_cap_failure_stays_poisoned_after_root_arrives() {
+    fn stock_ytd_stays_exact_through_the_float32_integer_limit() {
         let key = StockKey {
             warehouse_id: 1,
             item_id: 1,
         };
-        let mut versions = vec![stock_root(key)];
-        for _ in 0..33 {
-            versions.push(stock_after(*versions.last().unwrap(), 1, 0));
-        }
-        let mut collector = collector(1);
-        let first_gaps = (0..15)
-            .map(|index| {
-                let start = index * 2 + 1;
-                stock_mutation(key, 1, 0, versions[start], versions[start + 1])
-            })
-            .collect::<Vec<_>>();
-        collector
-            .record_terminal(TerminalEvidence::stocks(&first_gaps))
-            .unwrap();
-        assert_eq!(collector.storage().pending_intervals(), 15);
-
-        let overflow = [stock_mutation(key, 1, 0, versions[31], versions[32])];
+        let initial = stock_root(key);
+        let mut slot = StockSlot {
+            quantity: stock_quantity_after_delta(initial.quantity, MAX_EXACT_STOCK_YTD - 1),
+            quantity_delta: MAX_EXACT_STOCK_YTD - 1,
+            order_count: 1,
+            remote_count: 0,
+            initial_quantity: initial.quantity,
+        };
+        apply_stock_mutation(&root_for, key, &mut slot, 1, 0).unwrap();
+        assert_eq!(slot.endpoint().ytd_bits, (MAX_EXACT_STOCK_YTD as f32).to_bits());
+        let before = slot;
         assert!(matches!(
-            collector.record_terminal(TerminalEvidence::stocks(&overflow)),
-            Err(CollectorError::PendingLimit {
-                actual: 16,
-                limit: 15
-            })
+            apply_stock_mutation(&root_for, key, &mut slot, 1, 0),
+            Err(CollectorError::InvalidStockEdge(
+                "stock YTD exceeds the exact FLOAT32 integer range"
+            ))
         ));
-        assert_eq!(collector.storage().pending_intervals(), 15);
-        assert!(collector.storage().is_poisoned());
-
-        let root = [stock_mutation(key, 1, 0, versions[0], versions[1])];
-        assert!(matches!(
-            collector.record_terminal(TerminalEvidence::stocks(&root)),
-            Err(CollectorError::Poisoned { .. })
-        ));
-        assert!(matches!(
-            collector.seal(),
-            Err(CollectorError::Poisoned { .. })
-        ));
+        assert_eq!(slot, before);
     }
 
     #[test]
-    fn pending_limit_is_shared_across_customer_and_stock_samples() {
+    fn stock_tickets_do_not_consume_customer_pending_budget() {
         let stock_key = StockKey {
             warehouse_id: 1,
             item_id: 1,
         };
-        let mut stock_versions = vec![stock_root(stock_key)];
-        for _ in 0..18 {
-            stock_versions.push(stock_after(*stock_versions.last().unwrap(), 1, 0));
-        }
         let stock_gaps = (0..8)
-            .map(|index| {
-                let start = index * 2 + 1;
-                stock_mutation(
-                    stock_key,
-                    1,
-                    0,
-                    stock_versions[start],
-                    stock_versions[start + 1],
-                )
-            })
+            .map(|_| stock_mutation(stock_key, 1, 0))
             .collect::<Vec<_>>();
         let mut collector = collector(1);
         collector
             .record_terminal(TerminalEvidence::stocks(&stock_gaps))
             .unwrap();
+        assert_eq!(collector.storage().pending_intervals(), 0);
 
         let customer_key = CustomerKey {
             warehouse_id: 1,
@@ -2760,21 +2423,17 @@ mod tests {
         collector
             .record_terminal(TerminalEvidence::customers(&customer_gaps))
             .unwrap();
-        assert_eq!(collector.storage().pending_intervals(), 15);
+        assert_eq!(collector.storage().pending_intervals(), 7);
 
-        let overflow = [CustomerMutation::new(
+        let eighth_gap = [CustomerMutation::new(
             customer_key,
             payment_edge(customer_version(16, 0), -25.0, 25.0, 1.0),
         )];
-        assert!(matches!(
-            collector.record_terminal(TerminalEvidence::customers(&overflow)),
-            Err(CollectorError::PendingLimit {
-                actual: 16,
-                limit: 15
-            })
-        ));
-        assert_eq!(collector.storage().pending_intervals(), 15);
-        assert!(collector.storage().is_poisoned());
+        collector
+            .record_terminal(TerminalEvidence::customers(&eighth_gap))
+            .unwrap();
+        assert_eq!(collector.storage().pending_intervals(), 8);
+        assert!(!collector.storage().is_poisoned());
     }
 
     #[test]
@@ -2786,16 +2445,17 @@ mod tests {
                 warehouse_id: 1,
                 item_id,
             };
-            let initial = stock_root(key);
-            let mut after = stock_after(initial, 1, 0);
             if item_id == 3 {
-                after.ytd_bits ^= 1;
+                updates.push(StockMutation::new(key, 0, 0));
+            } else {
+                updates.push(stock_mutation(key, 1, 0));
             }
-            updates.push(stock_mutation(key, 1, 0, initial, after));
         }
         assert!(matches!(
             collector.record_terminal(TerminalEvidence::stocks(&updates)),
-            Err(CollectorError::FloatMismatch("stock YTD"))
+            Err(CollectorError::InvalidStockEdge(
+                "ordered quantity is outside 1..=10"
+            ))
         ));
         assert_eq!(collector.storage().selected_stock_count(), 0);
         assert_eq!(collector.storage().pending_intervals(), 0);
@@ -2803,33 +2463,30 @@ mod tests {
     }
 
     #[test]
-    fn one_million_successors_merge_into_one_pending_interval() {
+    fn one_million_stock_tickets_merge_into_one_exact_aggregate() {
         let mut collector = collector(32);
         let key = StockKey {
             warehouse_id: 1,
             item_id: 1,
         };
         let initial = stock_root(key);
-        let mut before = stock_after(initial, 1, 0);
+        let mut expected = initial;
         for index in 0..1_000_000 {
             let quantity = (index % 10 + 1) as u8;
             let remote = (index % 11 == 0) as u8;
-            let after = stock_after(before, quantity, remote);
-            let update = [stock_mutation(key, quantity, remote, before, after)];
+            let after = stock_after(expected, quantity, remote);
+            let update = [stock_mutation(key, quantity, remote)];
             collector
                 .record_terminal(TerminalEvidence::stocks(&update))
                 .unwrap();
-            before = after;
+            expected = after;
         }
-        assert_eq!(collector.storage().pending_intervals(), 1);
-        let first = stock_after(initial, 1, 0);
-        let root = [stock_mutation(key, 1, 0, initial, first)];
-        collector
-            .record_terminal(TerminalEvidence::stocks(&root))
-            .unwrap();
+        assert_eq!(collector.storage().pending_intervals(), 0);
         let sealed = collector.seal().unwrap();
-        assert_eq!(sealed.stock_update_count(), 1_000_001);
-        assert_eq!(sealed.stocks().next().unwrap().update_count(), 1_000_001);
+        assert_eq!(sealed.stock_update_count(), 1_000_000);
+        let stock = sealed.stocks().next().unwrap();
+        assert_eq!(stock.update_count(), 1_000_000);
+        assert_eq!(stock.endpoint(), expected.version());
     }
 
     #[test]
@@ -2879,7 +2536,7 @@ mod tests {
     }
 
     #[test]
-    fn unselected_edges_are_still_validated_and_stock_roots_are_exact() {
+    fn unselected_stock_tickets_are_still_validated() {
         let mut collector = collector(32);
         let keys = (1..=SAMPLE_LIMIT as i32)
             .map(|item_id| StockKey {
@@ -2905,15 +2562,12 @@ mod tests {
                 (sample_rank(TEST_SEED, STOCK_SAMPLE_DOMAIN, index), index) >= cutoff
             })
             .unwrap();
-        let expected = stock_root(key);
-        let forged = StockState {
-            ytd_bits: (-0.0_f32).to_bits(),
-            ..expected
-        };
-        let update = [stock_mutation(key, 1, 0, forged, stock_after(forged, 1, 0))];
+        let update = [StockMutation::new(key, 1, 2)];
         assert!(matches!(
             collector.record_terminal(TerminalEvidence::stocks(&update)),
-            Err(CollectorError::StockRootMismatch { .. })
+            Err(CollectorError::InvalidStockEdge(
+                "remote increment is outside 0..=1"
+            ))
         ));
     }
 
@@ -2925,7 +2579,7 @@ mod tests {
         };
         let root = stock_root(key);
         let after = stock_after(root, 3, 1);
-        let update = [stock_mutation(key, 3, 1, root, after)];
+        let update = [stock_mutation(key, 3, 1)];
         let mut collector = collector(32);
         collector
             .record_terminal(TerminalEvidence::stocks(&update))
@@ -2956,14 +2610,7 @@ mod tests {
             customer_key,
             payment_edge(customer_version(1, 0), -10.0, 10.0, 1.0),
         )];
-        let root = stock_root(stock_key);
-        let stock = [stock_mutation(
-            stock_key,
-            3,
-            1,
-            root,
-            stock_after(root, 3, 1),
-        )];
+        let stock = [stock_mutation(stock_key, 3, 1)];
         let mut collector = collector(32);
         collector
             .record_terminal(TerminalEvidence::customers(&customer))
@@ -3310,7 +2957,7 @@ mod tests {
                 &root_for,
             ),
             Err(CollectorError::InvalidSealedEvidence(
-                "single-update Stock YTD is not an exact quantity in 1..=10"
+                "Stock YTD is not an exact positive integer"
             ))
         ));
 
@@ -3339,7 +2986,36 @@ mod tests {
                 &root_for,
             ),
             Err(CollectorError::InvalidSealedEvidence(
-                "single-update Stock quantity transition is impossible"
+                "Stock quantity does not match its committed quantity delta"
+            ))
+        ));
+
+        let impossible_multi_update_quantity = CanonicalStockChain::new(
+            stock_key,
+            sample_rank(TEST_SEED, STOCK_SAMPLE_DOMAIN, stock_index),
+            stock_root.version(),
+            StockVersion {
+                quantity: stock_root.quantity,
+                ytd_bits: 11.0_f32.to_bits(),
+                order_count: 2,
+                remote_count: 1,
+            },
+        );
+        assert!(matches!(
+            SealedIntervalEvidence::from_canonical_entries(
+                50,
+                TEST_SEED,
+                INTERVAL_SAMPLE_POLICY_VERSION,
+                0,
+                2,
+                None,
+                None,
+                Vec::new(),
+                vec![impossible_multi_update_quantity],
+                &root_for,
+            ),
+            Err(CollectorError::InvalidSealedEvidence(
+                "Stock quantity does not match its committed quantity delta"
             ))
         ));
     }
