@@ -354,8 +354,9 @@ const ORDER_STATUS_LINES: &[StatementId] = &[StatementId::OrderStatusLines];
 
 const DELIVERY_OLDEST_ORDER: &[StatementId] = &[StatementId::DeliveryOldestOrder];
 const DELIVERY_LOCK_QUEUE: &[StatementId] = &[StatementId::DeliveryLockQueue];
-const DELIVERY_CONFIRM_QUEUE: &[StatementId] = &[StatementId::DeliveryConfirmQueue];
-const DELIVERY_ORDER: &[StatementId] = &[StatementId::DeliveryOrder];
+const DELIVERY_EARLIER_QUEUE_COUNT: &[StatementId] =
+    &[StatementId::DeliveryEarlierQueueCount];
+const DELIVERY_EXACT_QUEUE_COUNT: &[StatementId] = &[StatementId::DeliveryExactQueueCount];
 const DELIVERY_CUSTOMER: &[StatementId] = &[StatementId::DeliveryCustomer];
 const DELIVERY_LINE_ROWS: &[StatementId] = &[StatementId::DeliveryLineRows];
 const DELIVERY_LINE_SUM: &[StatementId] = &[StatementId::DeliveryLineSum];
@@ -571,11 +572,11 @@ const DELIVERY_STAGE_TWO_STEPS: &[PlanStep] = &[
         multiplicity: Multiplicity::PerClaimedDistrict,
     },
     PlanStep {
-        alternatives: DELIVERY_CONFIRM_QUEUE,
+        alternatives: DELIVERY_EARLIER_QUEUE_COUNT,
         multiplicity: Multiplicity::PerClaimedDistrict,
     },
     PlanStep {
-        alternatives: DELIVERY_ORDER,
+        alternatives: DELIVERY_EXACT_QUEUE_COUNT,
         multiplicity: Multiplicity::PerClaimedDistrict,
     },
     PlanStep {
@@ -930,11 +931,15 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::DeliveryLineRows,
             &[Int32, Int32, Int32],
-            "SELECT ol_number, ol_amount \
+            "SELECT ol_number, ol_amount, ol_o_id \
              FROM order_line \
              WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id = $3 \
-             ORDER BY ol_number ASC;",
-            &[("ol_number", Int32), ("ol_amount", Float32)],
+             ORDER BY ol_number;",
+            &[
+                ("ol_number", Int32),
+                ("ol_amount", Float32),
+                ("ol_o_id", Int32),
+            ],
         ),
         query(
             StatementId::DeliveryLineSum,
@@ -1449,6 +1454,77 @@ mod runtime_tests {
         assert_eq!(
             parameter_ordinals(&statement.sql).unwrap(),
             BTreeSet::from([1, 2, 3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn delivery_stage_two_matches_official_count_and_line_shapes() {
+        let catalog = final2026_catalog();
+        let find = |id: StatementId| {
+            catalog
+                .iter()
+                .find(|statement| statement.id == id.wire_id())
+                .unwrap()
+        };
+
+        let earlier = find(StatementId::DeliveryEarlierQueueCount);
+        assert!(earlier.sql.contains("SELECT COUNT(*) FROM new_orders"));
+        assert!(earlier.sql.contains("no_w_id = $1"));
+        assert!(earlier.sql.contains("no_d_id = $2"));
+        assert!(earlier.sql.contains("no_o_id < $3"));
+
+        let exact = find(StatementId::DeliveryExactQueueCount);
+        assert!(exact.sql.contains("SELECT COUNT(*) FROM new_orders"));
+        assert!(exact.sql.contains("no_w_id = $1"));
+        assert!(exact.sql.contains("no_d_id = $2"));
+        assert!(exact.sql.contains("no_o_id = $3"));
+
+        let lines = find(StatementId::DeliveryLineRows);
+        assert!(lines
+            .sql
+            .contains("SELECT ol_number, ol_amount, ol_o_id"));
+        assert!(lines.sql.contains("ORDER BY ol_number;"));
+        assert!(!lines.sql.contains("ORDER BY ol_number ASC"));
+        match &lines.kind {
+            StatementKind::Query { columns } => assert_eq!(
+                columns,
+                &[
+                    Column {
+                        name: "ol_number".to_owned(),
+                        sql_type: SqlType::Int32,
+                    },
+                    Column {
+                        name: "ol_amount".to_owned(),
+                        sql_type: SqlType::Float32,
+                    },
+                    Column {
+                        name: "ol_o_id".to_owned(),
+                        sql_type: SqlType::Int32,
+                    },
+                ]
+            ),
+            StatementKind::Command => panic!("Delivery line rows must be a query"),
+        }
+
+        let stage_two_ids = DELIVERY_STAGES[1]
+            .steps
+            .iter()
+            .map(|step| {
+                assert_eq!(step.multiplicity, Multiplicity::PerClaimedDistrict);
+                assert_eq!(step.alternatives.len(), 1);
+                step.alternatives[0]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stage_two_ids,
+            vec![
+                StatementId::DeliveryLockQueue,
+                StatementId::DeliveryEarlierQueueCount,
+                StatementId::DeliveryExactQueueCount,
+                StatementId::DeliveryCustomer,
+                StatementId::DeliveryLineRows,
+                StatementId::DeliveryLineSum,
+            ]
         );
     }
 

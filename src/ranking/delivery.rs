@@ -33,8 +33,8 @@ struct DistrictClaim {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StageTwoIndices {
-    confirm_queue: usize,
-    order: usize,
+    earlier_queue_count: usize,
+    exact_queue_count: usize,
     customer: usize,
     line_rows: usize,
     line_sum: usize,
@@ -219,14 +219,14 @@ fn stage_two_operations(
         };
         let base = operations.len();
         operations.push(operation(StatementId::DeliveryLockQueue, key()));
-        operations.push(operation(StatementId::DeliveryConfirmQueue, key()));
-        operations.push(operation(StatementId::DeliveryOrder, key()));
+        operations.push(operation(StatementId::DeliveryEarlierQueueCount, key()));
+        operations.push(operation(StatementId::DeliveryExactQueueCount, key()));
         operations.push(operation(StatementId::DeliveryCustomer, key()));
         operations.push(operation(StatementId::DeliveryLineRows, key()));
         operations.push(operation(StatementId::DeliveryLineSum, key()));
         indices.push(StageTwoIndices {
-            confirm_queue: base + 1,
-            order: base + 2,
+            earlier_queue_count: base + 1,
+            exact_queue_count: base + 2,
             customer: base + 3,
             line_rows: base + 4,
             line_sum: base + 5,
@@ -256,19 +256,17 @@ fn parse_stage_two(
             claim.district_id, claim.order_id
         );
 
-        let confirmed_order_id = results.single_int32(index.confirm_queue)?;
-        if confirmed_order_id != claim.order_id {
+        let earlier_queue_count = results.single_int32(index.earlier_queue_count)?;
+        if earlier_queue_count != 0 {
             return Err(SemanticViolation::new(format!(
-                "{context} queue confirmation changed oldest order from {} to \
-                 {confirmed_order_id}",
-                claim.order_id
+                "{context} has {earlier_queue_count} earlier queue rows; expected zero"
             )));
         }
 
-        let customer_id = results.single_int32(index.order)?;
-        if customer_id <= 0 {
+        let exact_queue_count = results.single_int32(index.exact_queue_count)?;
+        if exact_queue_count != 1 {
             return Err(SemanticViolation::new(format!(
-                "{context} returned invalid customer id {customer_id}"
+                "{context} has {exact_queue_count} exact queue rows; expected one"
             )));
         }
 
@@ -279,11 +277,10 @@ fn parse_stage_two(
                 customer.len()
             )));
         }
-        let joined_customer_id = row_int32(customer, 0, &format!("{context} customer"))?;
-        if joined_customer_id != customer_id {
+        let customer_id = row_int32(customer, 0, &format!("{context} customer"))?;
+        if customer_id <= 0 {
             return Err(SemanticViolation::new(format!(
-                "{context} order customer {customer_id} disagrees with joined customer \
-                 {joined_customer_id}"
+                "{context} returned invalid customer id {customer_id}"
             )));
         }
         let customer_balance_bits = row_f32_bits(customer, 1, &format!("{context} customer"))?;
@@ -305,9 +302,9 @@ fn parse_stage_two(
         }
         let mut amount_values = Vec::with_capacity(line_rows.len());
         for (offset, row) in line_rows.iter().enumerate() {
-            if row.len() != 2 {
+            if row.len() != 3 {
                 return Err(SemanticViolation::new(format!(
-                    "{context} line row {} returned {} columns; expected two",
+                    "{context} line row {} returned {} columns; expected three",
                     offset + 1,
                     row.len()
                 )));
@@ -318,6 +315,13 @@ fn parse_stage_two(
             if line_number != expected_line_number {
                 return Err(SemanticViolation::new(format!(
                     "{context} line sequence expected {expected_line_number}, got {line_number}"
+                )));
+            }
+            let line_order_id =
+                row_int32(row, 2, &format!("{context} line {line_number} order id"))?;
+            if line_order_id != claim.order_id {
+                return Err(SemanticViolation::new(format!(
+                    "{context} line {line_number} belongs to order {line_order_id}"
                 )));
             }
             amount_values.push(row_f32_bits(
@@ -596,15 +600,15 @@ mod tests {
             indices,
             vec![
                 StageTwoIndices {
-                    confirm_queue: 1,
-                    order: 2,
+                    earlier_queue_count: 1,
+                    exact_queue_count: 2,
                     customer: 3,
                     line_rows: 4,
                     line_sum: 5,
                 },
                 StageTwoIndices {
-                    confirm_queue: 7,
-                    order: 8,
+                    earlier_queue_count: 7,
+                    exact_queue_count: 8,
                     customer: 9,
                     line_rows: 10,
                     line_sum: 11,
@@ -622,6 +626,14 @@ mod tests {
                 WireValue::Int32(9),
                 WireValue::Int32(3017),
             ]
+        );
+        assert_eq!(
+            operations[1].statement_id,
+            StatementId::DeliveryEarlierQueueCount.wire_id()
+        );
+        assert_eq!(
+            operations[2].statement_id,
+            StatementId::DeliveryExactQueueCount.wire_id()
         );
     }
 
@@ -643,8 +655,8 @@ mod tests {
         let response = BatchResponse::Ok {
             executed_operations: operations.len() as u16,
             results: vec![
-                query(1, vec![vec![WireValue::Int32(3001)]]),
-                query(2, vec![vec![WireValue::Int32(42)]]),
+                query(1, vec![vec![WireValue::Int32(0)]]),
+                query(2, vec![vec![WireValue::Int32(1)]]),
                 query(
                     3,
                     vec![vec![
@@ -663,6 +675,7 @@ mod tests {
                             vec![
                                 WireValue::Int32((index + 1) as i32),
                                 WireValue::Float32(*bits),
+                                WireValue::Int32(3001),
                             ]
                         })
                         .collect(),
@@ -675,6 +688,71 @@ mod tests {
         assert_eq!(locked.len(), 1);
         assert_eq!(locked[0].line_amount_bits, amounts);
         assert_eq!(locked[0].amount_bits, sum_bits);
+    }
+
+    #[test]
+    fn stage_two_rejects_non_oldest_or_mismatched_line_order() {
+        let claims = [DistrictClaim {
+            district_id: 2,
+            order_id: 3001,
+        }];
+        let (operations, indices) = stage_two_operations(17, &claims);
+        let amounts = [1.0_f32.to_bits(); MIN_ORDER_LINES];
+
+        let response = |earlier_count, exact_count, line_order_id| BatchResponse::Ok {
+            executed_operations: operations.len() as u16,
+            results: vec![
+                query(1, vec![vec![WireValue::Int32(earlier_count)]]),
+                query(2, vec![vec![WireValue::Int32(exact_count)]]),
+                query(
+                    3,
+                    vec![vec![
+                        WireValue::Int32(42),
+                        WireValue::Float32(10.0_f32.to_bits()),
+                        WireValue::Int32(3),
+                        WireValue::Int32(4),
+                    ]],
+                ),
+                query(
+                    4,
+                    amounts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, bits)| {
+                            vec![
+                                WireValue::Int32((index + 1) as i32),
+                                WireValue::Float32(*bits),
+                                WireValue::Int32(line_order_id),
+                            ]
+                        })
+                        .collect(),
+                ),
+                query(
+                    5,
+                    vec![vec![WireValue::Float32(
+                        exact_f64_sum_to_f32_bits(&amounts).unwrap(),
+                    )]],
+                ),
+            ],
+        };
+
+        let earlier = accept_batch(response(1, 1, 3001), &operations).unwrap();
+        assert!(parse_stage_two(&earlier, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("earlier queue rows"));
+
+        let missing_exact = accept_batch(response(0, 0, 3001), &operations).unwrap();
+        assert!(parse_stage_two(&missing_exact, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("exact queue rows"));
+
+        let wrong_line_order = accept_batch(response(0, 1, 3002), &operations).unwrap();
+        assert!(parse_stage_two(&wrong_line_order, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("belongs to order 3002"));
     }
 
     #[test]
