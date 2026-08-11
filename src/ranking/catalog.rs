@@ -1172,9 +1172,9 @@ fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement 
     use SqlType::{Char, Float32, Int32};
 
     let predicate = if by_last_name {
-        "customer.c_last = $3 ORDER BY customer.c_first ASC, customer.c_id ASC"
+        "c_last = $3 ORDER BY c_first ASC, c_id ASC"
     } else {
-        "customer.c_id = $3"
+        "c_id = $3"
     };
     query(
         id,
@@ -1188,7 +1188,7 @@ fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement 
              c_discount, c_balance, \
              c_ytd_payment, c_payment_cnt, \
              c_delivery_cnt, c_data FROM customer \
-             WHERE customer.c_w_id = $1 AND customer.c_d_id = $2 AND {predicate};"
+             WHERE c_w_id = $1 AND c_d_id = $2 AND {predicate};"
         ),
         &[
             ("c_id", Int32),
@@ -1485,6 +1485,30 @@ mod runtime_tests {
         assert_eq!(
             parameter_ordinals(&statement.sql).unwrap(),
             BTreeSet::from([1, 2, 3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn payment_customer_queries_keep_unqualified_point_predicates() {
+        let catalog = final2026_catalog();
+        let find = |id: StatementId| {
+            catalog
+                .iter()
+                .find(|statement| statement.id == id.wire_id())
+                .unwrap()
+        };
+        let projection = "SELECT c_id, c_first, c_middle, c_last, c_street_1, c_street_2, \
+                          c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, \
+                          c_discount, c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt, \
+                          c_data FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND ";
+
+        assert_eq!(
+            find(StatementId::PaymentCustomerById).sql,
+            format!("{projection}c_id = $3;")
+        );
+        assert_eq!(
+            find(StatementId::PaymentCustomerByLast).sql,
+            format!("{projection}c_last = $3 ORDER BY c_first ASC, c_id ASC;")
         );
     }
 
