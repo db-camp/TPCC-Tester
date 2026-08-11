@@ -17,14 +17,16 @@ use crate::workload::{
     MIN_ITEM_QUANTITY, MIN_ORDER_LINES,
 };
 
-use super::catalog::{StatementId, UNDELIVERED_CARRIER_ID, UNDELIVERED_DATE};
+use super::catalog::{
+    new_order_stock_statement, StatementId, UNDELIVERED_CARRIER_ID, UNDELIVERED_DATE,
+};
 use super::common::{
     operation, row_char, row_f32_bits, row_int32, BatchResults, SemanticResult, SemanticResultExt,
     SemanticViolation,
 };
 use super::runner::{
     execute_batch, semantic_or_abort, NewOrderEvidence, RankedCommit, RankedTransactionError,
-    RankedTransactionOutcome, RecoveryNewOrderLineEvidence, StockVersion,
+    RankedTransactionOutcome, RecoveryNewOrderLineEvidence,
 };
 
 const MIN_STOCK_QUANTITY: i32 = 10;
@@ -287,6 +289,8 @@ fn build_stage_one(input: &ValidatedInput) -> StageOnePlan {
     }
 
     let mut line_results = Vec::with_capacity(input.lines.len());
+    let stock_statement = new_order_stock_statement(input.district_id)
+        .expect("validated New-Order district lost its stock projection");
     for line in &input.lines {
         let item = operations.len();
         operations.push(operation(
@@ -295,7 +299,7 @@ fn build_stage_one(input: &ValidatedInput) -> StageOnePlan {
         ));
         let stock = operations.len();
         operations.push(operation(
-            StatementId::NewOrderStock,
+            stock_statement,
             [
                 WireValue::Int32(line.supply_warehouse),
                 WireValue::Int32(line.item_id),
@@ -369,7 +373,7 @@ fn parse_stage_one(
     require_f32_range(district_tax_bits, 0.0, 0.2, "district.d_tax")?;
 
     let mut item_prices = BTreeMap::<i32, u32>::new();
-    let mut stock_snapshots = BTreeMap::<(i32, i32), (StockVersion, Vec<u8>)>::new();
+    let mut stock_snapshots = BTreeMap::<(i32, i32), (i32, Vec<u8>)>::new();
     let mut lines = Vec::with_capacity(input.lines.len());
 
     for (line, indices) in input.lines.iter().zip(&plan.line_results) {
@@ -432,7 +436,7 @@ fn parse_stage_one(
         )?;
         require_columns(
             stock,
-            15,
+            2,
             &format!(
                 "New-Order stock ({}, {})",
                 line.supply_warehouse, line.item_id
@@ -453,81 +457,9 @@ fn parse_stage_one(
                 line.supply_warehouse, line.item_id
             )));
         }
-        let stock_ytd_bits = row_f32_bits(
-            stock,
-            1,
-            &format!(
-                "New-Order stock ({}, {})",
-                line.supply_warehouse, line.item_id
-            ),
-        )?;
-        let stock_ytd = f32::from_bits(stock_ytd_bits);
-        if !stock_ytd.is_finite() || stock_ytd < 0.0 {
-            return Err(SemanticViolation::new(format!(
-                "stock ({}, {}) s_ytd must be finite and non-negative",
-                line.supply_warehouse, line.item_id
-            )));
-        }
-        let stock_order_count = row_int32(
-            stock,
-            2,
-            &format!(
-                "New-Order stock ({}, {})",
-                line.supply_warehouse, line.item_id
-            ),
-        )?;
-        let stock_remote_count = row_int32(
-            stock,
-            3,
-            &format!(
-                "New-Order stock ({}, {})",
-                line.supply_warehouse, line.item_id
-            ),
-        )?;
-        if stock_order_count < 0 || stock_remote_count < 0 || stock_remote_count > stock_order_count
-        {
-            return Err(SemanticViolation::new(format!(
-                "stock ({}, {}) has invalid counters ({stock_order_count},{stock_remote_count})",
-                line.supply_warehouse, line.item_id
-            )));
-        }
-        let stock_version = StockVersion {
-            quantity: stock_quantity,
-            ytd_bits: stock_ytd_bits,
-            order_count: stock_order_count,
-            remote_count: stock_remote_count,
-        };
-        require_char_range(
-            row_char(
-                stock,
-                4,
-                &format!(
-                    "New-Order stock ({}, {})",
-                    line.supply_warehouse, line.item_id
-                ),
-            )?,
-            26,
-            50,
-            "stock.s_data",
-        )?;
-        for column in 5..15 {
-            require_char_range(
-                row_char(
-                    stock,
-                    column,
-                    &format!(
-                        "New-Order stock ({}, {})",
-                        line.supply_warehouse, line.item_id
-                    ),
-                )?,
-                24,
-                24,
-                &format!("stock.s_dist_{:02}", column - 4),
-            )?;
-        }
         let district_info = row_char(
             stock,
-            input.district_id as usize + 4,
+            1,
             &format!(
                 "New-Order stock ({}, {})",
                 line.supply_warehouse, line.item_id
@@ -537,10 +469,10 @@ fn parse_stage_one(
         require_char_range(&district_info, 24, 24, "stock district information")?;
 
         let key = line.stock_key();
-        if let Some((previous_version, previous_info)) =
-            stock_snapshots.insert(key, (stock_version.clone(), district_info.clone()))
+        if let Some((previous_quantity, previous_info)) =
+            stock_snapshots.insert(key, (stock_quantity, district_info.clone()))
         {
-            if previous_version != stock_version || previous_info != district_info {
+            if previous_quantity != stock_quantity || previous_info != district_info {
                 return Err(SemanticViolation::new(format!(
                     "stock ({}, {}) returned inconsistent rows inside one snapshot",
                     line.supply_warehouse, line.item_id
@@ -846,11 +778,11 @@ mod tests {
                 StatementId::NewOrderLockStock.wire_id(),
                 StatementId::NewOrderLockStock.wire_id(),
                 StatementId::NewOrderItem.wire_id(),
-                StatementId::NewOrderStock.wire_id(),
+                StatementId::NewOrderStockD03.wire_id(),
                 StatementId::NewOrderItem.wire_id(),
-                StatementId::NewOrderStock.wire_id(),
+                StatementId::NewOrderStockD03.wire_id(),
                 StatementId::NewOrderItem.wire_id(),
-                StatementId::NewOrderStock.wire_id(),
+                StatementId::NewOrderStockD03.wire_id(),
             ]
         );
         assert_eq!(

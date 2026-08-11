@@ -62,13 +62,26 @@ pub enum StatementId {
     DeliveryUpdateLines = 79,
     DeliveryUpdateCustomer = 80,
     DeliveryCustomerAfter = 81,
+    DeliveryEarlierQueueCount = 82,
+    DeliveryExactQueueCount = 83,
 
     StockLevelNextOrder = 89,
     StockLevelCount = 90,
+
+    NewOrderStockD02 = 91,
+    NewOrderStockD03 = 92,
+    NewOrderStockD04 = 93,
+    NewOrderStockD05 = 94,
+    NewOrderStockD06 = 95,
+    NewOrderStockD07 = 96,
+    NewOrderStockD08 = 97,
+    NewOrderStockD09 = 98,
+    NewOrderStockD10 = 99,
+    PreflightNewOrderStockVersion = 100,
 }
 
 impl StatementId {
-    pub const ALL: [Self; 42] = [
+    pub const BASE: [Self; 42] = [
         Self::Begin,
         Self::Commit,
         Self::Abort,
@@ -111,6 +124,78 @@ impl StatementId {
         Self::DeliveryCustomerAfter,
         Self::StockLevelNextOrder,
         Self::StockLevelCount,
+    ];
+
+    pub const SUPPLEMENTAL: [Self; 12] = [
+        Self::DeliveryEarlierQueueCount,
+        Self::DeliveryExactQueueCount,
+        Self::NewOrderStockD02,
+        Self::NewOrderStockD03,
+        Self::NewOrderStockD04,
+        Self::NewOrderStockD05,
+        Self::NewOrderStockD06,
+        Self::NewOrderStockD07,
+        Self::NewOrderStockD08,
+        Self::NewOrderStockD09,
+        Self::NewOrderStockD10,
+        Self::PreflightNewOrderStockVersion,
+    ];
+
+    pub const ALL: [Self; 54] = [
+        Self::Begin,
+        Self::Commit,
+        Self::Abort,
+        Self::NewOrderHome,
+        Self::NewOrderLockStock,
+        Self::NewOrderItem,
+        Self::NewOrderStock,
+        Self::NewOrderAdvanceDistrict,
+        Self::NewOrderInsertOrder,
+        Self::NewOrderInsertQueue,
+        Self::NewOrderUpdateStockNormal,
+        Self::NewOrderUpdateStockWrapped,
+        Self::NewOrderInsertLine,
+        Self::PaymentWarehouse,
+        Self::PaymentUpdateWarehouse,
+        Self::PaymentDistrict,
+        Self::PaymentUpdateDistrict,
+        Self::PaymentCustomerById,
+        Self::PaymentCustomerByLast,
+        Self::PaymentUpdateGoodCustomer,
+        Self::PaymentUpdateBadCustomer,
+        Self::PaymentInsertHistory,
+        Self::PaymentCustomerAfter,
+        Self::OrderStatusCustomerById,
+        Self::OrderStatusCustomerByLast,
+        Self::OrderStatusLatestOrder,
+        Self::OrderStatusOrder,
+        Self::OrderStatusLines,
+        Self::DeliveryOldestOrder,
+        Self::DeliveryLockQueue,
+        Self::DeliveryConfirmQueue,
+        Self::DeliveryOrder,
+        Self::DeliveryCustomer,
+        Self::DeliveryLineRows,
+        Self::DeliveryLineSum,
+        Self::DeliveryDeleteQueue,
+        Self::DeliveryUpdateOrder,
+        Self::DeliveryUpdateLines,
+        Self::DeliveryUpdateCustomer,
+        Self::DeliveryCustomerAfter,
+        Self::StockLevelNextOrder,
+        Self::StockLevelCount,
+        Self::DeliveryEarlierQueueCount,
+        Self::DeliveryExactQueueCount,
+        Self::NewOrderStockD02,
+        Self::NewOrderStockD03,
+        Self::NewOrderStockD04,
+        Self::NewOrderStockD05,
+        Self::NewOrderStockD06,
+        Self::NewOrderStockD07,
+        Self::NewOrderStockD08,
+        Self::NewOrderStockD09,
+        Self::NewOrderStockD10,
+        Self::PreflightNewOrderStockVersion,
     ];
 
     pub const fn wire_id(self) -> u16 {
@@ -159,9 +244,37 @@ impl StatementId {
             Self::DeliveryUpdateLines => "delivery.update_lines",
             Self::DeliveryUpdateCustomer => "delivery.update_customer",
             Self::DeliveryCustomerAfter => "delivery.customer_after",
+            Self::DeliveryEarlierQueueCount => "delivery.earlier_queue_count",
+            Self::DeliveryExactQueueCount => "delivery.exact_queue_count",
             Self::StockLevelNextOrder => "stock_level.next_order",
             Self::StockLevelCount => "stock_level.count",
+            Self::NewOrderStockD02 => "new_order.stock_d02",
+            Self::NewOrderStockD03 => "new_order.stock_d03",
+            Self::NewOrderStockD04 => "new_order.stock_d04",
+            Self::NewOrderStockD05 => "new_order.stock_d05",
+            Self::NewOrderStockD06 => "new_order.stock_d06",
+            Self::NewOrderStockD07 => "new_order.stock_d07",
+            Self::NewOrderStockD08 => "new_order.stock_d08",
+            Self::NewOrderStockD09 => "new_order.stock_d09",
+            Self::NewOrderStockD10 => "new_order.stock_d10",
+            Self::PreflightNewOrderStockVersion => "preflight.new_order_stock_version",
         }
+    }
+}
+
+pub const fn new_order_stock_statement(district_id: i32) -> Option<StatementId> {
+    match district_id {
+        1 => Some(StatementId::NewOrderStock),
+        2 => Some(StatementId::NewOrderStockD02),
+        3 => Some(StatementId::NewOrderStockD03),
+        4 => Some(StatementId::NewOrderStockD04),
+        5 => Some(StatementId::NewOrderStockD05),
+        6 => Some(StatementId::NewOrderStockD06),
+        7 => Some(StatementId::NewOrderStockD07),
+        8 => Some(StatementId::NewOrderStockD08),
+        9 => Some(StatementId::NewOrderStockD09),
+        10 => Some(StatementId::NewOrderStockD10),
+        _ => None,
     }
 }
 
@@ -195,7 +308,18 @@ const NEW_ORDER_HOME: &[StatementId] = &[StatementId::NewOrderHome];
 const NEW_ORDER_DISTRICT: &[StatementId] = &[StatementId::StockLevelNextOrder];
 const NEW_ORDER_LOCK_STOCK: &[StatementId] = &[StatementId::NewOrderLockStock];
 const NEW_ORDER_ITEM: &[StatementId] = &[StatementId::NewOrderItem];
-const NEW_ORDER_STOCK: &[StatementId] = &[StatementId::NewOrderStock];
+const NEW_ORDER_STOCK: &[StatementId] = &[
+    StatementId::NewOrderStock,
+    StatementId::NewOrderStockD02,
+    StatementId::NewOrderStockD03,
+    StatementId::NewOrderStockD04,
+    StatementId::NewOrderStockD05,
+    StatementId::NewOrderStockD06,
+    StatementId::NewOrderStockD07,
+    StatementId::NewOrderStockD08,
+    StatementId::NewOrderStockD09,
+    StatementId::NewOrderStockD10,
+];
 const NEW_ORDER_ADVANCE_DISTRICT: &[StatementId] = &[StatementId::NewOrderAdvanceDistrict];
 const NEW_ORDER_INSERT_ORDER: &[StatementId] = &[StatementId::NewOrderInsertOrder];
 const NEW_ORDER_INSERT_QUEUE: &[StatementId] = &[StatementId::NewOrderInsertQueue];
@@ -556,7 +680,7 @@ pub const STOCK_LEVEL_STAGES: &[StageTemplate] = &[
 pub fn final2026_catalog() -> Vec<Statement> {
     use SqlType::{Char, Float32, Int32};
 
-    vec![
+    let mut catalog = vec![
         command(StatementId::Begin, &[], "BEGIN;"),
         command(StatementId::Commit, &[], "COMMIT;"),
         command(StatementId::Abort, &[], "ABORT;"),
@@ -594,36 +718,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
                 ("i_data", Char),
             ],
         ),
-        query(
-            StatementId::NewOrderStock,
-            &[Int32, Int32],
-            "SELECT s_quantity, s_ytd, \
-             s_order_cnt, s_remote_cnt, \
-             s_data, \
-             s_dist_01, s_dist_02, \
-             s_dist_03, s_dist_04, \
-             s_dist_05, s_dist_06, \
-             s_dist_07, s_dist_08, \
-             s_dist_09, s_dist_10 \
-             FROM stock WHERE s_w_id = $1 AND s_i_id = $2;",
-            &[
-                ("s_quantity", Int32),
-                ("s_ytd", Float32),
-                ("s_order_cnt", Int32),
-                ("s_remote_cnt", Int32),
-                ("s_data", Char),
-                ("s_dist_01", Char),
-                ("s_dist_02", Char),
-                ("s_dist_03", Char),
-                ("s_dist_04", Char),
-                ("s_dist_05", Char),
-                ("s_dist_06", Char),
-                ("s_dist_07", Char),
-                ("s_dist_08", Char),
-                ("s_dist_09", Char),
-                ("s_dist_10", Char),
-            ],
-        ),
+        new_order_stock_query(StatementId::NewOrderStock, 1),
         command(
             StatementId::NewOrderAdvanceDistrict,
             &[Int32, Int32],
@@ -906,7 +1001,61 @@ pub fn final2026_catalog() -> Vec<Statement> {
              AND stock.s_quantity < $5;",
             &[("low_stock_count", Int32)],
         ),
-    ]
+    ];
+    catalog.extend([
+        query(
+            StatementId::DeliveryEarlierQueueCount,
+            &[Int32, Int32, Int32],
+            "SELECT COUNT(*) FROM new_orders \
+             WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id < $3;",
+            &[("earlier_queue_count", Int32)],
+        ),
+        query(
+            StatementId::DeliveryExactQueueCount,
+            &[Int32, Int32, Int32],
+            "SELECT COUNT(*) FROM new_orders \
+             WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id = $3;",
+            &[("exact_queue_count", Int32)],
+        ),
+        new_order_stock_query(StatementId::NewOrderStockD02, 2),
+        new_order_stock_query(StatementId::NewOrderStockD03, 3),
+        new_order_stock_query(StatementId::NewOrderStockD04, 4),
+        new_order_stock_query(StatementId::NewOrderStockD05, 5),
+        new_order_stock_query(StatementId::NewOrderStockD06, 6),
+        new_order_stock_query(StatementId::NewOrderStockD07, 7),
+        new_order_stock_query(StatementId::NewOrderStockD08, 8),
+        new_order_stock_query(StatementId::NewOrderStockD09, 9),
+        new_order_stock_query(StatementId::NewOrderStockD10, 10),
+        query(
+            StatementId::PreflightNewOrderStockVersion,
+            &[Int32, Int32],
+            "SELECT s_quantity, s_ytd, s_order_cnt, s_remote_cnt \
+             FROM stock WHERE s_w_id = $1 AND s_i_id = $2;",
+            &[
+                ("s_quantity", Int32),
+                ("s_ytd", Float32),
+                ("s_order_cnt", Int32),
+                ("s_remote_cnt", Int32),
+            ],
+        ),
+    ]);
+    catalog
+}
+
+fn new_order_stock_query(id: StatementId, district_id: i32) -> Statement {
+    use SqlType::{Char, Int32};
+
+    assert!((1..=10).contains(&district_id));
+    let district_column = format!("s_dist_{district_id:02}");
+    query(
+        id,
+        &[Int32, Int32],
+        &format!(
+            "SELECT s_quantity, {district_column} \
+             FROM stock WHERE s_w_id = $1 AND s_i_id = $2;"
+        ),
+        &[("s_quantity", Int32), (district_column.as_str(), Char)],
+    )
 }
 
 /// Render one complete per-run catalogue from the persisted opaque layout.

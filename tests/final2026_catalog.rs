@@ -26,9 +26,13 @@ use std::collections::BTreeSet;
 use connection::prepared::{Statement, StatementKind};
 use connection::wire::SqlType;
 use ranking::catalog::{
-    final2026_catalog, validate_catalog, Multiplicity, StatementId, DELIVERY_EMPTY_STAGE,
-    DELIVERY_STAGES, NEW_ORDER_EXPECTED_ROLLBACK_STAGE, NEW_ORDER_STAGES, ORDER_STATUS_STAGES,
-    PAYMENT_STAGES, STOCK_LEVEL_STAGES, UNDELIVERED_CARRIER_ID, UNDELIVERED_DATE,
+    final2026_catalog, new_order_stock_statement, validate_catalog, Multiplicity, StatementId,
+    DELIVERY_EMPTY_STAGE, DELIVERY_STAGES, NEW_ORDER_EXPECTED_ROLLBACK_STAGE, NEW_ORDER_STAGES,
+    ORDER_STATUS_STAGES, PAYMENT_STAGES, STOCK_LEVEL_STAGES, UNDELIVERED_CARRIER_ID,
+    UNDELIVERED_DATE,
+};
+use runtime_schema::{
+    RuntimeSchema, FINAL2026_STATEMENT_KEYS, FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS,
 };
 
 fn find(catalog: &[Statement], id: StatementId) -> &Statement {
@@ -42,6 +46,22 @@ fn find(catalog: &[Statement], id: StatementId) -> &Statement {
 fn catalogue_has_unique_bounded_ids_and_dense_typed_markers() {
     let catalog = final2026_catalog();
     validate_catalog(&catalog).expect("valid public final catalogue");
+    assert_eq!(catalog.len(), 54);
+    assert_eq!(StatementId::BASE.len(), 42);
+    assert_eq!(StatementId::SUPPLEMENTAL.len(), 12);
+    assert_eq!(StatementId::ALL.len(), 54);
+    assert_eq!(
+        StatementId::BASE.map(StatementId::key),
+        FINAL2026_STATEMENT_KEYS
+    );
+    assert_eq!(
+        StatementId::SUPPLEMENTAL.map(StatementId::key),
+        FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS
+    );
+    assert_eq!(
+        StatementId::SUPPLEMENTAL.map(StatementId::wire_id),
+        [82, 83, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100]
+    );
 
     let ids: BTreeSet<_> = catalog.iter().map(|statement| statement.id).collect();
     assert_eq!(ids.len(), catalog.len());
@@ -61,6 +81,32 @@ fn catalogue_has_unique_bounded_ids_and_dense_typed_markers() {
             .contains("dense schema"),
         "a missing type declaration must reject the $1..$10 SQL"
     );
+}
+
+#[test]
+fn supplemental_catalogue_preserves_the_persisted_42_statement_cache() {
+    let schema = RuntimeSchema::opaque(2026).unwrap();
+    assert_eq!(schema.fingerprint(), 0x7167_a66c_d8d9_bac0);
+    let encoded = schema.encode();
+    assert_eq!(
+        encoded
+            .lines()
+            .filter(|line| line.starts_with("statement="))
+            .count(),
+        42
+    );
+    assert!(FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS
+        .iter()
+        .all(|key| !encoded.contains(*key)));
+
+    let decoded = RuntimeSchema::decode(&encoded).unwrap();
+    assert_eq!(decoded.encode(), encoded);
+    for id in StatementId::SUPPLEMENTAL {
+        assert_eq!(
+            decoded.statements().id(id.key()).unwrap(),
+            schema.statements().id(id.key()).unwrap()
+        );
+    }
 }
 
 #[test]
@@ -106,19 +152,35 @@ fn query_schemas_use_declared_names_and_exact_wire_types() {
         ],
     );
 
-    let stock = find(&catalog, StatementId::NewOrderStock);
-    let StatementKind::Query { columns } = &stock.kind else {
-        panic!("stock lookup must be a query");
-    };
-    assert_eq!(columns.len(), 15);
-    assert_eq!(columns[0].sql_type, SqlType::Int32);
-    assert_eq!(columns[1].sql_type, SqlType::Float32);
-    assert!(columns[2..4]
-        .iter()
-        .all(|column| column.sql_type == SqlType::Int32));
-    assert!(columns[4..]
-        .iter()
-        .all(|column| column.sql_type == SqlType::Char));
+    for district_id in 1..=10 {
+        let id = new_order_stock_statement(district_id).unwrap();
+        let stock = find(&catalog, id);
+        let StatementKind::Query { columns } = &stock.kind else {
+            panic!("district {district_id} stock lookup must be a query");
+        };
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "s_quantity");
+        assert_eq!(columns[0].sql_type, SqlType::Int32);
+        assert_eq!(columns[1].name, format!("s_dist_{district_id:02}"));
+        assert_eq!(columns[1].sql_type, SqlType::Char);
+        assert!(stock.sql.starts_with(&format!(
+            "SELECT s_quantity, s_dist_{district_id:02} FROM stock"
+        )));
+        assert!(!stock.sql.contains("s_ytd"));
+        assert!(!stock.sql.contains("s_order_cnt"));
+        assert!(!stock.sql.contains("s_remote_cnt"));
+        assert!(!stock.sql.contains("s_data"));
+    }
+
+    assert_query_columns(
+        find(&catalog, StatementId::PreflightNewOrderStockVersion),
+        &[
+            ("s_quantity", SqlType::Int32),
+            ("s_ytd", SqlType::Float32),
+            ("s_order_cnt", SqlType::Int32),
+            ("s_remote_cnt", SqlType::Int32),
+        ],
+    );
 
     let payment_by_last = find(&catalog, StatementId::PaymentCustomerByLast);
     assert_eq!(
@@ -235,6 +297,27 @@ fn delivery_reads_rows_and_sum_with_the_full_partition_key() {
         find(&catalog, StatementId::DeliveryLineSum),
         &[("ol_amount_sum", SqlType::Float32)],
     );
+
+    for (id, predicate, column) in [
+        (
+            StatementId::DeliveryEarlierQueueCount,
+            "no_o_id < $3",
+            "earlier_queue_count",
+        ),
+        (
+            StatementId::DeliveryExactQueueCount,
+            "no_o_id = $3",
+            "exact_queue_count",
+        ),
+    ] {
+        let statement = find(&catalog, id);
+        assert_eq!(statement.param_types, vec![SqlType::Int32; 3]);
+        assert!(statement.sql.contains("COUNT(*)"));
+        assert!(statement.sql.contains("no_w_id = $1"));
+        assert!(statement.sql.contains("no_d_id = $2"));
+        assert!(statement.sql.contains(predicate));
+        assert_query_columns(statement, &[(column, SqlType::Int32)]);
+    }
 }
 
 #[test]
@@ -301,6 +384,13 @@ fn stage_templates_preserve_the_ranked_round_trip_shapes() {
     assert!(NEW_ORDER_STAGES[0].steps.iter().any(|step| {
         step.multiplicity == Multiplicity::Once
             && step.alternatives == &[StatementId::StockLevelNextOrder]
+    }));
+    let district_stock_statements = (1..=10)
+        .map(|district_id| new_order_stock_statement(district_id).unwrap())
+        .collect::<Vec<_>>();
+    assert!(NEW_ORDER_STAGES[0].steps.iter().any(|step| {
+        step.multiplicity == Multiplicity::PerOrderLine
+            && step.alternatives == district_stock_statements.as_slice()
     }));
     assert!(!NEW_ORDER_STAGES[1].steps.iter().any(|step| {
         step.alternatives == &[StatementId::NewOrderStock]

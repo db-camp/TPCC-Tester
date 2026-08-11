@@ -16,7 +16,9 @@ use crate::error::TpccError;
 use crate::profile::{DISTRICTS_PER_WAREHOUSE, ITEM_COUNT};
 use crate::workload::{CUSTOMERS_PER_DISTRICT, INVALID_ITEM_ID};
 
-use super::catalog::{StatementId, UNDELIVERED_CARRIER_ID, UNDELIVERED_DATE};
+use super::catalog::{
+    new_order_stock_statement, StatementId, UNDELIVERED_CARRIER_ID, UNDELIVERED_DATE,
+};
 use super::common::{
     accept_batch, f32_add_bits, operation, row_char, row_f32_bits, row_int32, BatchExecutionError,
     BatchResults,
@@ -282,6 +284,7 @@ async fn verify_stock_level(
     let reconstructed_count = reconstruct_low_stock_count(
         client,
         selection.warehouse_id,
+        selection.district_id,
         selection.stock_threshold,
         &distinct_items,
     )
@@ -340,6 +343,7 @@ fn collect_distinct_line_items(
 async fn reconstruct_low_stock_count(
     client: &mut RmdbClient,
     warehouse_id: i32,
+    district_id: i32,
     threshold: i32,
     distinct_items: &BTreeSet<i32>,
 ) -> Result<i32, TpccError> {
@@ -350,7 +354,8 @@ async fn reconstruct_low_stock_count(
             .iter()
             .map(|item_id| {
                 operation(
-                    StatementId::NewOrderStock,
+                    new_order_stock_statement(district_id)
+                        .expect("validated StockLevel district lost its stock projection"),
                     [WireValue::Int32(warehouse_id), WireValue::Int32(*item_id)],
                 )
             })
@@ -372,11 +377,11 @@ async fn reconstruct_low_stock_count(
                     return abort_after_error(client, preflight_semantic(error.to_string())).await
                 }
             };
-            let stock = match parse_stock_version(row, warehouse_id, *item_id) {
+            let (quantity, _) = match parse_business_stock(row, warehouse_id, *item_id) {
                 Ok(stock) => stock,
                 Err(error) => return abort_after_error(client, preflight_semantic(error)).await,
             };
-            if stock.quantity < threshold {
+            if quantity < threshold {
                 low_stock_count = low_stock_count
                     .checked_add(1)
                     .ok_or_else(|| preflight_protocol("StockLevel reconstructed count overflow"))?;
@@ -898,11 +903,18 @@ fn exact_f32_mismatch(actual_bits: u32, expected_bits: u32, context: &str) -> St
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct NewOrderLineQueryIndices {
+    item: usize,
+    stock: usize,
+    stock_version: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct NewOrderStageOnePlan {
     operations: Vec<Operation>,
     home_result: usize,
     district_result: usize,
-    line_results: Vec<(usize, usize)>,
+    line_results: Vec<NewOrderLineQueryIndices>,
 }
 
 fn build_new_order_stage_one(selection: &PreflightSelection) -> NewOrderStageOnePlan {
@@ -924,6 +936,8 @@ fn build_new_order_stage_one(selection: &PreflightSelection) -> NewOrderStageOne
     }
 
     let mut line_results = Vec::with_capacity(PREFLIGHT_VALID_LINES + 1);
+    let stock_statement = new_order_stock_statement(selection.district_id)
+        .expect("validated NewOrder preflight district lost its stock projection");
     for item_id in selection.all_item_ids() {
         let item_result = operations.len();
         operations.push(operation(
@@ -932,13 +946,25 @@ fn build_new_order_stage_one(selection: &PreflightSelection) -> NewOrderStageOne
         ));
         let stock_result = operations.len();
         operations.push(operation(
-            StatementId::NewOrderStock,
+            stock_statement,
             [
                 WireValue::Int32(selection.warehouse_id),
                 WireValue::Int32(item_id),
             ],
         ));
-        line_results.push((item_result, stock_result));
+        let stock_version_result = operations.len();
+        operations.push(operation(
+            StatementId::PreflightNewOrderStockVersion,
+            [
+                WireValue::Int32(selection.warehouse_id),
+                WireValue::Int32(item_id),
+            ],
+        ));
+        line_results.push(NewOrderLineQueryIndices {
+            item: item_result,
+            stock: stock_result,
+            stock_version: stock_version_result,
+        });
     }
 
     NewOrderStageOnePlan {
@@ -991,20 +1017,26 @@ fn parse_new_order_stage_one(
         return Err("NewOrder preflight result map does not match its lines".to_owned());
     }
     let mut lines = Vec::with_capacity(selection.valid_lines.len());
-    for (index, ((item_result, stock_result), item_id)) in
-        plan.line_results.iter().zip(all_items.iter()).enumerate()
+    for (index, (indices, item_id)) in plan
+        .line_results
+        .iter()
+        .zip(all_items.iter())
+        .enumerate()
     {
         let item_rows = results
-            .rows(*item_result)
+            .rows(indices.item)
             .map_err(|error| error.to_string())?;
         let stock_rows = results
-            .rows(*stock_result)
+            .rows(indices.stock)
+            .map_err(|error| error.to_string())?;
+        let stock_version_rows = results
+            .rows(indices.stock_version)
             .map_err(|error| error.to_string())?;
         if index == selection.valid_lines.len() {
             if *item_id != INVALID_ITEM_ID as i32 {
                 return Err("NewOrder preflight invalid item is not final".to_owned());
             }
-            if !item_rows.is_empty() || !stock_rows.is_empty() {
+            if !item_rows.is_empty() || !stock_rows.is_empty() || !stock_version_rows.is_empty() {
                 return Err(format!(
                     "NewOrder preflight invalid final item {item_id} unexpectedly resolved"
                 ));
@@ -1043,29 +1075,26 @@ fn parse_new_order_stage_one(
                 warehouse = selection.warehouse_id
             ),
         )?;
-        let stock = parse_stock_version(stock_row, selection.warehouse_id, *item_id)?;
-        if stock_row.len() != 15 {
-            return Err(format!(
-                "NewOrder preflight stock ({}, {item_id}) returned {} columns, expected 15",
-                selection.warehouse_id,
-                stock_row.len()
-            ));
-        }
-        let district_info = row_char(
-            stock_row,
-            selection.district_id as usize + 4,
+        let (business_quantity, district_info) =
+            parse_business_stock(stock_row, selection.warehouse_id, *item_id)?;
+        let stock_version_row = exactly_one_row(
+            stock_version_rows,
             &format!(
-                "NewOrder preflight stock ({}, {item_id})",
+                "NewOrder preflight stock version ({}, {item_id})",
                 selection.warehouse_id
             ),
-        )
-        .map_err(|error| error.to_string())?
-        .to_vec();
-        if district_info.len() != 24 {
+        )?;
+        let stock = parse_stock_version(
+            stock_version_row,
+            selection.warehouse_id,
+            *item_id,
+        )?;
+        if stock.quantity != business_quantity {
             return Err(format!(
-                "NewOrder preflight stock ({}, {item_id}) district data has {} bytes, expected 24",
+                "NewOrder preflight stock ({}, {item_id}) business quantity {} disagrees with version quantity {}",
                 selection.warehouse_id,
-                district_info.len()
+                business_quantity,
+                stock.quantity
             ));
         }
 
@@ -1207,7 +1236,7 @@ fn append_new_order_state_probe(
     for line in &selection.valid_lines {
         stock_results.push((line.item_id, operations.len()));
         operations.push(operation(
-            StatementId::NewOrderStock,
+            StatementId::PreflightNewOrderStockVersion,
             [
                 WireValue::Int32(selection.warehouse_id),
                 WireValue::Int32(line.item_id),
@@ -1515,14 +1544,42 @@ fn order_key_parameters(selection: &PreflightSelection, order_id: i32) -> Vec<Wi
     ]
 }
 
+fn parse_business_stock(
+    row: &[WireValue],
+    warehouse_id: i32,
+    item_id: i32,
+) -> Result<(i32, Vec<u8>), String> {
+    if row.len() != 2 {
+        return Err(format!(
+            "business stock ({warehouse_id}, {item_id}) returned {} columns, expected 2",
+            row.len()
+        ));
+    }
+    let context = format!("business stock ({warehouse_id}, {item_id})");
+    let quantity = row_int32(row, 0, &context).map_err(|error| error.to_string())?;
+    if !(10..=100).contains(&quantity) {
+        return Err(format!("{context} quantity {quantity} is outside 10..=100"));
+    }
+    let district_info = row_char(row, 1, &context)
+        .map_err(|error| error.to_string())?
+        .to_vec();
+    if district_info.len() != 24 {
+        return Err(format!(
+            "{context} district data has {} bytes, expected 24",
+            district_info.len()
+        ));
+    }
+    Ok((quantity, district_info))
+}
+
 fn parse_stock_version(
     row: &[WireValue],
     warehouse_id: i32,
     item_id: i32,
 ) -> Result<StockVersion, String> {
-    if row.len() != 15 {
+    if row.len() != 4 {
         return Err(format!(
-            "stock ({warehouse_id}, {item_id}) returned {} columns, expected 15",
+            "stock ({warehouse_id}, {item_id}) returned {} columns, expected 4",
             row.len()
         ));
     }
@@ -1534,8 +1591,9 @@ fn parse_stock_version(
     if !(10..=100).contains(&quantity) {
         return Err(format!("{context} quantity {quantity} is outside 10..=100"));
     }
-    if f32::from_bits(ytd_bits) < 0.0 {
-        return Err(format!("{context} ytd is negative"));
+    let ytd = f32::from_bits(ytd_bits);
+    if !ytd.is_finite() || ytd < 0.0 {
+        return Err(format!("{context} ytd must be finite and non-negative"));
     }
     if order_count < 0 || !(0..=order_count).contains(&remote_count) {
         return Err(format!(
@@ -1761,15 +1819,19 @@ mod tests {
     }
 
     fn stock_row(stock: &StockVersion) -> Vec<WireValue> {
-        let mut row = vec![
+        vec![
             WireValue::Int32(stock.quantity),
             WireValue::Float32(stock.ytd_bits),
             WireValue::Int32(stock.order_count),
             WireValue::Int32(stock.remote_count),
-            WireValue::Char(vec![b'x'; 26]),
-        ];
-        row.extend((0..10).map(|_| WireValue::Char(vec![b'd'; 24])));
-        row
+        ]
+    }
+
+    fn business_stock_row(quantity: i32) -> Vec<WireValue> {
+        vec![
+            WireValue::Int32(quantity),
+            WireValue::Char(vec![b'd'; 24]),
+        ]
     }
 
     fn new_order_district_row(next_order_id: i32) -> Vec<WireValue> {
@@ -2245,7 +2307,9 @@ mod tests {
             parse_payment_warehouse_bits(&results, 0, "test").unwrap(),
             INITIAL_WAREHOUSE_YTD_BITS
         );
-        assert_eq!(StatementId::ALL.len(), 42);
+        assert_eq!(StatementId::BASE.len(), 42);
+        assert_eq!(StatementId::SUPPLEMENTAL.len(), 12);
+        assert_eq!(StatementId::ALL.len(), 54);
     }
 
     #[test]
@@ -2255,6 +2319,11 @@ mod tests {
             parse_stock_version(&stock_row(&stock), 1, 2).unwrap(),
             stock
         );
-        assert!(parse_stock_version(&stock_row(&stock)[..14], 1, 2).is_err());
+        assert!(parse_stock_version(&stock_row(&stock)[..3], 1, 2).is_err());
+        assert_eq!(
+            parse_business_stock(&business_stock_row(42), 1, 2).unwrap(),
+            (42, vec![b'd'; 24])
+        );
+        assert!(parse_business_stock(&stock_row(&stock), 1, 2).is_err());
     }
 }

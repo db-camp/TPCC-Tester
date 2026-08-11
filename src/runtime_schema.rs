@@ -18,6 +18,8 @@ const DOMAIN_TABLE_NAMES: &str = "final2026/runtime/table-name/v1";
 const DOMAIN_COLUMN_NAMES: &str = "final2026/runtime/column-name/v1";
 const DOMAIN_CSV_NAMES: &str = "final2026/runtime/csv-basename/v1";
 const DOMAIN_STATEMENT_IDS: &str = "final2026/runtime/statement-id/v1";
+const DOMAIN_SUPPLEMENTAL_STATEMENT_IDS: &str =
+    "final2026/runtime/supplemental-statement-id/v1";
 const DOMAIN_CREATE_ORDER: &str = "final2026/setup/create-order/v1";
 const DOMAIN_INDEX_ORDER: &str = "final2026/setup/index-order/v1";
 const DOMAIN_LOAD_ORDER: &str = "final2026/setup/load-order/v1";
@@ -300,6 +302,30 @@ const CANONICAL_STATEMENT_IDS: [u16; 42] = [
     51, 52, 53, 54, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 89, 90,
 ];
 
+/// Runtime-only prepared statements layered over the persisted 42-key layout.
+///
+/// These keys are deliberately excluded from `RuntimeSchema::encode` and its
+/// fingerprint. Their ids are reconstructed deterministically from the
+/// persisted base mapping so existing schema caches remain byte-for-byte
+/// compatible.
+pub const FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS: [&str; 12] = [
+    "delivery.earlier_queue_count",
+    "delivery.exact_queue_count",
+    "new_order.stock_d02",
+    "new_order.stock_d03",
+    "new_order.stock_d04",
+    "new_order.stock_d05",
+    "new_order.stock_d06",
+    "new_order.stock_d07",
+    "new_order.stock_d08",
+    "new_order.stock_d09",
+    "new_order.stock_d10",
+    "preflight.new_order_stock_version",
+];
+
+const CANONICAL_SUPPLEMENTAL_STATEMENT_IDS: [u16; 12] =
+    [82, 83, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100];
+
 pub const SETUP_CHECK_KEYS: [&str; 18] = [
     "setup.orders.sum_o_ol_cnt",
     "setup.stock.quantity_range",
@@ -409,6 +435,7 @@ impl SetupSchedule {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatementLayout {
     ids: BTreeMap<String, u16>,
+    supplemental_ids: BTreeMap<String, u16>,
 }
 
 impl StatementLayout {
@@ -426,20 +453,37 @@ impl StatementLayout {
                 ));
             }
         }
-        Ok(Self { ids })
+        Self::from_base(ids, mode)
+    }
+
+    fn from_base(
+        ids: BTreeMap<String, u16>,
+        mode: SchemaMode,
+    ) -> Result<Self, RuntimeSchemaError> {
+        let supplemental_ids = derive_supplemental_statement_ids(&ids, mode)?;
+        let layout = Self {
+            ids,
+            supplemental_ids,
+        };
+        layout.validate(mode)?;
+        Ok(layout)
     }
 
     pub fn id(&self, key: &str) -> Result<u16, RuntimeSchemaError> {
-        self.ids.get(key).copied().ok_or_else(|| {
-            RuntimeSchemaError::Invalid(format!("unknown logical statement key {key:?}"))
-        })
+        self.ids
+            .get(key)
+            .or_else(|| self.supplemental_ids.get(key))
+            .copied()
+            .ok_or_else(|| {
+                RuntimeSchemaError::Invalid(format!("unknown logical statement key {key:?}"))
+            })
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&str, u16)> {
         self.ids.iter().map(|(key, id)| (key.as_str(), *id))
     }
 
-    fn validate(&self) -> Result<(), RuntimeSchemaError> {
+    fn validate(&self, mode: SchemaMode) -> Result<(), RuntimeSchemaError> {
         if self.ids.len() != FINAL2026_STATEMENT_KEYS.len() {
             return Err(RuntimeSchemaError::Invalid(format!(
                 "statement layout has {} entries, expected {}",
@@ -455,6 +499,26 @@ impl StatementLayout {
                     "statement ids must be non-zero and unique".to_owned(),
                 ));
             }
+        }
+        if self.supplemental_ids.len() != FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS.len() {
+            return Err(RuntimeSchemaError::Invalid(format!(
+                "supplemental statement layout has {} entries, expected {}",
+                self.supplemental_ids.len(),
+                FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS.len()
+            )));
+        }
+        for key in FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS {
+            let id = self.id(key)?;
+            if id == 0 || !ids.insert(id) {
+                return Err(RuntimeSchemaError::Invalid(
+                    "base and supplemental statement ids must be non-zero and unique".to_owned(),
+                ));
+            }
+        }
+        if self.supplemental_ids != derive_supplemental_statement_ids(&self.ids, mode)? {
+            return Err(RuntimeSchemaError::Invalid(
+                "supplemental statement ids do not match the persisted base mapping".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -841,7 +905,7 @@ impl RuntimeSchema {
             tables,
             columns,
             csv_basenames,
-            statements: StatementLayout { ids: statement_ids },
+            statements: StatementLayout::from_base(statement_ids, mode)?,
             schedule,
             fingerprint,
         };
@@ -931,7 +995,7 @@ impl RuntimeSchema {
                 ));
             }
         }
-        self.statements.validate()?;
+        self.statements.validate(self.mode)?;
         self.schedule.validate()?;
         Ok(())
     }
@@ -1049,6 +1113,81 @@ fn derive_unique_statement_id(seed: u64, key: &str, used: &BTreeSet<u16>) -> u16
         }
     }
     unreachable!("u16 statement-id namespace exhausted")
+}
+
+fn derive_supplemental_statement_ids(
+    base_ids: &BTreeMap<String, u16>,
+    mode: SchemaMode,
+) -> Result<BTreeMap<String, u16>, RuntimeSchemaError> {
+    if base_ids.len() != FINAL2026_STATEMENT_KEYS.len() {
+        return Err(RuntimeSchemaError::Invalid(format!(
+            "cannot derive supplemental statement ids from {} base entries, expected {}",
+            base_ids.len(),
+            FINAL2026_STATEMENT_KEYS.len()
+        )));
+    }
+
+    let mut mapping_seed = FNV_OFFSET_BASIS;
+    let mut used = BTreeSet::new();
+    for key in FINAL2026_STATEMENT_KEYS {
+        let id = base_ids.get(key).copied().ok_or_else(|| {
+            RuntimeSchemaError::Invalid(format!(
+                "cannot derive supplemental statement ids without base key {key:?}"
+            ))
+        })?;
+        if id == 0 || !used.insert(id) {
+            return Err(RuntimeSchemaError::Invalid(
+                "base statement ids must be non-zero and unique".to_owned(),
+            ));
+        }
+        mapping_seed = hash_bytes(mapping_seed, key.as_bytes());
+        mapping_seed = hash_bytes(mapping_seed, &id.to_be_bytes());
+    }
+    mapping_seed = domain_seed(mapping_seed, DOMAIN_SUPPLEMENTAL_STATEMENT_IDS);
+
+    let mut supplemental_ids = BTreeMap::new();
+    for (ordinal, key) in FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS
+        .iter()
+        .enumerate()
+    {
+        let id = match mode {
+            SchemaMode::Canonical => CANONICAL_SUPPLEMENTAL_STATEMENT_IDS[ordinal],
+            SchemaMode::LocalSeedOpaqueV1 => {
+                let key_hash = hash_bytes(mapping_seed, key.as_bytes());
+                let start = (splitmix64(key_hash) % u64::from(u16::MAX) + 1) as u16;
+                first_free_statement_id(start, &used)?
+            }
+        };
+        if id == 0
+            || !used.insert(id)
+            || supplemental_ids.insert((*key).to_owned(), id).is_some()
+        {
+            return Err(RuntimeSchemaError::Invalid(
+                "base and supplemental statement ids must be non-zero and unique".to_owned(),
+            ));
+        }
+    }
+    Ok(supplemental_ids)
+}
+
+fn first_free_statement_id(
+    start: u16,
+    used: &BTreeSet<u16>,
+) -> Result<u16, RuntimeSchemaError> {
+    if start == 0 {
+        return Err(RuntimeSchemaError::Invalid(
+            "statement-id probe must start in 1..=65535".to_owned(),
+        ));
+    }
+    for offset in 0..u32::from(u16::MAX) {
+        let candidate = ((u32::from(start) - 1 + offset) % u32::from(u16::MAX) + 1) as u16;
+        if !used.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(RuntimeSchemaError::Invalid(
+        "u16 statement-id namespace exhausted".to_owned(),
+    ))
 }
 
 fn deterministic_shuffle<T>(values: &mut [T], seed: u64) {
@@ -1289,6 +1428,7 @@ mod tests {
         assert_eq!(left.columns.len(), 92);
         assert_eq!(left.csv_basenames.len(), 9);
         assert_eq!(left.statements.ids.len(), 42);
+        assert_eq!(left.statements.supplemental_ids.len(), 12);
         assert_eq!(left, RuntimeSchema::decode(&left.encode()).unwrap());
         left.validate().unwrap();
     }
@@ -1329,8 +1469,17 @@ mod tests {
         for seed in [73, 74] {
             let schema = RuntimeSchema::opaque(seed).unwrap();
             let expected = schema.statements.entries().collect::<Vec<_>>();
-            let ids = expected.iter().map(|(_, id)| *id).collect::<BTreeSet<_>>();
-            assert_eq!(ids.len(), FINAL2026_STATEMENT_KEYS.len());
+            let supplemental = FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS
+                .map(|key| (key, schema.statements.id(key).unwrap()));
+            let ids = expected
+                .iter()
+                .map(|(_, id)| *id)
+                .chain(supplemental.iter().map(|(_, id)| *id))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                ids.len(),
+                FINAL2026_STATEMENT_KEYS.len() + FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS.len()
+            );
             assert!(!ids.contains(&0));
             for _session in 0..32 {
                 assert_eq!(
@@ -1339,6 +1488,37 @@ mod tests {
                     "all 32 sessions must share one run layout"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn supplemental_ids_probe_across_wraparound_without_collisions() {
+        let used = BTreeSet::from([u16::MAX, 1, 2]);
+        assert_eq!(first_free_statement_id(u16::MAX, &used).unwrap(), 3);
+        assert!(first_free_statement_id(0, &used).is_err());
+    }
+
+    #[test]
+    fn supplemental_overlay_preserves_the_seed_2026_cache_contract() {
+        let schema = RuntimeSchema::opaque(2026).unwrap();
+        assert_eq!(schema.fingerprint(), 0x7167_a66c_d8d9_bac0);
+
+        let encoded = schema.encode();
+        assert_eq!(
+            encoded
+                .lines()
+                .filter(|line| line.starts_with("statement="))
+                .count(),
+            FINAL2026_STATEMENT_KEYS.len()
+        );
+        assert!(FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS
+            .iter()
+            .all(|key| !encoded.contains(key)));
+
+        let decoded = RuntimeSchema::decode(&encoded).unwrap();
+        assert_eq!(decoded.encode(), encoded);
+        for key in FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS {
+            assert_eq!(decoded.statements.id(key), schema.statements.id(key));
         }
     }
 
@@ -1389,6 +1569,10 @@ mod tests {
         assert_eq!(
             schema.statements.id("payment.update_warehouse").unwrap(),
             31
+        );
+        assert_eq!(
+            FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS.map(|key| schema.statements.id(key).unwrap()),
+            CANONICAL_SUPPLEMENTAL_STATEMENT_IDS
         );
     }
 }
