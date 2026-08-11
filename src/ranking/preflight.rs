@@ -1449,7 +1449,11 @@ fn validate_visible_new_order_state(
             state.order_rows
         ));
     }
-    let expected_delivery_rows = vec![vec![WireValue::Int32(selection.customer_id)]];
+    let expected_delivery_rows = vec![vec![
+        WireValue::Int32(selection.customer_id),
+        WireValue::Int32(UNDELIVERED_CARRIER_ID),
+        WireValue::Int32(selection.invalid_line_number()),
+    ]];
     if state.delivery_order_rows != expected_delivery_rows {
         return Err(format!(
             "NewOrder write prefix heap/order lookup mismatch: {:?}",
@@ -2233,7 +2237,11 @@ mod tests {
                 WireValue::Char(selection.timestamp.clone()),
                 WireValue::Int32(UNDELIVERED_CARRIER_ID),
             ]],
-            delivery_order_rows: vec![vec![WireValue::Int32(selection.customer_id)]],
+            delivery_order_rows: vec![vec![
+                WireValue::Int32(selection.customer_id),
+                WireValue::Int32(UNDELIVERED_CARRIER_ID),
+                WireValue::Int32(selection.invalid_line_number()),
+            ]],
             latest_order_rows: vec![vec![WireValue::Int32(3_001)]],
             order_line_rows: materialized
                 .lines

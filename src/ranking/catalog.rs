@@ -357,6 +357,7 @@ const DELIVERY_LOCK_QUEUE: &[StatementId] = &[StatementId::DeliveryLockQueue];
 const DELIVERY_EARLIER_QUEUE_COUNT: &[StatementId] =
     &[StatementId::DeliveryEarlierQueueCount];
 const DELIVERY_EXACT_QUEUE_COUNT: &[StatementId] = &[StatementId::DeliveryExactQueueCount];
+const DELIVERY_ORDER: &[StatementId] = &[StatementId::DeliveryOrder];
 const DELIVERY_CUSTOMER: &[StatementId] = &[StatementId::DeliveryCustomer];
 const DELIVERY_LINE_ROWS: &[StatementId] = &[StatementId::DeliveryLineRows];
 const DELIVERY_LINE_SUM: &[StatementId] = &[StatementId::DeliveryLineSum];
@@ -580,7 +581,7 @@ const DELIVERY_STAGE_TWO_STEPS: &[PlanStep] = &[
         multiplicity: Multiplicity::PerClaimedDistrict,
     },
     PlanStep {
-        alternatives: DELIVERY_CUSTOMER,
+        alternatives: DELIVERY_ORDER,
         multiplicity: Multiplicity::PerClaimedDistrict,
     },
     PlanStep {
@@ -594,6 +595,10 @@ const DELIVERY_STAGE_TWO_STEPS: &[PlanStep] = &[
 ];
 
 const DELIVERY_STAGE_THREE_STEPS: &[PlanStep] = &[
+    PlanStep {
+        alternatives: DELIVERY_CUSTOMER,
+        multiplicity: Multiplicity::PerClaimedDistrict,
+    },
     PlanStep {
         alternatives: DELIVERY_DELETE_QUEUE,
         multiplicity: Multiplicity::PerClaimedDistrict,
@@ -906,23 +911,20 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::DeliveryOrder,
             &[Int32, Int32, Int32],
-            "SELECT o_c_id FROM orders \
+            "SELECT o_c_id, o_carrier_id, o_ol_cnt FROM orders \
              WHERE o_w_id = $1 AND o_d_id = $2 AND o_id = $3;",
-            &[("o_c_id", Int32)],
+            &[
+                ("o_c_id", Int32),
+                ("o_carrier_id", Int32),
+                ("o_ol_cnt", Int32),
+            ],
         ),
         query(
             StatementId::DeliveryCustomer,
             &[Int32, Int32, Int32],
-            "SELECT customer.c_id, customer.c_balance, \
-             customer.c_payment_cnt, \
-             customer.c_delivery_cnt \
-             FROM customer, orders \
-             WHERE orders.o_w_id = $1 AND orders.o_d_id = $2 AND orders.o_id = $3 \
-             AND customer.c_w_id = orders.o_w_id \
-             AND customer.c_d_id = orders.o_d_id \
-             AND customer.c_id = orders.o_c_id;",
+            "SELECT c_balance, c_payment_cnt, c_delivery_cnt \
+             FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3;",
             &[
-                ("c_id", Int32),
                 ("c_balance", Float32),
                 ("c_payment_cnt", Int32),
                 ("c_delivery_cnt", Int32),
@@ -1479,6 +1481,38 @@ mod runtime_tests {
         assert!(exact.sql.contains("no_d_id = $2"));
         assert!(exact.sql.contains("no_o_id = $3"));
 
+        let order = find(StatementId::DeliveryOrder);
+        assert!(order
+            .sql
+            .contains("SELECT o_c_id, o_carrier_id, o_ol_cnt FROM orders"));
+        match &order.kind {
+            StatementKind::Query { columns } => assert_eq!(
+                columns,
+                &[
+                    Column {
+                        name: "o_c_id".to_owned(),
+                        sql_type: SqlType::Int32,
+                    },
+                    Column {
+                        name: "o_carrier_id".to_owned(),
+                        sql_type: SqlType::Int32,
+                    },
+                    Column {
+                        name: "o_ol_cnt".to_owned(),
+                        sql_type: SqlType::Int32,
+                    },
+                ]
+            ),
+            StatementKind::Command => panic!("Delivery order must be a query"),
+        }
+
+        let customer = find(StatementId::DeliveryCustomer);
+        assert!(customer
+            .sql
+            .contains("SELECT c_balance, c_payment_cnt, c_delivery_cnt"));
+        assert!(customer.sql.contains("FROM customer WHERE"));
+        assert!(!customer.sql.contains("FROM customer, orders"));
+
         let lines = find(StatementId::DeliveryLineRows);
         assert!(lines
             .sql
@@ -1521,9 +1555,27 @@ mod runtime_tests {
                 StatementId::DeliveryLockQueue,
                 StatementId::DeliveryEarlierQueueCount,
                 StatementId::DeliveryExactQueueCount,
-                StatementId::DeliveryCustomer,
+                StatementId::DeliveryOrder,
                 StatementId::DeliveryLineRows,
                 StatementId::DeliveryLineSum,
+            ]
+        );
+
+        let stage_three_ids = DELIVERY_STAGES[2]
+            .steps
+            .iter()
+            .map(|step| step.alternatives[0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stage_three_ids,
+            vec![
+                StatementId::DeliveryCustomer,
+                StatementId::DeliveryDeleteQueue,
+                StatementId::DeliveryUpdateOrder,
+                StatementId::DeliveryUpdateLines,
+                StatementId::DeliveryUpdateCustomer,
+                StatementId::DeliveryCustomerAfter,
+                StatementId::Commit,
             ]
         );
     }

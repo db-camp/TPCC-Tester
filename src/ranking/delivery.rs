@@ -12,7 +12,7 @@ use crate::profile::DISTRICTS_PER_WAREHOUSE;
 use crate::routing::RoutedTransaction;
 use crate::workload::DeliveryInput;
 
-use super::catalog::StatementId;
+use super::catalog::{StatementId, UNDELIVERED_CARRIER_ID};
 use super::common::{
     operation, row_f32_bits, row_int32, BatchResults, SemanticResult, SemanticResultExt,
     SemanticViolation,
@@ -35,7 +35,7 @@ struct DistrictClaim {
 struct StageTwoIndices {
     earlier_queue_count: usize,
     exact_queue_count: usize,
-    customer: usize,
+    order: usize,
     line_rows: usize,
     line_sum: usize,
 }
@@ -44,9 +44,6 @@ struct StageTwoIndices {
 struct LockedOrder {
     claim: DistrictClaim,
     customer_id: i32,
-    customer_balance_bits: u32,
-    customer_payment_count: i32,
-    customer_delivery_count: i32,
     line_count: u8,
     amount_bits: u32,
     line_amount_bits: Vec<u32>,
@@ -54,14 +51,21 @@ struct LockedOrder {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StageThreeIndex {
+    customer_before: usize,
     customer_after: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CustomerAfter {
+struct CustomerSnapshot {
     balance_bits: u32,
     payment_count: i32,
     delivery_count: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CustomerTransition {
+    before: CustomerSnapshot,
+    after: CustomerSnapshot,
 }
 
 /// Execute one immutable Delivery input.
@@ -107,29 +111,29 @@ pub async fn execute(
     // The successful third batch includes COMMIT.  A semantic mismatch found
     // below is fatal evidence about committed state; issuing ABORT now would be
     // both meaningless and a protocol error.
-    let customer_after =
+    let customer_transitions =
         validate_stage_three(&stage_three_results, &locked_orders, &stage_three_indices)
             .map_err(RankedTransactionError::Semantic)?;
 
     let evidence = locked_orders
         .into_iter()
-        .zip(customer_after)
-        .map(|(order, after)| DeliveredOrderEvidence {
+        .zip(customer_transitions)
+        .map(|(order, transition)| DeliveredOrderEvidence {
             warehouse_id,
             district_id: order.claim.district_id,
             order_id: order.claim.order_id,
             customer_id: order.customer_id,
             line_count: order.line_count,
             amount_bits: order.amount_bits,
-            customer_balance_before_bits: order.customer_balance_bits,
-            customer_balance_after_bits: after.balance_bits,
+            customer_balance_before_bits: transition.before.balance_bits,
+            customer_balance_after_bits: transition.after.balance_bits,
             customer_version_before: CustomerVersion {
-                payment_count: order.customer_payment_count,
-                delivery_count: order.customer_delivery_count,
+                payment_count: transition.before.payment_count,
+                delivery_count: transition.before.delivery_count,
             },
             customer_version_after: CustomerVersion {
-                payment_count: after.payment_count,
-                delivery_count: after.delivery_count,
+                payment_count: transition.after.payment_count,
+                delivery_count: transition.after.delivery_count,
             },
             delivery_timestamp: timestamp.as_bytes().to_vec(),
             line_amount_bits: order.line_amount_bits,
@@ -221,13 +225,13 @@ fn stage_two_operations(
         operations.push(operation(StatementId::DeliveryLockQueue, key()));
         operations.push(operation(StatementId::DeliveryEarlierQueueCount, key()));
         operations.push(operation(StatementId::DeliveryExactQueueCount, key()));
-        operations.push(operation(StatementId::DeliveryCustomer, key()));
+        operations.push(operation(StatementId::DeliveryOrder, key()));
         operations.push(operation(StatementId::DeliveryLineRows, key()));
         operations.push(operation(StatementId::DeliveryLineSum, key()));
         indices.push(StageTwoIndices {
             earlier_queue_count: base + 1,
             exact_queue_count: base + 2,
-            customer: base + 3,
+            order: base + 3,
             line_rows: base + 4,
             line_sum: base + 5,
         });
@@ -270,26 +274,36 @@ fn parse_stage_two(
             )));
         }
 
-        let customer = results.single_row(index.customer)?;
-        if customer.len() != 4 {
+        let order = results.single_row(index.order)?;
+        if order.len() != 3 {
             return Err(SemanticViolation::new(format!(
-                "{context} customer lookup returned {} columns; expected four",
-                customer.len()
+                "{context} order lookup returned {} columns; expected three",
+                order.len()
             )));
         }
-        let customer_id = row_int32(customer, 0, &format!("{context} customer"))?;
+        let customer_id = row_int32(order, 0, &format!("{context} order"))?;
         if customer_id <= 0 {
             return Err(SemanticViolation::new(format!(
                 "{context} returned invalid customer id {customer_id}"
             )));
         }
-        let customer_balance_bits = row_f32_bits(customer, 1, &format!("{context} customer"))?;
-        let customer_payment_count = row_int32(customer, 2, &format!("{context} customer"))?;
-        let customer_delivery_count = row_int32(customer, 3, &format!("{context} customer"))?;
-        if customer_payment_count < 0 || customer_delivery_count < 0 {
+        let carrier_id = row_int32(order, 1, &format!("{context} order"))?;
+        if carrier_id != UNDELIVERED_CARRIER_ID {
             return Err(SemanticViolation::new(format!(
-                "{context} customer has negative logical version \
-                 ({customer_payment_count},{customer_delivery_count})"
+                "{context} has carrier id {carrier_id}; expected undelivered carrier id \
+                 {UNDELIVERED_CARRIER_ID}"
+            )));
+        }
+        let declared_line_count = row_int32(order, 2, &format!("{context} order"))?;
+        let declared_line_count = usize::try_from(declared_line_count).map_err(|_| {
+            SemanticViolation::new(format!(
+                "{context} declared negative order-line count {declared_line_count}"
+            ))
+        })?;
+        if !(MIN_ORDER_LINES..=MAX_ORDER_LINES).contains(&declared_line_count) {
+            return Err(SemanticViolation::new(format!(
+                "{context} declared {declared_line_count} order lines; expected \
+                 {MIN_ORDER_LINES}..={MAX_ORDER_LINES}"
             )));
         }
 
@@ -297,6 +311,12 @@ fn parse_stage_two(
         if !(MIN_ORDER_LINES..=MAX_ORDER_LINES).contains(&line_rows.len()) {
             return Err(SemanticViolation::new(format!(
                 "{context} returned {} order lines; expected {MIN_ORDER_LINES}..={MAX_ORDER_LINES}",
+                line_rows.len()
+            )));
+        }
+        if line_rows.len() != declared_line_count {
+            return Err(SemanticViolation::new(format!(
+                "{context} declared {declared_line_count} order lines but returned {}",
                 line_rows.len()
             )));
         }
@@ -343,9 +363,6 @@ fn parse_stage_two(
         locked_orders.push(LockedOrder {
             claim: *claim,
             customer_id,
-            customer_balance_bits,
-            customer_payment_count,
-            customer_delivery_count,
             line_count: line_rows.len() as u8,
             amount_bits,
             line_amount_bits: amount_values,
@@ -361,13 +378,19 @@ fn stage_three_operations(
     timestamp: &str,
     orders: &[LockedOrder],
 ) -> (Vec<Operation>, Vec<StageThreeIndex>) {
-    let mut operations = Vec::with_capacity(orders.len() * 5 + 1);
+    let mut operations = Vec::with_capacity(orders.len() * 6 + 1);
     let mut indices = Vec::with_capacity(orders.len());
 
     for order in orders {
         let warehouse = WireValue::Int32(i32::from(warehouse_id));
         let district = WireValue::Int32(i32::from(order.claim.district_id));
         let order_id = WireValue::Int32(order.claim.order_id);
+        let customer_id = WireValue::Int32(order.customer_id);
+        let customer_before = operations.len();
+        operations.push(operation(
+            StatementId::DeliveryCustomer,
+            [warehouse.clone(), district.clone(), customer_id.clone()],
+        ));
         operations.push(operation(
             StatementId::DeliveryDeleteQueue,
             [warehouse.clone(), district.clone(), order_id.clone()],
@@ -396,15 +419,18 @@ fn stage_three_operations(
                 WireValue::Float32(order.amount_bits),
                 warehouse.clone(),
                 district.clone(),
-                WireValue::Int32(order.customer_id),
+                customer_id.clone(),
             ],
         ));
         let customer_after = operations.len();
         operations.push(operation(
             StatementId::DeliveryCustomerAfter,
-            [warehouse, district, WireValue::Int32(order.customer_id)],
+            [warehouse, district, customer_id],
         ));
-        indices.push(StageThreeIndex { customer_after });
+        indices.push(StageThreeIndex {
+            customer_before,
+            customer_after,
+        });
     }
 
     operations.push(operation(StatementId::Commit, []));
@@ -415,7 +441,7 @@ fn validate_stage_three(
     results: &BatchResults,
     orders: &[LockedOrder],
     indices: &[StageThreeIndex],
-) -> SemanticResult<Vec<CustomerAfter>> {
+) -> SemanticResult<Vec<CustomerTransition>> {
     if orders.len() != indices.len() {
         return Err(SemanticViolation::new(format!(
             "Delivery stage-three planner retained {} orders but {} index records",
@@ -424,39 +450,56 @@ fn validate_stage_three(
         )));
     }
 
-    let mut after = Vec::with_capacity(orders.len());
+    let mut transitions = Vec::with_capacity(orders.len());
     for (order, index) in orders.iter().zip(indices) {
-        let context = format!(
-            "Delivery customer after district {} order {}",
-            order.claim.district_id, order.claim.order_id
+        let order_context = format!(
+            "Delivery district {} order {} customer {}",
+            order.claim.district_id, order.claim.order_id, order.customer_id
         );
-        let row = results.single_row(index.customer_after)?;
-        if row.len() != 3 {
-            return Err(SemanticViolation::new(format!(
-                "{context} returned {} columns; expected three",
-                row.len()
-            )));
-        }
-        let actual_balance_bits = row_f32_bits(row, 0, &context)?;
-        let actual_payment_count = row_int32(row, 1, &context)?;
-        let actual_delivery_count = row_int32(row, 2, &context)?;
-        validate_customer_after(
-            order.customer_balance_bits,
-            order.customer_payment_count,
-            order.customer_delivery_count,
-            order.amount_bits,
-            actual_balance_bits,
-            actual_payment_count,
-            actual_delivery_count,
-            &context,
+        let before = parse_customer_snapshot(
+            results.single_row(index.customer_before)?,
+            &format!("{order_context} before update"),
         )?;
-        after.push(CustomerAfter {
-            balance_bits: actual_balance_bits,
-            payment_count: actual_payment_count,
-            delivery_count: actual_delivery_count,
-        });
+        let after = parse_customer_snapshot(
+            results.single_row(index.customer_after)?,
+            &format!("{order_context} after update"),
+        )?;
+        validate_customer_after(
+            before.balance_bits,
+            before.payment_count,
+            before.delivery_count,
+            order.amount_bits,
+            after.balance_bits,
+            after.payment_count,
+            after.delivery_count,
+            &order_context,
+        )?;
+        transitions.push(CustomerTransition { before, after });
     }
-    Ok(after)
+    Ok(transitions)
+}
+
+fn parse_customer_snapshot(row: &[WireValue], context: &str) -> SemanticResult<CustomerSnapshot> {
+    if row.len() != 3 {
+        return Err(SemanticViolation::new(format!(
+            "{context} returned {} columns; expected three",
+            row.len()
+        )));
+    }
+    let balance_bits = row_f32_bits(row, 0, context)?;
+    finite_f32(balance_bits, &format!("{context} balance"))?;
+    let payment_count = row_int32(row, 1, context)?;
+    let delivery_count = row_int32(row, 2, context)?;
+    if payment_count < 0 || delivery_count < 0 {
+        return Err(SemanticViolation::new(format!(
+            "{context} has negative logical version ({payment_count},{delivery_count})"
+        )));
+    }
+    Ok(CustomerSnapshot {
+        balance_bits,
+        payment_count,
+        delivery_count,
+    })
 }
 
 fn validate_customer_after(
@@ -602,14 +645,14 @@ mod tests {
                 StageTwoIndices {
                     earlier_queue_count: 1,
                     exact_queue_count: 2,
-                    customer: 3,
+                    order: 3,
                     line_rows: 4,
                     line_sum: 5,
                 },
                 StageTwoIndices {
                     earlier_queue_count: 7,
                     exact_queue_count: 8,
-                    customer: 9,
+                    order: 9,
                     line_rows: 10,
                     line_sum: 11,
                 },
@@ -634,6 +677,10 @@ mod tests {
         assert_eq!(
             operations[2].statement_id,
             StatementId::DeliveryExactQueueCount.wire_id()
+        );
+        assert_eq!(
+            operations[3].statement_id,
+            StatementId::DeliveryOrder.wire_id()
         );
     }
 
@@ -661,9 +708,8 @@ mod tests {
                     3,
                     vec![vec![
                         WireValue::Int32(42),
-                        WireValue::Float32(10.0_f32.to_bits()),
-                        WireValue::Int32(3),
-                        WireValue::Int32(4),
+                        WireValue::Int32(UNDELIVERED_CARRIER_ID),
+                        WireValue::Int32(amounts.len() as i32),
                     ]],
                 ),
                 query(
@@ -699,60 +745,134 @@ mod tests {
         let (operations, indices) = stage_two_operations(17, &claims);
         let amounts = [1.0_f32.to_bits(); MIN_ORDER_LINES];
 
-        let response = |earlier_count, exact_count, line_order_id| BatchResponse::Ok {
+        let response = |earlier_count, exact_count, carrier_id, declared_lines, line_order_id| {
+            BatchResponse::Ok {
+                executed_operations: operations.len() as u16,
+                results: vec![
+                    query(1, vec![vec![WireValue::Int32(earlier_count)]]),
+                    query(2, vec![vec![WireValue::Int32(exact_count)]]),
+                    query(
+                        3,
+                        vec![vec![
+                            WireValue::Int32(42),
+                            WireValue::Int32(carrier_id),
+                            WireValue::Int32(declared_lines),
+                        ]],
+                    ),
+                    query(
+                        4,
+                        amounts
+                            .iter()
+                            .enumerate()
+                            .map(|(index, bits)| {
+                                vec![
+                                    WireValue::Int32((index + 1) as i32),
+                                    WireValue::Float32(*bits),
+                                    WireValue::Int32(line_order_id),
+                                ]
+                            })
+                            .collect(),
+                    ),
+                    query(
+                        5,
+                        vec![vec![WireValue::Float32(
+                            exact_f64_sum_to_f32_bits(&amounts).unwrap(),
+                        )]],
+                    ),
+                ],
+            }
+        };
+
+        let earlier = accept_batch(response(1, 1, 0, 5, 3001), &operations).unwrap();
+        assert!(parse_stage_two(&earlier, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("earlier queue rows"));
+
+        let missing_exact = accept_batch(response(0, 0, 0, 5, 3001), &operations).unwrap();
+        assert!(parse_stage_two(&missing_exact, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("exact queue rows"));
+
+        let delivered = accept_batch(response(0, 1, 7, 5, 3001), &operations).unwrap();
+        assert!(parse_stage_two(&delivered, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("carrier id 7"));
+
+        let wrong_declared_count = accept_batch(response(0, 1, 0, 6, 3001), &operations).unwrap();
+        assert!(parse_stage_two(&wrong_declared_count, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("declared 6 order lines but returned 5"));
+
+        let wrong_line_order = accept_batch(response(0, 1, 0, 5, 3002), &operations).unwrap();
+        assert!(parse_stage_two(&wrong_line_order, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("belongs to order 3002"));
+    }
+
+    #[test]
+    fn stage_three_reads_customer_before_mutation_and_checks_after_commit() {
+        let order = LockedOrder {
+            claim: DistrictClaim {
+                district_id: 2,
+                order_id: 3001,
+            },
+            customer_id: 42,
+            line_count: 5,
+            amount_bits: 2.5_f32.to_bits(),
+            line_amount_bits: vec![0.5_f32.to_bits(); 5],
+        };
+        let (operations, indices) = stage_three_operations(17, 7, "2026-08-11", &[order.clone()]);
+        assert_eq!(operations.len(), 7);
+        assert_eq!(indices[0].customer_before, 0);
+        assert_eq!(indices[0].customer_after, 5);
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.statement_id)
+                .collect::<Vec<_>>(),
+            vec![
+                StatementId::DeliveryCustomer.wire_id(),
+                StatementId::DeliveryDeleteQueue.wire_id(),
+                StatementId::DeliveryUpdateOrder.wire_id(),
+                StatementId::DeliveryUpdateLines.wire_id(),
+                StatementId::DeliveryUpdateCustomer.wire_id(),
+                StatementId::DeliveryCustomerAfter.wire_id(),
+                StatementId::Commit.wire_id(),
+            ]
+        );
+
+        let response = BatchResponse::Ok {
             executed_operations: operations.len() as u16,
             results: vec![
-                query(1, vec![vec![WireValue::Int32(earlier_count)]]),
-                query(2, vec![vec![WireValue::Int32(exact_count)]]),
                 query(
-                    3,
+                    0,
                     vec![vec![
-                        WireValue::Int32(42),
                         WireValue::Float32(10.0_f32.to_bits()),
                         WireValue::Int32(3),
                         WireValue::Int32(4),
                     ]],
                 ),
                 query(
-                    4,
-                    amounts
-                        .iter()
-                        .enumerate()
-                        .map(|(index, bits)| {
-                            vec![
-                                WireValue::Int32((index + 1) as i32),
-                                WireValue::Float32(*bits),
-                                WireValue::Int32(line_order_id),
-                            ]
-                        })
-                        .collect(),
-                ),
-                query(
                     5,
-                    vec![vec![WireValue::Float32(
-                        exact_f64_sum_to_f32_bits(&amounts).unwrap(),
-                    )]],
+                    vec![vec![
+                        WireValue::Float32(12.5_f32.to_bits()),
+                        WireValue::Int32(3),
+                        WireValue::Int32(5),
+                    ]],
                 ),
             ],
         };
-
-        let earlier = accept_batch(response(1, 1, 3001), &operations).unwrap();
-        assert!(parse_stage_two(&earlier, &claims, &indices)
-            .unwrap_err()
-            .message()
-            .contains("earlier queue rows"));
-
-        let missing_exact = accept_batch(response(0, 0, 3001), &operations).unwrap();
-        assert!(parse_stage_two(&missing_exact, &claims, &indices)
-            .unwrap_err()
-            .message()
-            .contains("exact queue rows"));
-
-        let wrong_line_order = accept_batch(response(0, 1, 3002), &operations).unwrap();
-        assert!(parse_stage_two(&wrong_line_order, &claims, &indices)
-            .unwrap_err()
-            .message()
-            .contains("belongs to order 3002"));
+        let results = accept_batch(response, &operations).unwrap();
+        let transitions = validate_stage_three(&results, &[order], &indices).unwrap();
+        assert_eq!(transitions[0].before.balance_bits, 10.0_f32.to_bits());
+        assert_eq!(transitions[0].after.balance_bits, 12.5_f32.to_bits());
+        assert_eq!(transitions[0].before.delivery_count, 4);
+        assert_eq!(transitions[0].after.delivery_count, 5);
     }
 
     #[test]
