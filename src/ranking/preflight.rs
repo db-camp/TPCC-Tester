@@ -1841,6 +1841,80 @@ mod tests {
         ]
     }
 
+    fn new_order_stage_one_results(
+        selection: &PreflightSelection,
+        plan: &NewOrderStageOnePlan,
+        mismatch_first_quantity: bool,
+        resolve_invalid_version: bool,
+    ) -> BatchResults {
+        let mut query_results = vec![
+            BatchQueryResult {
+                operation_index: plan.home_result as u16,
+                rows: vec![vec![
+                    WireValue::Float32(0.0_f32.to_bits()),
+                    WireValue::Char(b"last".to_vec()),
+                    WireValue::Char(b"GC".to_vec()),
+                    WireValue::Float32(0.0_f32.to_bits()),
+                ]],
+            },
+            BatchQueryResult {
+                operation_index: plan.district_result as u16,
+                rows: vec![new_order_district_row(3_001)],
+            },
+        ];
+        let all_items = selection.all_item_ids().collect::<Vec<_>>();
+        for (index, (indices, item_id)) in
+            plan.line_results.iter().zip(all_items).enumerate()
+        {
+            let valid = index < selection.valid_lines.len();
+            query_results.push(BatchQueryResult {
+                operation_index: indices.item as u16,
+                rows: valid
+                    .then(|| {
+                        vec![vec![
+                            WireValue::Int32(item_id),
+                            WireValue::Float32(1.0_f32.to_bits()),
+                            WireValue::Char(Vec::new()),
+                            WireValue::Char(Vec::new()),
+                        ]]
+                    })
+                    .unwrap_or_default(),
+            });
+            query_results.push(BatchQueryResult {
+                operation_index: indices.stock as u16,
+                rows: valid
+                    .then(|| vec![business_stock_row(50)])
+                    .unwrap_or_default(),
+            });
+            let version_resolves = valid || resolve_invalid_version;
+            query_results.push(BatchQueryResult {
+                operation_index: indices.stock_version as u16,
+                rows: version_resolves
+                    .then(|| {
+                        vec![stock_row(&test_stock(
+                            if mismatch_first_quantity && index == 0 {
+                                51
+                            } else {
+                                50
+                            },
+                            0.0,
+                            0,
+                            0,
+                        ))]
+                    })
+                    .unwrap_or_default(),
+            });
+        }
+        accept_batch(
+            BatchResponse::Ok {
+                executed_operations: plan.operations.len() as u16,
+                results: query_results,
+            },
+            &plan.operations,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn selection_is_deterministic_domain_separated_and_in_range() {
         let left = test_selection();
@@ -1863,6 +1937,42 @@ mod tests {
             domain_sample(7, "preflight/warehouse", 0, 1_000_000),
             domain_sample(7, "preflight/district", 0, 1_000_000)
         );
+    }
+
+    #[test]
+    fn new_order_preflight_pairs_business_and_version_stock_queries() {
+        let selection = test_selection();
+        let plan = build_new_order_stage_one(&selection);
+        let expected_business = new_order_stock_statement(selection.district_id).unwrap();
+        for indices in &plan.line_results {
+            assert_eq!(
+                plan.operations[indices.stock].statement_id,
+                expected_business.wire_id()
+            );
+            assert_eq!(
+                plan.operations[indices.stock_version].statement_id,
+                StatementId::PreflightNewOrderStockVersion.wire_id()
+            );
+        }
+
+        let valid = new_order_stage_one_results(&selection, &plan, false, false);
+        assert_eq!(
+            parse_new_order_stage_one(&selection, &plan, &valid)
+                .unwrap()
+                .lines
+                .len(),
+            PREFLIGHT_VALID_LINES
+        );
+
+        let mismatch = new_order_stage_one_results(&selection, &plan, true, false);
+        assert!(parse_new_order_stage_one(&selection, &plan, &mismatch)
+            .unwrap_err()
+            .contains("disagrees with version quantity"));
+
+        let invalid_resolved = new_order_stage_one_results(&selection, &plan, false, true);
+        assert!(parse_new_order_stage_one(&selection, &plan, &invalid_resolved)
+            .unwrap_err()
+            .contains("invalid final item"));
     }
 
     #[test]
@@ -2313,7 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn stock_parser_requires_full_mutable_projection() {
+    fn stock_parsers_require_two_column_business_and_four_column_version() {
         let stock = test_stock(42, 7.0, 9, 2);
         assert_eq!(
             parse_stock_version(&stock_row(&stock), 1, 2).unwrap(),
