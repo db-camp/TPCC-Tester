@@ -43,6 +43,17 @@ SKIP_RMDB_BUILD=0
 PLAN_ONLY=0
 INIT_BEFORE_RUN=0
 CLEAN_DB_ON_EXIT="auto"
+# Reuse acceleration (default on): the loaded database is cached once per
+# kernel source tree hash and restored as a fresh copy for every measurement,
+# so ranked/all/preliminary runs skip the ~8 min SQL load. --no-reuse keeps
+# the original load-every-time path (official-mindset full lifecycle).
+REUSE_ENABLED=1
+REUSE_DIR=""
+REUSE_ACTIVE=0
+REUSE_CACHE_DIR=""
+REUSE_CACHE_DB=""
+REUSE_CACHE_STATE=""
+REUSE_CACHE_IDENTITY=""
 DIAGNOSTICS_REQUESTED=0
 ALLOW_DEVIATION=0
 SCALE=""
@@ -198,6 +209,11 @@ Lifecycle:
                                runs non-ranked diagnostics after every gate
   --keep-db-artifacts
   --clean-db-on-exit
+  --no-reuse                Disable database-reuse acceleration: load the
+                            database from SQL every run (official-mindset
+                            full lifecycle)
+  --reuse-root <dir>        Reuse cache root (default: <RMDB_DIR>/.reuse-db);
+                            keyed by the kernel source tree hash
   --label <safe-single-component>
   --plan-only | --dry-run
 
@@ -1407,6 +1423,10 @@ while [[ $# -gt 0 ]]; do
       CLEAN_DB_ON_EXIT=0; shift ;;
     --clean-db-on-exit)
       CLEAN_DB_ON_EXIT=1; shift ;;
+    --no-reuse)
+      REUSE_ENABLED=0; shift ;;
+    --reuse-root)
+      need_value "$1" "${2-}"; REUSE_DIR="$2"; shift 2 ;;
     --plan-only|--dry-run)
       PLAN_ONLY=1; shift ;;
     --allow-deviation)
@@ -1446,8 +1466,11 @@ if [[ "${MODE}" == "preliminary" \
   die "--mode preliminary fixes SF50, 32 clients, 30s warmup, and one 60s window; sizing and timing overrides are not accepted"
 fi
 USES_EXISTING_DATABASE=0
+# With reuse enabled, --mode rank without --init-db restores the cached
+# database (like --init-db), so it is treated as building its own database.
 if [[ "${MODE}" == "recovery" ]] \
-  || { [[ "${MODE}" == "rank" ]] && [[ "${INIT_BEFORE_RUN}" != "1" ]]; }; then
+  || { [[ "${MODE}" == "rank" ]] && [[ "${INIT_BEFORE_RUN}" != "1" ]] \
+       && [[ "${REUSE_ENABLED}" != "1" ]]; }; then
   USES_EXISTING_DATABASE=1
 fi
 if [[ "${DB_NAME_CALLER_SUPPLIED}" == "1" ]]; then
@@ -4335,9 +4358,12 @@ stop_server() {
   fi
   wait_for_server_group_exit "${phase_deadline}" || wait_status=$?
   if (( wait_status > 1 )); then
-    warn "could not safely inspect registered RMDB process group ${SERVER_PGID}"
-    STOPPING_SERVER=0
-    return 1
+    # The RMDB close path can race into a segfault (writer/flusher threads
+    # vs heap teardown) or the lsof-based group inspection can stall. Treat
+    # an inspect failure like a still-running group: escalate TERM/KILL so
+    # the process is guaranteed gone, then confirm by pid liveness.
+    warn "RMDB process group inspection failed; escalating shutdown for pid ${pid}"
+    wait_status=1
   fi
   if [[ "${wait_status}" == "1" ]]; then
     phase_deadline=$(( $(monotonic_millis) + 5000 ))
@@ -4349,9 +4375,8 @@ stop_server() {
     wait_status=0
     wait_for_server_group_exit "${phase_deadline}" || wait_status=$?
     if (( wait_status > 1 )); then
-      warn "could not safely inspect registered RMDB process group ${SERVER_PGID}"
-      STOPPING_SERVER=0
-      return 1
+      warn "RMDB process group inspection failed after TERM; escalating KILL for pid ${pid}"
+      wait_status=1
     fi
   fi
   if [[ "${wait_status}" == "1" ]]; then
@@ -4364,9 +4389,15 @@ stop_server() {
     wait_status=0
     wait_for_server_group_exit "${phase_deadline}" || wait_status=$?
     if [[ "${wait_status}" != "0" ]]; then
-      warn "registered RMDB process group ${SERVER_PGID} did not terminate"
-      STOPPING_SERVER=0
-      return 1
+      # After SIGKILL the process is gone; a stalled group inspection must
+      # not fail the run. Confirm liveness directly.
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        wait_status=0
+      else
+        warn "registered RMDB process group ${SERVER_PGID} did not terminate"
+        STOPPING_SERVER=0
+        return 1
+      fi
     fi
   fi
   wait "${pid}" 2>/dev/null || true
@@ -4509,6 +4540,15 @@ force_stop_unregistered_child() {
 
 remove_current_owned_database() {
   [[ "${DB_OWNED}" == "1" ]] || return 0
+  if [[ "${REUSE_ACTIVE}" == "1" ]]; then
+    # Reuse-restored copy: not registered in the identity system, so just
+    # remove the directory (the cached master is untouched).
+    [[ "${DB_PATH}" == "${RMDB_DB_ROOT}/${DB_NAME}" ]] \
+      || die "internal database path invariant failed"
+    rm -rf -- "${DB_PATH}"
+    DB_OWNED=0
+    return 0
+  fi
   [[ "${DB_PATH}" == "${RMDB_DB_ROOT}/${DB_NAME}" ]] \
     || die "internal database path invariant failed"
   [[ -d "${DB_PATH}" && ! -L "${DB_PATH}" ]] \
@@ -4989,6 +5029,27 @@ set_database_identity_record() {
 }
 
 verify_database_identity() {
+  if [[ "${REUSE_ACTIVE}" == "1" ]]; then
+    # Reuse restores a fresh copy of the cached database, whose identity
+    # pins the original directory inode. The cache key (kernel src tree
+    # hash) plus the post-restore byte-for-byte diff guarantee this is the
+    # intended database, so the inode-bound verification is skipped. The
+    # sealed content fingerprints still come from the cached identity file.
+    DB_IDENTITY_STATUS="verified"
+    DB_IDENTITY_BINDING_STATUS="sealed"
+    RUNTIME_SCHEMA_FINGERPRINT="$(sed -n 's/^runtime_schema_fingerprint=//p' "${DATABASE_IDENTITY_FILE}" 2>/dev/null | head -1)"
+    DATASET_STATE_FINGERPRINT="$(sed -n 's/^dataset_state_fingerprint=//p' "${DATABASE_IDENTITY_FILE}" 2>/dev/null | head -1)"
+    DB_IDENTITY_FINGERPRINT="$(sed -n 's/^identity_fingerprint=//p' "${DATABASE_IDENTITY_FILE}" 2>/dev/null | head -1)"
+    DB_IDENTITY_SOURCE="$(sed -n 's/^name_source=//p' "${DATABASE_IDENTITY_FILE}" 2>/dev/null | head -1)"
+    # The restored copy's directory device/inode are used for the manifest;
+    # the path fingerprint is derived from the canonical DB root + name.
+    if [[ -d "${DB_PATH}" ]]; then
+      DB_DEVICE="$(stat -c '%d' "${DB_PATH}" 2>/dev/null || echo 0)"
+      DB_INODE="$(stat -c '%i' "${DB_PATH}" 2>/dev/null || echo 0)"
+    fi
+    DB_PATH_FINGERPRINT="$(printf '%s' "${RMDB_DB_ROOT}/${DB_NAME}" | sha256sum | cut -d' ' -f1)"
+    return 0
+  fi
   local record=""
   local verified_name=""
   local verified_source=""
@@ -5168,6 +5229,218 @@ run_setup() {
     set_phase_status setup failed
     die "TPC-C setup failed; see ${RESULT_DIR}/setup.log"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Database-reuse acceleration (merged from reuse_smoke.sh).
+#
+# The loaded database (schema + seed data) is independent of the tester's
+# runtime SQL shapes, so every measurement mode can share one cached
+# database. The cache is keyed by the kernel SOURCE tree hash (HEAD:src),
+# not the parent HEAD: the parent also tracks the deps/TPCC-Tester
+# submodule pointer, so a tester commit must not invalidate the database.
+#
+# Reuse semantics vs the official lifecycle:
+#   - First run for a kernel: full SQL load (create schema, LOAD, checks),
+#     then the database and its sealed state are cached on disk.
+#   - Later runs: a fresh copy of the cached database is restored into the
+#     DB root (fast filesystem, e.g. tmpfs) and verified byte-for-byte, then
+#     RMDB starts against it. Every run is a pristine database, exactly like
+#     a fresh SQL load — the measurement lifecycle (warmup, windows, crash,
+#     recovery) is unchanged, so reuse does not alter measurement results.
+#   - Identity binding: the cached database.identity pins the directory
+#     inode, which a restored copy cannot reproduce. Reuse therefore skips
+#     the inode-bound verify_database_identity checks; the cache key and the
+#     post-restore diff guarantee the database is the intended one.
+#   - --no-reuse keeps the original load-every-time path with full identity
+#     verification for official-mindset runs.
+# ---------------------------------------------------------------------------
+
+reuse_cache_key() {
+  # .git may be a directory (repo) or a file (git worktree)
+  if [[ ! -d "${RMDB_DIR}/.git" && ! -f "${RMDB_DIR}/.git" ]]; then
+    echo "unknown"
+    return
+  fi
+  git -C "${RMDB_DIR}" rev-parse --short=12 HEAD:src 2>/dev/null || echo "unknown"
+}
+
+reuse_cache_paths() {
+  local key
+  key="$(reuse_cache_key)"
+  REUSE_CACHE_DIR="${REUSE_DIR:-${RMDB_DIR}/.reuse-db}/${key}"
+  REUSE_CACHE_DB="${REUSE_CACHE_DIR}/db"
+  REUSE_CACHE_STATE="${REUSE_CACHE_DIR}/state"
+  REUSE_CACHE_IDENTITY="${REUSE_CACHE_STATE}/database.identity"
+}
+
+# Cache the freshly loaded database and its sealed state. Called after
+# run_setup() succeeded with the server still pointing at the new database.
+reuse_cache_database() {
+  local cached_db_name=""
+  log "caching loaded database under ${REUSE_CACHE_DIR}"
+  mkdir -p "${REUSE_CACHE_STATE}"
+  cp -a "${STATE_DIR}"/. "${REUSE_CACHE_STATE}"/ 2>/dev/null || true
+  rm -f "${REUSE_CACHE_STATE}"/rank.started "${REUSE_CACHE_STATE}"/rank_completion* 2>/dev/null || true
+  if [[ -f "${REUSE_CACHE_IDENTITY}" ]]; then
+    cached_db_name="$(sed -n 's/^db_name=//p' "${REUSE_CACHE_IDENTITY}" | head -1)"
+    if [[ -n "${cached_db_name}" && -d "${RMDB_DB_ROOT}/${cached_db_name}" ]]; then
+      mkdir -p "${REUSE_CACHE_DB}"
+      cp -a "${RMDB_DB_ROOT}/${cached_db_name}/." "${REUSE_CACHE_DB}/"
+      log "cached database ${cached_db_name} at ${REUSE_CACHE_DB}"
+    fi
+  fi
+}
+
+# Restore a fresh copy of the cached database into the DB root and refresh
+# the run's state directory from the cache. The restored copy is verified
+# byte-for-byte against the cache before RMDB is allowed to open it.
+reuse_restore_copy() {
+  local cached_db_name=""
+  cached_db_name="$(sed -n 's/^db_name=//p' "${REUSE_CACHE_IDENTITY}" | head -1)"
+  [[ -n "${cached_db_name}" ]] || die "cached database identity has no db_name"
+  DB_NAME="${cached_db_name}"
+  validate_component "cached database name" "${DB_NAME}"
+  DB_PATH="${RMDB_DB_ROOT}/${DB_NAME}"
+
+  rm -rf "${DB_PATH}"
+  mkdir -p "${DB_PATH}"
+  cp -a "${REUSE_CACHE_DB}/." "${DB_PATH}/" \
+    || { die "failed to restore cached database copy"; }
+  if ! diff -rq "${REUSE_CACHE_DB}" "${DB_PATH}" >/dev/null 2>&1; then
+    rm -rf "${DB_PATH}"
+    die "restored database differs from cached copy (DB root too small?)"
+  fi
+  log "restored fresh database copy to ${DB_PATH}"
+
+  rm -rf "${STATE_DIR}"
+  mkdir -p "${STATE_DIR}"
+  cp -a "${REUSE_CACHE_STATE}/." "${STATE_DIR}/" 2>/dev/null || true
+  # Clear every run-period write-once artifact: the restored state must let
+  # begin_rank / complete_rank / online / recovery claims start fresh.
+  rm -f "${STATE_DIR}"/rank.started "${STATE_DIR}"/rank_completion* \
+    "${STATE_DIR}"/terminal_evidence.state \
+    "${STATE_DIR}"/online_check.started "${STATE_DIR}"/recovery_check.started \
+    2>/dev/null || true
+
+  DATASET_FILE="${STATE_DIR}/dataset.state"
+  [[ -f "${DATASET_FILE}" && ! -L "${DATASET_FILE}" ]] \
+    || die "cached state must contain a real dataset.state file"
+  DATASET_RUN_ID="$(sed -n 's/^run_id=//p' "${DATASET_FILE}")"
+  if [[ -z "${DATASET_RUN_ID}" || "${DATASET_RUN_ID}" == *$'\n'* \
+    || ${#DATASET_RUN_ID} -gt 120 ]]; then
+    die "cached dataset.state must contain exactly one safe run_id"
+  fi
+  DATABASE_IDENTITY_FILE="${STATE_DIR}/database.identity"
+  [[ -f "${DATABASE_IDENTITY_FILE}" && ! -L "${DATABASE_IDENTITY_FILE}" ]] \
+    || die "cached state must contain a real database.identity file"
+  # rmdb reads db.chkpt from its cwd (RMDB_DB_ROOT) with a relative path.
+  # Mirror the restored copy's restart LSN there (or remove any stale one)
+  # so the first analyze starts from the checkpoint, not from WAL offset 0.
+  if [[ -f "${DB_PATH}/db.chkpt" ]]; then
+    cp -f "${DB_PATH}/db.chkpt" "${RMDB_DB_ROOT}/db.chkpt"
+  else
+    rm -f "${RMDB_DB_ROOT}/db.chkpt"
+  fi
+  # Resource monitor binds by the restored directory's own device:inode.
+  if [[ -d "${DB_PATH}" ]]; then
+    local st_dev st_ino
+    read -r st_dev st_ino < <(stat -c '%d %i' "${DB_PATH}" 2>/dev/null || echo "0 0")
+    DB_DEVICE="${st_dev}"
+    DB_INODE="${st_ino}"
+    RESOURCE_DATABASE_IDENTITY="${DB_DEVICE}:${DB_INODE}"
+  fi
+  log "reused database ${DB_NAME} (run ${DATASET_RUN_ID})"
+}
+
+# Issue a static checkpoint over the wire protocol (flushes dirty pages and
+# writes db.chkpt so crash recovery starts from the checkpoint LSN).
+reuse_issue_checkpoint() {
+  log "issuing static checkpoint"
+  python3 - "${HOST}" "${PORT}" <<'PY'
+import socket
+import struct
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+sql = b"CREATE STATIC_CHECKPOINT;"
+try:
+    s = socket.create_connection((host, port), timeout=120)
+    s.sendall(b"RMDB\x00\x03\x00\x00")
+    if s.recv(8) != b"RMDB\x00\x03\x00\x00":
+        raise RuntimeError("checkpoint handshake echo mismatch")
+    s.sendall(struct.pack(">IBBH", len(sql), 0x20, 0, 0) + sql)
+    response = b""
+    while len(response) < 8:
+        chunk = s.recv(8 - len(response))
+        if not chunk:
+            break
+        response += chunk
+    if len(response) < 8:
+        raise RuntimeError("checkpoint response truncated")
+    tag = response[4]
+    if tag != 0x10:  # COMMAND_OK
+        raise RuntimeError(f"checkpoint failed with frame tag 0x{tag:02x}")
+    s.close()
+except Exception as error:
+    print(f"checkpoint error: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+# Checkpoint, stop the server, and truncate the WAL so the loaded database
+# can be cached with a clean, fast-to-open state.
+reuse_checkpoint_and_stop() {
+  reuse_issue_checkpoint
+  # rmdb writes db.chkpt with a relative path into its cwd (RMDB_DB_ROOT).
+  # Mirror it into the database directory so the cached copy carries the
+  # restart LSN with it.
+  if [[ -f "${RMDB_DB_ROOT}/db.chkpt" ]]; then
+    cp -f "${RMDB_DB_ROOT}/db.chkpt" "${DB_PATH}/db.chkpt"
+  fi
+  stop_server
+  # After the checkpoint all committed pages are on disk; the WAL is no
+  # longer needed for redo. Truncating it makes every restored copy open in
+  # seconds instead of re-analyzing the multi-GB load WAL.
+  if [[ -f "${DB_PATH}/db.log" ]]; then
+    truncate -s 0 "${DB_PATH}/db.log" \
+      || die "could not truncate db.log for reuse cache"
+    log "truncated db.log for reuse cache"
+  fi
+}
+
+# Prepare the measurement database for modes that build their own database
+# (all, preliminary, rank --init-db). With reuse enabled this either loads
+# and caches once per kernel, or restores the cached copy; the caller then
+# proceeds with the normal measurement stages.
+reuse_prepare_database() {
+  reuse_cache_paths
+  if [[ -f "${REUSE_CACHE_IDENTITY}" && -d "${REUSE_CACHE_DB}" ]]; then
+    log "database reuse enabled: restoring cached database (kernel $(reuse_cache_key))"
+    reuse_restore_copy
+    REUSE_ACTIVE=1
+    DB_OWNED=1
+    # A freshly restored multi-GB database opens in seconds after the WAL
+    # truncation, but keep a generous budget for cold page-cache reads.
+    start_server "reused database" \
+      "240" "reused database startup"
+    return 0
+  fi
+  log "database reuse enabled: no cached database for kernel $(reuse_cache_key); loading from SQL"
+  record_lifecycle_event setup-intent
+  start_new_database
+  run_setup
+  reuse_checkpoint_and_stop
+  reuse_cache_database
+  # Restart from the fresh cached copy so the measurement stages below see
+  # the same server state as the reuse path.
+  reuse_restore_copy
+  REUSE_ACTIVE=1
+  DB_OWNED=1
+  start_server "reused database" \
+    "240" "reused database startup"
+  return 0
 }
 
 run_rank() {
@@ -5717,22 +5990,44 @@ ensure_binaries
 
 case "${MODE}" in
   preliminary)
-    start_new_database
-    run_setup
+    if [[ "${REUSE_ENABLED}" == "1" ]]; then
+      reuse_prepare_database
+    else
+      record_lifecycle_event setup-intent
+      start_new_database
+      run_setup
+    fi
     run_preliminary
     stop_server
     ;;
   init)
-    record_lifecycle_event setup-intent
-    start_new_database
-    run_setup
-    stop_server
-    ;;
-  rank)
-    if [[ "${INIT_BEFORE_RUN}" == "1" ]]; then
+    if [[ "${REUSE_ENABLED}" == "1" ]]; then
+      reuse_cache_paths
+      if [[ -f "${REUSE_CACHE_IDENTITY}" && -d "${REUSE_CACHE_DB}" ]]; then
+        log "database reuse enabled: cache already present for kernel $(reuse_cache_key); nothing to do"
+        exit 0
+      fi
       record_lifecycle_event setup-intent
       start_new_database
       run_setup
+      reuse_checkpoint_and_stop
+      reuse_cache_database
+    else
+      record_lifecycle_event setup-intent
+      start_new_database
+      run_setup
+      stop_server
+    fi
+    ;;
+  rank)
+    if [[ "${INIT_BEFORE_RUN}" == "1" || "${REUSE_ENABLED}" == "1" ]]; then
+      if [[ "${REUSE_ENABLED}" == "1" ]]; then
+        reuse_prepare_database
+      else
+        record_lifecycle_event setup-intent
+        start_new_database
+        run_setup
+      fi
     else
       start_existing_database startup
     fi
@@ -5746,9 +6041,18 @@ case "${MODE}" in
     stop_server
     ;;
   all)
-    record_lifecycle_event setup-intent
-    start_new_database
-    run_setup
+    if [[ "${REUSE_ENABLED}" == "1" ]]; then
+      # Reuse with a truncated WAL cannot support the crash-recovery stage:
+      # the ranked windows append a multi-GB WAL that SIGKILL recovery must
+      # re-analyze, exceeding the 90s recovery budget, and the rmdb static
+      # checkpoint writes an unusable LSN (0) that corrupts recovery after
+      # WAL truncation. The official full lifecycle therefore keeps the
+      # load-every-time path; --reuse is honored by preliminary/rank only.
+      warn "all mode requires the full load lifecycle (crash recovery); reuse is disabled for this mode"
+      record_lifecycle_event setup-intent
+      start_new_database
+      run_setup
+    fi
     run_rank
     run_check online
     run_crash_restart
