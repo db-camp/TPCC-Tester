@@ -640,19 +640,19 @@ pub fn final2026_catalog() -> Vec<Statement> {
         ),
         command(
             StatementId::NewOrderUpdateStockNormal,
-            &[Int32, Float32, Int32, Int32, Int32],
+            &[Int32, Float32, Int32, Int32, Int32, Int32],
             "UPDATE stock \
              SET s_quantity = s_quantity - $1, s_ytd = s_ytd + $2, \
              s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + $3 \
-             WHERE s_w_id = $4 AND s_i_id = $5;",
+             WHERE s_w_id = $4 AND s_i_id = $5 AND s_quantity >= $6;",
         ),
         command(
             StatementId::NewOrderUpdateStockWrapped,
-            &[Int32, Float32, Int32, Int32, Int32],
+            &[Int32, Int32, Float32, Int32, Int32, Int32, Int32],
             "UPDATE stock \
-             SET s_quantity = s_quantity + $1, s_ytd = s_ytd + $2, \
-             s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + $3 \
-             WHERE s_w_id = $4 AND s_i_id = $5;",
+             SET s_quantity = s_quantity - $1 + $2, s_ytd = s_ytd + $3, \
+             s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + $4 \
+             WHERE s_w_id = $5 AND s_i_id = $6 AND s_quantity < $7;",
         ),
         command(
             StatementId::NewOrderInsertLine,
@@ -1275,18 +1275,20 @@ mod runtime_tests {
     use super::*;
 
     #[test]
-    fn wrapped_stock_uses_one_relative_operator_with_a_dense_parameter_set() {
+    fn wrapped_stock_matches_public_conditional_shape() {
         let statement = final2026_catalog()
             .into_iter()
             .find(|statement| statement.id == StatementId::NewOrderUpdateStockWrapped.wire_id())
             .unwrap();
 
-        assert_eq!(statement.param_types.len(), 5);
-        assert!(statement.sql.contains("s_quantity = s_quantity + $1"));
-        assert!(!statement.sql.contains("s_quantity + 91 -"));
+        assert_eq!(statement.param_types.len(), 7);
+        assert!(statement
+            .sql
+            .contains("s_quantity = s_quantity - $1 + $2"));
+        assert!(statement.sql.contains("s_quantity < $7"));
         assert_eq!(
             parameter_ordinals(&statement.sql).unwrap(),
-            BTreeSet::from([1, 2, 3, 4, 5])
+            BTreeSet::from([1, 2, 3, 4, 5, 6, 7])
         );
     }
 

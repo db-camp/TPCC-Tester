@@ -149,15 +149,20 @@ fn ranked_updates_keep_float32_arithmetic_inside_relative_sql() {
         );
     }
 
-    for id in [
-        StatementId::NewOrderUpdateStockNormal,
-        StatementId::NewOrderUpdateStockWrapped,
-    ] {
-        let statement = find(&catalog, id);
-        assert_eq!(statement.param_types[1], SqlType::Float32);
-        assert!(statement.sql.contains("s_ytd = s_ytd + $2"));
-        assert!(statement.sql.contains("s_remote_cnt = s_remote_cnt + $3"));
-    }
+    let normal = find(&catalog, StatementId::NewOrderUpdateStockNormal);
+    assert_eq!(normal.param_types[1], SqlType::Float32);
+    assert!(normal.sql.contains("s_ytd = s_ytd + $2"));
+    assert!(normal.sql.contains("s_remote_cnt = s_remote_cnt + $3"));
+    assert!(normal.sql.contains("s_quantity >= $6"));
+
+    let wrapped = find(&catalog, StatementId::NewOrderUpdateStockWrapped);
+    assert_eq!(wrapped.param_types[2], SqlType::Float32);
+    assert!(wrapped
+        .sql
+        .contains("s_quantity = s_quantity - $1 + $2"));
+    assert!(wrapped.sql.contains("s_ytd = s_ytd + $3"));
+    assert!(wrapped.sql.contains("s_remote_cnt = s_remote_cnt + $4"));
+    assert!(wrapped.sql.contains("s_quantity < $7"));
 }
 
 #[test]

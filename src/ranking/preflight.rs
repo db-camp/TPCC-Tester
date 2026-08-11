@@ -1089,20 +1089,33 @@ fn build_new_order_write_stage(
 
     for line in &materialized.lines {
         let normal_update = line.stock.quantity >= line.plan.quantity + 10;
-        operations.push(operation(
-            if normal_update {
-                StatementId::NewOrderUpdateStockNormal
-            } else {
-                StatementId::NewOrderUpdateStockWrapped
-            },
-            [
-                WireValue::Int32(line.plan.quantity),
-                WireValue::Float32((line.plan.quantity as f32).to_bits()),
-                WireValue::Int32(0),
-                WireValue::Int32(selection.warehouse_id),
-                WireValue::Int32(line.plan.item_id),
-            ],
-        ));
+        let stock_update = if normal_update {
+            operation(
+                StatementId::NewOrderUpdateStockNormal,
+                vec![
+                    WireValue::Int32(line.plan.quantity),
+                    WireValue::Float32((line.plan.quantity as f32).to_bits()),
+                    WireValue::Int32(0),
+                    WireValue::Int32(selection.warehouse_id),
+                    WireValue::Int32(line.plan.item_id),
+                    WireValue::Int32(line.plan.quantity + 10),
+                ],
+            )
+        } else {
+            operation(
+                StatementId::NewOrderUpdateStockWrapped,
+                vec![
+                    WireValue::Int32(line.plan.quantity),
+                    WireValue::Int32(91),
+                    WireValue::Float32((line.plan.quantity as f32).to_bits()),
+                    WireValue::Int32(0),
+                    WireValue::Int32(selection.warehouse_id),
+                    WireValue::Int32(line.plan.item_id),
+                    WireValue::Int32(line.plan.quantity + 10),
+                ],
+            )
+        };
+        operations.push(stock_update);
         operations.push(operation(
             StatementId::NewOrderInsertLine,
             [
