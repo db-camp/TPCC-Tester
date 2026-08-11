@@ -998,11 +998,11 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::StockLevelCount,
             &[Int32, Int32, Int32, Int32, Int32],
-            "SELECT COUNT(DISTINCT order_line.ol_i_id) \
+            "SELECT COUNT(DISTINCT (stock.s_i_id)) \
              FROM order_line, stock \
              WHERE order_line.ol_w_id = $1 AND order_line.ol_d_id = $2 \
-             AND order_line.ol_o_id >= $3 \
              AND order_line.ol_o_id < $4 \
+             AND order_line.ol_o_id >= $3 \
              AND stock.s_w_id = $1 \
              AND stock.s_i_id = order_line.ol_i_id \
              AND stock.s_quantity < $5;",
@@ -1449,6 +1449,13 @@ mod runtime_tests {
             .unwrap();
 
         assert_eq!(statement.param_types.len(), 5);
+        assert!(statement
+            .sql
+            .starts_with("SELECT COUNT(DISTINCT (stock.s_i_id)) FROM order_line, stock"));
+        assert!(
+            statement.sql.find("ol_o_id < $4").unwrap()
+                < statement.sql.find("ol_o_id >= $3").unwrap()
+        );
         assert!(statement.sql.contains("ol_o_id >= $3"));
         assert!(statement.sql.contains("ol_o_id < $4"));
         assert!(statement.sql.contains("s_quantity < $5"));

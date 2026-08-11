@@ -250,7 +250,7 @@ fn ranked_updates_keep_float32_arithmetic_inside_relative_sql() {
 }
 
 #[test]
-fn stock_level_is_one_server_side_distinct_join_with_complete_keys() {
+fn stock_level_matches_the_official_distinct_join_shape() {
     let catalog = final2026_catalog();
     let statement = find(&catalog, StatementId::StockLevelCount);
 
@@ -264,9 +264,14 @@ fn stock_level_is_one_server_side_distinct_join_with_complete_keys() {
             SqlType::Int32
         ]
     );
-    assert!(statement
-        .sql
-        .contains("COUNT(DISTINCT order_line.ol_i_id)"));
+    assert_eq!(
+        statement.sql,
+        "SELECT COUNT(DISTINCT (stock.s_i_id)) FROM order_line, stock \
+         WHERE order_line.ol_w_id = $1 AND order_line.ol_d_id = $2 \
+         AND order_line.ol_o_id < $4 AND order_line.ol_o_id >= $3 \
+         AND stock.s_w_id = $1 AND stock.s_i_id = order_line.ol_i_id \
+         AND stock.s_quantity < $5;"
+    );
     assert!(statement.sql.contains("stock.s_quantity < $5"));
     assert!(!statement.sql.contains("stock.s_quantity <= $5"));
     assert!(statement.sql.contains("order_line.ol_w_id = $1"));
