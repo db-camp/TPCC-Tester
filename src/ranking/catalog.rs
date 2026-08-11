@@ -563,8 +563,8 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::NewOrderHome,
             &[Int32, Int32, Int32],
-            "SELECT customer.c_discount AS c_discount, customer.c_last AS c_last, \
-             customer.c_credit AS c_credit, warehouse.w_tax AS w_tax \
+            "SELECT customer.c_discount, customer.c_last, \
+             customer.c_credit, warehouse.w_tax \
              FROM customer, warehouse \
              WHERE warehouse.w_id = $1 \
              AND customer.c_w_id = warehouse.w_id \
@@ -585,7 +585,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::NewOrderItem,
             &[Int32],
-            "SELECT i_id AS i_id, i_price AS i_price, i_name AS i_name, i_data AS i_data \
+            "SELECT i_id, i_price, i_name, i_data \
              FROM item WHERE i_id = $1;",
             &[
                 ("i_id", Int32),
@@ -597,14 +597,14 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::NewOrderStock,
             &[Int32, Int32],
-            "SELECT s_quantity AS s_quantity, s_ytd AS s_ytd, \
-             s_order_cnt AS s_order_cnt, s_remote_cnt AS s_remote_cnt, \
-             s_data AS s_data, \
-             s_dist_01 AS s_dist_01, s_dist_02 AS s_dist_02, \
-             s_dist_03 AS s_dist_03, s_dist_04 AS s_dist_04, \
-             s_dist_05 AS s_dist_05, s_dist_06 AS s_dist_06, \
-             s_dist_07 AS s_dist_07, s_dist_08 AS s_dist_08, \
-             s_dist_09 AS s_dist_09, s_dist_10 AS s_dist_10 \
+            "SELECT s_quantity, s_ytd, \
+             s_order_cnt, s_remote_cnt, \
+             s_data, \
+             s_dist_01, s_dist_02, \
+             s_dist_03, s_dist_04, \
+             s_dist_05, s_dist_06, \
+             s_dist_07, s_dist_08, \
+             s_dist_09, s_dist_10 \
              FROM stock WHERE s_w_id = $1 AND s_i_id = $2;",
             &[
                 ("s_quantity", Int32),
@@ -667,9 +667,9 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::PaymentWarehouse,
             &[Int32],
-            "SELECT w_ytd AS w_ytd, w_name AS w_name, w_street_1 AS w_street_1, \
-             w_street_2 AS w_street_2, w_city AS w_city, w_state AS w_state, \
-             w_zip AS w_zip FROM warehouse WHERE w_id = $1;",
+            "SELECT w_ytd, w_name, w_street_1, \
+             w_street_2, w_city, w_state, \
+             w_zip FROM warehouse WHERE w_id = $1;",
             &[
                 ("w_ytd", Float32),
                 ("w_name", Char),
@@ -688,9 +688,9 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::PaymentDistrict,
             &[Int32, Int32],
-            "SELECT d_ytd AS d_ytd, d_name AS d_name, d_street_1 AS d_street_1, \
-             d_street_2 AS d_street_2, d_city AS d_city, d_state AS d_state, \
-             d_zip AS d_zip FROM district WHERE d_w_id = $1 AND d_id = $2;",
+            "SELECT d_ytd, d_name, d_street_1, \
+             d_street_2, d_city, d_state, \
+             d_zip FROM district WHERE d_w_id = $1 AND d_id = $2;",
             &[
                 ("d_ytd", Float32),
                 ("d_name", Char),
@@ -735,9 +735,9 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::PaymentCustomerAfter,
             &[Int32, Int32, Int32],
-            "SELECT c_balance AS c_balance, c_ytd_payment AS c_ytd_payment, \
-             c_payment_cnt AS c_payment_cnt, c_delivery_cnt AS c_delivery_cnt, \
-             c_data AS c_data \
+            "SELECT c_balance, c_ytd_payment, \
+             c_payment_cnt, c_delivery_cnt, \
+             c_data \
              FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3;",
             &[
                 ("c_balance", Float32),
@@ -752,7 +752,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::OrderStatusLatestOrder,
             &[Int32, Int32, Int32],
-            "SELECT o_id AS o_id FROM orders \
+            "SELECT o_id FROM orders \
              WHERE o_w_id = $1 AND o_d_id = $2 AND o_c_id = $3 \
              ORDER BY o_id DESC LIMIT 1;",
             &[("o_id", Int32)],
@@ -760,8 +760,8 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::OrderStatusOrder,
             &[Int32, Int32, Int32],
-            "SELECT o_id AS o_id, o_entry_d AS o_entry_d, \
-             o_carrier_id AS o_carrier_id FROM orders \
+            "SELECT o_id, o_entry_d, \
+             o_carrier_id FROM orders \
              WHERE o_w_id = $1 AND o_d_id = $2 AND o_id = $3;",
             &[
                 ("o_id", Int32),
@@ -772,9 +772,9 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::OrderStatusLines,
             &[Int32, Int32, Int32],
-            "SELECT ol_number AS ol_number, ol_i_id AS ol_i_id, \
-             ol_supply_w_id AS ol_supply_w_id, ol_quantity AS ol_quantity, \
-             ol_amount AS ol_amount, ol_delivery_d AS ol_delivery_d \
+            "SELECT ol_number, ol_i_id, \
+             ol_supply_w_id, ol_quantity, \
+             ol_amount, ol_delivery_d \
              FROM order_line \
              WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id = $3 \
              ORDER BY ol_number ASC;",
@@ -790,7 +790,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::DeliveryOldestOrder,
             &[Int32, Int32],
-            "SELECT MIN(no_o_id) AS no_o_id FROM new_orders \
+            "SELECT MIN(no_o_id) FROM new_orders \
              WHERE no_w_id = $1 AND no_d_id = $2;",
             &[("no_o_id", Int32)],
         ),
@@ -803,23 +803,23 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::DeliveryConfirmQueue,
             &[Int32, Int32, Int32],
-            "SELECT no_o_id AS no_o_id FROM new_orders \
+            "SELECT no_o_id FROM new_orders \
              WHERE no_w_id = $1 AND no_d_id = $2 AND no_o_id = $3;",
             &[("no_o_id", Int32)],
         ),
         query(
             StatementId::DeliveryOrder,
             &[Int32, Int32, Int32],
-            "SELECT o_c_id AS o_c_id FROM orders \
+            "SELECT o_c_id FROM orders \
              WHERE o_w_id = $1 AND o_d_id = $2 AND o_id = $3;",
             &[("o_c_id", Int32)],
         ),
         query(
             StatementId::DeliveryCustomer,
             &[Int32, Int32, Int32],
-            "SELECT customer.c_id AS c_id, customer.c_balance AS c_balance, \
-             customer.c_payment_cnt AS c_payment_cnt, \
-             customer.c_delivery_cnt AS c_delivery_cnt \
+            "SELECT customer.c_id, customer.c_balance, \
+             customer.c_payment_cnt, \
+             customer.c_delivery_cnt \
              FROM customer, orders \
              WHERE orders.o_w_id = $1 AND orders.o_d_id = $2 AND orders.o_id = $3 \
              AND customer.c_w_id = orders.o_w_id \
@@ -835,7 +835,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::DeliveryLineRows,
             &[Int32, Int32, Int32],
-            "SELECT ol_number AS ol_number, ol_amount AS ol_amount \
+            "SELECT ol_number, ol_amount \
              FROM order_line \
              WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id = $3 \
              ORDER BY ol_number ASC;",
@@ -844,7 +844,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::DeliveryLineSum,
             &[Int32, Int32, Int32],
-            "SELECT SUM(ol_amount) AS ol_amount_sum FROM order_line \
+            "SELECT SUM(ol_amount) FROM order_line \
              WHERE ol_w_id = $1 AND ol_d_id = $2 AND ol_o_id = $3;",
             &[("ol_amount_sum", Float32)],
         ),
@@ -877,8 +877,8 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::DeliveryCustomerAfter,
             &[Int32, Int32, Int32],
-            "SELECT c_balance AS c_balance, c_payment_cnt AS c_payment_cnt, \
-             c_delivery_cnt AS c_delivery_cnt \
+            "SELECT c_balance, c_payment_cnt, \
+             c_delivery_cnt \
              FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND c_id = $3;",
             &[
                 ("c_balance", Float32),
@@ -889,14 +889,14 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::StockLevelNextOrder,
             &[Int32, Int32],
-            "SELECT d_next_o_id AS d_next_o_id, d_tax AS d_tax FROM district \
+            "SELECT d_next_o_id, d_tax FROM district \
              WHERE d_w_id = $1 AND d_id = $2;",
             &[("d_next_o_id", Int32), ("d_tax", Float32)],
         ),
         query(
             StatementId::StockLevelCount,
             &[Int32, Int32, Int32, Int32, Int32],
-            "SELECT COUNT(DISTINCT order_line.ol_i_id) AS low_stock_count \
+            "SELECT COUNT(DISTINCT order_line.ol_i_id) \
              FROM order_line, stock \
              WHERE order_line.ol_w_id = $1 AND order_line.ol_d_id = $2 \
              AND order_line.ol_o_id >= $3 \
@@ -913,7 +913,7 @@ pub fn final2026_catalog() -> Vec<Statement> {
 ///
 /// The canonical builder remains the logical source of relational semantics;
 /// this transformation replaces every statement id, SQL identifier, and
-/// declared result alias from the same immutable runtime schema.
+/// declared result name from the same immutable runtime schema.
 pub fn runtime_catalog(schema: &RuntimeSchema) -> Result<Vec<Statement>, CatalogError> {
     schema
         .validate()
@@ -951,7 +951,7 @@ pub fn runtime_catalog(schema: &RuntimeSchema) -> Result<Vec<Statement>, Catalog
 /// One validated catalogue derived once from the persisted per-run schema.
 ///
 /// Executors share this value across every session so statement ids, SQL, and
-/// declared result aliases cannot be regenerated or mixed after dispatch
+/// declared result names cannot be regenerated or mixed after dispatch
 /// begins.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeCatalog {
@@ -1002,14 +1002,14 @@ fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement 
         id,
         &[Int32, Int32, if by_last_name { Char } else { Int32 }],
         &format!(
-            "SELECT c_id AS c_id, c_first AS c_first, c_middle AS c_middle, \
-             c_last AS c_last, c_street_1 AS c_street_1, \
-             c_street_2 AS c_street_2, c_city AS c_city, c_state AS c_state, \
-             c_zip AS c_zip, c_phone AS c_phone, c_since AS c_since, \
-             c_credit AS c_credit, c_credit_lim AS c_credit_lim, \
-             c_discount AS c_discount, c_balance AS c_balance, \
-             c_ytd_payment AS c_ytd_payment, c_payment_cnt AS c_payment_cnt, \
-             c_delivery_cnt AS c_delivery_cnt, c_data AS c_data FROM customer \
+            "SELECT c_id, c_first, c_middle, \
+             c_last, c_street_1, \
+             c_street_2, c_city, c_state, \
+             c_zip, c_phone, c_since, \
+             c_credit, c_credit_lim, \
+             c_discount, c_balance, \
+             c_ytd_payment, c_payment_cnt, \
+             c_delivery_cnt, c_data FROM customer \
              WHERE customer.c_w_id = $1 AND customer.c_d_id = $2 AND {predicate};"
         ),
         &[
@@ -1048,8 +1048,8 @@ fn order_status_customer_statement(id: StatementId, by_last_name: bool) -> State
         id,
         &[Int32, Int32, if by_last_name { Char } else { Int32 }],
         &format!(
-            "SELECT c_id AS c_id, c_balance AS c_balance, c_first AS c_first, \
-             c_middle AS c_middle, c_last AS c_last FROM customer \
+            "SELECT c_id, c_balance, c_first, \
+             c_middle, c_last FROM customer \
              WHERE c_w_id = $1 AND c_d_id = $2 AND {predicate};"
         ),
         &[
@@ -1178,15 +1178,6 @@ fn validate_catalog_with(
                     "query statement {} has no declared columns",
                     statement.id
                 )));
-            }
-            for column in columns {
-                let alias = format!(" AS {}", column.name.to_ascii_uppercase());
-                if !upper.contains(&alias) {
-                    return Err(CatalogError::new(format!(
-                        "query statement {} does not project fixed alias {}",
-                        statement.id, column.name
-                    )));
-                }
             }
         }
     }
@@ -1348,7 +1339,7 @@ mod runtime_tests {
     }
 
     #[test]
-    fn opaque_catalog_renders_sql_and_declared_aliases_together() {
+    fn opaque_catalog_renders_sql_and_declared_result_names_together() {
         let schema = RuntimeSchema::opaque(2026).unwrap();
         let runtime = RuntimeCatalog::from_schema(&schema).unwrap();
         let catalog = runtime.statements();

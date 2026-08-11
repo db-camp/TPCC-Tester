@@ -868,7 +868,7 @@ impl Loader<'_> {
         for table in self.schema.schedule().count_tables() {
             let expected = materialized.asset(*table)?.row_count;
             let logical = table.canonical();
-            let sql = format!("SELECT COUNT(*) FROM {}", self.schema.table(*table));
+            let sql = row_count_sql(self.schema.table(*table));
             match self.cursor.execute(&sql, &[]).await {
                 Ok(result) => match result.rows.first().and_then(|row| row.first()) {
                     Some(value) => match value.parse::<i64>() {
@@ -910,12 +910,24 @@ impl Loader<'_> {
     }
 }
 
+fn row_count_sql(table: &str) -> String {
+    format!("SELECT COUNT(*) AS row_count FROM {table}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn load_verification_count_uses_the_official_alias_shape() {
+        assert_eq!(
+            row_count_sql("opaque_stock"),
+            "SELECT COUNT(*) AS row_count FROM opaque_stock"
+        );
+    }
 
     #[test]
     fn float_csv_serialization_round_trips_binary32_bits() {

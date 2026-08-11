@@ -64,8 +64,12 @@ fn catalogue_has_unique_bounded_ids_and_dense_typed_markers() {
 }
 
 #[test]
-fn query_schemas_use_fixed_aliases_and_exact_wire_types() {
+fn query_schemas_use_declared_names_and_exact_wire_types() {
     let catalog = final2026_catalog();
+    assert!(catalog.iter().all(|statement| {
+        !matches!(&statement.kind, StatementKind::Query { .. })
+            || !statement.sql.to_ascii_uppercase().contains(" AS ")
+    }));
 
     let home = find(&catalog, StatementId::NewOrderHome);
     assert_eq!(
@@ -200,7 +204,7 @@ fn stock_level_is_one_server_side_distinct_join_with_complete_keys() {
     );
     assert!(statement
         .sql
-        .contains("COUNT(DISTINCT order_line.ol_i_id) AS low_stock_count"));
+        .contains("COUNT(DISTINCT order_line.ol_i_id)"));
     assert!(statement.sql.contains("stock.s_quantity < $5"));
     assert!(!statement.sql.contains("stock.s_quantity <= $5"));
     assert!(statement.sql.contains("order_line.ol_w_id = $1"));
@@ -341,16 +345,6 @@ fn assert_query_columns(statement: &Statement, expected: &[(&str, SqlType)]) {
         .map(|column| (column.name.as_str(), column.sql_type))
         .collect();
     assert_eq!(actual, expected);
-    for (name, _) in expected {
-        assert!(
-            statement
-                .sql
-                .to_ascii_uppercase()
-                .contains(&format!(" AS {}", name.to_ascii_uppercase())),
-            "statement {} must use fixed alias {name}",
-            statement.id
-        );
-    }
 }
 
 fn find_mut(catalog: &mut [Statement], id: StatementId) -> &mut Statement {
