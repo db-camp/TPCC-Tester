@@ -91,6 +91,7 @@ where
     ) -> WireResult<PrepareResponse> {
         self.ensure_handshaken("PREPARE_SET")?;
         let (payload, replacement) = build_prepare_payload(statements)?;
+        self.begin_exchange("PREPARE_SET");
         let deadline = self
             .write_request_frame(FrameTag::PrepareSet, 0, &payload, "PREPARE_SET", timeout)
             .await?;
@@ -98,19 +99,23 @@ where
         let frame = self
             .read_response_frame_before(deadline, "PREPARE_SET")
             .await?;
-        match frame.tag {
+        let response = match frame.tag {
             FrameTag::PrepareOk => {
                 parse_prepare_ok(&frame.payload, statements)?;
                 self.prepared = replacement;
-                Ok(PrepareResponse::Installed)
+                PrepareResponse::Installed
             }
-            FrameTag::Error => Ok(PrepareResponse::Error {
+            FrameTag::Error => PrepareResponse::Error {
                 diagnostic: parse_diagnostic(&frame.payload, "ERROR")?,
-            }),
-            other => Err(WireError::Protocol(format!(
-                "unexpected {other:?} frame in PREPARE_SET response"
-            ))),
-        }
+            },
+            other => {
+                return Err(WireError::Protocol(format!(
+                    "unexpected {other:?} frame in PREPARE_SET response"
+                )))
+            }
+        };
+        self.complete_exchange("PREPARE_SET");
+        Ok(response)
     }
 
     /// Execute a bounded, ordered operation batch with mandatory AUTO_ABORT.
@@ -133,6 +138,7 @@ where
     ) -> WireResult<BatchResponse> {
         self.ensure_handshaken("EXEC_BATCH")?;
         let payload = build_batch_payload(operations, &self.prepared)?;
+        self.begin_exchange("EXEC_BATCH");
         let deadline = self
             .write_request_frame(
                 FrameTag::ExecBatch,
@@ -146,15 +152,21 @@ where
         let frame = self
             .read_response_frame_before(deadline, "EXEC_BATCH")
             .await?;
-        match frame.tag {
-            FrameTag::BatchResult => parse_batch_result(&frame.payload, operations, &self.prepared),
-            FrameTag::Error => Ok(BatchResponse::TopLevelError {
+        let response = match frame.tag {
+            FrameTag::BatchResult => {
+                parse_batch_result(&frame.payload, operations, &self.prepared)?
+            }
+            FrameTag::Error => BatchResponse::TopLevelError {
                 diagnostic: parse_diagnostic(&frame.payload, "ERROR")?,
-            }),
-            other => Err(WireError::Protocol(format!(
-                "unexpected {other:?} frame in EXEC_BATCH response"
-            ))),
-        }
+            },
+            other => {
+                return Err(WireError::Protocol(format!(
+                    "unexpected {other:?} frame in EXEC_BATCH response"
+                )))
+            }
+        };
+        self.complete_exchange("EXEC_BATCH");
+        Ok(response)
     }
 }
 
@@ -961,8 +973,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_exec_batch_gets_a_fresh_response_deadline() {
-        let timeout = Duration::from_millis(400);
+    async fn cancelled_prepare_poisons_without_sending_a_second_request() {
+        let statements = vec![command(1, Vec::new(), "begin;")];
+        let response = response_frame(FrameTag::PrepareOk, &prepare_ok(&[(1, Vec::new())]));
+        let (client_io, mut server_io) = duplex(64);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            let (tag, flags, _) = read_request(&mut server_io).await;
+            assert_eq!((tag, flags), (FrameTag::PrepareSet, 0));
+            sleep(Duration::from_millis(80)).await;
+            server_io.write_all(&response).await.unwrap();
+
+            let mut unexpected_request = [0_u8; 1];
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    server_io.read_exact(&mut unexpected_request),
+                )
+                .await
+                .is_err(),
+                "client sent a second request after cancelling PREPARE_SET"
+            );
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25),
+            connection.prepare_set(&statements),
+        )
+        .await
+        .is_err());
+        sleep(Duration::from_millis(100)).await;
+
+        let reuse_error = connection
+            .prepare_set(&statements)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reuse_error.contains("incomplete or invalid PREPARE_SET"),
+            "{reuse_error}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_poisons_without_sending_a_second_request() {
         let operation = Operation {
             statement_id: 1,
             parameters: vec![WireValue::Int32(7)],
@@ -971,11 +1028,61 @@ mod tests {
         let (client_io, mut server_io) = duplex(64);
         let server = tokio::spawn(async move {
             server_handshake(&mut server_io).await;
+            let (tag, flags, _) = read_request(&mut server_io).await;
+            assert_eq!((tag, flags), (FrameTag::ExecBatch, AUTO_ABORT_FLAG));
+            sleep(Duration::from_millis(80)).await;
+            server_io.write_all(&response).await.unwrap();
 
-            for _ in 0..2 {
+            let mut unexpected_request = [0_u8; 1];
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    server_io.read_exact(&mut unexpected_request),
+                )
+                .await
+                .is_err(),
+                "client sent a second request after cancelling EXEC_BATCH"
+            );
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        connection.prepared = test_dictionary();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25),
+            connection.exec_batch(std::slice::from_ref(&operation)),
+        )
+        .await
+        .is_err());
+        sleep(Duration::from_millis(100)).await;
+
+        let reuse_error = connection
+            .exec_batch(std::slice::from_ref(&operation))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reuse_error.contains("incomplete or invalid EXEC_BATCH"),
+            "{reuse_error}"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_abort_and_top_level_error_allow_another_batch() {
+        let operation = Operation {
+            statement_id: 1,
+            parameters: vec![WireValue::Int32(7)],
+        };
+        let abort = response_frame(FrameTag::BatchResult, &failed_batch_payload(1, 0, 0, 0));
+        let top_level_error = response_frame(FrameTag::Error, b"rejected");
+        let success = response_frame(FrameTag::BatchResult, &successful_command_batch(1));
+        let (client_io, mut server_io) = duplex(64);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            for response in [abort, top_level_error, success] {
                 let (tag, flags, _) = read_request(&mut server_io).await;
                 assert_eq!((tag, flags), (FrameTag::ExecBatch, AUTO_ABORT_FLAG));
-                sleep(Duration::from_millis(250)).await;
                 server_io.write_all(&response).await.unwrap();
             }
         });
@@ -983,18 +1090,85 @@ mod tests {
         let mut connection = WireConnection::new(client_io);
         connection.handshake().await.unwrap();
         connection.prepared = test_dictionary();
-        for _ in 0..2 {
-            assert_eq!(
-                connection
-                    .exec_batch_with_timeout(std::slice::from_ref(&operation), timeout)
-                    .await
-                    .unwrap(),
-                BatchResponse::Ok {
-                    executed_operations: 1,
-                    results: Vec::new(),
-                }
-            );
-        }
+        assert_eq!(
+            connection
+                .exec_batch(std::slice::from_ref(&operation))
+                .await
+                .unwrap(),
+            BatchResponse::TransactionAbort {
+                executed_operations: 0,
+                failed_operation: 0,
+                diagnostic: String::new(),
+            }
+        );
+        assert_eq!(
+            connection
+                .exec_batch(std::slice::from_ref(&operation))
+                .await
+                .unwrap(),
+            BatchResponse::TopLevelError {
+                diagnostic: "rejected".to_owned(),
+            }
+        );
+        assert_eq!(
+            connection
+                .exec_batch(std::slice::from_ref(&operation))
+                .await
+                .unwrap(),
+            BatchResponse::Ok {
+                executed_operations: 1,
+                results: Vec::new(),
+            }
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_prepared_exchange_gets_a_fresh_response_deadline() {
+        let timeout = Duration::from_millis(400);
+        let statements = vec![command(1, vec![SqlType::Int32], "update t set i=$1;")];
+        let operation = Operation {
+            statement_id: 1,
+            parameters: vec![WireValue::Int32(7)],
+        };
+        let prepare_response =
+            response_frame(FrameTag::PrepareOk, &prepare_ok(&[(1, Vec::new())]));
+        let batch_response =
+            response_frame(FrameTag::BatchResult, &successful_command_batch(1));
+        let (client_io, mut server_io) = duplex(64);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+
+            let (tag, flags, _) = read_request(&mut server_io).await;
+            assert_eq!((tag, flags), (FrameTag::PrepareSet, 0));
+            sleep(Duration::from_millis(250)).await;
+            server_io.write_all(&prepare_response).await.unwrap();
+
+            let (tag, flags, _) = read_request(&mut server_io).await;
+            assert_eq!((tag, flags), (FrameTag::ExecBatch, AUTO_ABORT_FLAG));
+            sleep(Duration::from_millis(250)).await;
+            server_io.write_all(&batch_response).await.unwrap();
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        connection.handshake().await.unwrap();
+        assert_eq!(
+            connection
+                .prepare_set_with_timeout(&statements, timeout)
+                .await
+                .unwrap(),
+            PrepareResponse::Installed
+        );
+        assert_eq!(
+            connection
+                .exec_batch_with_timeout(std::slice::from_ref(&operation), timeout)
+                .await
+                .unwrap(),
+            BatchResponse::Ok {
+                executed_operations: 1,
+                results: Vec::new(),
+            }
+        );
         server.await.unwrap();
     }
 

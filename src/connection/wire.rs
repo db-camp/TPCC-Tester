@@ -391,7 +391,7 @@ where
         // exchange, dropping it at any await point must leave the connection
         // unusable. Only a fully consumed and validated terminal clears this
         // marker.
-        self.incomplete_exchange = Some("EXEC_STREAM");
+        self.begin_exchange("EXEC_STREAM");
         async {
             let deadline = self
                 .write_request_frame(
@@ -452,7 +452,7 @@ where
                                 "query response terminated with COMMAND_OK".to_owned(),
                             ));
                         }
-                        self.incomplete_exchange = None;
+                        self.complete_exchange("EXEC_STREAM");
                         return Ok(FoldStreamResponse::CommandOk);
                     }
                     FrameTag::ResultEnd => {
@@ -467,7 +467,7 @@ where
                                 "RESULT_END row_count {declared_row_count} does not match {row_count} ROW frames"
                             )));
                         }
-                        self.incomplete_exchange = None;
+                        self.complete_exchange("EXEC_STREAM");
                         if let Some(error) = callback_error {
                             return Err(error);
                         }
@@ -480,12 +480,12 @@ where
                     FrameTag::TransactionAbort => {
                         let diagnostic =
                             parse_diagnostic(&frame.payload, "TRANSACTION_ABORT")?;
-                        self.incomplete_exchange = None;
+                        self.complete_exchange("EXEC_STREAM");
                         return Ok(FoldStreamResponse::TransactionAbort { diagnostic });
                     }
                     FrameTag::Error => {
                         let diagnostic = parse_diagnostic(&frame.payload, "ERROR")?;
-                        self.incomplete_exchange = None;
+                        self.complete_exchange("EXEC_STREAM");
                         return Ok(FoldStreamResponse::Error { diagnostic });
                     }
                     other => {
@@ -518,6 +518,24 @@ where
             )))
         } else {
             Ok(())
+        }
+    }
+
+    /// Mark a request/response exchange as started before its first I/O.
+    ///
+    /// The marker deliberately survives future cancellation and every error
+    /// path. Only a fully consumed, valid terminal response may clear it.
+    pub(crate) fn begin_exchange(&mut self, request_name: &'static str) {
+        debug_assert!(self.incomplete_exchange.is_none());
+        self.incomplete_exchange = Some(request_name);
+    }
+
+    /// Clear the exchange marker after a complete terminal response.
+    pub(crate) fn complete_exchange(&mut self, request_name: &'static str) {
+        if self.incomplete_exchange == Some(request_name) {
+            self.incomplete_exchange = None;
+        } else {
+            debug_assert_eq!(self.incomplete_exchange, Some(request_name));
         }
     }
 
