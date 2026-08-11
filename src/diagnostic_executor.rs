@@ -30,7 +30,9 @@ use crate::profile::{TransactionKind, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES};
 use crate::ranking::catalog::RuntimeCatalog;
 use crate::ranking::common::install_statement_layout;
 use crate::ranking::dispatch::{self, FrozenTransaction};
-use crate::ranking::runner::RankedTransactionOutcome;
+use crate::ranking::runner::{
+    DirectRetryDecision, DirectRetryState, RankedTransactionOutcome,
+};
 use crate::ranking::session::open_ranked_session;
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
 use crate::run_state::StateStore;
@@ -525,6 +527,7 @@ async fn run_worker(
         let kind = frozen.ticket().kind();
         let measured = phase == DiagnosticPhase::Measurement;
         let mut logical_attempt_recorded = false;
+        let mut retry_state = DirectRetryState::default();
 
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -597,8 +600,17 @@ async fn run_worker(
                     if timeline.phase(Instant::now()) != Some(phase) {
                         break;
                     }
-                    // Retry the exact frozen transaction directly. Only the
-                    // phase cutoff can stop another physical attempt.
+                    match retry_state.on_transaction_abort() {
+                        DirectRetryDecision::RetrySameParameters => {
+                            // Retry the exact frozen transaction directly.
+                        }
+                        DirectRetryDecision::Abandon => {
+                            if measured {
+                                stats.abandoned = stats.abandoned.saturating_add(1);
+                            }
+                            break;
+                        }
+                    }
                 }
                 Ok(Err(error)) => {
                     cancelled.store(true, Ordering::Release);

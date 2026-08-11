@@ -121,6 +121,34 @@ pub enum RankedTransactionOutcome {
     ExpectedRollback,
 }
 
+/// Shared, non-configurable policy for a complete retryable transaction abort.
+///
+/// The first `TRANSACTION_ABORT` retries the exact frozen transaction once. A
+/// second abort is the final outcome for that logical selection. Keeping this
+/// state outside both executors prevents fast and ranked runs from silently
+/// applying different retry limits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DirectRetryState {
+    retry_used: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectRetryDecision {
+    RetrySameParameters,
+    Abandon,
+}
+
+impl DirectRetryState {
+    pub fn on_transaction_abort(&mut self) -> DirectRetryDecision {
+        if self.retry_used {
+            DirectRetryDecision::Abandon
+        } else {
+            self.retry_used = true;
+            DirectRetryDecision::RetrySameParameters
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RankedTransactionError {
     #[error("ranked transport failed: {0}")]
@@ -210,6 +238,24 @@ mod tests {
         let _keeps_wire_type_visible = BatchResponse::TopLevelError {
             diagnostic: String::new(),
         };
+    }
+
+    #[test]
+    fn direct_retry_state_retries_once_then_abandons() {
+        let mut state = DirectRetryState::default();
+
+        assert_eq!(
+            state.on_transaction_abort(),
+            DirectRetryDecision::RetrySameParameters
+        );
+        assert_eq!(
+            state.on_transaction_abort(),
+            DirectRetryDecision::Abandon
+        );
+        assert_eq!(
+            state.on_transaction_abort(),
+            DirectRetryDecision::Abandon
+        );
     }
 
     #[test]

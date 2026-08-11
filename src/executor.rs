@@ -33,7 +33,9 @@ use crate::ranking::evidence_collector::{CustomerKey, StockKey};
 use crate::ranking::ledger::LedgerClass;
 use crate::ranking::preflight;
 use crate::ranking::rich_recovery_samples::{InitialCustomerData, InitialHistoryRow};
-use crate::ranking::runner::{RankedTransactionOutcome, StockVersion};
+use crate::ranking::runner::{
+    DirectRetryDecision, DirectRetryState, RankedTransactionOutcome, StockVersion,
+};
 use crate::ranking::session::open_ranked_session;
 use crate::ranking::preflight::PreparedPathPreflightProof;
 use crate::ranking::terminal_evidence::{
@@ -700,6 +702,7 @@ async fn run_worker_inner(
                 Err(error) => return Err(scheduler_error(error)),
             }
         };
+        let mut retry_state = DirectRetryState::default();
 
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -876,6 +879,13 @@ async fn run_worker_inner(
                             .map_err(scheduler_error)?
                     };
                     if disposition != AttemptDisposition::RetrySameParameters {
+                        break;
+                    }
+                    if retry_state.on_transaction_abort() == DirectRetryDecision::Abandon {
+                        let mut state = lock_scheduler(&scheduler)?;
+                        state
+                            .abandon_retry(phase_ticket)
+                            .map_err(scheduler_error)?;
                         break;
                     }
                     let (ticket, deadline) = {
