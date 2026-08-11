@@ -12,7 +12,8 @@ use crate::workload::StockLevelInput;
 
 use super::catalog::StatementId;
 use super::common::{
-    operation, BatchResults, SemanticResult, SemanticResultExt, SemanticViolation,
+    operation, row_f32_bits, row_int32, BatchResults, SemanticResult, SemanticResultExt,
+    SemanticViolation,
 };
 use super::runner::{
     execute_batch, semantic_or_abort, RankedCommit, RankedTransactionError,
@@ -102,7 +103,21 @@ pub(super) fn stock_level_count_parameters(
 }
 
 fn read_next_order_id(results: &BatchResults) -> SemanticResult<i32> {
-    validate_next_order_id(results.single_int32(1)?)
+    let row = results.single_row(1)?;
+    if row.len() != 2 {
+        return Err(SemanticViolation::new(format!(
+            "Stock-Level district returned {} columns, expected 2",
+            row.len()
+        )));
+    }
+    let next_order_id = row_int32(row, 0, "Stock-Level district")?;
+    let tax = f32::from_bits(row_f32_bits(row, 1, "Stock-Level district")?);
+    if !(0.0..=0.2).contains(&tax) {
+        return Err(SemanticViolation::new(format!(
+            "Stock-Level d_tax must be in 0..=0.2, got {tax}"
+        )));
+    }
+    validate_next_order_id(next_order_id)
 }
 
 fn validate_next_order_id(next_order_id: i32) -> SemanticResult<i32> {

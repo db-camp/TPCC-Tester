@@ -224,7 +224,11 @@ async fn verify_stock_level(
     let begin_results =
         execute_preflight_batch(client, "StockLevel begin/next-order", &begin).await?;
     let next_order_id =
-        match parse_positive_scalar(&begin_results, 1, "StockLevel preflight d_next_o_id") {
+        match parse_new_order_district_order_id(
+            &begin_results,
+            1,
+            "StockLevel preflight district",
+        ) {
             Ok(value) => value,
             Err(error) => return semantic_abort(client, error).await,
         };
@@ -897,6 +901,7 @@ fn exact_f32_mismatch(actual_bits: u32, expected_bits: u32, context: &str) -> St
 struct NewOrderStageOnePlan {
     operations: Vec<Operation>,
     home_result: usize,
+    district_result: usize,
     line_results: Vec<(usize, usize)>,
 }
 
@@ -904,6 +909,8 @@ fn build_new_order_stage_one(selection: &PreflightSelection) -> NewOrderStageOne
     let mut operations = vec![operation(StatementId::Begin, [])];
     let home_result = operations.len();
     operations.push(new_order_home_operation(selection));
+    let district_result = operations.len();
+    operations.push(new_order_district_operation(selection));
 
     let stock_keys: BTreeSet<_> = selection.all_item_ids().collect();
     for item_id in stock_keys {
@@ -937,6 +944,7 @@ fn build_new_order_stage_one(selection: &PreflightSelection) -> NewOrderStageOne
     NewOrderStageOnePlan {
         operations,
         home_result,
+        district_result,
         line_results,
     }
 }
@@ -960,8 +968,23 @@ fn parse_new_order_stage_one(
     plan: &NewOrderStageOnePlan,
     results: &BatchResults,
 ) -> Result<MaterializedNewOrder, String> {
-    let order_id =
-        parse_new_order_home_order_id(results, plan.home_result, "NewOrder preflight home")?;
+    let home = exactly_one_row(
+        results
+            .rows(plan.home_result)
+            .map_err(|error| error.to_string())?,
+        "NewOrder preflight home",
+    )?;
+    if home.len() != 4 {
+        return Err(format!(
+            "NewOrder preflight home returned {} columns, expected 4",
+            home.len()
+        ));
+    }
+    let order_id = parse_new_order_district_order_id(
+        results,
+        plan.district_result,
+        "NewOrder preflight district",
+    )?;
 
     let all_items: Vec<_> = selection.all_item_ids().collect();
     if plan.line_results.len() != all_items.len() {
@@ -990,13 +1013,21 @@ fn parse_new_order_stage_one(
         }
 
         let item = exactly_one_row(item_rows, &format!("NewOrder preflight item {item_id}"))?;
-        if item.len() != 3 {
+        if item.len() != 4 {
             return Err(format!(
-                "NewOrder preflight item {item_id} returned {} columns, expected 3",
+                "NewOrder preflight item {item_id} returned {} columns, expected 4",
                 item.len()
             ));
         }
-        let price_bits = row_f32_bits(item, 0, &format!("NewOrder preflight item {item_id}"))
+        let returned_item_id =
+            row_int32(item, 0, &format!("NewOrder preflight item {item_id}"))
+                .map_err(|error| error.to_string())?;
+        if returned_item_id != *item_id {
+            return Err(format!(
+                "NewOrder preflight item {item_id} returned id {returned_item_id}"
+            ));
+        }
+        let price_bits = row_f32_bits(item, 1, &format!("NewOrder preflight item {item_id}"))
             .map_err(|error| error.to_string())?;
         let price = f32::from_bits(price_bits);
         if !(1.0..=100.0).contains(&price) {
@@ -1155,7 +1186,7 @@ struct NewOrderState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NewOrderStateProbe {
-    home_result: usize,
+    district_result: usize,
     stock_results: Vec<(i32, usize)>,
     order_result: usize,
     delivery_order_result: usize,
@@ -1169,8 +1200,8 @@ fn append_new_order_state_probe(
     selection: &PreflightSelection,
     order_id: i32,
 ) -> NewOrderStateProbe {
-    let home_result = operations.len();
-    operations.push(new_order_home_operation(selection));
+    let district_result = operations.len();
+    operations.push(new_order_district_operation(selection));
 
     let mut stock_results = Vec::with_capacity(selection.valid_lines.len());
     for line in &selection.valid_lines {
@@ -1215,7 +1246,7 @@ fn append_new_order_state_probe(
     ));
 
     NewOrderStateProbe {
-        home_result,
+        district_result,
         stock_results,
         order_result,
         delivery_order_result,
@@ -1230,8 +1261,11 @@ fn parse_new_order_state(
     probe: &NewOrderStateProbe,
     selection: &PreflightSelection,
 ) -> Result<NewOrderState, String> {
-    let district_next_order_id =
-        parse_new_order_home_order_id(results, probe.home_result, "NewOrder rollback home")?;
+    let district_next_order_id = parse_new_order_district_order_id(
+        results,
+        probe.district_result,
+        "NewOrder rollback district",
+    )?;
 
     let mut stocks = BTreeMap::new();
     for (item_id, operation_index) in &probe.stock_results {
@@ -1311,12 +1345,12 @@ async fn read_prospective_order_id(
 ) -> Result<i32, TpccError> {
     let operations = [
         operation(StatementId::Begin, []),
-        new_order_home_operation(selection),
+        new_order_district_operation(selection),
         operation(StatementId::Abort, []),
     ];
     let results =
         execute_preflight_batch(client, "NewOrder rollback prospective order", &operations).await?;
-    parse_new_order_home_order_id(&results, 1, "NewOrder rollback prospective home")
+    parse_new_order_district_order_id(&results, 1, "NewOrder rollback prospective district")
         .map_err(preflight_semantic)
 }
 
@@ -1463,6 +1497,16 @@ fn new_order_home_operation(selection: &PreflightSelection) -> Operation {
     )
 }
 
+fn new_order_district_operation(selection: &PreflightSelection) -> Operation {
+    operation(
+        StatementId::StockLevelNextOrder,
+        [
+            WireValue::Int32(selection.warehouse_id),
+            WireValue::Int32(selection.district_id),
+        ],
+    )
+}
+
 fn order_key_parameters(selection: &PreflightSelection, order_id: i32) -> Vec<WireValue> {
     vec![
         WireValue::Int32(selection.warehouse_id),
@@ -1520,7 +1564,7 @@ fn exactly_one_row<'a>(
     }
 }
 
-fn parse_new_order_home_order_id(
+fn parse_new_order_district_order_id(
     results: &BatchResults,
     operation_index: usize,
     context: &str,
@@ -1531,17 +1575,22 @@ fn parse_new_order_home_order_id(
             .map_err(|error| error.to_string())?,
         context,
     )?;
-    if row.len() != 6 {
+    if row.len() != 2 {
         return Err(format!(
-            "{context} returned {} columns, expected 6",
+            "{context} returned {} columns, expected 2",
             row.len()
         ));
     }
-    let value = row_int32(row, 4, context).map_err(|error| error.to_string())?;
+    let value = row_int32(row, 0, context).map_err(|error| error.to_string())?;
     if value <= 0 {
         return Err(format!(
             "{context} d_next_o_id must be positive, got {value}"
         ));
+    }
+    let tax_bits = row_f32_bits(row, 1, context).map_err(|error| error.to_string())?;
+    let tax = f32::from_bits(tax_bits);
+    if !(0.0..=0.2).contains(&tax) {
+        return Err(format!("{context} d_tax must be in 0..=0.2, got {tax}"));
     }
     Ok(value)
 }
@@ -1723,14 +1772,10 @@ mod tests {
         row
     }
 
-    fn new_order_home_row(next_order_id: i32) -> Vec<WireValue> {
+    fn new_order_district_row(next_order_id: i32) -> Vec<WireValue> {
         vec![
-            WireValue::Float32(0.1_f32.to_bits()),
-            WireValue::Char(b"LAST".to_vec()),
-            WireValue::Char(b"GC".to_vec()),
-            WireValue::Float32(0.2_f32.to_bits()),
             WireValue::Int32(next_order_id),
-            WireValue::Float32(0.3_f32.to_bits()),
+            WireValue::Float32(0.1_f32.to_bits()),
         ]
     }
 
@@ -1826,8 +1871,8 @@ mod tests {
     }
 
     #[test]
-    fn new_order_home_parser_reads_index_four_from_the_full_projection() {
-        let operations = [operation(StatementId::NewOrderHome, [])];
+    fn new_order_district_parser_reads_the_two_column_projection() {
+        let operations = [operation(StatementId::StockLevelNextOrder, [])];
         let results_for = |row| {
             accept_batch(
                 BatchResponse::Ok {
@@ -1842,34 +1887,36 @@ mod tests {
             .unwrap()
         };
 
-        let valid = results_for(new_order_home_row(3_001));
+        let valid = results_for(new_order_district_row(3_001));
         assert_eq!(
-            parse_new_order_home_order_id(&valid, 0, "test home").unwrap(),
+            parse_new_order_district_order_id(&valid, 0, "test district").unwrap(),
             3_001
         );
 
         let scalar = results_for(vec![WireValue::Int32(3_001)]);
-        assert!(parse_new_order_home_order_id(&scalar, 0, "test home").is_err());
+        assert!(parse_new_order_district_order_id(&scalar, 0, "test district").is_err());
 
-        let mut wrong_type = new_order_home_row(3_001);
-        wrong_type[4] = WireValue::Float32(3_001.0_f32.to_bits());
+        let mut wrong_type = new_order_district_row(3_001);
+        wrong_type[0] = WireValue::Float32(3_001.0_f32.to_bits());
         let wrong_type = results_for(wrong_type);
-        assert!(parse_new_order_home_order_id(&wrong_type, 0, "test home").is_err());
+        assert!(parse_new_order_district_order_id(&wrong_type, 0, "test district").is_err());
 
-        let non_positive = results_for(new_order_home_row(0));
-        assert!(parse_new_order_home_order_id(&non_positive, 0, "test home").is_err());
+        let non_positive = results_for(new_order_district_row(0));
+        assert!(
+            parse_new_order_district_order_id(&non_positive, 0, "test district").is_err()
+        );
     }
 
     #[test]
-    fn new_order_state_probe_accepts_the_full_home_projection() {
+    fn new_order_state_probe_accepts_the_district_projection() {
         let selection = test_selection();
         let mut operations = Vec::new();
         let probe = append_new_order_state_probe(&mut operations, &selection, 3_001);
         let stock = test_stock(50, 0.0, 0, 0);
         let query_results = (0..operations.len())
             .map(|operation_index| {
-                let rows = if operation_index == probe.home_result {
-                    vec![new_order_home_row(3_001)]
+                let rows = if operation_index == probe.district_result {
+                    vec![new_order_district_row(3_001)]
                 } else if probe
                     .stock_results
                     .iter()

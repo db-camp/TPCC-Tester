@@ -79,6 +79,24 @@ fn query_schemas_use_fixed_aliases_and_exact_wire_types() {
             ("c_last", SqlType::Char),
             ("c_credit", SqlType::Char),
             ("w_tax", SqlType::Float32),
+        ],
+    );
+    assert_eq!(home.sql.matches("FROM customer, warehouse").count(), 1);
+    assert!(!home.sql.contains("district"));
+
+    assert_query_columns(
+        find(&catalog, StatementId::NewOrderItem),
+        &[
+            ("i_id", SqlType::Int32),
+            ("i_price", SqlType::Float32),
+            ("i_name", SqlType::Char),
+            ("i_data", SqlType::Char),
+        ],
+    );
+
+    assert_query_columns(
+        find(&catalog, StatementId::StockLevelNextOrder),
+        &[
             ("d_next_o_id", SqlType::Int32),
             ("d_tax", SqlType::Float32),
         ],
@@ -276,9 +294,12 @@ fn stage_templates_preserve_the_ranked_round_trip_shapes() {
         step.multiplicity == Multiplicity::SortedUniqueStock
             && step.alternatives == &[StatementId::NewOrderLockStock]
     }));
-    assert!(NEW_ORDER_STAGES[1].steps.iter().any(|step| {
-        step.multiplicity == Multiplicity::PerOrderLine
-            && step.alternatives == &[StatementId::NewOrderStock]
+    assert!(NEW_ORDER_STAGES[0].steps.iter().any(|step| {
+        step.multiplicity == Multiplicity::Once
+            && step.alternatives == &[StatementId::StockLevelNextOrder]
+    }));
+    assert!(!NEW_ORDER_STAGES[1].steps.iter().any(|step| {
+        step.alternatives == &[StatementId::NewOrderStock]
     }));
     assert!(DELIVERY_STAGES[0].steps.iter().any(|step| {
         step.multiplicity == Multiplicity::TenDistricts

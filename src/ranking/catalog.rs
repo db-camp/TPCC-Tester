@@ -192,6 +192,7 @@ const BEGIN: &[StatementId] = &[StatementId::Begin];
 const COMMIT: &[StatementId] = &[StatementId::Commit];
 const ABORT: &[StatementId] = &[StatementId::Abort];
 const NEW_ORDER_HOME: &[StatementId] = &[StatementId::NewOrderHome];
+const NEW_ORDER_DISTRICT: &[StatementId] = &[StatementId::StockLevelNextOrder];
 const NEW_ORDER_LOCK_STOCK: &[StatementId] = &[StatementId::NewOrderLockStock];
 const NEW_ORDER_ITEM: &[StatementId] = &[StatementId::NewOrderItem];
 const NEW_ORDER_STOCK: &[StatementId] = &[StatementId::NewOrderStock];
@@ -253,6 +254,10 @@ const NEW_ORDER_STAGE_ONE_STEPS: &[PlanStep] = &[
         multiplicity: Multiplicity::Once,
     },
     PlanStep {
+        alternatives: NEW_ORDER_DISTRICT,
+        multiplicity: Multiplicity::Once,
+    },
+    PlanStep {
         alternatives: NEW_ORDER_LOCK_STOCK,
         multiplicity: Multiplicity::SortedUniqueStock,
     },
@@ -281,10 +286,6 @@ const NEW_ORDER_STAGE_TWO_STEPS: &[PlanStep] = &[
     },
     PlanStep {
         alternatives: NEW_ORDER_UPDATE_STOCK,
-        multiplicity: Multiplicity::PerOrderLine,
-    },
-    PlanStep {
-        alternatives: NEW_ORDER_STOCK,
         multiplicity: Multiplicity::PerOrderLine,
     },
     PlanStep {
@@ -563,20 +564,16 @@ pub fn final2026_catalog() -> Vec<Statement> {
             StatementId::NewOrderHome,
             &[Int32, Int32, Int32],
             "SELECT customer.c_discount AS c_discount, customer.c_last AS c_last, \
-             customer.c_credit AS c_credit, warehouse.w_tax AS w_tax, \
-             district.d_next_o_id AS d_next_o_id, district.d_tax AS d_tax \
-             FROM customer, warehouse, district \
+             customer.c_credit AS c_credit, warehouse.w_tax AS w_tax \
+             FROM customer, warehouse \
              WHERE warehouse.w_id = $1 \
-             AND district.d_w_id = warehouse.w_id AND district.d_id = $2 \
              AND customer.c_w_id = warehouse.w_id \
-             AND customer.c_d_id = district.d_id AND customer.c_id = $3;",
+             AND customer.c_d_id = $2 AND customer.c_id = $3;",
             &[
                 ("c_discount", Float32),
                 ("c_last", Char),
                 ("c_credit", Char),
                 ("w_tax", Float32),
-                ("d_next_o_id", Int32),
-                ("d_tax", Float32),
             ],
         ),
         command(
@@ -588,9 +585,14 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::NewOrderItem,
             &[Int32],
-            "SELECT i_price AS i_price, i_name AS i_name, i_data AS i_data \
+            "SELECT i_id AS i_id, i_price AS i_price, i_name AS i_name, i_data AS i_data \
              FROM item WHERE i_id = $1;",
-            &[("i_price", Float32), ("i_name", Char), ("i_data", Char)],
+            &[
+                ("i_id", Int32),
+                ("i_price", Float32),
+                ("i_name", Char),
+                ("i_data", Char),
+            ],
         ),
         query(
             StatementId::NewOrderStock,
@@ -887,9 +889,9 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::StockLevelNextOrder,
             &[Int32, Int32],
-            "SELECT d_next_o_id AS d_next_o_id FROM district \
+            "SELECT d_next_o_id AS d_next_o_id, d_tax AS d_tax FROM district \
              WHERE d_w_id = $1 AND d_id = $2;",
-            &[("d_next_o_id", Int32)],
+            &[("d_next_o_id", Int32), ("d_tax", Float32)],
         ),
         query(
             StatementId::StockLevelCount,

@@ -258,6 +258,7 @@ struct LineQueryIndices {
 struct StageOnePlan {
     operations: Vec<Operation>,
     home_result: usize,
+    district_result: usize,
     line_results: Vec<LineQueryIndices>,
 }
 
@@ -270,6 +271,14 @@ fn build_stage_one(input: &ValidatedInput) -> StageOnePlan {
             WireValue::Int32(input.warehouse_id),
             WireValue::Int32(input.district_id),
             WireValue::Int32(input.customer_id),
+        ],
+    ));
+    let district_result = operations.len();
+    operations.push(operation(
+        StatementId::StockLevelNextOrder,
+        [
+            WireValue::Int32(input.warehouse_id),
+            WireValue::Int32(input.district_id),
         ],
     ));
 
@@ -302,6 +311,7 @@ fn build_stage_one(input: &ValidatedInput) -> StageOnePlan {
     StageOnePlan {
         operations,
         home_result,
+        district_result,
         line_results,
     }
 }
@@ -332,7 +342,7 @@ fn parse_stage_one(
     }
 
     let home = results.single_row(plan.home_result)?;
-    require_columns(home, 6, "New-Order home")?;
+    require_columns(home, 4, "New-Order home")?;
     let discount_bits = row_f32_bits(home, 0, "New-Order home")?;
     require_f32_range(discount_bits, 0.0, 0.5, "customer.c_discount")?;
     require_char_range(
@@ -350,13 +360,16 @@ fn parse_stage_one(
     }
     let warehouse_tax_bits = row_f32_bits(home, 3, "New-Order home")?;
     require_f32_range(warehouse_tax_bits, 0.0, 0.2, "warehouse.w_tax")?;
-    let order_id = row_int32(home, 4, "New-Order home")?;
+
+    let district = results.single_row(plan.district_result)?;
+    require_columns(district, 2, "New-Order district")?;
+    let order_id = row_int32(district, 0, "New-Order district")?;
     if order_id <= 0 {
         return Err(SemanticViolation::new(format!(
             "district.d_next_o_id must be positive, got {order_id}"
         )));
     }
-    let district_tax_bits = row_f32_bits(home, 5, "New-Order home")?;
+    let district_tax_bits = row_f32_bits(district, 1, "New-Order district")?;
     require_f32_range(district_tax_bits, 0.0, 0.2, "district.d_tax")?;
 
     let mut item_prices = BTreeMap::<i32, u32>::new();
@@ -377,8 +390,16 @@ fn parse_stage_one(
         }
 
         let item = exactly_one_row(item_rows, &format!("New-Order item {}", line.item_id))?;
-        require_columns(item, 3, &format!("New-Order item {}", line.item_id))?;
-        let price_bits = row_f32_bits(item, 0, &format!("New-Order item {}", line.item_id))?;
+        require_columns(item, 4, &format!("New-Order item {}", line.item_id))?;
+        let returned_item_id =
+            row_int32(item, 0, &format!("New-Order item {}", line.item_id))?;
+        if returned_item_id != line.item_id {
+            return Err(SemanticViolation::new(format!(
+                "New-Order item {} returned id {returned_item_id}",
+                line.item_id
+            )));
+        }
+        let price_bits = row_f32_bits(item, 1, &format!("New-Order item {}", line.item_id))?;
         require_f32_range(
             price_bits,
             MIN_ITEM_PRICE,
@@ -386,13 +407,13 @@ fn parse_stage_one(
             &format!("item {} i_price", line.item_id),
         )?;
         require_char_range(
-            row_char(item, 1, &format!("New-Order item {}", line.item_id))?,
+            row_char(item, 2, &format!("New-Order item {}", line.item_id))?,
             14,
             24,
             &format!("item {} i_name", line.item_id),
         )?;
         require_char_range(
-            row_char(item, 2, &format!("New-Order item {}", line.item_id))?,
+            row_char(item, 3, &format!("New-Order item {}", line.item_id))?,
             26,
             50,
             &format!("item {} i_data", line.item_id),
@@ -892,6 +913,7 @@ mod tests {
             vec![
                 StatementId::Begin.wire_id(),
                 StatementId::NewOrderHome.wire_id(),
+                StatementId::StockLevelNextOrder.wire_id(),
                 StatementId::NewOrderLockStock.wire_id(),
                 StatementId::NewOrderLockStock.wire_id(),
                 StatementId::NewOrderItem.wire_id(),
@@ -904,15 +926,19 @@ mod tests {
         );
         assert_eq!(
             plan.operations[2].parameters,
-            vec![WireValue::Int32(1), WireValue::Int32(70)]
+            vec![WireValue::Int32(2), WireValue::Int32(3)]
         );
         assert_eq!(
             plan.operations[3].parameters,
+            vec![WireValue::Int32(1), WireValue::Int32(70)]
+        );
+        assert_eq!(
+            plan.operations[4].parameters,
             vec![WireValue::Int32(9), WireValue::Int32(80)]
         );
-        assert_eq!(plan.operations[4].parameters, vec![WireValue::Int32(80)]);
-        assert_eq!(plan.operations[6].parameters, vec![WireValue::Int32(70)]);
-        assert_eq!(plan.operations[8].parameters, vec![WireValue::Int32(80)]);
+        assert_eq!(plan.operations[5].parameters, vec![WireValue::Int32(80)]);
+        assert_eq!(plan.operations[7].parameters, vec![WireValue::Int32(70)]);
+        assert_eq!(plan.operations[9].parameters, vec![WireValue::Int32(80)]);
     }
 
     #[test]
