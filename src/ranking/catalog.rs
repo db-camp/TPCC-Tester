@@ -78,6 +78,8 @@ pub enum StatementId {
     NewOrderStockD09 = 98,
     NewOrderStockD10 = 99,
     PreflightNewOrderStockVersion = 100,
+    PaymentWarehouseAfter = 101,
+    PaymentDistrictAfter = 102,
 }
 
 impl StatementId {
@@ -126,7 +128,7 @@ impl StatementId {
         Self::StockLevelCount,
     ];
 
-    pub const SUPPLEMENTAL: [Self; 12] = [
+    pub const SUPPLEMENTAL: [Self; 14] = [
         Self::DeliveryEarlierQueueCount,
         Self::DeliveryExactQueueCount,
         Self::NewOrderStockD02,
@@ -139,9 +141,11 @@ impl StatementId {
         Self::NewOrderStockD09,
         Self::NewOrderStockD10,
         Self::PreflightNewOrderStockVersion,
+        Self::PaymentWarehouseAfter,
+        Self::PaymentDistrictAfter,
     ];
 
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 56] = [
         Self::Begin,
         Self::Commit,
         Self::Abort,
@@ -196,6 +200,8 @@ impl StatementId {
         Self::NewOrderStockD09,
         Self::NewOrderStockD10,
         Self::PreflightNewOrderStockVersion,
+        Self::PaymentWarehouseAfter,
+        Self::PaymentDistrictAfter,
     ];
 
     pub const fn wire_id(self) -> u16 {
@@ -258,6 +264,8 @@ impl StatementId {
             Self::NewOrderStockD09 => "new_order.stock_d09",
             Self::NewOrderStockD10 => "new_order.stock_d10",
             Self::PreflightNewOrderStockVersion => "preflight.new_order_stock_version",
+            Self::PaymentWarehouseAfter => "payment.warehouse_after",
+            Self::PaymentDistrictAfter => "payment.district_after",
         }
     }
 }
@@ -330,8 +338,10 @@ const NEW_ORDER_UPDATE_STOCK: &[StatementId] = &[
 const NEW_ORDER_INSERT_LINE: &[StatementId] = &[StatementId::NewOrderInsertLine];
 
 const PAYMENT_WAREHOUSE: &[StatementId] = &[StatementId::PaymentWarehouse];
+const PAYMENT_WAREHOUSE_AFTER: &[StatementId] = &[StatementId::PaymentWarehouseAfter];
 const PAYMENT_UPDATE_WAREHOUSE: &[StatementId] = &[StatementId::PaymentUpdateWarehouse];
 const PAYMENT_DISTRICT: &[StatementId] = &[StatementId::PaymentDistrict];
+const PAYMENT_DISTRICT_AFTER: &[StatementId] = &[StatementId::PaymentDistrictAfter];
 const PAYMENT_UPDATE_DISTRICT: &[StatementId] = &[StatementId::PaymentUpdateDistrict];
 const PAYMENT_CUSTOMER: &[StatementId] = &[
     StatementId::PaymentCustomerById,
@@ -459,7 +469,7 @@ const PAYMENT_STAGE_ONE_STEPS: &[PlanStep] = &[
         multiplicity: Multiplicity::Once,
     },
     PlanStep {
-        alternatives: PAYMENT_WAREHOUSE,
+        alternatives: PAYMENT_WAREHOUSE_AFTER,
         multiplicity: Multiplicity::Once,
     },
     PlanStep {
@@ -471,7 +481,7 @@ const PAYMENT_STAGE_ONE_STEPS: &[PlanStep] = &[
         multiplicity: Multiplicity::Once,
     },
     PlanStep {
-        alternatives: PAYMENT_DISTRICT,
+        alternatives: PAYMENT_DISTRICT_AFTER,
         multiplicity: Multiplicity::Once,
     },
     PlanStep {
@@ -1044,6 +1054,18 @@ pub fn final2026_catalog() -> Vec<Statement> {
                 ("s_order_cnt", Int32),
                 ("s_remote_cnt", Int32),
             ],
+        ),
+        query(
+            StatementId::PaymentWarehouseAfter,
+            &[Int32],
+            "SELECT w_ytd FROM warehouse WHERE w_id = $1;",
+            &[("w_ytd", Float32)],
+        ),
+        query(
+            StatementId::PaymentDistrictAfter,
+            &[Int32, Int32],
+            "SELECT d_ytd FROM district WHERE d_w_id = $1 AND d_id = $2;",
+            &[("d_ytd", Float32)],
         ),
     ]);
     catalog

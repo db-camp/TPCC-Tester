@@ -2436,8 +2436,8 @@ mod tests {
             INITIAL_WAREHOUSE_YTD_BITS
         );
         assert_eq!(StatementId::BASE.len(), 42);
-        assert_eq!(StatementId::SUPPLEMENTAL.len(), 12);
-        assert_eq!(StatementId::ALL.len(), 54);
+        assert_eq!(StatementId::SUPPLEMENTAL.len(), 14);
+        assert_eq!(StatementId::ALL.len(), 56);
     }
 
     #[test]

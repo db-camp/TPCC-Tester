@@ -308,7 +308,7 @@ const CANONICAL_STATEMENT_IDS: [u16; 42] = [
 /// fingerprint. Their ids are reconstructed deterministically from the
 /// persisted base mapping so existing schema caches remain byte-for-byte
 /// compatible.
-pub const FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS: [&str; 12] = [
+pub const FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS: [&str; 14] = [
     "delivery.earlier_queue_count",
     "delivery.exact_queue_count",
     "new_order.stock_d02",
@@ -321,10 +321,12 @@ pub const FINAL2026_SUPPLEMENTAL_STATEMENT_KEYS: [&str; 12] = [
     "new_order.stock_d09",
     "new_order.stock_d10",
     "preflight.new_order_stock_version",
+    "payment.warehouse_after",
+    "payment.district_after",
 ];
 
-const CANONICAL_SUPPLEMENTAL_STATEMENT_IDS: [u16; 12] =
-    [82, 83, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100];
+const CANONICAL_SUPPLEMENTAL_STATEMENT_IDS: [u16; 14] =
+    [82, 83, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102];
 
 pub const SETUP_CHECK_KEYS: [&str; 18] = [
     "setup.orders.sum_o_ol_cnt",
@@ -1428,7 +1430,7 @@ mod tests {
         assert_eq!(left.columns.len(), 92);
         assert_eq!(left.csv_basenames.len(), 9);
         assert_eq!(left.statements.ids.len(), 42);
-        assert_eq!(left.statements.supplemental_ids.len(), 12);
+        assert_eq!(left.statements.supplemental_ids.len(), 14);
         assert_eq!(left, RuntimeSchema::decode(&left.encode()).unwrap());
         left.validate().unwrap();
     }

@@ -46,10 +46,10 @@ fn find(catalog: &[Statement], id: StatementId) -> &Statement {
 fn catalogue_has_unique_bounded_ids_and_dense_typed_markers() {
     let catalog = final2026_catalog();
     validate_catalog(&catalog).expect("valid public final catalogue");
-    assert_eq!(catalog.len(), 54);
+    assert_eq!(catalog.len(), 56);
     assert_eq!(StatementId::BASE.len(), 42);
-    assert_eq!(StatementId::SUPPLEMENTAL.len(), 12);
-    assert_eq!(StatementId::ALL.len(), 54);
+    assert_eq!(StatementId::SUPPLEMENTAL.len(), 14);
+    assert_eq!(StatementId::ALL.len(), 56);
     assert_eq!(
         StatementId::BASE.map(StatementId::key),
         FINAL2026_STATEMENT_KEYS
@@ -60,7 +60,7 @@ fn catalogue_has_unique_bounded_ids_and_dense_typed_markers() {
     );
     assert_eq!(
         StatementId::SUPPLEMENTAL.map(StatementId::wire_id),
-        [82, 83, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100]
+        [82, 83, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102]
     );
 
     let ids: BTreeSet<_> = catalog.iter().map(|statement| statement.id).collect();
@@ -199,6 +199,62 @@ fn query_schemas_use_declared_names_and_exact_wire_types() {
     assert!(order_status_by_last
         .sql
         .contains("ORDER BY c_first ASC, c_id ASC"));
+}
+
+#[test]
+fn payment_keeps_wide_before_reads_and_uses_ytd_only_after_reads() {
+    let catalog = final2026_catalog();
+    let warehouse_before = find(&catalog, StatementId::PaymentWarehouse);
+    let warehouse_after = find(&catalog, StatementId::PaymentWarehouseAfter);
+    let district_before = find(&catalog, StatementId::PaymentDistrict);
+    let district_after = find(&catalog, StatementId::PaymentDistrictAfter);
+
+    assert_query_columns(
+        warehouse_before,
+        &[
+            ("w_ytd", SqlType::Float32),
+            ("w_name", SqlType::Char),
+            ("w_street_1", SqlType::Char),
+            ("w_street_2", SqlType::Char),
+            ("w_city", SqlType::Char),
+            ("w_state", SqlType::Char),
+            ("w_zip", SqlType::Char),
+        ],
+    );
+    assert_query_columns(warehouse_after, &[("w_ytd", SqlType::Float32)]);
+    assert_eq!(warehouse_after.param_types, vec![SqlType::Int32]);
+    assert_eq!(warehouse_after.sql, "SELECT w_ytd FROM warehouse WHERE w_id = $1;");
+
+    assert_query_columns(
+        district_before,
+        &[
+            ("d_ytd", SqlType::Float32),
+            ("d_name", SqlType::Char),
+            ("d_street_1", SqlType::Char),
+            ("d_street_2", SqlType::Char),
+            ("d_city", SqlType::Char),
+            ("d_state", SqlType::Char),
+            ("d_zip", SqlType::Char),
+        ],
+    );
+    assert_query_columns(district_after, &[("d_ytd", SqlType::Float32)]);
+    assert_eq!(district_after.param_types, vec![SqlType::Int32; 2]);
+    assert_eq!(
+        district_after.sql,
+        "SELECT d_ytd FROM district WHERE d_w_id = $1 AND d_id = $2;"
+    );
+
+    let stage_one = PAYMENT_STAGES[0].steps;
+    assert_eq!(stage_one[1].alternatives, &[StatementId::PaymentWarehouse]);
+    assert_eq!(
+        stage_one[3].alternatives,
+        &[StatementId::PaymentWarehouseAfter]
+    );
+    assert_eq!(stage_one[4].alternatives, &[StatementId::PaymentDistrict]);
+    assert_eq!(
+        stage_one[6].alternatives,
+        &[StatementId::PaymentDistrictAfter]
+    );
 }
 
 #[test]

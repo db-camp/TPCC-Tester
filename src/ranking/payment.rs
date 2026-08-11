@@ -33,7 +33,9 @@ const STAGE_ONE_CUSTOMER: usize = 7;
 const STAGE_TWO_CUSTOMER_AFTER: usize = 2;
 
 const WAREHOUSE_COLUMNS: usize = 7;
+const WAREHOUSE_AFTER_COLUMNS: usize = 1;
 const DISTRICT_COLUMNS: usize = 7;
+const DISTRICT_AFTER_COLUMNS: usize = 1;
 const CUSTOMER_COLUMNS: usize = 19;
 const CUSTOMER_AFTER_COLUMNS: usize = 5;
 const MAX_NAME_BYTES: usize = 10;
@@ -247,7 +249,7 @@ fn build_stage_one(
             StatementId::PaymentUpdateWarehouse,
             [amount.clone(), home_w.clone()],
         ),
-        operation(StatementId::PaymentWarehouse, [home_w.clone()]),
+        operation(StatementId::PaymentWarehouseAfter, [home_w.clone()]),
         operation(
             StatementId::PaymentDistrict,
             [home_w.clone(), home_d.clone()],
@@ -256,7 +258,7 @@ fn build_stage_one(
             StatementId::PaymentUpdateDistrict,
             [amount, home_w.clone(), home_d.clone()],
         ),
-        operation(StatementId::PaymentDistrict, [home_w, home_d]),
+        operation(StatementId::PaymentDistrictAfter, [home_w, home_d]),
         operation(customer_statement, [customer_w, customer_d, customer_key]),
     ]
 }
@@ -305,7 +307,7 @@ fn validate_stage_one(
     let warehouse_after = results.single_row(STAGE_ONE_WAREHOUSE_AFTER)?;
     expect_width(
         warehouse_after,
-        WAREHOUSE_COLUMNS,
+        WAREHOUSE_AFTER_COLUMNS,
         "Payment warehouse after",
     )?;
     let warehouse_before_bits = row_f32_bits(warehouse_before, 0, "Payment warehouse before")?;
@@ -321,7 +323,11 @@ fn validate_stage_one(
     let district_before = results.single_row(STAGE_ONE_DISTRICT_BEFORE)?;
     expect_width(district_before, DISTRICT_COLUMNS, "Payment district before")?;
     let district_after = results.single_row(STAGE_ONE_DISTRICT_AFTER)?;
-    expect_width(district_after, DISTRICT_COLUMNS, "Payment district after")?;
+    expect_width(
+        district_after,
+        DISTRICT_AFTER_COLUMNS,
+        "Payment district after",
+    )?;
     let district_before_bits = row_f32_bits(district_before, 0, "Payment district before")?;
     let district_after_bits = row_f32_bits(district_after, 0, "Payment district after")?;
     expect_f32_add(
@@ -706,6 +712,10 @@ mod tests {
         warehouse_row(ytd_bits, name)
     }
 
+    fn ytd_row(ytd_bits: u32) -> Vec<WireValue> {
+        vec![WireValue::Float32(ytd_bits)]
+    }
+
     fn customer_row(
         id: i32,
         first: &[u8],
@@ -776,10 +786,10 @@ mod tests {
                 StatementId::Begin.wire_id(),
                 StatementId::PaymentWarehouse.wire_id(),
                 StatementId::PaymentUpdateWarehouse.wire_id(),
-                StatementId::PaymentWarehouse.wire_id(),
+                StatementId::PaymentWarehouseAfter.wire_id(),
                 StatementId::PaymentDistrict.wire_id(),
                 StatementId::PaymentUpdateDistrict.wire_id(),
-                StatementId::PaymentDistrict.wire_id(),
+                StatementId::PaymentDistrictAfter.wire_id(),
                 StatementId::PaymentCustomerById.wire_id(),
             ]
         );
@@ -892,9 +902,9 @@ mod tests {
             &operations,
             [
                 (1, vec![warehouse_row(large, b"WAREHOUSE")]),
-                (3, vec![warehouse_row(large, b"WAREHOUSE")]),
+                (3, vec![ytd_row(large)]),
                 (4, vec![district_row(district_before, b"DISTRICT")]),
-                (6, vec![district_row(district_after, b"DISTRICT")]),
+                (6, vec![ytd_row(district_after)]),
                 (7, vec![customer.clone()]),
             ],
         );
@@ -904,9 +914,9 @@ mod tests {
             &operations,
             [
                 (1, vec![warehouse_row(large, b"WAREHOUSE")]),
-                (3, vec![warehouse_row(large.wrapping_add(1), b"WAREHOUSE")]),
+                (3, vec![ytd_row(large.wrapping_add(1))]),
                 (4, vec![district_row(district_before, b"DISTRICT")]),
-                (6, vec![district_row(district_after, b"DISTRICT")]),
+                (6, vec![ytd_row(district_after)]),
                 (7, vec![customer]),
             ],
         );
