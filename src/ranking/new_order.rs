@@ -709,33 +709,21 @@ fn build_stage_two(
             .checked_add(line.plan.quantity as u32)
             .ok_or_else(|| SemanticViolation::new("New-Order stock YTD delta overflow"))?;
 
-        let stock_update = if normal_update {
-            operation(
-                StatementId::NewOrderUpdateStockNormal,
-                vec![
-                    WireValue::Int32(line.plan.quantity),
-                    WireValue::Float32((line.plan.quantity as f32).to_bits()),
-                    WireValue::Int32(remote),
-                    WireValue::Int32(line.plan.supply_warehouse),
-                    WireValue::Int32(line.plan.item_id),
-                    WireValue::Int32(line.plan.quantity + 10),
-                ],
-            )
-        } else {
-            operation(
-                StatementId::NewOrderUpdateStockWrapped,
-                vec![
-                    WireValue::Int32(line.plan.quantity),
-                    WireValue::Int32(91),
-                    WireValue::Float32((line.plan.quantity as f32).to_bits()),
-                    WireValue::Int32(remote),
-                    WireValue::Int32(line.plan.supply_warehouse),
-                    WireValue::Int32(line.plan.item_id),
-                    WireValue::Int32(line.plan.quantity + 10),
-                ],
-            )
-        };
-        operations.push(stock_update);
+        operations.push(operation(
+            if normal_update {
+                StatementId::NewOrderUpdateStockNormal
+            } else {
+                StatementId::NewOrderUpdateStockWrapped
+            },
+            [
+                WireValue::Int32(line.plan.quantity),
+                WireValue::Float32((line.plan.quantity as f32).to_bits()),
+                WireValue::Int32(remote),
+                WireValue::Int32(line.plan.supply_warehouse),
+                WireValue::Int32(line.plan.item_id),
+                WireValue::Int32(line.plan.quantity + 10),
+            ],
+        ));
         // Aligned with official appendix A §7: the second NewOrder dependency
         // stage is a pure write batch (update stocks, insert order_line rows,
         // commit/abort). No per-line stock read-back is issued, matching the
@@ -1015,14 +1003,13 @@ mod tests {
             stage.operations[5].parameters,
             vec![
                 WireValue::Int32(8),
-                WireValue::Int32(91),
                 WireValue::Float32(8.0_f32.to_bits()),
                 WireValue::Int32(0),
                 WireValue::Int32(2),
                 WireValue::Int32(10),
                 WireValue::Int32(18),
             ],
-            "wrapped stock binds the public subtract/add and threshold shape"
+            "wrapped stock binds quantity and the public branch threshold"
         );
         assert_eq!(stage.recovery_lines.len(), 2);
         assert_eq!(stage.recovery_lines[0].stock_before.quantity, 25);
