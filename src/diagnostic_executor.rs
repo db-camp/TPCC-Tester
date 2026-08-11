@@ -525,13 +525,6 @@ async fn run_worker(
         let kind = frozen.ticket().kind();
         let measured = phase == DiagnosticPhase::Measurement;
         let mut logical_attempt_recorded = false;
-        // Same retry bound as the ranked executor: conflict storms are cut
-        // short so the physical attempt rate tracks the official client.
-        let retry_limit: u32 = std::env::var("TPCC_RETRY_LIMIT")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
-        let mut retry_count = 0_u32;
 
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -604,16 +597,8 @@ async fn run_worker(
                     if timeline.phase(Instant::now()) != Some(phase) {
                         break;
                     }
-                    // Bound conflict retries (aligned with the ranked executor):
-                    // a transaction that keeps losing the hotspot race is
-                    // abandoned after `retry_limit` attempts.
-                    retry_count += 1;
-                    if retry_count > retry_limit {
-                        if measured {
-                            stats.abandoned += 1;
-                        }
-                        break;
-                    }
+                    // Retry the exact frozen transaction directly. Only the
+                    // phase cutoff can stop another physical attempt.
                 }
                 Ok(Err(error)) => {
                     cancelled.store(true, Ordering::Release);

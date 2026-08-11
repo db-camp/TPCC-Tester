@@ -700,14 +700,6 @@ async fn run_worker_inner(
                 Err(error) => return Err(scheduler_error(error)),
             }
         };
-        let mut retry_count = 0_u32;
-        // Maximum physical attempts per transaction before abandonment.
-        // 0 = no retries at all (aligned with the official client's high
-        // abandoned rate under saturation); configurable via TPCC_RETRY_LIMIT.
-        let retry_limit: u32 = std::env::var("TPCC_RETRY_LIMIT")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
 
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -872,8 +864,7 @@ async fn run_worker_inner(
                     }
                     break;
                 }
-                Ok(Err(error))
-                    if error.is_retryable_abort() || error.is_response_timeout() => {
+                Ok(Err(error)) if error.is_retryable_abort() => {
                     let disposition = {
                         let mut state = lock_scheduler(&scheduler)?;
                         state
@@ -885,23 +876,6 @@ async fn run_worker_inner(
                             .map_err(scheduler_error)?
                     };
                     if disposition != AttemptDisposition::RetrySameParameters {
-                        break;
-                    }
-                    // Bound retry storms: a transaction that keeps losing the
-                    // hotspot race is abandoned after RETRY_LIMIT attempts
-                    // (mirrors the official client's abandoned class). This
-                    // cuts the long-tail latency that dominates the average
-                    // transaction period.
-                    if retry_count >= retry_limit {
-                        let mut state = lock_scheduler(&scheduler)?;
-                        if state
-                            .abandon_retry(phase_ticket)
-                            .is_err()
-                        {
-                            state
-                                .abandon_read_only_inflight_at(phase_ticket, completed_at)
-                                .map_err(scheduler_error)?;
-                        }
                         break;
                     }
                     let (ticket, deadline) = {
@@ -916,14 +890,8 @@ async fn run_worker_inner(
                             Err(error) => return Err(scheduler_error(error)),
                         }
                     };
-                    // De-collide retry storms on hot rows: all workers retry
-                    // the same frozen parameters immediately, so concurrent
-                    // retries on one district/stock row collide on the row
-                    // lock. Exponential backoff (1ms doubling, jittered,
-                    // capped at 40ms) lets hot-row writers serialize instead
-                    // of repeatedly aborting each other. It never changes the
-                    // frozen parameters, only the retry timing.
-                    retry_count += 1;
+                    // TRANSACTION_ABORT already rolled the transaction back;
+                    // retry the exact frozen parameters and logical sequence.
                     (phase_ticket, attempt_deadline) = (ticket, deadline);
                 }
                 Ok(Err(error)) => {
