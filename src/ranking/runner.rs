@@ -27,8 +27,6 @@ pub struct RecoveryNewOrderLineEvidence {
     pub quantity: u8,
     pub amount_bits: u32,
     pub district_info: Vec<u8>,
-    pub stock_before: StockVersion,
-    pub stock_after: StockVersion,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

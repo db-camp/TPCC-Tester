@@ -4069,7 +4069,7 @@ mod tests {
 
     use crate::profile::TransactionKind;
     use crate::ranking::evidence_collector::IntervalCollector;
-    use crate::ranking::runner::{RecoveryNewOrderLineEvidence, StockVersion};
+    use crate::ranking::runner::RecoveryNewOrderLineEvidence;
     use crate::routing::{ClientSequence, OfficialRouter, StageId, WorkloadSeed};
     use crate::workload::{CustomerSelector, Final2026Workload};
 
@@ -4190,19 +4190,6 @@ mod tests {
                 quantity: line.quantity(),
                 amount_bits: 1.0_f32.to_bits(),
                 district_info: vec![b'D'; DISTRICT_INFO_BYTES],
-                stock_before: StockVersion {
-                    quantity: 50,
-                    ytd_bits: 0.0_f32.to_bits(),
-                    order_count: 0,
-                    remote_count: 0,
-                },
-                stock_after: StockVersion {
-                    quantity: 49,
-                    ytd_bits: f32::from(line.quantity()).to_bits(),
-                    order_count: 1,
-                    remote_count: u8::from(line.supply_warehouse() != ticket.route().home_warehouse)
-                        as i32,
-                },
             })
             .collect::<Vec<_>>();
         NewOrderEvidence {

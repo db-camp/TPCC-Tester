@@ -59,13 +59,9 @@ pub async fn execute(
         build_stage_two(&validated, &materialized).require_explicit_abort(),
     )
     .await?;
-    let stage_two_results = execute_batch(client, &stage_two.operations).await?;
-
-    // The terminal is the final operation in this batch, so a mismatch is a
-    // fatal post-terminal semantic failure. A stale writer must instead be
-    // rejected by the server as TRANSACTION_ABORT while the batch executes.
-    validate_stage_two_stock_readbacks(&stage_two_results, &stage_two)
-        .map_err(RankedTransactionError::Semantic)?;
+    // A stale writer must be rejected by the server as TRANSACTION_ABORT while
+    // the pure-write batch executes.
+    execute_batch(client, &stage_two.operations).await?;
 
     if validated.expected_rollback {
         return Ok(RankedTransactionOutcome::ExpectedRollback);
@@ -319,7 +315,7 @@ fn build_stage_one(input: &ValidatedInput) -> StageOnePlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MaterializedLine {
     plan: LinePlan,
-    initial_stock: StockVersion,
+    initial_quantity: i32,
     amount_bits: u32,
     district_info: Vec<u8>,
 }
@@ -554,7 +550,7 @@ fn parse_stage_one(
 
         lines.push(MaterializedLine {
             plan: *line,
-            initial_stock: stock_version,
+            initial_quantity: stock_quantity,
             amount_bits: multiply_f32_bits(price_bits, line.quantity)?,
             district_info,
         });
@@ -644,7 +640,6 @@ fn multiply_f32_bits(price_bits: u32, quantity: i32) -> SemanticResult<u32> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StageTwoPlan {
     operations: Vec<Operation>,
-    stock_after_results: Vec<usize>,
     remote_line_count: u8,
     stock_ytd_delta: u32,
     recovery_lines: Vec<RecoveryNewOrderLineEvidence>,
@@ -687,42 +682,29 @@ fn build_stage_two(
         ),
     ];
 
-    let mut current_stocks = BTreeMap::<(i32, i32), StockVersion>::new();
+    let mut current_quantities = BTreeMap::<(i32, i32), i32>::new();
     let mut remote_line_count = 0_u8;
     let mut stock_ytd_delta = 0_u32;
-    let mut stock_after_results = Vec::with_capacity(materialized.lines.len());
     let mut recovery_lines = Vec::with_capacity(materialized.lines.len());
     for line in &materialized.lines {
         let key = line.plan.stock_key();
-        let current = current_stocks
+        let current_quantity = current_quantities
             .entry(key)
-            .or_insert_with(|| line.initial_stock.clone());
-        let stock_before = current.clone();
-        let normal_update = current.quantity >= line.plan.quantity + 10;
-        current.quantity = if normal_update {
-            current.quantity - line.plan.quantity
+            .or_insert(line.initial_quantity);
+        let normal_update = *current_quantity >= line.plan.quantity + 10;
+        *current_quantity = if normal_update {
+            *current_quantity - line.plan.quantity
         } else {
-            current.quantity - line.plan.quantity + 91
+            *current_quantity - line.plan.quantity + 91
         };
-        if !(MIN_STOCK_QUANTITY..=MAX_STOCK_QUANTITY).contains(&current.quantity) {
+        if !(MIN_STOCK_QUANTITY..=MAX_STOCK_QUANTITY).contains(&*current_quantity) {
             return Err(SemanticViolation::new(format!(
                 "stock ({}, {}) relative update produced out-of-range quantity {}",
-                line.plan.supply_warehouse, line.plan.item_id, current.quantity
+                line.plan.supply_warehouse, line.plan.item_id, *current_quantity
             )));
         }
 
         let remote = i32::from(line.plan.supply_warehouse != input.warehouse_id);
-        let stock_ytd = f32::from_bits(current.ytd_bits);
-        current.ytd_bits = (stock_ytd + line.plan.quantity as f32).to_bits();
-        current.order_count = current
-            .order_count
-            .checked_add(1)
-            .ok_or_else(|| SemanticViolation::new("New-Order stock order count overflow"))?;
-        current.remote_count = current
-            .remote_count
-            .checked_add(remote)
-            .ok_or_else(|| SemanticViolation::new("New-Order stock remote count overflow"))?;
-        let stock_after = current.clone();
         remote_line_count = remote_line_count
             .checked_add(remote as u8)
             .ok_or_else(|| SemanticViolation::new("New-Order remote line count overflow"))?;
@@ -775,8 +757,6 @@ fn build_stage_two(
                 .map_err(|_| SemanticViolation::new("New-Order quantity does not fit UINT8"))?,
             amount_bits: line.amount_bits,
             district_info: line.district_info.clone(),
-            stock_before,
-            stock_after,
         });
     }
 
@@ -791,61 +771,15 @@ fn build_stage_two(
 
     Ok(StageTwoPlan {
         operations,
-        stock_after_results,
         remote_line_count,
         stock_ytd_delta,
         recovery_lines,
     })
 }
 
-fn validate_stage_two_stock_readbacks(
-    results: &BatchResults,
-    plan: &StageTwoPlan,
-) -> SemanticResult<()> {
-    // No per-line stock read-back is issued (official stage-2 is a pure write
-    // batch), so there is nothing to verify when the readback map is empty.
-    if plan.stock_after_results.is_empty() {
-        return Ok(());
-    }
-    if plan.stock_after_results.len() != plan.recovery_lines.len() {
-        return Err(SemanticViolation::new(
-            "New-Order stock readback map differs from recovery line count",
-        ));
-    }
-
-    for (operation_index, line) in plan
-        .stock_after_results
-        .iter()
-        .copied()
-        .zip(&plan.recovery_lines)
-    {
-        let context = format!(
-            "New-Order stock readback ({}, {}) after line {}",
-            line.supply_warehouse, line.item_id, line.number
-        );
-        let row = results.single_row(operation_index)?;
-        require_columns(row, 15, &context)?;
-        let actual = StockVersion {
-            quantity: row_int32(row, 0, &context)?,
-            ytd_bits: row_f32_bits(row, 1, &context)?,
-            order_count: row_int32(row, 2, &context)?,
-            remote_count: row_int32(row, 3, &context)?,
-        };
-        if actual != line.stock_after {
-            return Err(SemanticViolation::new(format!(
-                "{context} was {actual:?}, expected exact relative-update endpoint {:?}",
-                line.stock_after
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::prepared::{BatchQueryResult, BatchResponse};
-    use crate::ranking::common::accept_batch;
 
     fn line(
         number: u8,
@@ -878,12 +812,7 @@ mod tests {
     fn materialized(plan: LinePlan, stock: i32, amount: f32) -> MaterializedLine {
         MaterializedLine {
             plan,
-            initial_stock: StockVersion {
-                quantity: stock,
-                ytd_bits: 0.0_f32.to_bits(),
-                order_count: 0,
-                remote_count: 0,
-            },
+            initial_quantity: stock,
             amount_bits: amount.to_bits(),
             district_info: b"district".to_vec(),
         }
@@ -1007,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_stock_keys_choose_updates_from_simulated_relative_state() {
+    fn repeated_stock_keys_choose_updates_from_simulated_quantity() {
         let first = line(1, 2, 10, 8, false);
         let second = line(2, 2, 10, 8, false);
         let input = input(vec![first, second], false);
@@ -1038,66 +967,13 @@ mod tests {
             "wrapped stock binds quantity and the public branch threshold"
         );
         assert_eq!(stage.recovery_lines.len(), 2);
-        assert_eq!(stage.recovery_lines[0].stock_before.quantity, 25);
-        assert_eq!(stage.recovery_lines[0].stock_after.quantity, 17);
         assert_eq!(
-            stage.recovery_lines[0].stock_after.ytd_bits,
-            8.0_f32.to_bits()
-        );
-        assert_eq!(stage.recovery_lines[0].stock_after.order_count, 1);
-        assert_eq!(stage.recovery_lines[1].stock_before.quantity, 17);
-        assert_eq!(stage.recovery_lines[1].stock_after.quantity, 100);
-        assert_eq!(
-            stage.recovery_lines[1].stock_after.ytd_bits,
-            16.0_f32.to_bits()
-        );
-        assert_eq!(stage.recovery_lines[1].stock_after.order_count, 2);
-    }
-
-    fn readback_results(stage: &StageTwoPlan, _versions: &[StockVersion]) -> BatchResults {
-        assert!(
-            stage.stock_after_results.is_empty(),
-            "no per-line stock read-backs are issued"
-        );
-        let results = Vec::new();
-        accept_batch(
-            BatchResponse::Ok {
-                executed_operations: stage.operations.len() as u16,
-                results,
-            },
-            &stage.operations,
-        )
-        .unwrap()
-    }
-
-    fn one_line_stage() -> StageTwoPlan {
-        let only = line(1, 2, 10, 7, false);
-        let input = input(vec![only], false);
-        let materialized = MaterializedOrder {
-            order_id: 3001,
-            lines: vec![materialized(only, 100, 14.0)],
-        };
-        build_stage_two(&input, &materialized).unwrap()
-    }
-
-    #[test]
-    fn stock_readback_skipped_when_none_issued() {
-        let stage = one_line_stage();
-        assert!(stage.stock_after_results.is_empty());
-        assert!(
-            validate_stage_two_stock_readbacks(&readback_results(&stage, &[]), &stage).is_ok()
-        );
-    }
-
-    #[test]
-    fn stock_readback_skipped_even_with_pending_versions() {
-        let stage = one_line_stage();
-        assert!(stage.stock_after_results.is_empty());
-        let stale = stage.recovery_lines[0].stock_before.clone();
-        // No read-backs are issued, so any supplied read-back set is ignored
-        // and validation trivially passes.
-        assert!(
-            validate_stage_two_stock_readbacks(&readback_results(&stage, &[stale]), &stage).is_ok()
+            stage
+                .recovery_lines
+                .iter()
+                .map(|line| (line.number, line.quantity))
+                .collect::<Vec<_>>(),
+            vec![(1, 8), (2, 8)]
         );
     }
 
