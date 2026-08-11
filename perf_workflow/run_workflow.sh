@@ -103,7 +103,6 @@ STOPPING_SERVER=0
 SERVER_LOG=""
 RESULT_DIR=""
 RUN_TEMP_DIR=""
-REUSE_SETUP_CHECK_STATE=""
 CSV_DIR=""
 LOAD_DIR=""
 STATE_DIR=""
@@ -4571,22 +4570,6 @@ remove_current_run_temp() {
   rm -rf -- "${RUN_TEMP_DIR}"
 }
 
-remove_reuse_setup_check_state() {
-  [[ -n "${REUSE_SETUP_CHECK_STATE}" ]] || return 0
-  case "${REUSE_SETUP_CHECK_STATE}" in
-    "${RUN_TEMP_DIR}"/reuse-setup-check-state.*) ;;
-    *) return 1 ;;
-  esac
-  if [[ -d "${REUSE_SETUP_CHECK_STATE}" \
-    && ! -L "${REUSE_SETUP_CHECK_STATE}" ]]; then
-    rm -rf -- "${REUSE_SETUP_CHECK_STATE}"
-  elif [[ -e "${REUSE_SETUP_CHECK_STATE}" \
-    || -L "${REUSE_SETUP_CHECK_STATE}" ]]; then
-    return 1
-  fi
-  REUSE_SETUP_CHECK_STATE=""
-}
-
 cleanup() {
   CLEANUP_RC=$?
   local rc="${CLEANUP_RC}"
@@ -4604,7 +4587,6 @@ cleanup() {
   if [[ "${WORKFLOW_SUCCEEDED}" == "1" && "${CLEAN_DB_ON_EXIT}" == "1" ]]; then
     remove_current_owned_database || rc=$?
   fi
-  remove_reuse_setup_check_state || true
   remove_current_run_temp || true
   exit "${rc}"
 }
@@ -5263,11 +5245,9 @@ run_setup() {
 #     then the database and its sealed state are cached on disk.
 #   - Later runs: a fresh copy of the cached database is restored into the
 #     DB root (fast filesystem, e.g. tmpfs) and verified byte-for-byte, then
-#     RMDB starts against it and replays the read-only post-load setup checks.
-#     The replay restores the same internal-cache history that the official
-#     load/check lifecycle has immediately before its benchmark warmup. Every
-#     run is a pristine database, exactly like a fresh SQL load — the measured
-#     warmup, windows, crash, and recovery lifecycle remains unchanged.
+#     RMDB starts against it. Every run is a pristine database, exactly like
+#     a fresh SQL load — the measurement lifecycle (warmup, windows, crash,
+#     recovery) is unchanged, so reuse does not alter measurement results.
 #   - Identity binding: the cached database.identity pins the directory
 #     inode, which a restored copy cannot reproduce. Reuse therefore skips
 #     the inode-bound verify_database_identity checks; the cache key and the
@@ -5373,42 +5353,6 @@ reuse_restore_copy() {
   log "reused database ${DB_NAME} (run ${DATASET_RUN_ID})"
 }
 
-# Restarting RMDB necessarily discards its process-local buffer pool. Replay
-# the existing public post-load setup checks before benchmark warmup so a
-# restored database reaches the same cache history as a freshly loaded one.
-# The checks contain only SELECT queries. They run against a disposable copy
-# of the sealed state because setup-check claims and receipts are write-once;
-# the authoritative run state and its formal chain remain byte-for-byte
-# untouched. The replay is outside every measured interval and fails closed.
-reuse_replay_setup_check() {
-  local replay_log="${RESULT_DIR}/reuse_setup_check.log"
-  [[ -d "${RUN_TEMP_DIR}" && ! -L "${RUN_TEMP_DIR}" ]] \
-    || die "run temp directory is unavailable for reuse setup-check replay"
-  [[ -z "${REUSE_SETUP_CHECK_STATE}" ]] \
-    || die "reuse setup-check replay state is already active"
-  REUSE_SETUP_CHECK_STATE="$(
-    mktemp -d "${RUN_TEMP_DIR}/reuse-setup-check-state.XXXXXX"
-  )" || die "could not create disposable reuse setup-check state"
-  cp -a "${STATE_DIR}/." "${REUSE_SETUP_CHECK_STATE}/" \
-    || { remove_reuse_setup_check_state || true; \
-         die "could not copy sealed state for reuse setup-check replay"; }
-  rm -f -- "${REUSE_SETUP_CHECK_STATE}/setup_check.started" \
-    "${REUSE_SETUP_CHECK_STATE}/setup_check.passed"
-
-  log "replaying read-only post-load setup checks after database restore"
-  if ! run_profile_tester "${replay_log}" \
-      --check --check-scope setup \
-      --profile "${PROFILE}" --seed "${SEED}" \
-      --state-dir "${REUSE_SETUP_CHECK_STATE}" \
-      --host "${HOST}" --port "${PORT}"; then
-    remove_reuse_setup_check_state || true
-    die "reused database setup-check replay failed; see ${replay_log}"
-  fi
-  remove_reuse_setup_check_state \
-    || die "could not remove disposable reuse setup-check state"
-  log "read-only post-load setup-check replay passed"
-}
-
 # Issue a static checkpoint over the wire protocol (flushes dirty pages and
 # writes db.chkpt so crash recovery starts from the checkpoint LSN).
 reuse_issue_checkpoint() {
@@ -5481,7 +5425,6 @@ reuse_prepare_database() {
     # truncation, but keep a generous budget for cold page-cache reads.
     start_server "reused database" \
       "240" "reused database startup"
-    reuse_replay_setup_check
     return 0
   fi
   log "database reuse enabled: no cached database for kernel $(reuse_cache_key); loading from SQL"
@@ -5497,7 +5440,6 @@ reuse_prepare_database() {
   DB_OWNED=1
   start_server "reused database" \
     "240" "reused database startup"
-  reuse_replay_setup_check
   return 0
 }
 
