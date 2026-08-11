@@ -3,9 +3,11 @@ mod profile;
 #[path = "../src/routing.rs"]
 mod routing;
 
-use profile::{Final2026Profile, MEASUREMENT_WINDOWS};
+use profile::{
+    Final2026Profile, TransactionKind, MEASUREMENT_WINDOWS, TRANSACTION_DECK_SIZE, TRANSACTION_MIX,
+};
 use routing::{ClientSequence, OfficialRouter, StageId, WorkloadSeed};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[test]
 fn public_profile_and_router_form_a_reproducible_stage_contract() {
@@ -22,6 +24,89 @@ fn public_profile_and_router_form_a_reproducible_stage_contract() {
             assert_eq!(sequence.next_txn_no(), 1);
         }
     }
+}
+
+#[test]
+fn every_complete_client_block_has_the_exact_transaction_quota() {
+    let router = OfficialRouter::new(WorkloadSeed(2026));
+    for stage in [
+        StageId::WARMUP,
+        StageId::measurement(0),
+        StageId::measurement(1),
+        StageId::measurement(2),
+    ] {
+        let wheel = router.wheel(stage);
+        for client_id in 0..profile::OFFICIAL_CLIENTS {
+            let mut sequence = ClientSequence::new(client_id).unwrap();
+            for _block in 0..3 {
+                let mut counts = HashMap::new();
+                for _ in 0..TRANSACTION_DECK_SIZE {
+                    let transaction = router.begin_transaction(&wheel, &mut sequence).unwrap();
+                    *counts.entry(transaction.kind).or_insert(0_usize) += 1;
+                }
+                for (kind, weight) in TRANSACTION_MIX {
+                    assert_eq!(counts[&kind], usize::from(weight));
+                }
+            }
+        }
+    }
+}
+
+fn transaction_kinds(
+    seed: WorkloadSeed,
+    stage: StageId,
+    client_id: u16,
+    count: usize,
+) -> Vec<TransactionKind> {
+    let router = OfficialRouter::new(seed);
+    let wheel = router.wheel(stage);
+    let mut sequence = ClientSequence::new(client_id).unwrap();
+    (0..count)
+        .map(|_| {
+            router
+                .begin_transaction(&wheel, &mut sequence)
+                .unwrap()
+                .kind
+        })
+        .collect()
+}
+
+#[test]
+fn transaction_decks_are_deterministic_and_domain_isolated() {
+    let seed = WorkloadSeed(0x2026_cafe_f00d);
+    let stage = StageId::measurement(0);
+    let two_blocks = transaction_kinds(seed, stage, 0, 2 * TRANSACTION_DECK_SIZE);
+
+    assert_eq!(
+        two_blocks,
+        transaction_kinds(seed, stage, 0, 2 * TRANSACTION_DECK_SIZE)
+    );
+    assert_ne!(
+        &two_blocks[..TRANSACTION_DECK_SIZE],
+        &two_blocks[TRANSACTION_DECK_SIZE..]
+    );
+    assert_ne!(
+        two_blocks[..TRANSACTION_DECK_SIZE],
+        transaction_kinds(seed, stage, 1, TRANSACTION_DECK_SIZE)
+    );
+    assert_ne!(
+        two_blocks[..TRANSACTION_DECK_SIZE],
+        transaction_kinds(
+            seed,
+            StageId::measurement(1),
+            0,
+            TRANSACTION_DECK_SIZE
+        )
+    );
+    assert_ne!(
+        two_blocks[..TRANSACTION_DECK_SIZE],
+        transaction_kinds(
+            WorkloadSeed(seed.0 + 1),
+            stage,
+            0,
+            TRANSACTION_DECK_SIZE
+        )
+    );
 }
 
 #[test]

@@ -8,6 +8,7 @@ use crate::profile::{
     EXTRA_COLD_WAREHOUSES_PER_STAGE, HOT_DISTRICT_PERCENT, HOT_ITEMS, HOT_ITEM_PERCENT,
     HOT_SLOTS_PER_WAREHOUSE, HOT_WAREHOUSES, ITEM_COUNT, NEW_ORDER_REMOTE_PERCENT,
     OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES, PAYMENT_REMOTE_PERCENT, ROUTING_SLOTS, ROUTING_WAVES,
+    TRANSACTION_DECK_SIZE,
 };
 use std::error::Error;
 use std::fmt;
@@ -315,6 +316,7 @@ impl OfficialRouter {
     ) -> Result<RoutedTransaction, RouteError> {
         let txn_no = sequence.consume();
         let client_id = sequence.client_id;
+        let kind = sequence.transaction_kind(self.seed, wheel.stage, txn_no);
         let home_warehouse = wheel.warehouse_for(client_id, txn_no)?;
         let coordinates = [
             wheel.stage.value(),
@@ -322,13 +324,6 @@ impl OfficialRouter {
             txn_no,
             u64::from(home_warehouse),
         ];
-        let kind_bucket = bounded(
-            derive_seed(self.seed.0, "transaction-kind", &coordinates),
-            100,
-        ) as u8;
-        let kind = transaction_for_bucket(kind_bucket)
-            .expect("a bounded transaction bucket is always valid");
-
         let home_district = match self.hot_district_for(home_warehouse) {
             Some(hot_district)
                 if chance(
@@ -387,9 +382,49 @@ impl OfficialRouter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TransactionKindDeck {
+    seed: WorkloadSeed,
+    stage: StageId,
+    client_id: u16,
+    block: u64,
+    buckets: [u8; TRANSACTION_DECK_SIZE],
+}
+
+impl TransactionKindDeck {
+    fn new(seed: WorkloadSeed, stage: StageId, client_id: u16, block: u64) -> Self {
+        let mut buckets = std::array::from_fn(|index| index as u8);
+        shuffle(
+            &mut buckets,
+            derive_seed(
+                seed.0,
+                "transaction-kind-deck",
+                &[stage.value(), u64::from(client_id), block],
+            ),
+        );
+        Self {
+            seed,
+            stage,
+            client_id,
+            block,
+            buckets,
+        }
+    }
+
+    fn matches(&self, seed: WorkloadSeed, stage: StageId, client_id: u16, block: u64) -> bool {
+        (self.seed, self.stage, self.client_id, self.block) == (seed, stage, client_id, block)
+    }
+
+    fn kind(&self, offset: usize) -> TransactionKind {
+        transaction_for_bucket(self.buckets[offset])
+            .expect("a transaction deck contains every bucket in 0..100 exactly once")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientSequence {
     client_id: u16,
     next_txn_no: u64,
+    kind_deck: Option<TransactionKindDeck>,
 }
 
 impl ClientSequence {
@@ -401,6 +436,7 @@ impl ClientSequence {
         Ok(Self {
             client_id,
             next_txn_no: 0,
+            kind_deck: None,
         })
     }
 
@@ -419,6 +455,31 @@ impl ClientSequence {
             .checked_add(1)
             .expect("transaction sequence overflow");
         current
+    }
+
+    fn transaction_kind(
+        &mut self,
+        seed: WorkloadSeed,
+        stage: StageId,
+        txn_no: u64,
+    ) -> TransactionKind {
+        let block = txn_no / TRANSACTION_DECK_SIZE as u64;
+        let refresh = self
+            .kind_deck
+            .as_ref()
+            .is_none_or(|deck| !deck.matches(seed, stage, self.client_id, block));
+        if refresh {
+            self.kind_deck = Some(TransactionKindDeck::new(
+                seed,
+                stage,
+                self.client_id,
+                block,
+            ));
+        }
+        self.kind_deck
+            .as_ref()
+            .expect("transaction kind deck was initialized")
+            .kind((txn_no % TRANSACTION_DECK_SIZE as u64) as usize)
     }
 }
 
@@ -802,6 +863,32 @@ mod tests {
         let after_abandon = router.begin_transaction(&wheel, &mut sequence).unwrap();
         assert_eq!(after_abandon.txn_no, 1);
         assert_eq!(sequence.next_txn_no(), 2);
+    }
+
+    #[test]
+    fn transaction_kind_deck_cache_rotates_at_the_block_boundary() {
+        let router = router();
+        let wheel = router.wheel(StageId::measurement(0));
+        let mut sequence = ClientSequence::new(7).unwrap();
+
+        for _ in 0..TRANSACTION_DECK_SIZE {
+            router.begin_transaction(&wheel, &mut sequence).unwrap();
+        }
+        let first = sequence
+            .kind_deck
+            .clone()
+            .expect("the first selection initializes the deck cache");
+        assert_eq!(first.block, 0);
+        assert_eq!(sequence.next_txn_no(), TRANSACTION_DECK_SIZE as u64);
+
+        router.begin_transaction(&wheel, &mut sequence).unwrap();
+        let second = sequence
+            .kind_deck
+            .as_ref()
+            .expect("the boundary selection refreshes the deck cache");
+        assert_eq!(second.block, 1);
+        assert_ne!(second.buckets, first.buckets);
+        assert_eq!(sequence.next_txn_no(), TRANSACTION_DECK_SIZE as u64 + 1);
     }
 
     #[test]

@@ -7,7 +7,10 @@ mod workload;
 
 use std::collections::HashMap;
 
-use profile::{TransactionKind, HOT_DISTRICT_PERCENT, HOT_ITEM_PERCENT, NEW_ORDER_REMOTE_PERCENT};
+use profile::{
+    TransactionKind, HOT_DISTRICT_PERCENT, HOT_ITEM_PERCENT, NEW_ORDER_REMOTE_PERCENT,
+    TRANSACTION_DECK_SIZE, TRANSACTION_MIX,
+};
 use routing::{ClientSequence, OfficialRouter, StageId, WorkloadSeed};
 use workload::{
     CustomerSelector, Final2026Workload, TransactionParameters, CUSTOMERS_PER_DISTRICT,
@@ -265,14 +268,12 @@ fn deterministic_sampling_tracks_the_published_probabilities() {
     }
 
     let total: u64 = counts.kinds.values().sum();
-    assert_percent(counts.kinds[&TransactionKind::NewOrder], total, 45.0, 0.35);
-    assert_percent(counts.kinds[&TransactionKind::Payment], total, 43.0, 0.35);
-    for kind in [
-        TransactionKind::OrderStatus,
-        TransactionKind::Delivery,
-        TransactionKind::StockLevel,
-    ] {
-        assert_percent(counts.kinds[&kind], total, 4.0, 0.18);
+    assert_eq!(total % TRANSACTION_DECK_SIZE as u64, 0);
+    for (kind, weight) in TRANSACTION_MIX {
+        assert_eq!(
+            counts.kinds[&kind],
+            total * u64::from(weight) / TRANSACTION_DECK_SIZE as u64
+        );
     }
     assert_percent(
         counts.hot_district_transactions,

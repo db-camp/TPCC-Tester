@@ -49,9 +49,11 @@ pub const TRANSACTION_MIX: [(TransactionKind, u8); 5] = [
     (TransactionKind::StockLevel, 4),
 ];
 
-/// Maps an unbiased bucket in `0..100` onto the published transaction mix.
+pub const TRANSACTION_DECK_SIZE: usize = 100;
+
+/// Maps a deck bucket onto the published transaction mix.
 pub fn transaction_for_bucket(bucket: u8) -> Option<TransactionKind> {
-    if bucket >= 100 {
+    if usize::from(bucket) >= TRANSACTION_DECK_SIZE {
         return None;
     }
 
@@ -346,15 +348,15 @@ mod tests {
     #[test]
     fn transaction_buckets_match_the_published_mix_exactly() {
         let mut counts = HashMap::new();
-        for bucket in 0..100 {
+        for bucket in 0..TRANSACTION_DECK_SIZE {
             *counts
-                .entry(transaction_for_bucket(bucket).unwrap())
+                .entry(transaction_for_bucket(bucket as u8).unwrap())
                 .or_insert(0_u8) += 1;
         }
         for (kind, expected) in TRANSACTION_MIX {
             assert_eq!(counts[&kind], expected);
         }
-        assert_eq!(transaction_for_bucket(100), None);
+        assert_eq!(transaction_for_bucket(TRANSACTION_DECK_SIZE as u8), None);
     }
 
     #[test]
