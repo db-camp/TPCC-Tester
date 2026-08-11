@@ -154,7 +154,7 @@ pub struct Config {
 
     /// Run one non-ranked 30s warmup plus one 60s measurement window
     #[arg(long)]
-    pub preliminary: bool,
+    pub fast: bool,
 
     /// Run one explicitly non-ranked final2026 diagnostic workload phase
     #[arg(long = "diagnostic-workload-seconds")]
@@ -328,11 +328,11 @@ pub enum ConfigError {
     #[error("--diagnostic-workload-seconds must be used by itself")]
     DiagnosticWorkloadMustBeExclusive,
 
-    #[error("--preliminary must be used by itself")]
-    PreliminaryMustBeExclusive,
+    #[error("--fast must be used by itself")]
+    FastMustBeExclusive,
 
-    #[error("preliminary final2026 requires exactly 50 warehouses and 32 clients")]
-    PreliminaryRequiresOfficialShape,
+    #[error("fast final2026 requires exactly 50 warehouses and 32 clients")]
+    FastRequiresOfficialShape,
 
     #[error("--diagnostic-workload-seconds and --diagnostic-segment must be supplied together")]
     DiagnosticSegmentMustMatchWorkload,
@@ -357,7 +357,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_raw()?;
         let diagnostic_workload = self.diagnostic_workload_seconds.is_some();
-        let preliminary = self.preliminary;
+        let fast = self.fast;
         if diagnostic_workload != self.diagnostic_segment.is_some() {
             return Err(ConfigError::DiagnosticSegmentMustMatchWorkload);
         }
@@ -379,7 +379,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
-                || preliminary
+                || fast
                 || diagnostic_workload
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
@@ -403,7 +403,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
-                || preliminary
+                || fast
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
                 || self.attest_formal_state
@@ -423,7 +423,7 @@ impl Config {
         {
             return Err(ConfigError::DiagnosticWorkloadRequiresOfficialShape);
         }
-        if preliminary
+        if fast
             && (self.create_schema
                 || self.init
                 || self.check
@@ -443,13 +443,13 @@ impl Config {
                 || self.diagnostic_segment.is_some()
                 || self.check_scope != CheckScope::Setup)
         {
-            return Err(ConfigError::PreliminaryMustBeExclusive);
+            return Err(ConfigError::FastMustBeExclusive);
         }
-        if preliminary
+        if fast
             && (self.scale_factor != i32::from(crate::profile::OFFICIAL_WAREHOUSES)
                 || self.threads != usize::from(crate::profile::OFFICIAL_CLIENTS))
         {
-            return Err(ConfigError::PreliminaryRequiresOfficialShape);
+            return Err(ConfigError::FastRequiresOfficialShape);
         }
 
         if self.lifecycle_event.is_some()
@@ -458,7 +458,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
-                || preliminary
+                || fast
                 || diagnostic_workload
                 || self.probe_ready
                 || self.post_crash_response_probe
@@ -475,7 +475,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
-                || preliminary
+                || fast
                 || diagnostic_workload
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
@@ -493,7 +493,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
-                || preliminary
+                || fast
                 || diagnostic_workload
                 || self.probe_ready
                 || self.lifecycle_event.is_some()
@@ -512,7 +512,7 @@ impl Config {
         if (self.create_schema
             || self.init
             || self.benchmark
-            || preliminary
+            || fast
             || diagnostic_workload
             || self.lifecycle_event.is_some()
             || self.attest_formal_state
@@ -523,7 +523,7 @@ impl Config {
         }
         if (self.init
             || self.benchmark
-            || preliminary
+            || fast
             || self.check
             || diagnostic_workload
             || self.lifecycle_event.is_some()
@@ -541,7 +541,7 @@ impl Config {
                 || self.check
                 || self.stats
                 || self.benchmark
-                || preliminary
+                || fast
                 || diagnostic_workload
                 || self.lifecycle_event.is_some()
                 || self.attest_formal_state
@@ -857,19 +857,19 @@ mod tests {
 
     #[test]
     fn rtt_sim_applies_uniformly_across_modes_without_deviation() {
-        let preliminary = Config::try_parse_from([
+        let fast = Config::try_parse_from([
             "tpcc-tester",
-            "--preliminary",
+            "--fast",
             "--seed",
             "1",
             "--rtt-sim-ms",
             "20",
             "--state-dir",
-            "/tmp/tpcc-final2026-rtt-preliminary-state",
+            "/tmp/tpcc-final2026-rtt-fast-state",
         ])
         .unwrap();
-        preliminary.validate().unwrap();
-        assert!(preliminary
+        fast.validate().unwrap();
+        assert!(fast
             .resolved_profile()
             .unwrap()
             .extra_deviations()
@@ -1338,20 +1338,20 @@ mod tests {
     }
 
     #[test]
-    fn preliminary_is_fixed_shape_state_bound_and_non_composable() {
+    fn fast_is_fixed_shape_state_bound_and_non_composable() {
         let valid = Config::try_parse_from([
             "tpcc-tester",
-            "--preliminary",
+            "--fast",
             "--seed",
             "7",
             "--state-dir",
-            "/tmp/tpcc-final2026-preliminary-state",
+            "/tmp/tpcc-final2026-fast-state",
         ])
         .unwrap();
         valid.validate().unwrap();
 
         let missing_state =
-            Config::try_parse_from(["tpcc-tester", "--preliminary", "--seed", "7"]).unwrap();
+            Config::try_parse_from(["tpcc-tester", "--fast", "--seed", "7"]).unwrap();
         assert!(matches!(
             missing_state.validate(),
             Err(ConfigError::MissingStateDir)
@@ -1359,49 +1359,49 @@ mod tests {
 
         let overridden = Config::try_parse_from([
             "tpcc-tester",
-            "--preliminary",
+            "--fast",
             "--seed",
             "7",
             "--state-dir",
-            "/tmp/tpcc-final2026-preliminary-state",
+            "/tmp/tpcc-final2026-fast-state",
             "--clients",
             "2",
         ])
         .unwrap();
         assert!(matches!(
             overridden.validate(),
-            Err(ConfigError::PreliminaryRequiresOfficialShape)
+            Err(ConfigError::FastRequiresOfficialShape)
         ));
 
         let wrong_scale = Config::try_parse_from([
             "tpcc-tester",
-            "--preliminary",
+            "--fast",
             "--seed",
             "7",
             "--state-dir",
-            "/tmp/tpcc-final2026-preliminary-state",
+            "/tmp/tpcc-final2026-fast-state",
             "--scale",
             "49",
         ])
         .unwrap();
         assert!(matches!(
             wrong_scale.validate(),
-            Err(ConfigError::PreliminaryRequiresOfficialShape)
+            Err(ConfigError::FastRequiresOfficialShape)
         ));
 
         let combined = Config::try_parse_from([
             "tpcc-tester",
-            "--preliminary",
+            "--fast",
             "--benchmark",
             "--seed",
             "7",
             "--state-dir",
-            "/tmp/tpcc-final2026-preliminary-state",
+            "/tmp/tpcc-final2026-fast-state",
         ])
         .unwrap();
         assert!(matches!(
             combined.validate(),
-            Err(ConfigError::PreliminaryMustBeExclusive)
+            Err(ConfigError::FastMustBeExclusive)
         ));
     }
 }

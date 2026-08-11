@@ -4232,7 +4232,7 @@ if "--benchmark" in sys.argv:
                 0.0,
             )
 
-    def test_resource_sampler_accepts_one_preliminary_window_only_explicitly(self):
+    def test_resource_sampler_accepts_one_fast_window_only_explicitly(self):
         one_window = (
             "schema_version=1\n"
             "kind=final2026_rank_timeline\n"
@@ -5578,7 +5578,7 @@ while :; do sleep 0.05; done
                 manifest["phases"],
                 {
                     "setup": "passed",
-                    "preliminary": "not_applicable",
+                    "fast": "not_applicable",
                     "rank": "passed",
                     "online": "passed",
                     "crash_restart": "passed",
@@ -5860,7 +5860,7 @@ while :; do sleep 0.05; done
                 failed_manifest["phases"],
                 {
                     "setup": "passed",
-                    "preliminary": "not_applicable",
+                    "fast": "not_applicable",
                     "rank": "passed",
                     "online": "passed",
                     "crash_restart": "passed",

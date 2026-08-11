@@ -80,7 +80,7 @@ performance_test_record/<UTC-run-id>_final2026/
 
 ```bash
 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
-  --mode preliminary \
+  --mode fast \
   --seed 2026
 ```
 
@@ -94,7 +94,7 @@ rank claim 或 terminal evidence。
 客户端无限速发送会形成重试风暴（本地实测约 81% 的物理尝试是重试、物理尝试率
 约 2440/s，官方约 733/s），掩盖服务器真实能力。`--rtt-sim-ms <ms>` 在每个
 attempt（含重试）前插入模拟 RTT，把本地 attempt 率对齐到官方水平；本地
-preliminary 实测最优约 30ms（物理 ~820/s，重试占比降到 ~19%，NewOrder/min
+fast 实测最优约 30ms（物理 ~820/s，重试占比降到 ~19%，NewOrder/min
 相对 rtt=0 提升约 40%）。它是环境对齐（复现官方跨主机网络的客观物理延迟），
 不是思考时间偏差，因此**默认 30ms 且不破坏排名配置**；`--rtt-sim-ms 0` 选择
 本地 loopback。
@@ -107,7 +107,7 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh --mode all --seed 2026
 deps/TPCC-Tester/perf_workflow/run_workflow.sh --mode all --seed 2026 --rtt-sim-ms 0
 
 # 快速官方对齐初测
-deps/TPCC-Tester/perf_workflow/run_workflow.sh --mode preliminary --seed 2026
+deps/TPCC-Tester/perf_workflow/run_workflow.sh --mode fast --seed 2026
 ```
 
 ### 官方对齐校验：`compare_official.py`

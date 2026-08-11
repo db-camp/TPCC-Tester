@@ -60,7 +60,7 @@ const fn diagnostic_stage(segment: DiagnosticSegment) -> StageId {
     }
 }
 
-fn publish_preliminary_resource_timeline(
+fn publish_fast_resource_timeline(
     _phase_start: Instant,
     warmup: Duration,
     measurement: Duration,
@@ -74,7 +74,7 @@ fn publish_preliminary_resource_timeline(
     let origin_unix_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(value) => value.as_nanos(),
         Err(error) => {
-            warn!("preliminary resource timeline clock is invalid: {error}");
+            warn!("fast resource timeline clock is invalid: {error}");
             return;
         }
     };
@@ -90,7 +90,7 @@ fn publish_preliminary_resource_timeline(
     );
     if let Err(error) = publish_resource_timeline(&output, payload.as_bytes()) {
         warn!(
-            "could not publish non-ranked preliminary resource timeline {}: {error}",
+            "could not publish non-ranked fast resource timeline {}: {error}",
             output.display()
         );
     }
@@ -104,7 +104,7 @@ fn publish_resource_timeline(output: &Path, payload: &[u8]) -> io::Result<()> {
     let file_name = output
         .file_name()
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| OsStr::new("preliminary_timeline"));
+        .unwrap_or_else(|| OsStr::new("fast_timeline"));
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
         file_name.to_string_lossy(),
@@ -161,7 +161,7 @@ impl DiagnosticExecutor {
         .await
     }
 
-    pub async fn run_preliminary(&self) -> Result<DiagnosticRunResult, TpccError> {
+    pub async fn run_fast(&self) -> Result<DiagnosticRunResult, TpccError> {
         self.run_timed(
             DiagnosticSegment::Observation,
             PRELIMINARY_WARMUP_STAGE,
@@ -180,7 +180,7 @@ impl DiagnosticExecutor {
         measurement_stage: StageId,
         warmup: Duration,
         measurement: Duration,
-        preliminary: bool,
+        fast: bool,
     ) -> Result<DiagnosticRunResult, TpccError> {
         let seed = self.effective.seed.ok_or_else(|| {
             TpccError::Protocol("diagnostic workload requires an explicit seed".to_owned())
@@ -250,8 +250,8 @@ impl DiagnosticExecutor {
         let phase_start = Instant::now();
         let phase_timing =
             DiagnosticTimeline::new(phase_start, warmup, measurement, phase_tail_grace)?;
-        if preliminary {
-            publish_preliminary_resource_timeline(phase_start, warmup, measurement);
+        if fast {
+            publish_fast_resource_timeline(phase_start, warmup, measurement);
         }
         timeline_sender.send(Some(phase_timing)).map_err(|_| {
             TpccError::Protocol("diagnostic workers left before timing release".to_owned())
@@ -291,7 +291,7 @@ impl DiagnosticExecutor {
             segment,
             warmup,
             measurement,
-            preliminary,
+            fast,
             response_timeout,
             phase_tail_grace,
             stats: aggregate,
@@ -797,7 +797,7 @@ pub struct DiagnosticRunResult {
     segment: DiagnosticSegment,
     warmup: Duration,
     measurement: Duration,
-    preliminary: bool,
+    fast: bool,
     response_timeout: Duration,
     phase_tail_grace: Duration,
     stats: DiagnosticStats,
@@ -808,8 +808,8 @@ impl DiagnosticRunResult {
         println!("=== TPCC final2026 diagnostic workload ===");
         println!(
             "mode={}",
-            if self.preliminary {
-                "non_ranked_preliminary"
+            if self.fast {
+                "non_ranked_fast"
             } else {
                 "non_ranked_diagnostic"
             }
@@ -873,7 +873,7 @@ impl DiagnosticRunResult {
         );
         println!(
             "state_artifacts_written={}",
-            if self.preliminary {
+            if self.fast {
                 "none"
             } else {
                 "append_only_phase_claim_and_receipt"
@@ -923,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn preliminary_stages_restart_at_zero_in_distinct_routing_domains() {
+    fn fast_stages_restart_at_zero_in_distinct_routing_domains() {
         let router = OfficialRouter::new(WorkloadSeed(0x2026_0731));
         assert_ne!(PRELIMINARY_WARMUP_STAGE, PRELIMINARY_MEASUREMENT_STAGE);
 

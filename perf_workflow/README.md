@@ -138,7 +138,7 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 
   ```bash
   taskset -c 0-15 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
-    --mode preliminary --seed 2026
+    --mode fast --seed 2026
   ```
 
 - **客户端网络**：本地 tester 在连接建立时对每个 socket 设置 `TCP_NODELAY`
@@ -151,7 +151,7 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
   约束，会形成重试风暴（本地实测约 81% 的物理尝试是重试、物理尝试率约
   2440/s，而官方约 733/s），使吞吐被无效冲突回滚拖累。`--rtt-sim-ms` 在每个
   attempt（含重试）前插入模拟 RTT，把本地 attempt 率对齐到官方水平。
-  本地 preliminary 实测：`rtt=0` → NewOrder/min ≈12400（物理 2440/s），
+  本地 fast 实测：`rtt=0` → NewOrder/min ≈12400（物理 2440/s），
   `rtt=30ms` → ≈17700（物理 ~820/s，重试占比降到 ~19%），`rtt=43ms` →
   ≈14450（物理 ~630/s，被过度限速）。因此 30ms 附近的校准最接近官方
   attempt 时序。
@@ -193,19 +193,19 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
 
 ## 明确非排名的 smoke
 
-性能优化迭代可使用固定的 preliminary 流程。它仍新建并装载完整 SF50
+性能优化迭代可使用固定的 fast 流程。它仍新建并装载完整 SF50
 数据集，使用 32 个持久 prepared 客户端和正式事务路由，但只执行连续
 `30s warmup + 1×60s measurement`。预热与测量使用独立阶段轮盘，每个客户端
 在测量阶段重新从 `txn_no=0` 开始，重试仍只复用原阶段的冻结参数：
 
 ```bash
 deps/TPCC-Tester/perf_workflow/run_workflow.sh \
-  --mode preliminary \
+  --mode fast \
   --seed 2026
 ```
 
 该模式拒绝 scale、clients、warmup 和 window 覆盖，结果始终为
-`NON-RANKED`。它只写 `preliminary.log`、非排名 manifest 和资源 observation，
+`NON-RANKED`。它只写 `fast.log`、非排名 manifest 和资源 observation，
 不会创建 `rank.started`、`terminal_evidence.state`，也不会执行在线校验、
 崩溃恢复或正式状态证明。正式结论仍必须来自完整 `--mode all`。
 
@@ -231,7 +231,7 @@ smoke 保留三窗口、Wire、事务与校验路径，但 profile 和结果会�
 | 模式 | 行为 |
 | --- | --- |
 | `all` | 新建/装载、rank、在线检查、`SIGKILL`、同库重启、恢复检查 |
-| `preliminary` | 新建/装载后执行 NON-RANKED `30s + 1×60s` 性能初测 |
+| `fast` | 新建/装载后执行 NON-RANKED `30s + 1×60s` 性能初测 |
 | `init` | 新建并装载数据库，成功后保留 |
 | `rank` | 对已有数据库 rank 并执行在线检查；`--init-db` 可先新建/装载 |
 | `recovery` | 启动已有数据库并执行恢复检查 |

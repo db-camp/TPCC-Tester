@@ -726,13 +726,13 @@ def load_authoritative_manifest(
     if not text:
         raise ManifestError("manifest.json is missing or empty")
     try:
-        preliminary = json.loads(text)
+        fast = json.loads(text)
     except json.JSONDecodeError:
-        preliminary = None
+        fast = None
 
     state_descriptor = -1
-    if isinstance(preliminary, dict) and preliminary.get("mode") == "all":
-        paths = preliminary.get("paths")
+    if isinstance(fast, dict) and fast.get("mode") == "all":
+        paths = fast.get("paths")
         state_value = paths.get("state") if isinstance(paths, dict) else None
         if not isinstance(state_value, str):
             raise ManifestError("manifest.json has no formal-state directory")

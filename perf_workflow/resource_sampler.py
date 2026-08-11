@@ -1543,7 +1543,7 @@ def aggregate_segments(arguments):
     ]
     final_disk = max(final_candidates, default=(0, None))[1]
 
-    if arguments.mode in {"all", "rank", "preliminary"}:
+    if arguments.mode in {"all", "rank", "fast"}:
         try:
             timeline_content, timeline_metadata = read_stable_file(
                 arguments.timeline,
@@ -1760,7 +1760,7 @@ def build_parser():
     aggregate.add_argument(
         "--mode",
         required=True,
-        choices=("all", "init", "rank", "recovery", "preliminary"),
+        choices=("all", "init", "rank", "recovery", "fast"),
     )
     aggregate.add_argument("--output", required=True, type=Path)
     aggregate.add_argument(
