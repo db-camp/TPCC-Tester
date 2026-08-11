@@ -44,8 +44,6 @@ use crate::workload::Final2026Workload;
 // domains rather than replaying the same deterministic transaction prefix.
 const DIAGNOSTIC_WARMUP_STAGE: StageId = StageId::custom(0x6469_6167_7761_726d);
 const DIAGNOSTIC_OBSERVATION_STAGE: StageId = StageId::custom(0x6469_6167_6f62_7376);
-const PRELIMINARY_WARMUP_STAGE: StageId = StageId::custom(0x7072_656c_7761_726d);
-const PRELIMINARY_MEASUREMENT_STAGE: StageId = StageId::custom(0x7072_656c_6d65_6173);
 const RESOURCE_TIMELINE_ENV: &str = "RMDB_TPCC_RESOURCE_TIMELINE_FILE";
 const DIAGNOSTIC_FAMILIES: [(TransactionKind, &str); 5] = [
     (TransactionKind::NewOrder, "new_order"),
@@ -166,8 +164,8 @@ impl DiagnosticExecutor {
     pub async fn run_fast(&self) -> Result<DiagnosticRunResult, TpccError> {
         self.run_timed(
             DiagnosticSegment::Observation,
-            PRELIMINARY_WARMUP_STAGE,
-            PRELIMINARY_MEASUREMENT_STAGE,
+            StageId::WARMUP,
+            StageId::measurement(0),
             Duration::from_secs(PRELIMINARY_WARMUP_SECONDS),
             Duration::from_secs(PRELIMINARY_MEASUREMENT_SECONDS),
             true,
@@ -920,12 +918,14 @@ mod tests {
     }
 
     #[test]
-    fn fast_stages_restart_at_zero_in_distinct_routing_domains() {
+    fn fast_reuses_the_first_ranked_routing_domains() {
         let router = OfficialRouter::new(WorkloadSeed(0x2026_0731));
-        assert_ne!(PRELIMINARY_WARMUP_STAGE, PRELIMINARY_MEASUREMENT_STAGE);
+        let warmup_stage = StageId::WARMUP;
+        let measurement_stage = StageId::measurement(0);
+        assert_ne!(warmup_stage, measurement_stage);
 
-        let warmup_wheel = router.wheel(PRELIMINARY_WARMUP_STAGE);
-        let measurement_wheel = router.wheel(PRELIMINARY_MEASUREMENT_STAGE);
+        let warmup_wheel = router.wheel(warmup_stage);
+        let measurement_wheel = router.wheel(measurement_stage);
         let mut warmup_sequence = ClientSequence::new(31).unwrap();
         let mut measurement_sequence = ClientSequence::new(31).unwrap();
         let warmup_ticket = Final2026Workload::new(&router, &warmup_wheel)
@@ -937,11 +937,8 @@ mod tests {
 
         assert_eq!(warmup_ticket.route().txn_no, 0);
         assert_eq!(measurement_ticket.route().txn_no, 0);
-        assert_eq!(warmup_ticket.route().stage, PRELIMINARY_WARMUP_STAGE);
-        assert_eq!(
-            measurement_ticket.route().stage,
-            PRELIMINARY_MEASUREMENT_STAGE
-        );
+        assert_eq!(warmup_ticket.route().stage, StageId::WARMUP);
+        assert_eq!(measurement_ticket.route().stage, StageId::measurement(0));
     }
 
     #[test]
