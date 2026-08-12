@@ -202,6 +202,18 @@ struct TimeoutPoison {
     phase: WireTimeoutPhase,
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "cygwin",
+))]
+fn rearm_tcp_quickack(stream: &TcpStream) {
+    // TCP_QUICKACK is only a transient hint on Linux. A rejected hint must
+    // not turn an otherwise healthy protocol exchange into an I/O failure.
+    let _ = stream.set_quickack(true);
+}
+
 /// A sequential RMDB Wire Protocol connection.
 ///
 /// The API intentionally exposes one complete request at a time, matching the
@@ -212,6 +224,9 @@ pub struct WireConnection<S> {
     timeout_poison: Option<TimeoutPoison>,
     incomplete_exchange: Option<&'static str>,
     pub(crate) prepared: BTreeMap<u16, PreparedDefinition>,
+    // Only real TCP connections install this hook. Generic/mock transports
+    // remain independent of platform socket options.
+    quickack_rearm: Option<fn(&S)>,
 }
 
 impl WireConnection<TcpStream> {
@@ -228,7 +243,23 @@ impl WireConnection<TcpStream> {
         // here removes the local/remote network-factor gap. (The server side
         // intentionally has no NODELAY/QUICKACK handling.)
         stream.set_nodelay(true)?;
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "cygwin",
+        ))]
+        rearm_tcp_quickack(&stream);
         let mut connection = Self::new(stream);
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "fuchsia",
+            target_os = "cygwin",
+        ))]
+        {
+            connection.quickack_rearm = Some(rearm_tcp_quickack);
+        }
         connection.handshake().await?;
         Ok(connection)
     }
@@ -245,6 +276,7 @@ where
             timeout_poison: None,
             incomplete_exchange: None,
             prepared: BTreeMap::new(),
+            quickack_rearm: None,
         }
     }
 
@@ -638,6 +670,13 @@ where
     }
 
     async fn read_response_frame(&mut self) -> WireResult<Frame> {
+        // final_test2 and Aries send each response frame's 8-byte header and
+        // payload with separate writes. Linux consumes TCP_QUICKACK after an
+        // ACK, so re-arm it for every frame: otherwise the server's Nagle can
+        // wait on a delayed ACK for the header before releasing the payload.
+        if let Some(rearm) = self.quickack_rearm {
+            rearm(&self.io);
+        }
         let mut header = [0_u8; 8];
         self.io.read_exact(&mut header).await?;
 
@@ -1029,6 +1068,42 @@ mod tests {
         let payload_bytes = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
         let mut payload = vec![0_u8; payload_bytes];
         stream.read_exact(&mut payload).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quickack_hook_runs_once_per_frame_and_generic_connections_skip_it() {
+        static QUICKACK_REARMS: AtomicUsize = AtomicUsize::new(0);
+
+        let columns = meta(&[("i", SqlType::Int32)]);
+        let mut row = Vec::new();
+        encode_value(SqlType::Int32, &WireValue::Int32(42), &mut row).unwrap();
+        let mut response = frame(FrameTag::Meta, 0, 0, &columns);
+        response.extend(frame(FrameTag::Row, 0, 0, &row));
+        response.extend(frame(FrameTag::ResultEnd, 0, 0, &1_u64.to_be_bytes()));
+
+        let (client_io, mut server_io) = duplex(128);
+        let server = tokio::spawn(async move {
+            server_handshake(&mut server_io).await;
+            read_exec_request(&mut server_io).await;
+            server_io.write_all(&response).await.unwrap();
+        });
+
+        let mut connection = WireConnection::new(client_io);
+        assert!(connection.quickack_rearm.is_none());
+        connection.handshake().await.unwrap();
+        QUICKACK_REARMS.store(0, Ordering::SeqCst);
+        connection.quickack_rearm = Some(|_| {
+            QUICKACK_REARMS.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let result = connection.exec_stream("select i from t;").await.unwrap();
+        assert!(matches!(
+            result,
+            StreamResponse::Query { rows, .. }
+                if rows == vec![vec![WireValue::Int32(42)]]
+        ));
+        assert_eq!(QUICKACK_REARMS.load(Ordering::SeqCst), 3);
+        server.await.unwrap();
     }
 
     #[tokio::test]
