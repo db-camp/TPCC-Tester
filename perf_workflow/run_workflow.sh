@@ -151,14 +151,18 @@ RMDB_BUILD_TYPE="Release"
 RMDB_BUILD_MACHINE="$(uname -m)"
 RMDB_BUILD_PLATFORM_ALIGNMENT="local_non_x86_64"
 RMDB_RELEASE_FLAGS="-O2 -DNDEBUG -g0"
-# Local performance runs use the host's full instruction set (AVX2 etc.) so
-# the machine's real service rate is measured; the official grader builds
-# with generic x86-64, and RMDB_RELEASE_ARCH can force that back.
-RMDB_RELEASE_ARCH="${RMDB_RELEASE_ARCH:-native}"
+# x86-64 defaults must match the official build contract. An explicit local
+# environment override remains available for diagnostics.
+RMDB_RELEASE_ARCH="${RMDB_RELEASE_ARCH:-x86-64}"
+RMDB_RELEASE_TUNE="${RMDB_RELEASE_TUNE:-generic}"
 case "${RMDB_BUILD_MACHINE}" in
   x86_64|amd64)
-    RMDB_BUILD_PLATFORM_ALIGNMENT="official_x86_64"
-    RMDB_RELEASE_FLAGS="${RMDB_RELEASE_FLAGS} -march=${RMDB_RELEASE_ARCH}"
+    if [[ "${RMDB_RELEASE_ARCH}" == "x86-64" && "${RMDB_RELEASE_TUNE}" == "generic" ]]; then
+      RMDB_BUILD_PLATFORM_ALIGNMENT="official_x86_64"
+    else
+      RMDB_BUILD_PLATFORM_ALIGNMENT="local_x86_64_override"
+    fi
+    RMDB_RELEASE_FLAGS="${RMDB_RELEASE_FLAGS} -march=${RMDB_RELEASE_ARCH} -mtune=${RMDB_RELEASE_TUNE}"
     ;;
 esac
 # The canonical codec emits at most 16 MiB of lower-hex payload. The

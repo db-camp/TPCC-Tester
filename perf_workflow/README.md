@@ -141,6 +141,14 @@ deps/TPCC-Tester/perf_workflow/run_workflow.sh \
     --mode fast --seed 2026
   ```
 
+- **编译指令集**：x86-64 默认固定使用官方报告记录的
+  `-march=x86-64 -mtune=generic`，并在 manifest 中标记为
+  `official_x86_64`。仅供本地诊断的显式环境覆盖仍可使用
+  `RMDB_RELEASE_ARCH` 和 `RMDB_RELEASE_TUNE`，例如
+  `RMDB_RELEASE_ARCH=native RMDB_RELEASE_TUNE=native`；覆盖后的 manifest
+  会记录实际 flags，并标记为 `local_x86_64_override`，不应与官方口径结果
+  混用。
+
 - **客户端网络**：本地 tester 在连接建立时对每个 socket 设置 `TCP_NODELAY`
   （`WireConnection::connect`），与官方隐藏客户端一致；本地不再依赖服务器
   侧的 NODELAY/QUICKACK（官方客户端自带 NODELAY，服务器侧这些设置在官方
