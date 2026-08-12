@@ -18,8 +18,8 @@ use super::common::{
     SemanticViolation,
 };
 use super::runner::{
-    execute_batch, semantic_or_abort, CustomerVersion, DeliveredOrderEvidence, RankedCommit,
-    RankedTransactionError, RankedTransactionOutcome,
+    abort_retryable_contention, execute_batch, semantic_or_abort, CustomerVersion,
+    DeliveredOrderEvidence, RankedCommit, RankedTransactionError, RankedTransactionOutcome,
 };
 
 const MIN_ORDER_LINES: usize = 5;
@@ -49,6 +49,12 @@ struct LockedOrder {
     line_amount_bits: Vec<u32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StageTwoOutcome {
+    Locked(Vec<LockedOrder>),
+    ClaimLost(DistrictClaim),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StageThreeIndex {
     customer_before: usize,
@@ -70,8 +76,9 @@ struct CustomerTransition {
 
 /// Execute one immutable Delivery input.
 ///
-/// A `TRANSACTION_ABORT` returned by any batch remains the only retryable
-/// failure through `RankedTransactionError::is_retryable_abort`.
+/// A server-side `TRANSACTION_ABORT`, or a claim that disappears before the
+/// second-stage confirmation and is explicitly aborted here, is retryable
+/// through `RankedTransactionError::is_retryable_abort`.
 pub async fn execute(
     client: &mut RmdbClient,
     route: &RoutedTransaction,
@@ -98,11 +105,21 @@ pub async fn execute(
 
     let (stage_two, stage_two_indices) = stage_two_operations(warehouse_id, &claims);
     let stage_two_results = execute_batch(client, &stage_two).await?;
-    let locked_orders = semantic_or_abort(
+    let stage_two_outcome = semantic_or_abort(
         client,
         parse_stage_two(&stage_two_results, &claims, &stage_two_indices).require_explicit_abort(),
     )
     .await?;
+    let locked_orders = match stage_two_outcome {
+        StageTwoOutcome::Locked(orders) => orders,
+        StageTwoOutcome::ClaimLost(claim) => {
+            let diagnostic = format!(
+                "Delivery warehouse district {} order {} disappeared before queue confirmation",
+                claim.district_id, claim.order_id
+            );
+            return Err(abort_retryable_contention(client, diagnostic).await);
+        }
+    };
 
     let (stage_three, stage_three_indices) =
         stage_three_operations(warehouse_id, input.carrier_id(), timestamp, &locked_orders);
@@ -244,7 +261,7 @@ fn parse_stage_two(
     results: &BatchResults,
     claims: &[DistrictClaim],
     indices: &[StageTwoIndices],
-) -> SemanticResult<Vec<LockedOrder>> {
+) -> SemanticResult<StageTwoOutcome> {
     if claims.len() != indices.len() {
         return Err(SemanticViolation::new(format!(
             "Delivery stage-two planner retained {} claims but {} index records",
@@ -254,6 +271,7 @@ fn parse_stage_two(
     }
 
     let mut locked_orders = Vec::with_capacity(claims.len());
+    let mut lost_claim = None;
     for (claim, index) in claims.iter().zip(indices) {
         let context = format!(
             "Delivery warehouse district {} order {}",
@@ -268,6 +286,10 @@ fn parse_stage_two(
         }
 
         let exact_queue_count = results.single_int32(index.exact_queue_count)?;
+        if exact_queue_count == 0 {
+            lost_claim.get_or_insert(*claim);
+            continue;
+        }
         if exact_queue_count != 1 {
             return Err(SemanticViolation::new(format!(
                 "{context} has {exact_queue_count} exact queue rows; expected one"
@@ -369,7 +391,10 @@ fn parse_stage_two(
         });
     }
 
-    Ok(locked_orders)
+    Ok(match lost_claim {
+        Some(claim) => StageTwoOutcome::ClaimLost(claim),
+        None => StageTwoOutcome::Locked(locked_orders),
+    })
 }
 
 fn stage_three_operations(
@@ -730,10 +755,72 @@ mod tests {
             ],
         };
         let results = accept_batch(response, &operations).unwrap();
-        let locked = parse_stage_two(&results, &claims, &indices).unwrap();
+        let StageTwoOutcome::Locked(locked) =
+            parse_stage_two(&results, &claims, &indices).unwrap()
+        else {
+            panic!("complete queue evidence must retain the locked order");
+        };
         assert_eq!(locked.len(), 1);
         assert_eq!(locked[0].line_amount_bits, amounts);
         assert_eq!(locked[0].amount_bits, sum_bits);
+    }
+
+    #[test]
+    fn one_lost_claim_discards_other_locked_districts() {
+        let claims = [
+            DistrictClaim {
+                district_id: 2,
+                order_id: 3001,
+            },
+            DistrictClaim {
+                district_id: 9,
+                order_id: 3017,
+            },
+        ];
+        let (operations, indices) = stage_two_operations(17, &claims);
+        let amounts = [1.0_f32.to_bits(); MIN_ORDER_LINES];
+        let sum_bits = exact_f64_sum_to_f32_bits(&amounts).unwrap();
+        let response = BatchResponse::Ok {
+            executed_operations: operations.len() as u16,
+            results: vec![
+                query(1, vec![vec![WireValue::Int32(0)]]),
+                query(2, vec![vec![WireValue::Int32(1)]]),
+                query(
+                    3,
+                    vec![vec![
+                        WireValue::Int32(42),
+                        WireValue::Int32(UNDELIVERED_CARRIER_ID),
+                        WireValue::Int32(MIN_ORDER_LINES as i32),
+                    ]],
+                ),
+                query(
+                    4,
+                    amounts
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, bits)| {
+                            vec![
+                                WireValue::Int32((offset + 1) as i32),
+                                WireValue::Float32(*bits),
+                                WireValue::Int32(3001),
+                            ]
+                        })
+                        .collect(),
+                ),
+                query(5, vec![vec![WireValue::Float32(sum_bits)]]),
+                query(7, vec![vec![WireValue::Int32(0)]]),
+                query(8, vec![vec![WireValue::Int32(0)]]),
+                query(9, Vec::new()),
+                query(10, Vec::new()),
+                query(11, Vec::new()),
+            ],
+        };
+        let results = accept_batch(response, &operations).unwrap();
+
+        assert_eq!(
+            parse_stage_two(&results, &claims, &indices).unwrap(),
+            StageTwoOutcome::ClaimLost(claims[1])
+        );
     }
 
     #[test]
@@ -783,14 +870,46 @@ mod tests {
             }
         };
 
-        let earlier = accept_batch(response(1, 1, 0, 5, 3001), &operations).unwrap();
+        let earlier = accept_batch(response(1, 0, 0, 5, 3001), &operations).unwrap();
         assert!(parse_stage_two(&earlier, &claims, &indices)
             .unwrap_err()
             .message()
             .contains("earlier queue rows"));
 
-        let missing_exact = accept_batch(response(0, 0, 0, 5, 3001), &operations).unwrap();
-        assert!(parse_stage_two(&missing_exact, &claims, &indices)
+        let lost_exact = accept_batch(response(0, 0, 0, 5, 3001), &operations).unwrap();
+        assert_eq!(
+            parse_stage_two(&lost_exact, &claims, &indices).unwrap(),
+            StageTwoOutcome::ClaimLost(claims[0])
+        );
+
+        let mut missing_exact_result = response(0, 1, 0, 5, 3001);
+        let BatchResponse::Ok { results, .. } = &mut missing_exact_result else {
+            unreachable!("test response is successful");
+        };
+        results.retain(|result| result.operation_index != 2);
+        let missing_exact_result = accept_batch(missing_exact_result, &operations).unwrap();
+        assert!(parse_stage_two(&missing_exact_result, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("operation 2 has no query result"));
+
+        let mut wrong_exact_type = response(0, 1, 0, 5, 3001);
+        let BatchResponse::Ok { results, .. } = &mut wrong_exact_type else {
+            unreachable!("test response is successful");
+        };
+        results
+            .iter_mut()
+            .find(|result| result.operation_index == 2)
+            .unwrap()
+            .rows[0][0] = WireValue::Char(b"1".to_vec());
+        let wrong_exact_type = accept_batch(wrong_exact_type, &operations).unwrap();
+        assert!(parse_stage_two(&wrong_exact_type, &claims, &indices)
+            .unwrap_err()
+            .message()
+            .contains("expected INT32"));
+
+        let duplicate_exact = accept_batch(response(0, 2, 0, 5, 3001), &operations).unwrap();
+        assert!(parse_stage_two(&duplicate_exact, &claims, &indices)
             .unwrap_err()
             .message()
             .contains("exact queue rows"));

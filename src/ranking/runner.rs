@@ -158,6 +158,9 @@ pub enum RankedTransactionError {
     #[error("ranked semantic validation failed: {0}")]
     Semantic(SemanticViolation),
 
+    #[error("retryable client-detected transaction contention: {diagnostic}")]
+    RetryableContention { diagnostic: String },
+
     #[error("semantic validation failed ({semantic}); explicit ABORT cleanup failed ({cleanup})")]
     Cleanup {
         semantic: SemanticViolation,
@@ -170,6 +173,7 @@ impl RankedTransactionError {
         matches!(
             self,
             Self::Batch(BatchExecutionError::RetryableAbort { .. })
+                | Self::RetryableContention { .. }
         )
     }
 
@@ -191,6 +195,10 @@ pub async fn execute_batch(
     Ok(accept_batch(response, operations)?)
 }
 
+fn explicit_abort_operations() -> [Operation; 1] {
+    [abort_operation()]
+}
+
 /// Resolve a typed semantic read, issuing an explicit ABORT when it failed
 /// while a transaction was still open.
 pub async fn semantic_or_abort<T>(
@@ -200,7 +208,7 @@ pub async fn semantic_or_abort<T>(
     match result {
         Ok(value) => Ok(value),
         Err(semantic) if semantic.requires_explicit_abort() => {
-            let operations = [abort_operation()];
+            let operations = explicit_abort_operations();
             match execute_batch(client, &operations).await {
                 Ok(_) => Err(RankedTransactionError::Semantic(semantic)),
                 Err(cleanup) => Err(RankedTransactionError::Cleanup {
@@ -213,11 +221,37 @@ pub async fn semantic_or_abort<T>(
     }
 }
 
+/// Abort an open transaction after a client-side concurrency precondition
+/// disappeared, then expose the attempt through the same bounded retry policy
+/// as a server-side `TRANSACTION_ABORT`.
+pub async fn abort_retryable_contention(
+    client: &mut RmdbClient,
+    diagnostic: String,
+) -> RankedTransactionError {
+    let operations = explicit_abort_operations();
+    match execute_batch(client, &operations).await {
+        Ok(_) => RankedTransactionError::RetryableContention { diagnostic },
+        Err(cleanup) => RankedTransactionError::Cleanup {
+            semantic: SemanticViolation::new(diagnostic),
+            cleanup: cleanup.to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::connection::prepared::BatchResponse;
     use crate::ranking::common::BatchExecutionError;
+    use crate::ranking::catalog::StatementId;
+
+    #[test]
+    fn explicit_abort_cleanup_uses_the_canonical_operation() {
+        let operations = explicit_abort_operations();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].statement_id, StatementId::Abort.wire_id());
+        assert!(operations[0].parameters.is_empty());
+    }
 
     #[test]
     fn retry_classification_is_exact() {
@@ -227,6 +261,11 @@ mod tests {
             diagnostic: "write conflict".to_owned(),
         });
         assert!(retryable.is_retryable_abort());
+
+        let detected_contention = RankedTransactionError::RetryableContention {
+            diagnostic: "Delivery claim disappeared".to_owned(),
+        };
+        assert!(detected_contention.is_retryable_abort());
 
         let fatal = RankedTransactionError::Batch(BatchExecutionError::FatalTopLevel {
             diagnostic: "bad request".to_owned(),
