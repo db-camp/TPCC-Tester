@@ -177,6 +177,15 @@ impl RankedTransactionError {
         )
     }
 
+    /// Whether the server completed AUTO_ABORT and returned TRANSACTION_ABORT.
+    ///
+    /// Client-detected Delivery contention is retryable too, but it has
+    /// already sent an explicit ABORT and must not affect server-abort
+    /// scheduling policy.
+    pub fn is_server_retryable_abort(&self) -> bool {
+        matches!(self, Self::Batch(BatchExecutionError::RetryableAbort { .. }))
+    }
+
     /// A response-read deadline exceeded on a ranked request. The official
     /// client abandons such attempts (uniform ~22-27% abandoned across
     /// transaction families) instead of failing the worker, so the local
@@ -261,16 +270,19 @@ mod tests {
             diagnostic: "write conflict".to_owned(),
         });
         assert!(retryable.is_retryable_abort());
+        assert!(retryable.is_server_retryable_abort());
 
         let detected_contention = RankedTransactionError::RetryableContention {
             diagnostic: "Delivery claim disappeared".to_owned(),
         };
         assert!(detected_contention.is_retryable_abort());
+        assert!(!detected_contention.is_server_retryable_abort());
 
         let fatal = RankedTransactionError::Batch(BatchExecutionError::FatalTopLevel {
             diagnostic: "bad request".to_owned(),
         });
         assert!(!fatal.is_retryable_abort());
+        assert!(!fatal.is_server_retryable_abort());
 
         let _keeps_wire_type_visible = BatchResponse::TopLevelError {
             diagnostic: String::new(),
