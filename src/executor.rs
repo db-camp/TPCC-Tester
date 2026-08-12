@@ -941,7 +941,6 @@ async fn run_worker_inner(
                     break;
                 }
                 Ok(Err(error)) if error.is_retryable_abort() => {
-                    let server_retryable_abort = error.is_server_retryable_abort();
                     let disposition = {
                         let mut state = lock_scheduler(&scheduler)?;
                         state
@@ -961,15 +960,6 @@ async fn run_worker_inner(
                             .abandon_retry(phase_ticket)
                             .map_err(scheduler_error)?;
                         break;
-                    }
-                    // A winning multi-batch transaction may still need its
-                    // client task to send the batch containing COMMIT. Give
-                    // other ready tasks one scheduling turn before this
-                    // loser immediately retries the same frozen parameters.
-                    // This is not a timer or backoff and does not change the
-                    // retry count, transaction input, or phase deadline.
-                    if server_retryable_abort {
-                        tokio::task::yield_now().await;
                     }
                     let (ticket, deadline) = {
                         let mut state = lock_scheduler(&scheduler)?;
