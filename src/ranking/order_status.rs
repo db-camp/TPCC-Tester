@@ -22,8 +22,7 @@ use super::runner::{
 
 const CUSTOMER_QUERY_OPERATION: usize = 1;
 const LATEST_ORDER_QUERY_OPERATION: usize = 0;
-const ORDER_QUERY_OPERATION: usize = 0;
-const LINES_QUERY_OPERATION: usize = 1;
+const LINES_QUERY_OPERATION: usize = 0;
 
 /// Execute one OrderStatus transaction in exactly three AUTO_ABORT batches.
 pub async fn execute(
@@ -60,7 +59,6 @@ pub async fn execute(
 
     let order_parameters = partition_order_parameters(route, order_id);
     let stage_three = [
-        operation(StatementId::OrderStatusOrder, order_parameters.clone()),
         operation(StatementId::OrderStatusLines, order_parameters),
         operation(StatementId::Commit, []),
     ];
@@ -68,13 +66,8 @@ pub async fn execute(
 
     // COMMIT has completed at this point. A semantic mismatch is fatal but
     // must not send a fourth cleanup batch against the next transaction.
-    validate_final_results(
-        &stage_three_results,
-        ORDER_QUERY_OPERATION,
-        LINES_QUERY_OPERATION,
-        order_id,
-    )
-    .map_err(RankedTransactionError::Semantic)?;
+    validate_final_results(&stage_three_results, LINES_QUERY_OPERATION)
+        .map_err(RankedTransactionError::Semantic)?;
 
     Ok(RankedTransactionOutcome::Committed(
         RankedCommit::OrderStatus,
@@ -236,44 +229,35 @@ fn latest_order_id(
     results: &super::common::BatchResults,
     operation_index: usize,
 ) -> SemanticResult<i32> {
-    let order_id = results.single_int32(operation_index)?;
+    parse_order(results.single_row(operation_index)?)
+}
+
+fn validate_final_results(
+    results: &super::common::BatchResults,
+    lines_operation: usize,
+) -> SemanticResult<()> {
+    validate_lines(results.rows(lines_operation)?)
+}
+
+fn parse_order(row: &[WireValue]) -> SemanticResult<i32> {
+    expect_columns(row, 3, "OrderStatus latest order row")?;
+    let order_id = row_int32(row, 0, "OrderStatus latest order row")?;
     if order_id <= 0 {
         return Err(SemanticViolation::new(format!(
             "OrderStatus latest order id {order_id} must be positive"
         )));
     }
-    Ok(order_id)
-}
 
-fn validate_final_results(
-    results: &super::common::BatchResults,
-    order_operation: usize,
-    lines_operation: usize,
-    expected_order_id: i32,
-) -> SemanticResult<()> {
-    validate_order(results.single_row(order_operation)?, expected_order_id)?;
-    validate_lines(results.rows(lines_operation)?)
-}
-
-fn validate_order(row: &[WireValue], expected_order_id: i32) -> SemanticResult<()> {
-    expect_columns(row, 3, "OrderStatus order row")?;
-    let order_id = row_int32(row, 0, "OrderStatus order row")?;
-    if order_id != expected_order_id {
-        return Err(SemanticViolation::new(format!(
-            "OrderStatus order row id {order_id} does not match latest order {expected_order_id}"
-        )));
-    }
-
-    let entry = row_char(row, 1, "OrderStatus order row")?;
+    let entry = row_char(row, 1, "OrderStatus latest order row")?;
     validate_char(entry, 1, 30, "OrderStatus o_entry_d")?;
 
-    let carrier_id = row_int32(row, 2, "OrderStatus order row")?;
+    let carrier_id = row_int32(row, 2, "OrderStatus latest order row")?;
     if !(0..=10).contains(&carrier_id) {
         return Err(SemanticViolation::new(format!(
             "OrderStatus carrier id {carrier_id} is outside 0..=10"
         )));
     }
-    Ok(())
+    Ok(order_id)
 }
 
 fn validate_lines(rows: &[Vec<WireValue>]) -> SemanticResult<()> {
@@ -465,15 +449,32 @@ mod tests {
 
     #[test]
     fn stage_query_operation_indices_are_fixed() {
-        let operations = vec![
-            operation(
-                StatementId::OrderStatusOrder,
-                [
-                    WireValue::Int32(1),
-                    WireValue::Int32(2),
+        let latest_operations = vec![operation(
+            StatementId::OrderStatusLatestOrder,
+            [
+                WireValue::Int32(1),
+                WireValue::Int32(2),
+                WireValue::Int32(7),
+            ],
+        )];
+        let latest_response = BatchResponse::Ok {
+            executed_operations: 1,
+            results: vec![BatchQueryResult {
+                operation_index: LATEST_ORDER_QUERY_OPERATION as u16,
+                rows: vec![vec![
                     WireValue::Int32(3001),
-                ],
-            ),
+                    WireValue::Char(b"2026-07-29".to_vec()),
+                    WireValue::Int32(0),
+                ]],
+            }],
+        };
+        let latest_results = accept_batch(latest_response, &latest_operations).unwrap();
+        assert_eq!(
+            latest_order_id(&latest_results, LATEST_ORDER_QUERY_OPERATION).unwrap(),
+            3001
+        );
+
+        let operations = vec![
             operation(
                 StatementId::OrderStatusLines,
                 [
@@ -485,25 +486,14 @@ mod tests {
             operation(StatementId::Commit, []),
         ];
         let response = BatchResponse::Ok {
-            executed_operations: 3,
-            results: vec![
-                BatchQueryResult {
-                    operation_index: ORDER_QUERY_OPERATION as u16,
-                    rows: vec![vec![
-                        WireValue::Int32(3001),
-                        WireValue::Char(b"2026-07-29".to_vec()),
-                        WireValue::Int32(0),
-                    ]],
-                },
-                BatchQueryResult {
-                    operation_index: LINES_QUERY_OPERATION as u16,
-                    rows: (1..=5).map(valid_line).collect(),
-                },
-            ],
+            executed_operations: 2,
+            results: vec![BatchQueryResult {
+                operation_index: LINES_QUERY_OPERATION as u16,
+                rows: (1..=5).map(valid_line).collect(),
+            }],
         };
         let results = accept_batch(response, &operations).unwrap();
-        validate_final_results(&results, ORDER_QUERY_OPERATION, LINES_QUERY_OPERATION, 3001)
-            .unwrap();
+        validate_final_results(&results, LINES_QUERY_OPERATION).unwrap();
     }
 
     #[test]

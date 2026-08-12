@@ -260,6 +260,45 @@ fn payment_keeps_wide_before_reads_and_uses_ytd_only_after_reads() {
 }
 
 #[test]
+fn order_status_latest_lookup_returns_the_order_header_once() {
+    let catalog = final2026_catalog();
+    let latest = find(&catalog, StatementId::OrderStatusLatestOrder);
+    assert_query_columns(
+        latest,
+        &[
+            ("o_id", SqlType::Int32),
+            ("o_entry_d", SqlType::Char),
+            ("o_carrier_id", SqlType::Int32),
+        ],
+    );
+    assert!(latest.sql.contains("o_c_id = $3"));
+    assert!(latest.sql.contains("ORDER BY o_id DESC LIMIT 1"));
+
+    assert_eq!(
+        ORDER_STATUS_STAGES[1].steps[0].alternatives,
+        &[StatementId::OrderStatusLatestOrder]
+    );
+    assert_eq!(ORDER_STATUS_STAGES[2].steps.len(), 2);
+    assert_eq!(
+        ORDER_STATUS_STAGES[2].steps[0].alternatives,
+        &[StatementId::OrderStatusLines]
+    );
+    assert_eq!(
+        ORDER_STATUS_STAGES[2].steps[1].alternatives,
+        &[StatementId::Commit]
+    );
+
+    assert_query_columns(
+        find(&catalog, StatementId::OrderStatusOrder),
+        &[
+            ("o_id", SqlType::Int32),
+            ("o_entry_d", SqlType::Char),
+            ("o_carrier_id", SqlType::Int32),
+        ],
+    );
+}
+
+#[test]
 fn ranked_updates_keep_float32_arithmetic_inside_relative_sql() {
     let catalog = final2026_catalog();
 

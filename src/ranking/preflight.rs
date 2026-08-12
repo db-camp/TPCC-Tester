@@ -1412,7 +1412,9 @@ fn require_pristine_order_slot(
         )));
     }
     if snapshot.latest_order_rows.iter().any(
-        |row| matches!(row.as_slice(), [WireValue::Int32(value)] if *value == prospective_order_id),
+        |row| {
+            matches!(row.as_slice(), [WireValue::Int32(value), ..] if *value == prospective_order_id)
+        },
     ) {
         return Err(preflight_semantic(format!(
             "{context}: prospective order {prospective_order_id} is reachable through \
@@ -1460,7 +1462,11 @@ fn validate_visible_new_order_state(
             state.delivery_order_rows
         ));
     }
-    let expected_latest_rows = vec![vec![WireValue::Int32(materialized.order_id)]];
+    let expected_latest_rows = vec![vec![
+        WireValue::Int32(materialized.order_id),
+        WireValue::Char(selection.timestamp.clone()),
+        WireValue::Int32(UNDELIVERED_CARRIER_ID),
+    ]];
     if state.latest_order_rows != expected_latest_rows {
         return Err(format!(
             "NewOrder write prefix secondary order index mismatch: {:?}",
@@ -2178,7 +2184,11 @@ mod tests {
             stocks,
             order_rows: Vec::new(),
             delivery_order_rows: Vec::new(),
-            latest_order_rows: vec![vec![WireValue::Int32(3_000)]],
+            latest_order_rows: vec![vec![
+                WireValue::Int32(3_000),
+                WireValue::Char(b"2026-07-29".to_vec()),
+                WireValue::Int32(0),
+            ]],
             order_line_rows: Vec::new(),
             queue_rows: Vec::new(),
         };
@@ -2193,7 +2203,11 @@ mod tests {
         assert!(require_pristine_order_slot(&indexed_residue, 3_001, "test").is_err());
 
         let mut secondary_residue = before.clone();
-        secondary_residue.latest_order_rows = vec![vec![WireValue::Int32(3_001)]];
+        secondary_residue.latest_order_rows = vec![vec![
+            WireValue::Int32(3_001),
+            WireValue::Char(b"2026-07-29".to_vec()),
+            WireValue::Int32(0),
+        ]];
         assert!(require_pristine_order_slot(&secondary_residue, 3_001, "test").is_err());
     }
 
@@ -2242,7 +2256,11 @@ mod tests {
                 WireValue::Int32(UNDELIVERED_CARRIER_ID),
                 WireValue::Int32(selection.invalid_line_number()),
             ]],
-            latest_order_rows: vec![vec![WireValue::Int32(3_001)]],
+            latest_order_rows: vec![vec![
+                WireValue::Int32(3_001),
+                WireValue::Char(selection.timestamp.clone()),
+                WireValue::Int32(UNDELIVERED_CARRIER_ID),
+            ]],
             order_line_rows: materialized
                 .lines
                 .iter()

@@ -359,7 +359,6 @@ const ORDER_STATUS_CUSTOMER: &[StatementId] = &[
     StatementId::OrderStatusCustomerByLast,
 ];
 const ORDER_STATUS_LATEST_ORDER: &[StatementId] = &[StatementId::OrderStatusLatestOrder];
-const ORDER_STATUS_ORDER: &[StatementId] = &[StatementId::OrderStatusOrder];
 const ORDER_STATUS_LINES: &[StatementId] = &[StatementId::OrderStatusLines];
 
 const DELIVERY_OLDEST_ORDER: &[StatementId] = &[StatementId::DeliveryOldestOrder];
@@ -537,10 +536,6 @@ const ORDER_STATUS_STAGE_TWO_STEPS: &[PlanStep] = &[PlanStep {
 }];
 
 const ORDER_STATUS_STAGE_THREE_STEPS: &[PlanStep] = &[
-    PlanStep {
-        alternatives: ORDER_STATUS_ORDER,
-        multiplicity: Multiplicity::Once,
-    },
     PlanStep {
         alternatives: ORDER_STATUS_LINES,
         multiplicity: Multiplicity::Once,
@@ -863,10 +858,14 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::OrderStatusLatestOrder,
             &[Int32, Int32, Int32],
-            "SELECT o_id FROM orders \
+            "SELECT o_id, o_entry_d, o_carrier_id FROM orders \
              WHERE o_w_id = $1 AND o_d_id = $2 AND o_c_id = $3 \
              ORDER BY o_id DESC LIMIT 1;",
-            &[("o_id", Int32)],
+            &[
+                ("o_id", Int32),
+                ("o_entry_d", Char),
+                ("o_carrier_id", Int32),
+            ],
         ),
         query(
             StatementId::OrderStatusOrder,
