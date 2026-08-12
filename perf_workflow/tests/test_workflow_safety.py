@@ -2080,6 +2080,19 @@ trap - EXIT
             group_text,
         )
 
+    def test_reuse_cache_key_binds_runtime_schema_seed_and_scale(self):
+        script_text = SCRIPT.read_text(encoding="utf-8")
+        function_start = script_text.index("reuse_cache_key() {")
+        function_end = script_text.index(
+            "\n}\n\nreuse_cache_paths() {",
+            function_start,
+        )
+        function_text = script_text[function_start:function_end]
+        self.assertIn("HEAD:src", function_text)
+        self.assertIn("schema-v2", function_text)
+        self.assertIn('"${SEED}"', function_text)
+        self.assertIn('"${EFFECTIVE_SCALE}"', function_text)
+
     def test_registration_timeout_kills_stalled_pre_group_launcher(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)

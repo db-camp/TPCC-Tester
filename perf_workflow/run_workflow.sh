@@ -5238,11 +5238,9 @@ run_setup() {
 # ---------------------------------------------------------------------------
 # Database-reuse acceleration.
 #
-# The loaded database (schema + seed data) is independent of the tester's
-# runtime SQL shapes, so every measurement mode can share one cached
-# database. The cache is keyed by the kernel SOURCE tree hash (HEAD:src),
-# not the parent HEAD: the parent also tracks the deps/TPCC-Tester
-# submodule pointer, so a tester commit must not invalidate the database.
+# The loaded database is independent of timed SQL shapes, but it does depend
+# on the runtime-schema algorithm, seed, and scale factor.  Bind all four
+# inputs so a Tester schema change can never silently restore a legacy layout.
 #
 # Reuse semantics vs the official lifecycle:
 #   - First run for a kernel: full SQL load (create schema, LOAD, checks),
@@ -5266,7 +5264,11 @@ reuse_cache_key() {
     echo "unknown"
     return
   fi
-  git -C "${RMDB_DIR}" rev-parse --short=12 HEAD:src 2>/dev/null || echo "unknown"
+  local kernel_source
+  kernel_source="$(git -C "${RMDB_DIR}" rev-parse --short=12 HEAD:src 2>/dev/null \
+    || echo "unknown")"
+  printf '%s-schema-v2-seed-%s-sf-%s\n' \
+    "${kernel_source}" "${SEED}" "${EFFECTIVE_SCALE}"
 }
 
 reuse_cache_paths() {
