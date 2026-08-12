@@ -86,7 +86,7 @@ fn catalogue_has_unique_bounded_ids_and_dense_typed_markers() {
 #[test]
 fn supplemental_catalogue_preserves_the_persisted_42_statement_cache() {
     let schema = RuntimeSchema::opaque(2026).unwrap();
-    assert_eq!(schema.fingerprint(), 0x7167_a66c_d8d9_bac0);
+    assert_eq!(schema.fingerprint(), 0x45b1_0a2a_a625_dea4);
     let encoded = schema.encode();
     assert_eq!(
         encoded

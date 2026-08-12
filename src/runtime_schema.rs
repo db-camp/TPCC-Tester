@@ -929,6 +929,15 @@ impl RuntimeSchema {
             fingerprint,
         };
         schema.validate()?;
+        if schema.mode == SchemaMode::LocalSeedOpaqueV2 {
+            let derived = Self::derive(schema.seed, SchemaMode::LocalSeedOpaqueV2)?;
+            if schema != derived {
+                return Err(RuntimeSchemaError::Invalid(
+                    "local_seed_opaque_v2 mapping is not the deterministic seed-derived layout"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(schema)
     }
 
@@ -1456,8 +1465,24 @@ mod tests {
         assert_eq!(left.csv_basenames.len(), 9);
         assert_eq!(left.statements.ids.len(), 42);
         assert_eq!(left.statements.supplemental_ids.len(), 14);
+        assert_eq!(left.mode(), SchemaMode::LocalSeedOpaqueV2);
+        assert!(left.tables.values().all(|identifier| identifier.len() == 15));
+        assert!(left.columns.values().all(|identifier| identifier.len() == 15));
+        assert!(left.csv_basenames.values().all(|name| {
+            name.strip_suffix(".csv")
+                .is_some_and(|stem| stem.len() == 15)
+        }));
         assert_eq!(left, RuntimeSchema::decode(&left.encode()).unwrap());
         left.validate().unwrap();
+    }
+
+    #[test]
+    fn opaque_v1_remains_stable_and_decodable() {
+        let schema = RuntimeSchema::derive(2026, SchemaMode::LocalSeedOpaqueV1).unwrap();
+        assert_eq!(schema.fingerprint(), 0x7167_a66c_d8d9_bac0);
+        assert!(schema.tables.values().all(|identifier| identifier.len() == 17));
+        assert!(schema.columns.values().all(|identifier| identifier.len() == 17));
+        assert_eq!(RuntimeSchema::decode(&schema.encode()).unwrap(), schema);
     }
 
     #[test]
@@ -1528,7 +1553,7 @@ mod tests {
     #[test]
     fn supplemental_overlay_preserves_the_seed_2026_cache_contract() {
         let schema = RuntimeSchema::opaque(2026).unwrap();
-        assert_eq!(schema.fingerprint(), 0x7167_a66c_d8d9_bac0);
+        assert_eq!(schema.fingerprint(), 0x45b1_0a2a_a625_dea4);
 
         let encoded = schema.encode();
         assert_eq!(

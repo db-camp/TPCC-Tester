@@ -30,7 +30,9 @@ use crate::ranking::core_artifact_codec::{
 use crate::ranking::evidence_collector::CustomerKey;
 use crate::ranking::rich_recovery_samples::{InitialCustomerData, InitialHistoryRow};
 use crate::ranking::terminal_evidence::SealedTerminalEvidence;
-use crate::runtime_schema::{RuntimeSchema, ENCODED_BEGIN_MARKER, ENCODED_END_MARKER};
+use crate::runtime_schema::{
+    RuntimeSchema, SchemaMode, ENCODED_BEGIN_MARKER, ENCODED_END_MARKER,
+};
 use crate::sample_evidence::SetupEvidence;
 
 const STATE_VERSION: u32 = 5;
@@ -2008,6 +2010,11 @@ fn validate_formal_state_semantics(
             "dataset seed mismatch: expected {expected_seed}, got {}",
             dataset.seed
         )));
+    }
+    if dataset.runtime_schema.mode() == SchemaMode::LocalSeedOpaqueV1 {
+        return Err(StateError::Invalid(
+            "formal state uses legacy local_seed_opaque_v1 runtime schema".to_owned(),
+        ));
     }
     expected_contract.validate(&dataset)?;
 

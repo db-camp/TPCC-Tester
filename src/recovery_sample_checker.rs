@@ -1396,7 +1396,7 @@ mod tests {
     #[test]
     fn point_renderer_is_opaque_terminated_and_forbids_wide_shapes() {
         let schema = RuntimeSchema::opaque(0x1234).unwrap();
-        assert_eq!(schema.mode(), SchemaMode::LocalSeedOpaqueV1);
+        assert_eq!(schema.mode(), SchemaMode::LocalSeedOpaqueV2);
         let query = point_query(Vec::new());
         let rendered = render_and_only_point_sql(&schema, query.scope, &query.logical_sql).unwrap();
         assert!(rendered.ends_with(';'));
