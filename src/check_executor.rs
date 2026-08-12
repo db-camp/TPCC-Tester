@@ -1891,7 +1891,7 @@ mod tests {
     #[test]
     fn recovery_integer_gate_uses_production_opaque_renderer() {
         let dataset = smoke_dataset(1);
-        assert_eq!(dataset.runtime_schema.mode(), SchemaMode::LocalSeedOpaqueV2);
+        assert_eq!(dataset.runtime_schema.mode(), SchemaMode::LocalSeedOpaqueV3);
 
         let expectations = bounded_recovery_expectations(
             &dataset,
