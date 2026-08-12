@@ -340,19 +340,24 @@ fn ranked_updates_keep_float32_arithmetic_inside_relative_sql() {
     }
 
     let normal = find(&catalog, StatementId::NewOrderUpdateStockNormal);
-    assert_eq!(normal.param_types[1], SqlType::Float32);
-    assert!(normal.sql.contains("s_ytd = s_ytd + $2"));
-    assert!(normal.sql.contains("s_remote_cnt = s_remote_cnt + $3"));
-    assert!(normal.sql.contains("s_quantity >= $6"));
+    assert_eq!(normal.param_types, vec![SqlType::Int32; 5]);
+    assert!(normal.sql.contains("s_quantity = s_quantity - $1"));
+    assert!(normal.sql.contains("s_ytd = s_ytd + $1"));
+    assert!(normal.sql.contains("s_remote_cnt = s_remote_cnt + $2"));
+    assert!(normal.sql.contains("s_w_id = $3"));
+    assert!(normal.sql.contains("s_i_id = $4"));
+    assert!(normal.sql.contains("s_quantity >= $5"));
 
     let wrapped = find(&catalog, StatementId::NewOrderUpdateStockWrapped);
-    assert_eq!(wrapped.param_types[1], SqlType::Float32);
+    assert_eq!(wrapped.param_types, vec![SqlType::Int32; 5]);
     assert!(wrapped
         .sql
         .contains("s_quantity = s_quantity - $1 + 91"));
-    assert!(wrapped.sql.contains("s_ytd = s_ytd + $2"));
-    assert!(wrapped.sql.contains("s_remote_cnt = s_remote_cnt + $3"));
-    assert!(wrapped.sql.contains("s_quantity < $6"));
+    assert!(wrapped.sql.contains("s_ytd = s_ytd + $1"));
+    assert!(wrapped.sql.contains("s_remote_cnt = s_remote_cnt + $2"));
+    assert!(wrapped.sql.contains("s_w_id = $3"));
+    assert!(wrapped.sql.contains("s_i_id = $4"));
+    assert!(wrapped.sql.contains("s_quantity < $5"));
 }
 
 #[test]

@@ -1166,7 +1166,6 @@ fn build_new_order_write_stage(
             },
             [
                 WireValue::Int32(line.plan.quantity),
-                WireValue::Float32((line.plan.quantity as f32).to_bits()),
                 WireValue::Int32(0),
                 WireValue::Int32(selection.warehouse_id),
                 WireValue::Int32(line.plan.item_id),
@@ -2167,6 +2166,25 @@ mod tests {
                 .filter(|id| **id == StatementId::NewOrderInsertLine.wire_id())
                 .count(),
             PREFLIGHT_VALID_LINES
+        );
+        let first_line = &selection.valid_lines[0];
+        let first_stock_update = operations
+            .iter()
+            .find(|operation| {
+                operation.statement_id == StatementId::NewOrderUpdateStockNormal.wire_id()
+                    || operation.statement_id
+                        == StatementId::NewOrderUpdateStockWrapped.wire_id()
+            })
+            .unwrap();
+        assert_eq!(
+            first_stock_update.parameters,
+            vec![
+                WireValue::Int32(first_line.quantity),
+                WireValue::Int32(0),
+                WireValue::Int32(selection.warehouse_id),
+                WireValue::Int32(first_line.item_id),
+                WireValue::Int32(first_line.quantity + 10),
+            ]
         );
         assert!(!ids.contains(&StatementId::Abort.wire_id()));
     }

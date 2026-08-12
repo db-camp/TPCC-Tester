@@ -660,7 +660,6 @@ fn build_stage_two(
             },
             [
                 WireValue::Int32(line.plan.quantity),
-                WireValue::Float32((line.plan.quantity as f32).to_bits()),
                 WireValue::Int32(remote),
                 WireValue::Int32(line.plan.supply_warehouse),
                 WireValue::Int32(line.plan.item_id),
@@ -853,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_batch_ends_in_commit_and_uses_relative_float_delta() {
+    fn successful_batch_ends_in_commit_and_reuses_integer_quantity() {
         let only = line(1, 2, 10, 7, false);
         let input = input(vec![only], false);
         let materialized = MaterializedOrder {
@@ -870,7 +869,6 @@ mod tests {
             stage.operations[2].parameters,
             vec![
                 WireValue::Int32(7),
-                WireValue::Float32(7.0_f32.to_bits()),
                 WireValue::Int32(0),
                 WireValue::Int32(2),
                 WireValue::Int32(10),
@@ -902,7 +900,6 @@ mod tests {
             stage.operations[4].parameters,
             vec![
                 WireValue::Int32(8),
-                WireValue::Float32(8.0_f32.to_bits()),
                 WireValue::Int32(0),
                 WireValue::Int32(2),
                 WireValue::Int32(10),
