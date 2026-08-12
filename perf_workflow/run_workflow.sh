@@ -5267,7 +5267,7 @@ reuse_cache_key() {
   local kernel_source
   kernel_source="$(git -C "${RMDB_DIR}" rev-parse --short=12 HEAD:src 2>/dev/null \
     || echo "unknown")"
-  printf '%s-schema-v2-seed-%s-sf-%s\n' \
+  printf '%s-schema-v3-seed-%s-sf-%s\n' \
     "${kernel_source}" "${SEED}" "${EFFECTIVE_SCALE}"
 }
 

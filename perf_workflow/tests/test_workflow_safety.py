@@ -2089,7 +2089,8 @@ trap - EXIT
         )
         function_text = script_text[function_start:function_end]
         self.assertIn("HEAD:src", function_text)
-        self.assertIn("schema-v2", function_text)
+        self.assertIn("schema-v3", function_text)
+        self.assertNotIn("schema-v2", function_text)
         self.assertIn('"${SEED}"', function_text)
         self.assertIn('"${EFFECTIVE_SCALE}"', function_text)
 
