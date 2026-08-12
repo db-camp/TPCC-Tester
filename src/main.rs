@@ -56,7 +56,7 @@ fn setup_tracing(verbose: u8) {
         .init();
 }
 
-#[tokio::main(worker_threads = 64)]
+#[tokio::main(worker_threads = 16)]
 async fn main() {
     let config = Config::parse();
     setup_tracing(config.verbose);
