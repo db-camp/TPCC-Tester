@@ -72,7 +72,7 @@ fn transaction_kinds(
 }
 
 #[test]
-fn transaction_decks_are_deterministic_and_domain_isolated() {
+fn transaction_cycles_are_deterministic_and_domain_isolated() {
     let seed = WorkloadSeed(0x2026_cafe_f00d);
     let stage = StageId::measurement(0);
     let two_blocks = transaction_kinds(seed, stage, 0, 2 * TRANSACTION_DECK_SIZE);
@@ -81,7 +81,7 @@ fn transaction_decks_are_deterministic_and_domain_isolated() {
         two_blocks,
         transaction_kinds(seed, stage, 0, 2 * TRANSACTION_DECK_SIZE)
     );
-    assert_ne!(
+    assert_eq!(
         &two_blocks[..TRANSACTION_DECK_SIZE],
         &two_blocks[TRANSACTION_DECK_SIZE..]
     );
@@ -107,6 +107,35 @@ fn transaction_decks_are_deterministic_and_domain_isolated() {
             TRANSACTION_DECK_SIZE
         )
     );
+}
+
+#[test]
+fn transaction_cycles_bound_per_client_family_bursts() {
+    let kinds = transaction_kinds(
+        WorkloadSeed(2026),
+        StageId::measurement(0),
+        7,
+        2 * TRANSACTION_DECK_SIZE,
+    );
+
+    assert!(kinds
+        .windows(3)
+        .all(|window| !(window[0] == window[1] && window[1] == window[2])));
+
+    for family in [
+        TransactionKind::OrderStatus,
+        TransactionKind::Delivery,
+        TransactionKind::StockLevel,
+    ] {
+        let positions: Vec<_> = kinds
+            .iter()
+            .enumerate()
+            .filter_map(|(position, kind)| (*kind == family).then_some(position))
+            .collect();
+        assert!(positions
+            .windows(2)
+            .all(|pair| pair[1] - pair[0] <= 27));
+    }
 }
 
 #[test]
