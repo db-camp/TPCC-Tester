@@ -773,18 +773,8 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::PaymentWarehouse,
             &[Int32],
-            "SELECT w_ytd, w_name, w_street_1, \
-             w_street_2, w_city, w_state, \
-             w_zip FROM warehouse WHERE w_id = $1;",
-            &[
-                ("w_ytd", Float32),
-                ("w_name", Char),
-                ("w_street_1", Char),
-                ("w_street_2", Char),
-                ("w_city", Char),
-                ("w_state", Char),
-                ("w_zip", Char),
-            ],
+            "SELECT w_ytd, w_name FROM warehouse WHERE w_id = $1;",
+            &[("w_ytd", Float32), ("w_name", Char)],
         ),
         command(
             StatementId::PaymentUpdateWarehouse,
@@ -794,18 +784,9 @@ pub fn final2026_catalog() -> Vec<Statement> {
         query(
             StatementId::PaymentDistrict,
             &[Int32, Int32],
-            "SELECT d_ytd, d_name, d_street_1, \
-             d_street_2, d_city, d_state, \
-             d_zip FROM district WHERE d_w_id = $1 AND d_id = $2;",
-            &[
-                ("d_ytd", Float32),
-                ("d_name", Char),
-                ("d_street_1", Char),
-                ("d_street_2", Char),
-                ("d_city", Char),
-                ("d_state", Char),
-                ("d_zip", Char),
-            ],
+            "SELECT d_ytd, d_name FROM district \
+             WHERE d_w_id = $1 AND d_id = $2;",
+            &[("d_ytd", Float32), ("d_name", Char)],
         ),
         command(
             StatementId::PaymentUpdateDistrict,
@@ -1179,12 +1160,8 @@ fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement 
         id,
         &[Int32, Int32, if by_last_name { Char } else { Int32 }],
         &format!(
-            "SELECT c_id, c_first, c_middle, \
-             c_last, c_street_1, \
-             c_street_2, c_city, c_state, \
-             c_zip, c_phone, c_since, \
-             c_credit, c_credit_lim, \
-             c_discount, c_balance, \
+            "SELECT c_id, c_first, c_last, \
+             c_credit, c_balance, \
              c_ytd_payment, c_payment_cnt, \
              c_delivery_cnt, c_data FROM customer \
              WHERE c_w_id = $1 AND c_d_id = $2 AND {predicate};"
@@ -1192,18 +1169,8 @@ fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement 
         &[
             ("c_id", Int32),
             ("c_first", Char),
-            ("c_middle", Char),
             ("c_last", Char),
-            ("c_street_1", Char),
-            ("c_street_2", Char),
-            ("c_city", Char),
-            ("c_state", Char),
-            ("c_zip", Char),
-            ("c_phone", Char),
-            ("c_since", Char),
             ("c_credit", Char),
-            ("c_credit_lim", Int32),
-            ("c_discount", Float32),
             ("c_balance", Float32),
             ("c_ytd_payment", Float32),
             ("c_payment_cnt", Int32),
@@ -1496,9 +1463,8 @@ mod runtime_tests {
                 .find(|statement| statement.id == id.wire_id())
                 .unwrap()
         };
-        let projection = "SELECT c_id, c_first, c_middle, c_last, c_street_1, c_street_2, \
-                          c_city, c_state, c_zip, c_phone, c_since, c_credit, c_credit_lim, \
-                          c_discount, c_balance, c_ytd_payment, c_payment_cnt, c_delivery_cnt, \
+        let projection = "SELECT c_id, c_first, c_last, c_credit, c_balance, \
+                          c_ytd_payment, c_payment_cnt, c_delivery_cnt, \
                           c_data FROM customer WHERE c_w_id = $1 AND c_d_id = $2 AND ";
 
         assert_eq!(

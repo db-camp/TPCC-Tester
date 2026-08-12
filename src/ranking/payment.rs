@@ -32,11 +32,11 @@ const STAGE_ONE_DISTRICT_AFTER: usize = 6;
 const STAGE_ONE_CUSTOMER: usize = 7;
 const STAGE_TWO_CUSTOMER_AFTER: usize = 2;
 
-const WAREHOUSE_COLUMNS: usize = 7;
+const WAREHOUSE_COLUMNS: usize = 2;
 const WAREHOUSE_AFTER_COLUMNS: usize = 1;
-const DISTRICT_COLUMNS: usize = 7;
+const DISTRICT_COLUMNS: usize = 2;
 const DISTRICT_AFTER_COLUMNS: usize = 1;
-const CUSTOMER_COLUMNS: usize = 19;
+const CUSTOMER_COLUMNS: usize = 9;
 const CUSTOMER_AFTER_COLUMNS: usize = 5;
 const MAX_NAME_BYTES: usize = 10;
 const MAX_HISTORY_DATA_BYTES: usize = 24;
@@ -423,8 +423,8 @@ fn parse_customer(row: &[WireValue]) -> SemanticResult<CustomerSnapshot> {
         )));
     }
     let first = row_char(row, 1, "Payment customer")?.to_vec();
-    let last = row_char(row, 3, "Payment customer")?.to_vec();
-    let credit = match row_char(row, 11, "Payment customer")? {
+    let last = row_char(row, 2, "Payment customer")?.to_vec();
+    let credit = match row_char(row, 3, "Payment customer")? {
         b"GC" => CustomerCredit::Good,
         b"BC" => CustomerCredit::Bad,
         value => {
@@ -434,14 +434,14 @@ fn parse_customer(row: &[WireValue]) -> SemanticResult<CustomerSnapshot> {
             )));
         }
     };
-    let payment_count = row_int32(row, 16, "Payment customer")?;
-    let delivery_count = row_int32(row, 17, "Payment customer")?;
+    let payment_count = row_int32(row, 6, "Payment customer")?;
+    let delivery_count = row_int32(row, 7, "Payment customer")?;
     if payment_count < 0 || delivery_count < 0 {
         return Err(SemanticViolation::new(format!(
             "Payment customer {id} has negative logical version ({payment_count},{delivery_count})"
         )));
     }
-    let data = row_char(row, 18, "Payment customer")?.to_vec();
+    let data = row_char(row, 8, "Payment customer")?.to_vec();
     if data.len() > MAX_CUSTOMER_DATA_BYTES {
         return Err(SemanticViolation::new(format!(
             "Payment customer {id} c_data has {} bytes; maximum is {MAX_CUSTOMER_DATA_BYTES}",
@@ -454,8 +454,8 @@ fn parse_customer(row: &[WireValue]) -> SemanticResult<CustomerSnapshot> {
         first,
         last,
         credit,
-        balance_bits: row_f32_bits(row, 14, "Payment customer")?,
-        ytd_payment_bits: row_f32_bits(row, 15, "Payment customer")?,
+        balance_bits: row_f32_bits(row, 4, "Payment customer")?,
+        ytd_payment_bits: row_f32_bits(row, 5, "Payment customer")?,
         payment_count,
         delivery_count,
         data,
@@ -701,11 +701,6 @@ mod tests {
         vec![
             WireValue::Float32(ytd_bits),
             WireValue::Char(name.to_vec()),
-            WireValue::Char(b"street1".to_vec()),
-            WireValue::Char(b"street2".to_vec()),
-            WireValue::Char(b"city".to_vec()),
-            WireValue::Char(b"ST".to_vec()),
-            WireValue::Char(b"123456789".to_vec()),
         ]
     }
 
@@ -731,18 +726,8 @@ mod tests {
         vec![
             WireValue::Int32(id),
             WireValue::Char(first.to_vec()),
-            WireValue::Char(b"OE".to_vec()),
             WireValue::Char(last.to_vec()),
-            WireValue::Char(b"street1".to_vec()),
-            WireValue::Char(b"street2".to_vec()),
-            WireValue::Char(b"city".to_vec()),
-            WireValue::Char(b"ST".to_vec()),
-            WireValue::Char(b"123456789".to_vec()),
-            WireValue::Char(b"1234567890123456".to_vec()),
-            WireValue::Char(b"2026-07-29 12:00:00".to_vec()),
             WireValue::Char(credit.to_vec()),
-            WireValue::Int32(50_000),
-            WireValue::Float32(0.1_f32.to_bits()),
             WireValue::Float32(balance_bits),
             WireValue::Float32(ytd_bits),
             WireValue::Int32(payment_count),

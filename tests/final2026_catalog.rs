@@ -204,7 +204,7 @@ fn query_schemas_use_declared_names_and_exact_wire_types() {
 }
 
 #[test]
-fn payment_keeps_wide_before_reads_and_uses_ytd_only_after_reads() {
+fn payment_before_reads_only_fields_consumed_by_the_runner() {
     let catalog = final2026_catalog();
     let warehouse_before = find(&catalog, StatementId::PaymentWarehouse);
     let warehouse_after = find(&catalog, StatementId::PaymentWarehouseAfter);
@@ -216,11 +216,6 @@ fn payment_keeps_wide_before_reads_and_uses_ytd_only_after_reads() {
         &[
             ("w_ytd", SqlType::Float32),
             ("w_name", SqlType::Char),
-            ("w_street_1", SqlType::Char),
-            ("w_street_2", SqlType::Char),
-            ("w_city", SqlType::Char),
-            ("w_state", SqlType::Char),
-            ("w_zip", SqlType::Char),
         ],
     );
     assert_query_columns(warehouse_after, &[("w_ytd", SqlType::Float32)]);
@@ -232,11 +227,6 @@ fn payment_keeps_wide_before_reads_and_uses_ytd_only_after_reads() {
         &[
             ("d_ytd", SqlType::Float32),
             ("d_name", SqlType::Char),
-            ("d_street_1", SqlType::Char),
-            ("d_street_2", SqlType::Char),
-            ("d_city", SqlType::Char),
-            ("d_state", SqlType::Char),
-            ("d_zip", SqlType::Char),
         ],
     );
     assert_query_columns(district_after, &[("d_ytd", SqlType::Float32)]);
@@ -246,6 +236,25 @@ fn payment_keeps_wide_before_reads_and_uses_ytd_only_after_reads() {
         "SELECT d_ytd FROM district WHERE d_w_id = $1 AND d_id = $2;"
     );
 
+    for id in [
+        StatementId::PaymentCustomerById,
+        StatementId::PaymentCustomerByLast,
+    ] {
+        assert_query_columns(
+            find(&catalog, id),
+            &[
+                ("c_id", SqlType::Int32),
+                ("c_first", SqlType::Char),
+                ("c_last", SqlType::Char),
+                ("c_credit", SqlType::Char),
+                ("c_balance", SqlType::Float32),
+                ("c_ytd_payment", SqlType::Float32),
+                ("c_payment_cnt", SqlType::Int32),
+                ("c_delivery_cnt", SqlType::Int32),
+                ("c_data", SqlType::Char),
+            ],
+        );
+    }
     let stage_one = PAYMENT_STAGES[0].steps;
     assert_eq!(stage_one[1].alternatives, &[StatementId::PaymentWarehouse]);
     assert_eq!(
