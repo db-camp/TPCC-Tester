@@ -18,6 +18,8 @@ use tokio::time::Instant;
 pub const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 pub const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 pub const HANDSHAKE: [u8; 8] = [b'R', b'M', b'D', b'B', 0, 3, 0, 0];
+const FRAME_HEADER_BYTES: usize = 8;
+const MAX_FRAME_BYTES: usize = FRAME_HEADER_BYTES + MAX_FRAME_PAYLOAD;
 
 #[derive(Debug, Error)]
 pub enum WireError {
@@ -223,6 +225,7 @@ pub struct WireConnection<S> {
     handshaken: bool,
     timeout_poison: Option<TimeoutPoison>,
     incomplete_exchange: Option<&'static str>,
+    request_frame: Vec<u8>,
     pub(crate) prepared: BTreeMap<u16, PreparedDefinition>,
     // Only real TCP connections install this hook. Generic/mock transports
     // remain independent of platform socket options.
@@ -275,6 +278,7 @@ where
             handshaken: false,
             timeout_poison: None,
             incomplete_exchange: None,
+            request_frame: Vec::new(),
             prepared: BTreeMap::new(),
             quickack_rearm: None,
         }
@@ -615,13 +619,23 @@ where
 
         let payload_bytes = u32::try_from(payload.len())
             .map_err(|_| WireError::Protocol("frame payload length does not fit u32".to_owned()))?;
-        let mut header = [0_u8; 8];
-        header[..4].copy_from_slice(&payload_bytes.to_be_bytes());
-        header[4] = tag as u8;
-        header[5] = flags;
+        let frame_bytes = FRAME_HEADER_BYTES + payload.len();
+        self.request_frame.clear();
+        if self.request_frame.capacity() < frame_bytes {
+            // Grow only to the checked frame size instead of requesting
+            // geometric headroom. The protocol check above bounds every
+            // allocation request by MAX_FRAME_BYTES per connection.
+            self.request_frame.reserve_exact(frame_bytes);
+        }
+        debug_assert!(frame_bytes <= MAX_FRAME_BYTES);
+        self.request_frame
+            .extend_from_slice(&payload_bytes.to_be_bytes());
+        self.request_frame.push(tag as u8);
+        self.request_frame.push(flags);
+        self.request_frame.extend_from_slice(&[0, 0]);
+        self.request_frame.extend_from_slice(payload);
 
-        self.io.write_all(&header).await?;
-        self.io.write_all(payload).await?;
+        self.io.write_all(&self.request_frame).await?;
         self.io.flush().await?;
         Ok(())
     }
@@ -972,6 +986,48 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingIo {
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl AsyncRead for RecordingIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _destination: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RecordingIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            source: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.push(source.to_vec());
+            Poll::Ready(Ok(source.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     fn frame(tag: FrameTag, flags: u8, reserved: u16, payload: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(8 + payload.len());
         bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -980,6 +1036,36 @@ mod tests {
         bytes.extend_from_slice(&reserved.to_be_bytes());
         bytes.extend_from_slice(payload);
         bytes
+    }
+
+    #[tokio::test]
+    async fn request_frame_combines_header_and_payload_and_reuses_capacity() {
+        let payload = b"select 1;";
+        let mut connection = WireConnection::new(RecordingIo::default());
+
+        connection
+            .write_frame(FrameTag::ExecStream, 0x5a, payload)
+            .await
+            .unwrap();
+        let allocated_capacity = connection.request_frame.capacity();
+        assert!(allocated_capacity >= FRAME_HEADER_BYTES + payload.len());
+        assert!(allocated_capacity <= MAX_FRAME_BYTES);
+
+        connection
+            .write_frame(FrameTag::ExecBatch, 0, &[])
+            .await
+            .unwrap();
+        assert_eq!(connection.request_frame.capacity(), allocated_capacity);
+
+        let io = connection.into_inner();
+        assert_eq!(
+            io.writes,
+            vec![
+                frame(FrameTag::ExecStream, 0x5a, 0, payload),
+                frame(FrameTag::ExecBatch, 0, 0, &[]),
+            ]
+        );
+        assert_eq!(io.flushes, 2);
     }
 
     fn meta(columns: &[(&str, SqlType)]) -> Vec<u8> {
