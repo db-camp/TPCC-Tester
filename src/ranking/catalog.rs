@@ -1172,7 +1172,7 @@ fn payment_customer_statement(id: StatementId, by_last_name: bool) -> Statement 
     use SqlType::{Char, Float32, Int32};
 
     let predicate = if by_last_name {
-        "c_last = $3 ORDER BY c_first ASC, c_id ASC"
+        "c_last = $3"
     } else {
         "c_id = $3"
     };
@@ -1218,7 +1218,7 @@ fn order_status_customer_statement(id: StatementId, by_last_name: bool) -> State
     use SqlType::{Char, Float32, Int32};
 
     let predicate = if by_last_name {
-        "c_last = $3 ORDER BY c_first ASC, c_id ASC"
+        "c_last = $3"
     } else {
         "c_id = $3"
     };
@@ -1489,7 +1489,7 @@ mod runtime_tests {
     }
 
     #[test]
-    fn payment_customer_queries_keep_unqualified_point_predicates() {
+    fn customer_queries_keep_unqualified_predicates_without_server_sorting() {
         let catalog = final2026_catalog();
         let find = |id: StatementId| {
             catalog
@@ -1508,7 +1508,19 @@ mod runtime_tests {
         );
         assert_eq!(
             find(StatementId::PaymentCustomerByLast).sql,
-            format!("{projection}c_last = $3 ORDER BY c_first ASC, c_id ASC;")
+            format!("{projection}c_last = $3;")
+        );
+
+        let order_status_projection =
+            "SELECT c_id, c_balance, c_first, c_middle, c_last FROM customer \
+             WHERE c_w_id = $1 AND c_d_id = $2 AND ";
+        assert_eq!(
+            find(StatementId::OrderStatusCustomerById).sql,
+            format!("{order_status_projection}c_id = $3;")
+        );
+        assert_eq!(
+            find(StatementId::OrderStatusCustomerByLast).sql,
+            format!("{order_status_projection}c_last = $3;")
         );
     }
 

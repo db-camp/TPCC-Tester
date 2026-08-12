@@ -175,12 +175,15 @@ fn select_customer_id(
             Ok(selected.id)
         }
         CustomerSelector::LastName(_) => {
+            matches.sort_by(|left, right| {
+                left.first
+                    .cmp(&right.first)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
             for pair in matches.windows(2) {
-                let left = (&pair[0].first, pair[0].id);
-                let right = (&pair[1].first, pair[1].id);
-                if left >= right {
+                if pair[0].first == pair[1].first && pair[0].id == pair[1].id {
                     return Err(SemanticViolation::new(
-                        "OrderStatus surname rows are not strictly ordered by (c_first, c_id)",
+                        "OrderStatus surname lookup returned duplicate (c_first, c_id)",
                     ));
                 }
             }
@@ -450,9 +453,14 @@ mod tests {
         ];
         assert_eq!(select_customer_id(input.customer(), Ok(&rows)).unwrap(), 12);
 
-        let mut unordered = rows;
+        let mut unordered = rows.clone();
         unordered.swap(1, 2);
-        assert!(select_customer_id(input.customer(), Ok(&unordered)).is_err());
+        assert_eq!(select_customer_id(input.customer(), Ok(&unordered)).unwrap(), 12);
+
+        let duplicate_row = rows[0].clone();
+        let mut duplicate = rows;
+        duplicate.push(duplicate_row);
+        assert!(select_customer_id(input.customer(), Ok(&duplicate)).is_err());
     }
 
     #[test]

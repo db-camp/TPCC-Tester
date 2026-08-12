@@ -392,18 +392,19 @@ fn select_last_name_customer(
                 customer.id
             )));
         }
-        if let Some(previous) = customers.last() {
-            let ordering = compare_customer_order(previous, &customer);
-            if ordering != Ordering::Less {
-                return Err(SemanticViolation::new(format!(
-                    "Payment surname rows are not strictly ordered by (c_first, c_id) \
-                     before customer {}",
-                    customer.id
-                )));
-            }
-        }
         customers.push(customer);
     }
+
+    customers.sort_by(compare_customer_order);
+    for pair in customers.windows(2) {
+        if compare_customer_order(&pair[0], &pair[1]) == Ordering::Equal {
+            return Err(SemanticViolation::new(format!(
+                "Payment surname lookup returned duplicate (c_first, c_id) for customer {}",
+                pair[1].id
+            )));
+        }
+    }
+
     Ok(customer_lower_median(&customers)?.clone())
 }
 
@@ -874,9 +875,15 @@ mod tests {
         let selected = select_last_name_customer(&rows, b"BARBARBAR").unwrap();
         assert_eq!(selected.id, 2);
 
-        let mut reordered = rows;
+        let mut reordered = rows.clone();
         reordered.swap(1, 2);
-        assert!(select_last_name_customer(&reordered, b"BARBARBAR").is_err());
+        let selected = select_last_name_customer(&reordered, b"BARBARBAR").unwrap();
+        assert_eq!(selected.id, 2);
+
+        let duplicate_row = rows[0].clone();
+        let mut duplicate = rows;
+        duplicate.push(duplicate_row);
+        assert!(select_last_name_customer(&duplicate, b"BARBARBAR").is_err());
     }
 
     #[test]

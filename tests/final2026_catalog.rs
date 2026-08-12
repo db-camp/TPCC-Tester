@@ -189,7 +189,8 @@ fn query_schemas_use_declared_names_and_exact_wire_types() {
     );
     assert!(payment_by_last
         .sql
-        .contains("ORDER BY customer.c_first ASC, customer.c_id ASC"));
+        .ends_with("WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3;"));
+    assert!(!payment_by_last.sql.contains("ORDER BY"));
 
     let order_status_by_last = find(&catalog, StatementId::OrderStatusCustomerByLast);
     assert_eq!(
@@ -198,7 +199,8 @@ fn query_schemas_use_declared_names_and_exact_wire_types() {
     );
     assert!(order_status_by_last
         .sql
-        .contains("ORDER BY c_first ASC, c_id ASC"));
+        .ends_with("WHERE c_w_id = $1 AND c_d_id = $2 AND c_last = $3;"));
+    assert!(!order_status_by_last.sql.contains("ORDER BY"));
 }
 
 #[test]
