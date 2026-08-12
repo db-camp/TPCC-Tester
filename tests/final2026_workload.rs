@@ -329,25 +329,18 @@ fn assert_customer_nurand(
 ) {
     let constants = route.nurand_constants();
     match customer {
-        CustomerSelector::LastName(last_name) => {
-            if u64::from(last_name.number()) == u64::from(constants.c_last_load()) {
-                // TPC-C 5.11: 1% of lookups target the load-time constant last
-                // name (c_last_load), not a NURand-drawn name.
-            } else {
-                assert_eq!(
-                    u64::from(last_name.number()),
-                    expected_nurand(
-                        route,
-                        domain,
-                        1,
-                        255,
-                        0,
-                        999,
-                        u64::from(constants.c_last_run()),
-                    )
-                );
-            }
-        }
+        CustomerSelector::LastName(last_name) => assert_eq!(
+            u64::from(last_name.number()),
+            expected_nurand(
+                route,
+                domain,
+                1,
+                255,
+                0,
+                999,
+                u64::from(constants.c_last_run()),
+            )
+        ),
         CustomerSelector::Id(customer_id) => assert_eq!(
             u64::from(*customer_id),
             expected_nurand(
