@@ -460,6 +460,10 @@ const PAYMENT_STAGE_ONE_STEPS: &[PlanStep] = &[
         multiplicity: Multiplicity::Once,
     },
     PlanStep {
+        alternatives: PAYMENT_CUSTOMER,
+        multiplicity: Multiplicity::Once,
+    },
+    PlanStep {
         alternatives: PAYMENT_WAREHOUSE,
         multiplicity: Multiplicity::Once,
     },
@@ -481,10 +485,6 @@ const PAYMENT_STAGE_ONE_STEPS: &[PlanStep] = &[
     },
     PlanStep {
         alternatives: PAYMENT_DISTRICT_AFTER,
-        multiplicity: Multiplicity::Once,
-    },
-    PlanStep {
-        alternatives: PAYMENT_CUSTOMER,
         multiplicity: Multiplicity::Once,
     },
 ];
