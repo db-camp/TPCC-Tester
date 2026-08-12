@@ -2,14 +2,15 @@
 //!
 //! The official seed, identifiers, statement ids, and schedules are private.
 //! This module deliberately defines a versioned local domain
-//! (`local_seed_opaque_v2`) instead of claiming to reproduce hidden assets.
+//! (`local_seed_opaque_v3`) instead of claiming to reproduce hidden assets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
 pub const OPAQUE_SCHEMA_ALGORITHM_V1: &str = "local_seed_opaque_v1";
-pub const OPAQUE_SCHEMA_ALGORITHM: &str = "local_seed_opaque_v2";
+pub const OPAQUE_SCHEMA_ALGORITHM_V2: &str = "local_seed_opaque_v2";
+pub const OPAQUE_SCHEMA_ALGORITHM: &str = "local_seed_opaque_v3";
 pub const CANONICAL_SCHEMA_ALGORITHM: &str = "canonical";
 
 pub const ENCODED_BEGIN_MARKER: &str = "runtime_schema_begin";
@@ -17,6 +18,10 @@ pub const ENCODED_END_MARKER: &str = "runtime_schema_end";
 
 const DOMAIN_TABLE_NAMES: &str = "final2026/runtime/table-name/v1";
 const DOMAIN_COLUMN_NAMES: &str = "final2026/runtime/column-name/v1";
+const DOMAIN_INDEXED_COLUMN_NAMES_V3: &str =
+    "final2026/runtime/indexed-column-name/v3";
+const DOMAIN_OTHER_IDENTIFIER_NAMES_V3: &str =
+    "final2026/runtime/other-identifier-name/v3";
 const DOMAIN_CSV_NAMES: &str = "final2026/runtime/csv-basename/v1";
 const DOMAIN_STATEMENT_IDS: &str = "final2026/runtime/statement-id/v1";
 const DOMAIN_SUPPLEMENTAL_STATEMENT_IDS: &str =
@@ -31,6 +36,7 @@ const DOMAIN_CHECK_ORDER: &str = "final2026/setup/check-order/v1";
 pub enum SchemaMode {
     LocalSeedOpaqueV1,
     LocalSeedOpaqueV2,
+    LocalSeedOpaqueV3,
     Canonical,
 }
 
@@ -38,19 +44,26 @@ impl SchemaMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LocalSeedOpaqueV1 => OPAQUE_SCHEMA_ALGORITHM_V1,
-            Self::LocalSeedOpaqueV2 => OPAQUE_SCHEMA_ALGORITHM,
+            Self::LocalSeedOpaqueV2 => OPAQUE_SCHEMA_ALGORITHM_V2,
+            Self::LocalSeedOpaqueV3 => OPAQUE_SCHEMA_ALGORITHM,
             Self::Canonical => CANONICAL_SCHEMA_ALGORITHM,
         }
     }
 
     const fn is_opaque(self) -> bool {
-        matches!(self, Self::LocalSeedOpaqueV1 | Self::LocalSeedOpaqueV2)
+        matches!(
+            self,
+            Self::LocalSeedOpaqueV1
+                | Self::LocalSeedOpaqueV2
+                | Self::LocalSeedOpaqueV3
+        )
     }
 
     fn parse(value: &str) -> Result<Self, RuntimeSchemaError> {
         match value {
             OPAQUE_SCHEMA_ALGORITHM_V1 => Ok(Self::LocalSeedOpaqueV1),
-            OPAQUE_SCHEMA_ALGORITHM => Ok(Self::LocalSeedOpaqueV2),
+            OPAQUE_SCHEMA_ALGORITHM_V2 => Ok(Self::LocalSeedOpaqueV2),
+            OPAQUE_SCHEMA_ALGORITHM => Ok(Self::LocalSeedOpaqueV3),
             CANONICAL_SCHEMA_ALGORITHM => Ok(Self::Canonical),
             _ => Err(RuntimeSchemaError::Invalid(format!(
                 "unknown runtime schema mode {value:?}"
@@ -246,6 +259,39 @@ impl LogicalIndex {
             Self::OrderLinePrimary => 7,
             Self::ItemPrimary => 8,
             Self::StockPrimary => 9,
+        }
+    }
+
+    pub const fn definition(self) -> (LogicalTable, &'static [&'static str]) {
+        match self {
+            Self::WarehousePrimary => (LogicalTable::Warehouse, &["w_id"]),
+            Self::DistrictPrimary => (LogicalTable::District, &["d_w_id", "d_id"]),
+            Self::CustomerPrimary => (
+                LogicalTable::Customer,
+                &["c_w_id", "c_d_id", "c_id"],
+            ),
+            Self::CustomerLastName => (
+                LogicalTable::Customer,
+                &["c_w_id", "c_d_id", "c_last", "c_id"],
+            ),
+            Self::NewOrdersPrimary => (
+                LogicalTable::NewOrders,
+                &["no_w_id", "no_d_id", "no_o_id"],
+            ),
+            Self::OrdersPrimary => (
+                LogicalTable::Orders,
+                &["o_w_id", "o_d_id", "o_id"],
+            ),
+            Self::OrdersCustomer => (
+                LogicalTable::Orders,
+                &["o_w_id", "o_d_id", "o_c_id", "o_id"],
+            ),
+            Self::OrderLinePrimary => (
+                LogicalTable::OrderLine,
+                &["ol_w_id", "ol_d_id", "ol_o_id", "ol_number"],
+            ),
+            Self::ItemPrimary => (LogicalTable::Item, &["i_id"]),
+            Self::StockPrimary => (LogicalTable::Stock, &["s_w_id", "s_i_id"]),
         }
     }
 
@@ -455,7 +501,9 @@ impl StatementLayout {
         for (ordinal, key) in FINAL2026_STATEMENT_KEYS.iter().enumerate() {
             let id = match mode {
                 SchemaMode::Canonical => CANONICAL_STATEMENT_IDS[ordinal],
-                SchemaMode::LocalSeedOpaqueV1 | SchemaMode::LocalSeedOpaqueV2 => {
+                SchemaMode::LocalSeedOpaqueV1
+                | SchemaMode::LocalSeedOpaqueV2
+                | SchemaMode::LocalSeedOpaqueV3 => {
                     derive_unique_statement_id(seed, key, &used)
                 }
             };
@@ -553,8 +601,11 @@ impl RuntimeSchema {
     pub fn derive(seed: u64, mode: SchemaMode) -> Result<Self, RuntimeSchemaError> {
         let mut used_identifiers = BTreeSet::new();
         let mut used_csv_stems = BTreeSet::new();
-        let mut tables = BTreeMap::new();
-        let mut columns = BTreeMap::new();
+        let (mut tables, mut columns) = if mode == SchemaMode::LocalSeedOpaqueV3 {
+            derive_v3_identifiers(seed)?
+        } else {
+            (BTreeMap::new(), BTreeMap::new())
+        };
         let mut csv_basenames = BTreeMap::new();
 
         for table in LogicalTable::ALL {
@@ -571,13 +622,19 @@ impl RuntimeSchema {
                         &used_identifiers,
                     )
                 }
+                SchemaMode::LocalSeedOpaqueV3 => tables
+                    .get(logical)
+                    .expect("derived v3 layout lost a table")
+                    .clone(),
             };
             used_identifiers.insert(runtime.clone());
             tables.insert(logical.to_owned(), runtime);
 
             let csv = match mode {
                 SchemaMode::Canonical => format!("{logical}.csv"),
-                SchemaMode::LocalSeedOpaqueV1 | SchemaMode::LocalSeedOpaqueV2 => {
+                SchemaMode::LocalSeedOpaqueV1
+                | SchemaMode::LocalSeedOpaqueV2
+                | SchemaMode::LocalSeedOpaqueV3 => {
                     format!(
                         "{}.csv",
                         derive_unique_identifier(
@@ -585,7 +642,12 @@ impl RuntimeSchema {
                             DOMAIN_CSV_NAMES,
                             logical,
                             'f',
-                            mode,
+                            match mode {
+                                SchemaMode::LocalSeedOpaqueV3 => {
+                                    SchemaMode::LocalSeedOpaqueV2
+                                }
+                                other => other,
+                            },
                             &used_csv_stems,
                         )
                     )
@@ -611,6 +673,10 @@ impl RuntimeSchema {
                             &used_identifiers,
                         )
                     }
+                    SchemaMode::LocalSeedOpaqueV3 => columns
+                        .get(*column)
+                        .expect("derived v3 layout lost a column")
+                        .clone(),
                 };
                 used_identifiers.insert(runtime.clone());
                 columns.insert((*column).to_owned(), runtime);
@@ -635,7 +701,7 @@ impl RuntimeSchema {
     }
 
     pub fn opaque(seed: u64) -> Result<Self, RuntimeSchemaError> {
-        Self::derive(seed, SchemaMode::LocalSeedOpaqueV2)
+        Self::derive(seed, SchemaMode::LocalSeedOpaqueV3)
     }
 
     pub fn canonical(seed: u64) -> Result<Self, RuntimeSchemaError> {
@@ -929,12 +995,17 @@ impl RuntimeSchema {
             fingerprint,
         };
         schema.validate()?;
-        if schema.mode == SchemaMode::LocalSeedOpaqueV2 {
-            let derived = Self::derive(schema.seed, SchemaMode::LocalSeedOpaqueV2)?;
+        if matches!(
+            schema.mode,
+            SchemaMode::LocalSeedOpaqueV2 | SchemaMode::LocalSeedOpaqueV3
+        ) {
+            let derived = Self::derive(schema.seed, schema.mode)?;
             if schema != derived {
                 return Err(RuntimeSchemaError::Invalid(
-                    "local_seed_opaque_v2 mapping is not the deterministic seed-derived layout"
-                        .to_owned(),
+                    format!(
+                        "{} mapping is not the deterministic seed-derived layout",
+                        schema.mode.as_str()
+                    ),
                 ));
             }
         }
@@ -1112,6 +1183,83 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+fn indexed_columns() -> Result<BTreeSet<&'static str>, RuntimeSchemaError> {
+    let mut columns = BTreeSet::new();
+    for index in LogicalIndex::ALL {
+        let (table, index_columns) = index.definition();
+        if index_columns
+            .iter()
+            .any(|column| !table.columns().contains(column))
+        {
+            return Err(RuntimeSchemaError::Invalid(format!(
+                "logical index {index:?} contains a column outside {}",
+                table.canonical()
+            )));
+        }
+        columns.extend(index_columns.iter().copied());
+    }
+    if columns.len() != 21 {
+        return Err(RuntimeSchemaError::Invalid(format!(
+            "logical indexes cover {} unique columns, expected 21",
+            columns.len()
+        )));
+    }
+    Ok(columns)
+}
+
+fn derive_v3_identifiers(
+    seed: u64,
+) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>), RuntimeSchemaError> {
+    let indexed = indexed_columns()?;
+    let mut short_pool = (b'a'..=b'z')
+        .map(|byte| char::from(byte).to_string())
+        .collect::<Vec<_>>();
+    deterministic_shuffle(
+        &mut short_pool,
+        domain_seed(seed, DOMAIN_INDEXED_COLUMN_NAMES_V3),
+    );
+    let mut other_pool = (b'a'..=b'z')
+        .flat_map(|first| {
+            (b'0'..=b'9').map(move |second| {
+                format!("{}{}", char::from(first), char::from(second))
+            })
+        })
+        .collect::<Vec<_>>();
+    deterministic_shuffle(
+        &mut other_pool,
+        domain_seed(seed, DOMAIN_OTHER_IDENTIFIER_NAMES_V3),
+    );
+    let mut short_names = short_pool.into_iter();
+    let mut other_names = other_pool.into_iter();
+    let mut tables = BTreeMap::new();
+    let mut columns = BTreeMap::new();
+
+    for table in LogicalTable::ALL {
+        let table_name = other_names
+            .next()
+            .ok_or_else(|| RuntimeSchemaError::Invalid("v3 table-name pool exhausted".to_owned()))?;
+        tables.insert(table.canonical().to_owned(), table_name);
+        for column in table.columns() {
+            let runtime = if indexed.contains(column) {
+                short_names.next().ok_or_else(|| {
+                    RuntimeSchemaError::Invalid("v3 indexed-column pool exhausted".to_owned())
+                })?
+            } else {
+                other_names.next().ok_or_else(|| {
+                    RuntimeSchemaError::Invalid("v3 identifier pool exhausted".to_owned())
+                })?
+            };
+            columns.insert((*column).to_owned(), runtime);
+        }
+    }
+    if short_names.count() != 5 || other_names.count() != 180 {
+        return Err(RuntimeSchemaError::Invalid(
+            "v3 identifier pools did not consume the expected 21/80 names".to_owned(),
+        ));
+    }
+    Ok((tables, columns))
+}
+
 fn derive_unique_identifier(
     seed: u64,
     domain: &str,
@@ -1130,7 +1278,9 @@ fn derive_unique_identifier(
             SchemaMode::LocalSeedOpaqueV2 => {
                 format!("{prefix}{:014x}", digest & 0x00ff_ffff_ffff_ffff)
             }
-            SchemaMode::Canonical => unreachable!("canonical identifiers are not derived"),
+            SchemaMode::LocalSeedOpaqueV3 | SchemaMode::Canonical => {
+                unreachable!("this identifier mode is not hash-derived")
+            }
         };
         if !used.contains(&candidate) && !is_reserved(&candidate) {
             return candidate;
@@ -1188,7 +1338,9 @@ fn derive_supplemental_statement_ids(
     {
         let id = match mode {
             SchemaMode::Canonical => CANONICAL_SUPPLEMENTAL_STATEMENT_IDS[ordinal],
-            SchemaMode::LocalSeedOpaqueV1 | SchemaMode::LocalSeedOpaqueV2 => {
+            SchemaMode::LocalSeedOpaqueV1
+            | SchemaMode::LocalSeedOpaqueV2
+            | SchemaMode::LocalSeedOpaqueV3 => {
                 let key_hash = hash_bytes(mapping_seed, key.as_bytes());
                 let start = (splitmix64(key_hash) % u64::from(u16::MAX) + 1) as u16;
                 first_free_statement_id(start, &used)?
@@ -1465,13 +1617,29 @@ mod tests {
         assert_eq!(left.csv_basenames.len(), 9);
         assert_eq!(left.statements.ids.len(), 42);
         assert_eq!(left.statements.supplemental_ids.len(), 14);
-        assert_eq!(left.mode(), SchemaMode::LocalSeedOpaqueV2);
-        assert!(left.tables.values().all(|identifier| identifier.len() == 15));
-        assert!(left.columns.values().all(|identifier| identifier.len() == 15));
+        assert_eq!(left.mode(), SchemaMode::LocalSeedOpaqueV3);
+        let indexed = indexed_columns().unwrap();
+        assert!(left.tables.values().all(|identifier| identifier.len() == 2));
+        for table in LogicalTable::ALL {
+            for column in table.columns() {
+                let expected_len = if indexed.contains(column) { 1 } else { 2 };
+                assert_eq!(left.column(table, column).unwrap().len(), expected_len);
+            }
+        }
         assert!(left.csv_basenames.values().all(|name| {
             name.strip_suffix(".csv")
                 .is_some_and(|stem| stem.len() == 15)
         }));
+        for index in LogicalIndex::ALL {
+            let (table, columns) = index.definition();
+            let physical_name_len = left.table(table).len()
+                + columns
+                    .iter()
+                    .map(|column| 1 + left.column(table, column).unwrap().len())
+                    .sum::<usize>()
+                + ".idx".len();
+            assert!(physical_name_len <= 15);
+        }
         assert_eq!(left, RuntimeSchema::decode(&left.encode()).unwrap());
         left.validate().unwrap();
     }
@@ -1482,6 +1650,15 @@ mod tests {
         assert_eq!(schema.fingerprint(), 0x7167_a66c_d8d9_bac0);
         assert!(schema.tables.values().all(|identifier| identifier.len() == 17));
         assert!(schema.columns.values().all(|identifier| identifier.len() == 17));
+        assert_eq!(RuntimeSchema::decode(&schema.encode()).unwrap(), schema);
+    }
+
+    #[test]
+    fn opaque_v2_remains_stable_and_decodable() {
+        let schema = RuntimeSchema::derive(2026, SchemaMode::LocalSeedOpaqueV2).unwrap();
+        assert_eq!(schema.fingerprint(), 0x45b1_0a2a_a625_dea4);
+        assert!(schema.tables.values().all(|identifier| identifier.len() == 15));
+        assert!(schema.columns.values().all(|identifier| identifier.len() == 15));
         assert_eq!(RuntimeSchema::decode(&schema.encode()).unwrap(), schema);
     }
 
@@ -1553,7 +1730,7 @@ mod tests {
     #[test]
     fn supplemental_overlay_preserves_the_seed_2026_cache_contract() {
         let schema = RuntimeSchema::opaque(2026).unwrap();
-        assert_eq!(schema.fingerprint(), 0x45b1_0a2a_a625_dea4);
+        assert_eq!(schema.fingerprint(), 0x5d9d_0873_a493_13ff);
 
         let encoded = schema.encode();
         assert_eq!(
