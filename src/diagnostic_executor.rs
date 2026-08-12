@@ -30,6 +30,7 @@ use crate::profile::{TransactionKind, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES};
 use crate::ranking::catalog::RuntimeCatalog;
 use crate::ranking::common::{install_statement_layout, BatchExecutionError};
 use crate::ranking::dispatch::{self, FrozenTransaction};
+use crate::ranking::preflight;
 use crate::ranking::runner::{
     DirectRetryDecision, DirectRetryState, RankedTransactionError, RankedTransactionOutcome,
 };
@@ -212,9 +213,27 @@ impl DiagnosticExecutor {
             "preparing {} diagnostic Wire v3 sessions with SNAPSHOT ISOLATION and PREPARE_SET",
             OFFICIAL_CLIENTS
         );
-        let sessions = self
+        let mut sessions = self
             .open_sessions(response_timeout, Arc::clone(&catalog))
             .await?;
+        if fast {
+            if sessions.len() < 2 {
+                return Err(TpccError::Protocol(
+                    "fast semantic preflight requires two prepared sessions".to_owned(),
+                ));
+            }
+            let (primary, contenders) = sessions.split_at_mut(1);
+            let primary = primary.first_mut().ok_or_else(|| {
+                TpccError::Protocol("fast semantic preflight lost its primary session".to_owned())
+            })?;
+            let contender = contenders.first_mut().ok_or_else(|| {
+                TpccError::Protocol(
+                    "fast semantic preflight lost its contender session".to_owned(),
+                )
+            })?;
+            preflight::run(primary, contender, seed, OFFICIAL_WAREHOUSES).await?;
+            info!("full prepared semantic preflight passed before fast timing barrier");
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
         let ready_barrier = Arc::new(Barrier::new(usize::from(OFFICIAL_CLIENTS) + 1));
         let start_barrier = Arc::new(Barrier::new(usize::from(OFFICIAL_CLIENTS) + 1));

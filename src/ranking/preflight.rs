@@ -63,19 +63,19 @@ impl PreparedPathPreflightProof {
     }
 }
 
-/// Run the deterministic, non-measured semantic preflight on an already
-/// configured and prepared ranked connection.
+/// Run the deterministic, non-measured semantic preflight on two already
+/// configured and prepared ranked connections.
 pub async fn run(
     primary: &mut RmdbClient,
+    contender: &mut RmdbClient,
     seed: u64,
     warehouses: u16,
 ) -> Result<PreparedPathPreflightProof, TpccError> {
     let selection = PreflightSelection::derive(seed, warehouses)?;
     verify_stock_level(primary, &selection).await?;
     verify_new_order_rollback(primary, &selection).await?;
-    // Do not inject a synthetic duplicate-key failure before measurement.
-    // Ranked batches still carry AUTO_ABORT, while this non-TPC-C probe would
-    // make entry depend on an extra error-response surface.
+    verify_new_order_auto_abort(primary, &selection).await?;
+    verify_payment_stale_write(primary, contender, selection.warehouse_id).await?;
     Ok(PreparedPathPreflightProof { seed, warehouses })
 }
 
@@ -771,9 +771,9 @@ fn parse_payment_warehouse_bits(
             .map_err(|error| error.to_string())?,
         context,
     )?;
-    if row.len() != 7 {
+    if row.len() != 2 {
         return Err(format!(
-            "{context} returned {} warehouse columns, expected 7",
+            "{context} returned {} warehouse columns, expected 2",
             row.len()
         ));
     }
@@ -2444,7 +2444,7 @@ mod tests {
     }
 
     #[test]
-    fn payment_probe_uses_reversible_binary32_transition_and_full_projection() {
+    fn payment_probe_uses_reversible_binary32_transition_and_current_projection() {
         let incremented =
             f32_add_bits(INITIAL_WAREHOUSE_YTD_BITS, PAYMENT_PROBE_AMOUNT_BITS).unwrap();
         assert_eq!(incremented, 300_001.0_f32.to_bits());
@@ -2454,8 +2454,10 @@ mod tests {
         );
 
         let operations = [payment_warehouse_operation(1)];
-        let mut row = vec![WireValue::Float32(INITIAL_WAREHOUSE_YTD_BITS)];
-        row.extend((0..6).map(|_| WireValue::Char(Vec::new())));
+        let row = vec![
+            WireValue::Float32(INITIAL_WAREHOUSE_YTD_BITS),
+            WireValue::Char(b"warehouse".to_vec()),
+        ];
         let results = accept_batch(
             BatchResponse::Ok {
                 executed_operations: 1,

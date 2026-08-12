@@ -275,14 +275,20 @@ impl BenchmarkExecutor {
              running untimed prepared semantic preflight",
             profile.clients
         );
-        if sessions.is_empty() {
+        if sessions.len() < 2 {
             return Err(TpccError::Protocol(
-                "ranked semantic preflight requires a prepared session".to_owned(),
+                "ranked semantic preflight requires two prepared sessions".to_owned(),
             ));
         }
-        let primary_session = sessions.first_mut().ok_or_else(|| {
+        let (primary_sessions, contender_sessions) = sessions.split_at_mut(1);
+        let primary_session = primary_sessions.first_mut().ok_or_else(|| {
             TpccError::Protocol(
                 "ranked semantic preflight lost its primary prepared session".to_owned(),
+            )
+        })?;
+        let contender_session = contender_sessions.first_mut().ok_or_else(|| {
+            TpccError::Protocol(
+                "ranked semantic preflight lost its contender prepared session".to_owned(),
             )
         })?;
         // DIAGNOSTIC: skip the untimed preflight on state-polluted experiment
@@ -291,7 +297,13 @@ impl BenchmarkExecutor {
             info!("prepared semantic preflight SKIPPED (diagnostic override)");
             PreparedPathPreflightProof::unverified(seed, profile.warehouses)
         } else {
-            let preflight = preflight::run(primary_session, seed, profile.warehouses).await?;
+            let preflight = preflight::run(
+                primary_session,
+                contender_session,
+                seed,
+                profile.warehouses,
+            )
+            .await?;
             info!("prepared semantic preflight passed before timing-barrier release");
             preflight
         };
