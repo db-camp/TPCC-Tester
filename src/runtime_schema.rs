@@ -2,13 +2,14 @@
 //!
 //! The official seed, identifiers, statement ids, and schedules are private.
 //! This module deliberately defines a versioned local domain
-//! (`local_seed_opaque_v1`) instead of claiming to reproduce hidden assets.
+//! (`local_seed_opaque_v2`) instead of claiming to reproduce hidden assets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
-pub const OPAQUE_SCHEMA_ALGORITHM: &str = "local_seed_opaque_v1";
+pub const OPAQUE_SCHEMA_ALGORITHM_V1: &str = "local_seed_opaque_v1";
+pub const OPAQUE_SCHEMA_ALGORITHM: &str = "local_seed_opaque_v2";
 pub const CANONICAL_SCHEMA_ALGORITHM: &str = "canonical";
 
 pub const ENCODED_BEGIN_MARKER: &str = "runtime_schema_begin";
@@ -29,20 +30,27 @@ const DOMAIN_CHECK_ORDER: &str = "final2026/setup/check-order/v1";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchemaMode {
     LocalSeedOpaqueV1,
+    LocalSeedOpaqueV2,
     Canonical,
 }
 
 impl SchemaMode {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::LocalSeedOpaqueV1 => OPAQUE_SCHEMA_ALGORITHM,
+            Self::LocalSeedOpaqueV1 => OPAQUE_SCHEMA_ALGORITHM_V1,
+            Self::LocalSeedOpaqueV2 => OPAQUE_SCHEMA_ALGORITHM,
             Self::Canonical => CANONICAL_SCHEMA_ALGORITHM,
         }
     }
 
+    const fn is_opaque(self) -> bool {
+        matches!(self, Self::LocalSeedOpaqueV1 | Self::LocalSeedOpaqueV2)
+    }
+
     fn parse(value: &str) -> Result<Self, RuntimeSchemaError> {
         match value {
-            OPAQUE_SCHEMA_ALGORITHM => Ok(Self::LocalSeedOpaqueV1),
+            OPAQUE_SCHEMA_ALGORITHM_V1 => Ok(Self::LocalSeedOpaqueV1),
+            OPAQUE_SCHEMA_ALGORITHM => Ok(Self::LocalSeedOpaqueV2),
             CANONICAL_SCHEMA_ALGORITHM => Ok(Self::Canonical),
             _ => Err(RuntimeSchemaError::Invalid(format!(
                 "unknown runtime schema mode {value:?}"
@@ -387,7 +395,7 @@ impl SetupSchedule {
             count_tables: LogicalTable::ALL.to_vec(),
             setup_checks: SETUP_CHECK_KEYS.to_vec(),
         };
-        if mode == SchemaMode::LocalSeedOpaqueV1 {
+        if mode.is_opaque() {
             deterministic_shuffle(
                 &mut schedule.create_tables,
                 domain_seed(seed, DOMAIN_CREATE_ORDER),
@@ -447,7 +455,9 @@ impl StatementLayout {
         for (ordinal, key) in FINAL2026_STATEMENT_KEYS.iter().enumerate() {
             let id = match mode {
                 SchemaMode::Canonical => CANONICAL_STATEMENT_IDS[ordinal],
-                SchemaMode::LocalSeedOpaqueV1 => derive_unique_statement_id(seed, key, &used),
+                SchemaMode::LocalSeedOpaqueV1 | SchemaMode::LocalSeedOpaqueV2 => {
+                    derive_unique_statement_id(seed, key, &used)
+                }
             };
             if id == 0 || !used.insert(id) || ids.insert((*key).to_owned(), id).is_some() {
                 return Err(RuntimeSchemaError::Invalid(
@@ -551,20 +561,23 @@ impl RuntimeSchema {
             let logical = table.canonical();
             let runtime = match mode {
                 SchemaMode::Canonical => logical.to_owned(),
-                SchemaMode::LocalSeedOpaqueV1 => derive_unique_identifier(
-                    seed,
-                    DOMAIN_TABLE_NAMES,
-                    logical,
-                    't',
-                    &used_identifiers,
-                ),
+                SchemaMode::LocalSeedOpaqueV1 | SchemaMode::LocalSeedOpaqueV2 => {
+                    derive_unique_identifier(
+                        seed,
+                        DOMAIN_TABLE_NAMES,
+                        logical,
+                        't',
+                        mode,
+                        &used_identifiers,
+                    )
+                }
             };
             used_identifiers.insert(runtime.clone());
             tables.insert(logical.to_owned(), runtime);
 
             let csv = match mode {
                 SchemaMode::Canonical => format!("{logical}.csv"),
-                SchemaMode::LocalSeedOpaqueV1 => {
+                SchemaMode::LocalSeedOpaqueV1 | SchemaMode::LocalSeedOpaqueV2 => {
                     format!(
                         "{}.csv",
                         derive_unique_identifier(
@@ -572,6 +585,7 @@ impl RuntimeSchema {
                             DOMAIN_CSV_NAMES,
                             logical,
                             'f',
+                            mode,
                             &used_csv_stems,
                         )
                     )
@@ -587,13 +601,16 @@ impl RuntimeSchema {
             for column in table.columns() {
                 let runtime = match mode {
                     SchemaMode::Canonical => (*column).to_owned(),
-                    SchemaMode::LocalSeedOpaqueV1 => derive_unique_identifier(
-                        seed,
-                        DOMAIN_COLUMN_NAMES,
-                        &format!("{logical}.{column}"),
-                        'c',
-                        &used_identifiers,
-                    ),
+                    SchemaMode::LocalSeedOpaqueV1 | SchemaMode::LocalSeedOpaqueV2 => {
+                        derive_unique_identifier(
+                            seed,
+                            DOMAIN_COLUMN_NAMES,
+                            &format!("{logical}.{column}"),
+                            'c',
+                            mode,
+                            &used_identifiers,
+                        )
+                    }
                 };
                 used_identifiers.insert(runtime.clone());
                 columns.insert((*column).to_owned(), runtime);
@@ -618,7 +635,7 @@ impl RuntimeSchema {
     }
 
     pub fn opaque(seed: u64) -> Result<Self, RuntimeSchemaError> {
-        Self::derive(seed, SchemaMode::LocalSeedOpaqueV1)
+        Self::derive(seed, SchemaMode::LocalSeedOpaqueV2)
     }
 
     pub fn canonical(seed: u64) -> Result<Self, RuntimeSchemaError> {
@@ -981,7 +998,7 @@ impl RuntimeSchema {
                 }
             }
         }
-        if self.mode == SchemaMode::LocalSeedOpaqueV1 {
+        if self.mode.is_opaque() {
             let logical_identifiers = LogicalTable::ALL
                 .iter()
                 .flat_map(|table| {
@@ -1091,13 +1108,21 @@ fn derive_unique_identifier(
     domain: &str,
     logical: &str,
     prefix: char,
+    mode: SchemaMode,
     used: &BTreeSet<String>,
 ) -> String {
     for probe in 0_u64.. {
         let mut value = domain_seed(seed, domain);
         value = hash_bytes(value, logical.as_bytes());
         value = hash_bytes(value, &probe.to_be_bytes());
-        let candidate = format!("{prefix}{:016x}", splitmix64(value));
+        let digest = splitmix64(value);
+        let candidate = match mode {
+            SchemaMode::LocalSeedOpaqueV1 => format!("{prefix}{digest:016x}"),
+            SchemaMode::LocalSeedOpaqueV2 => {
+                format!("{prefix}{:014x}", digest & 0x00ff_ffff_ffff_ffff)
+            }
+            SchemaMode::Canonical => unreachable!("canonical identifiers are not derived"),
+        };
         if !used.contains(&candidate) && !is_reserved(&candidate) {
             return candidate;
         }
@@ -1154,7 +1179,7 @@ fn derive_supplemental_statement_ids(
     {
         let id = match mode {
             SchemaMode::Canonical => CANONICAL_SUPPLEMENTAL_STATEMENT_IDS[ordinal],
-            SchemaMode::LocalSeedOpaqueV1 => {
+            SchemaMode::LocalSeedOpaqueV1 | SchemaMode::LocalSeedOpaqueV2 => {
                 let key_hash = hash_bytes(mapping_seed, key.as_bytes());
                 let start = (splitmix64(key_hash) % u64::from(u16::MAX) + 1) as u16;
                 first_free_statement_id(start, &used)?

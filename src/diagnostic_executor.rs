@@ -347,9 +347,9 @@ impl DiagnosticExecutor {
                 dataset.seed, dataset.warehouses, seed, self.config.scale_factor
             )));
         }
-        if dataset.runtime_schema.mode() != SchemaMode::LocalSeedOpaqueV1 {
+        if dataset.runtime_schema.mode() != SchemaMode::LocalSeedOpaqueV2 {
             return Err(TpccError::Protocol(format!(
-                "diagnostic workload requires local_seed_opaque_v1 state, found {}",
+                "diagnostic workload requires local_seed_opaque_v2 state, found {}",
                 dataset.runtime_schema.mode().as_str()
             )));
         }
