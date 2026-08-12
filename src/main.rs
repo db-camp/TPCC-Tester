@@ -542,7 +542,7 @@ fn load_bound_state(
     let expected_schema_mode = if config.canonical_schema {
         runtime_schema::SchemaMode::Canonical
     } else {
-        runtime_schema::SchemaMode::LocalSeedOpaqueV2
+        runtime_schema::SchemaMode::LocalSeedOpaqueV3
     };
     let schema_mismatch = dataset.runtime_schema.mode() != expected_schema_mode;
     if dataset.warehouses != config.scale_factor

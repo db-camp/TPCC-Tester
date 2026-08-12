@@ -2011,9 +2011,12 @@ fn validate_formal_state_semantics(
             dataset.seed
         )));
     }
-    if dataset.runtime_schema.mode() == SchemaMode::LocalSeedOpaqueV1 {
+    if matches!(
+        dataset.runtime_schema.mode(),
+        SchemaMode::LocalSeedOpaqueV1 | SchemaMode::LocalSeedOpaqueV2
+    ) {
         return Err(StateError::Invalid(
-            "formal state uses legacy local_seed_opaque_v1 runtime schema".to_owned(),
+            "formal state uses a legacy opaque runtime schema".to_owned(),
         ));
     }
     expected_contract.validate(&dataset)?;
@@ -4384,6 +4387,32 @@ mod tests {
         assert!(receipt.starts_with("FORMAL_STATE_V2 terminal_evidence_size="));
         assert!(!receipt.contains("ranking"));
         assert!(!receipt.contains("public_spec_aligned"));
+    }
+
+    #[test]
+    fn formal_state_rejects_legacy_opaque_schema_modes() {
+        let seed = 0x5a0c_e002;
+        let contract = sample_contract(1);
+        for mode in [
+            SchemaMode::LocalSeedOpaqueV1,
+            SchemaMode::LocalSeedOpaqueV2,
+        ] {
+            let mut dataset = sample_dataset("run-formal-legacy-schema", seed);
+            dataset.runtime_schema = RuntimeSchema::derive(seed, mode).unwrap();
+            dataset.setup_evidence.runtime_schema_fingerprint =
+                dataset.runtime_schema.fingerprint();
+            dataset.validate().unwrap();
+            let files = [FormalFileBytes {
+                name: DATASET_FILE,
+                bytes: dataset.encode().into_bytes(),
+            }];
+
+            let error = validate_formal_state_semantics(&files, seed, &contract).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid final2026 state: formal state uses a legacy opaque runtime schema"
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -586,7 +586,7 @@ impl Config {
         if self.canonical_schema {
             extra_deviations.push(EffectiveDeviation {
                 field: "runtime_schema",
-                official: "local_seed_opaque_v2".to_owned(),
+                official: "local_seed_opaque_v3".to_owned(),
                 effective: "canonical".to_owned(),
             });
         }
@@ -955,7 +955,7 @@ mod tests {
             resolved.extra_deviations(),
             &[EffectiveDeviation {
                 field: "runtime_schema",
-                official: "local_seed_opaque_v2".to_owned(),
+                official: "local_seed_opaque_v3".to_owned(),
                 effective: "canonical".to_owned(),
             }]
         );
