@@ -171,14 +171,6 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
         return run_diagnose(&config).await;
     }
 
-    if config.fast {
-        info!("启动 final2026 NON-RANKED fast：30s warmup + 1x60s measurement");
-        let exec = diagnostic_executor::DiagnosticExecutor::new(config, effective);
-        let result = exec.run_fast().await?;
-        result.print_report();
-        return Ok(());
-    }
-
     if config.diagnostic_workload_seconds.is_some() {
         let (store, dataset, contract) = load_bound_state(&config, &effective)?;
         let segment = config
@@ -465,6 +457,30 @@ async fn run(config: Config, effective: ResolvedProfile) -> Result<(), Box<dyn s
             check_executor::probe_public_post_crash_responses(cursor.client_mut(), &dataset)
                 .await?;
         }
+    }
+
+    if config.fast {
+        info!(
+            "启动 formal-executor final2026 NON-RANKED fast：30s warmup + 1x60s measurement"
+        );
+        let (_, dataset, _) = load_bound_state(&config, &effective)?;
+        let setup = dataset.setup_evidence();
+        let setup_timestamp = String::from_utf8(setup.load_timestamp.clone())
+            .map_err(|_| "validated setup load timestamp is not UTF-8")?;
+        let setup_generator = Arc::new(data_gen::TpccDataGen::with_seed_and_timestamp(
+            dataset.warehouses,
+            setup.load_seed,
+            setup_timestamp,
+        ));
+        let exec = executor::BenchmarkExecutor::new(
+            config,
+            effective,
+            dataset.runtime_schema.clone(),
+            setup_generator,
+        );
+        let result = exec.run_fast().await?;
+        result.print_report();
+        return Ok(());
     }
 
     if config.benchmark {

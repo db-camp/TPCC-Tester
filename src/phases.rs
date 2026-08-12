@@ -24,23 +24,23 @@ const WARMUP_DURATION: Duration = Duration::from_secs(WARMUP_SECONDS);
 ///
 /// [`Self::official`] is the public final profile used by
 /// [`Final2026Scheduler::new`].  Any other value is a local, non-ranked smoke
-/// schedule: it preserves the three-window state machine and measurement
-/// accounting, but must not be reported as an official ranked run.
+/// schedule: it preserves the formal state machine and measurement accounting,
+/// but must not be reported as an official ranked run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhaseScheduleConfig {
     clients: u16,
     warmup_duration: Duration,
+    measurement_windows: u8,
     measurement_window_duration: Duration,
 }
 
 impl PhaseScheduleConfig {
     /// Builds a local, non-ranked smoke schedule.
     ///
-    /// The final profile always has exactly three measurement windows, so the
-    /// number of windows is intentionally not configurable.
     pub fn new(
         clients: u16,
         warmup_duration: Duration,
+        measurement_windows: u8,
         measurement_window_duration: Duration,
     ) -> Result<Self, SchedulerError> {
         if clients == 0 || clients > OFFICIAL_CLIENTS {
@@ -49,9 +49,15 @@ impl PhaseScheduleConfig {
         if measurement_window_duration.is_zero() {
             return Err(SchedulerError::InvalidMeasurementWindowDuration);
         }
+        if !(1..=FORMAL_WINDOW_COUNT as u8).contains(&measurement_windows) {
+            return Err(SchedulerError::InvalidMeasurementWindowCount(
+                measurement_windows,
+            ));
+        }
         Ok(Self {
             clients,
             warmup_duration,
+            measurement_windows,
             measurement_window_duration,
         })
     }
@@ -60,6 +66,7 @@ impl PhaseScheduleConfig {
         Self {
             clients: OFFICIAL_CLIENTS,
             warmup_duration: WARMUP_DURATION,
+            measurement_windows: FORMAL_WINDOW_COUNT as u8,
             measurement_window_duration: FORMAL_WINDOW_DURATION,
         }
     }
@@ -70,6 +77,10 @@ impl PhaseScheduleConfig {
 
     pub const fn warmup_duration(self) -> Duration {
         self.warmup_duration
+    }
+
+    pub const fn measurement_windows(self) -> u8 {
+        self.measurement_windows
     }
 
     pub const fn measurement_window_duration(self) -> Duration {
@@ -176,10 +187,12 @@ pub enum PhaseId {
 }
 
 impl PhaseId {
-    fn next(self) -> Option<Self> {
+    fn next(self, measurement_windows: u8) -> Option<Self> {
         match self {
             Self::Warmup => Some(Self::FormalWindow(0)),
-            Self::FormalWindow(index) if usize::from(index) + 1 < FORMAL_WINDOW_COUNT => {
+            Self::FormalWindow(index)
+                if usize::from(index) + 1 < usize::from(measurement_windows) =>
+            {
                 Some(Self::FormalWindow(index + 1))
             }
             Self::FormalWindow(_) => None,
@@ -391,6 +404,8 @@ pub enum SchedulerError {
     InvalidScheduleClients(u16),
     #[error("local measurement-window duration must be non-zero")]
     InvalidMeasurementWindowDuration,
+    #[error("local measurement-window count {0} must be in 1..=3")]
+    InvalidMeasurementWindowCount(u8),
     #[error("worker {worker:?} is outside this run's configured 0..{configured_clients} range")]
     WorkerNotConfigured {
         worker: WorkerId,
@@ -545,6 +560,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         let schedule = PhaseScheduleConfig::new(
             schedule.clients,
             schedule.warmup_duration,
+            schedule.measurement_windows,
             schedule.measurement_window_duration,
         )?;
         Ok(Self {
@@ -1051,6 +1067,13 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
     /// Produces the ranked summary only after the exact timeline ends and all
     /// accepted grace-tail responses have drained.
     pub fn measurement_summary(&mut self) -> Result<MeasurementSummary, SchedulerError> {
+        self.completed_windows()?;
+        Ok(MeasurementSummary::from_windows(&self.windows))
+    }
+
+    /// Returns only the configured measurement prefix after the exact timeline
+    /// ends and all accepted grace-tail responses have drained.
+    pub fn completed_windows(&mut self) -> Result<&[WindowStats], SchedulerError> {
         self.poll()?;
         self.ensure_not_failed()?;
         if !self.timeline_complete {
@@ -1062,11 +1085,12 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
         if self
             .windows
             .iter()
+            .take(usize::from(self.schedule.measurement_windows))
             .any(|window| !window.accounting_is_consistent())
         {
             return Err(SchedulerError::InconsistentMeasurementAccounting);
         }
-        Ok(MeasurementSummary::from_windows(&self.windows))
+        Ok(&self.windows[..usize::from(self.schedule.measurement_windows)])
     }
 
     fn observe_now(&mut self) -> Result<Duration, SchedulerError> {
@@ -1104,7 +1128,7 @@ impl<C: MonotonicClock, R: EventRecorder> Final2026Scheduler<C, R> {
                     at: deadline,
                 });
             }
-            self.announced_phase = phase.next();
+            self.announced_phase = phase.next(self.schedule.measurement_windows);
             match self.announced_phase {
                 Some(next) => {
                     let (start, next_deadline) = self.phase_bounds(next)?;
@@ -1500,7 +1524,8 @@ mod tests {
     #[test]
     fn local_non_ranked_schedule_uses_two_workers_and_three_continuous_windows() {
         let clock = FakeClock::default();
-        let schedule = PhaseScheduleConfig::new(2, Duration::ZERO, Duration::from_secs(1)).unwrap();
+        let schedule =
+            PhaseScheduleConfig::new(2, Duration::ZERO, 3, Duration::from_secs(1)).unwrap();
         let mut scheduler = Final2026Scheduler::new_with_schedule(
             clock.clone(),
             Vec::new(),
@@ -1593,18 +1618,79 @@ mod tests {
     #[test]
     fn local_schedule_validation_keeps_three_windows_fixed() {
         assert_eq!(
-            PhaseScheduleConfig::new(0, Duration::ZERO, Duration::from_secs(1)),
+            PhaseScheduleConfig::new(0, Duration::ZERO, 3, Duration::from_secs(1)),
             Err(SchedulerError::InvalidScheduleClients(0))
         );
         assert_eq!(
-            PhaseScheduleConfig::new(OFFICIAL_CLIENTS + 1, Duration::ZERO, Duration::from_secs(1),),
+            PhaseScheduleConfig::new(
+                OFFICIAL_CLIENTS + 1,
+                Duration::ZERO,
+                3,
+                Duration::from_secs(1),
+            ),
             Err(SchedulerError::InvalidScheduleClients(OFFICIAL_CLIENTS + 1))
         );
         assert_eq!(
-            PhaseScheduleConfig::new(1, Duration::ZERO, Duration::ZERO),
+            PhaseScheduleConfig::new(1, Duration::ZERO, 3, Duration::ZERO),
             Err(SchedulerError::InvalidMeasurementWindowDuration)
         );
+        assert_eq!(
+            PhaseScheduleConfig::new(1, Duration::ZERO, 0, Duration::from_secs(1)),
+            Err(SchedulerError::InvalidMeasurementWindowCount(0))
+        );
+        assert_eq!(
+            PhaseScheduleConfig::new(1, Duration::ZERO, 4, Duration::from_secs(1)),
+            Err(SchedulerError::InvalidMeasurementWindowCount(4))
+        );
         assert_eq!(FORMAL_WINDOW_COUNT, 3);
+    }
+
+    #[test]
+    fn one_window_schedule_ends_after_the_active_prefix() {
+        let clock = FakeClock::default();
+        let schedule =
+            PhaseScheduleConfig::new(1, Duration::from_secs(2), 1, Duration::from_secs(3))
+                .unwrap();
+        let mut scheduler = Final2026Scheduler::new_with_schedule(
+            clock.clone(),
+            Vec::new(),
+            LocalRuntimeLimits::new(Duration::from_secs(1)).unwrap(),
+            [1, 2, 3, 4],
+            schedule,
+        )
+        .unwrap();
+        scheduler
+            .worker_prepared(WorkerId::new(0).unwrap(), PreparedSessionId(1))
+            .unwrap();
+        scheduler.start().unwrap();
+
+        clock.set(Duration::from_secs(5));
+        scheduler.poll().unwrap();
+
+        let starts = scheduler
+            .recorder()
+            .iter()
+            .filter_map(|event| match event {
+                SchedulerEvent::PhaseStarted { phase, .. } => Some(*phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(starts, vec![PhaseId::Warmup, PhaseId::FormalWindow(0)]);
+        assert!(scheduler.timeline_complete());
+        assert_eq!(scheduler.completed_windows().unwrap().len(), 1);
+        let gates = scheduler
+            .recorder()
+            .iter()
+            .filter_map(|event| match event {
+                SchedulerEvent::WindowGateEvaluated { window, .. } => Some(*window),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(gates, vec![0]);
+        assert!(scheduler.recorder().iter().any(|event| matches!(
+            event,
+            SchedulerEvent::TimelineCompleted { at } if *at == Duration::from_secs(5)
+        )));
     }
 
     #[test]

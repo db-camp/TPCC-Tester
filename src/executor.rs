@@ -13,7 +13,9 @@ use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::config::{Config, ResolvedProfile};
+use crate::config::{
+    Config, ResolvedProfile, PRELIMINARY_MEASUREMENT_SECONDS, PRELIMINARY_WARMUP_SECONDS,
+};
 use crate::connection::client::RmdbClient;
 use crate::data_gen::TpccDataGen;
 use crate::error::TpccError;
@@ -41,12 +43,14 @@ use crate::ranking::preflight::PreparedPathPreflightProof;
 use crate::ranking::terminal_evidence::{
     SealedTerminalEvidence, TerminalEvidenceCollector, TerminalEvidenceError,
 };
+use crate::profile::OFFICIAL_CLIENTS;
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
 use crate::runtime_schema::RuntimeSchema;
 use crate::transaction::TransactionType;
 use crate::workload::Final2026Workload;
 
 const RESOURCE_TIMELINE_ENV: &str = "RMDB_TPCC_RESOURCE_TIMELINE_FILE";
+const FAST_MEASUREMENT_WINDOWS: u8 = 1;
 
 struct ResourceTimelineRecorder {
     output: Option<PathBuf>,
@@ -116,9 +120,10 @@ fn encode_resource_timeline(origin_unix_ns: u128, schedule: PhaseScheduleConfig)
          kind=final2026_rank_timeline\n\
          origin_unix_ns={origin_unix_ns}\n\
          warmup_ns={}\n\
-         measurement_windows={FORMAL_WINDOW_COUNT}\n\
+         measurement_windows={}\n\
          measurement_window_ns={}\n",
         schedule.warmup_duration().as_nanos(),
+        schedule.measurement_windows(),
         schedule.measurement_window_duration().as_nanos(),
     )
 }
@@ -169,6 +174,7 @@ struct RankedSessionConfig {
     port: u16,
     response_timeout: Duration,
     rtt_sim_ms: u64,
+    force_terminal_evidence: bool,
     catalog: Arc<RuntimeCatalog>,
 }
 
@@ -208,6 +214,66 @@ impl BenchmarkExecutor {
 
     pub async fn run(&self) -> Result<Final2026RunResult, TpccError> {
         let profile = &self.effective.final2026;
+        let ranked = self.effective.is_ranked_configuration();
+        let schedule = PhaseScheduleConfig::new(
+            profile.clients,
+            profile.warmup,
+            profile.measurement_windows,
+            profile.measurement_window,
+        )
+        .map_err(scheduler_error)?;
+        let completed = self.run_with_schedule(schedule, ranked).await?;
+        let summary = MeasurementSummary::from_windows(&completed.windows);
+        let window_rates = std::array::from_fn(|index| {
+            completed.windows[index]
+                .new_order_per_minute_for(profile.measurement_window)
+                .unwrap_or(0.0)
+        });
+        let result = Final2026RunResult {
+            ranked,
+            windows: completed.windows,
+            summary,
+            window_rates,
+            median_new_order_per_minute: median_of_three(window_rates),
+            response_timeout: completed.response_timeout,
+            phase_tail_grace: completed.phase_tail_grace,
+            rtt_sim_ms: completed.rtt_sim_ms,
+            terminal_evidence: completed.terminal_evidence,
+        };
+
+        if result.ranked && !result.summary.passed() {
+            result.print_report();
+            return Err(TpccError::QueryError(
+                "formal final2026 measurement failed a mandatory semantic/coverage gate".to_owned(),
+            ));
+        }
+        Ok(result)
+    }
+
+    pub async fn run_fast(&self) -> Result<FastRunResult, TpccError> {
+        let schedule = PhaseScheduleConfig::new(
+            OFFICIAL_CLIENTS,
+            Duration::from_secs(PRELIMINARY_WARMUP_SECONDS),
+            FAST_MEASUREMENT_WINDOWS,
+            Duration::from_secs(PRELIMINARY_MEASUREMENT_SECONDS),
+        )
+        .map_err(scheduler_error)?;
+        let completed = self.run_with_schedule(schedule, false).await?;
+        Ok(FastRunResult {
+            window: completed.windows[0].clone(),
+            schedule: completed.schedule,
+            response_timeout: completed.response_timeout,
+            phase_tail_grace: completed.phase_tail_grace,
+            rtt_sim_ms: completed.rtt_sim_ms,
+        })
+    }
+
+    async fn run_with_schedule(
+        &self,
+        schedule: PhaseScheduleConfig,
+        ranked: bool,
+    ) -> Result<CompletedRun, TpccError> {
+        let profile = &self.effective.final2026;
         let seed = self.effective.seed.ok_or_else(|| {
             TpccError::Protocol("ranked run requires an explicit seed".to_owned())
         })?;
@@ -233,10 +299,6 @@ impl BenchmarkExecutor {
         let limits =
             LocalRuntimeLimits::new(Duration::from_secs(self.config.phase_tail_grace_seconds))
                 .map_err(scheduler_error)?;
-        let schedule =
-            PhaseScheduleConfig::new(profile.clients, profile.warmup, profile.measurement_window)
-                .map_err(scheduler_error)?;
-
         let router = if self.effective.is_ranked_configuration() {
             OfficialRouter::new(WorkloadSeed(seed))
         } else {
@@ -258,22 +320,23 @@ impl BenchmarkExecutor {
 
         info!(
             "preparing {} persistent Wire v3 sessions before the timing barrier",
-            profile.clients
+            schedule.clients()
         );
         let session_config = Arc::new(RankedSessionConfig {
             host: self.config.host.clone(),
             port: self.config.port,
             response_timeout,
             rtt_sim_ms: self.config.rtt_sim_ms,
+            force_terminal_evidence: self.config.fast,
             catalog: Arc::clone(&catalog),
         });
         let mut sessions = self
-            .open_sessions(profile.clients, Arc::clone(&session_config))
+            .open_sessions(schedule.clients(), Arc::clone(&session_config))
             .await?;
         info!(
             "all {} sessions completed SNAPSHOT ISOLATION and PREPARE_SET schema verification; \
              running untimed prepared semantic preflight",
-            profile.clients
+            schedule.clients()
         );
         if sessions.len() < 2 {
             return Err(TpccError::Protocol(
@@ -293,7 +356,9 @@ impl BenchmarkExecutor {
         })?;
         // DIAGNOSTIC: skip the untimed preflight on state-polluted experiment
         // databases (TPCC_SKIP_PREFLIGHT=1).
-        let prepared_path_preflight = if std::env::var("TPCC_SKIP_PREFLIGHT").is_ok() {
+        let prepared_path_preflight = if !self.config.fast
+            && std::env::var("TPCC_SKIP_PREFLIGHT").is_ok()
+        {
             info!("prepared semantic preflight SKIPPED (diagnostic override)");
             PreparedPathPreflightProof::unverified(seed, profile.warehouses)
         } else {
@@ -313,7 +378,7 @@ impl BenchmarkExecutor {
         let terminal_evidence = Arc::new(
             TerminalEvidenceCollector::new(
                 profile.warehouses,
-                profile.clients,
+                schedule.clients(),
                 seed,
                 move |key: StockKey| {
                     Some(StockVersion {
@@ -355,7 +420,7 @@ impl BenchmarkExecutor {
         );
         {
             let mut state = lock_scheduler(&scheduler)?;
-            for worker in 0..profile.clients {
+            for worker in 0..schedule.clients() {
                 state
                     .worker_prepared(
                         WorkerId::new(worker).map_err(scheduler_error)?,
@@ -366,8 +431,8 @@ impl BenchmarkExecutor {
         }
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let ready_barrier = Arc::new(Barrier::new(usize::from(profile.clients) + 1));
-        let start_barrier = Arc::new(Barrier::new(usize::from(profile.clients) + 1));
+        let ready_barrier = Arc::new(Barrier::new(usize::from(schedule.clients()) + 1));
+        let start_barrier = Arc::new(Barrier::new(usize::from(schedule.clients()) + 1));
         let mut workers = JoinSet::new();
         for (worker_index, session) in sessions.into_iter().enumerate() {
             let scheduler = Arc::clone(&scheduler);
@@ -402,13 +467,14 @@ impl BenchmarkExecutor {
         }
         start_barrier.wait().await;
         info!(
-            "all worker tasks ready; timing started: one {}s warmup followed continuously by 3x{}s windows",
-            profile.warmup.as_secs(),
-            profile.measurement_window.as_secs()
+            "all worker tasks ready; timing started: one {}s warmup followed continuously by {}x{}s windows",
+            schedule.warmup_duration().as_secs(),
+            schedule.measurement_windows(),
+            schedule.measurement_window_duration().as_secs()
         );
 
         let mut first_error = None;
-        let mut completed_workers = vec![false; usize::from(profile.clients)];
+        let mut completed_workers = vec![false; usize::from(schedule.clients())];
         while let Some(joined) = workers.join_next().await {
             match joined {
                 Ok(Ok(worker)) => {
@@ -477,45 +543,29 @@ impl BenchmarkExecutor {
             .await
             .map_err(terminal_evidence_error)?;
 
-        let (windows, summary) = {
+        let windows = {
             let mut state = lock_scheduler(&scheduler)?;
-            let summary = state.measurement_summary().map_err(scheduler_error)?;
-            (state.windows().clone(), summary)
+            state.completed_windows().map_err(scheduler_error)?;
+            state.windows().clone()
         };
-        if self.effective.is_ranked_configuration()
+        if ranked
             && windows
                 .iter()
+                .take(usize::from(schedule.measurement_windows()))
                 .any(|window| !window.stability_samples_complete())
         {
             return Err(TpccError::Protocol(
                 "ranked NewOrder five-second stability samples are incomplete".to_owned(),
             ));
         }
-        let window_rates = std::array::from_fn(|index| {
-            windows[index]
-                .new_order_per_minute_for(profile.measurement_window)
-                .unwrap_or(0.0)
-        });
-        let median_new_order_per_minute = median_of_three(window_rates);
-        let result = Final2026RunResult {
-            ranked: self.effective.is_ranked_configuration(),
+        Ok(CompletedRun {
             windows,
-            summary,
-            window_rates,
-            median_new_order_per_minute,
+            schedule,
             response_timeout,
             phase_tail_grace: limits.phase_tail_grace,
             rtt_sim_ms: self.config.rtt_sim_ms,
             terminal_evidence,
-        };
-
-        if result.ranked && !result.summary.passed() {
-            result.print_report();
-            return Err(TpccError::QueryError(
-                "formal final2026 measurement failed a mandatory semantic/coverage gate".to_owned(),
-            ));
-        }
-        Ok(result)
+        })
     }
 
     async fn open_sessions(
@@ -560,6 +610,15 @@ impl BenchmarkExecutor {
             })
             .collect()
     }
+}
+
+struct CompletedRun {
+    windows: [WindowStats; FORMAL_WINDOW_COUNT],
+    schedule: PhaseScheduleConfig,
+    response_timeout: Duration,
+    phase_tail_grace: Duration,
+    rtt_sim_ms: u64,
+    terminal_evidence: SealedTerminalEvidence,
 }
 
 struct RunRouting {
@@ -863,7 +922,9 @@ async fn run_worker_inner(
                     if let Some(class) = class {
                         // DIAGNOSTIC: skip the bounded terminal-evidence ACK
                         // gate to measure its impact on ranked throughput.
-                        if std::env::var("TPCC_SKIP_EVIDENCE").is_ok() {
+                        if !session_config.force_terminal_evidence
+                            && std::env::var("TPCC_SKIP_EVIDENCE").is_ok()
+                        {
                             // evidence skipped for diagnosis
                         } else if let Err(error) = terminal_evidence
                             .record_terminal(worker_value, class, frozen.ticket(), &outcome)
@@ -980,6 +1041,103 @@ fn rank_report_configuration_lines(ranked: bool) -> [&'static str; 2] {
             "ranked_configuration=0",
         ]
     }
+}
+
+pub struct FastRunResult {
+    window: WindowStats,
+    schedule: PhaseScheduleConfig,
+    response_timeout: Duration,
+    phase_tail_grace: Duration,
+    rtt_sim_ms: u64,
+}
+
+impl FastRunResult {
+    pub fn print_report(&self) {
+        println!("=== TPCC final2026 non-ranked fast measurement ===");
+        println!("mode=non_ranked_fast");
+        println!("ranked_configuration=0");
+        println!(
+            "clients={},warmup_seconds={},measurement_windows={},measurement_seconds={},mix=45/43/4/4/4,no_think_time=true",
+            self.schedule.clients(),
+            self.schedule.warmup_duration().as_secs(),
+            self.schedule.measurement_windows(),
+            self.schedule.measurement_window_duration().as_secs(),
+        );
+        println!(
+            "local_safety=response_timeout:{}s,phase_tail_grace:{}s (official values unpublished)",
+            self.response_timeout.as_secs(),
+            self.phase_tail_grace.as_secs()
+        );
+        println!(
+            "environment_alignment=rtt_sim_ms:{} (0 = loopback; non-zero is a non-ranked diagnostic)",
+            self.rtt_sim_ms
+        );
+        println!(
+            "selected={},physical_attempts={},committed={},expected_rollback={},retry_abort={},abandoned={},grace_tail={}",
+            fast_selected(&self.window),
+            self.window.physical_attempts,
+            self.window.committed,
+            self.window.expected_rollbacks,
+            self.window.retry_aborts,
+            self.window.abandoned,
+            self.window.grace_tail,
+        );
+        for (transaction_type, label) in [
+            (TransactionType::NewOrder, "new_order"),
+            (TransactionType::Payment, "payment"),
+            (TransactionType::OrderStatus, "order_status"),
+            (TransactionType::Delivery, "delivery"),
+            (TransactionType::StockLevel, "stock_level"),
+        ] {
+            println!(
+                "{}",
+                fast_family_report_line(&self.window, transaction_type, label)
+            );
+        }
+        let new_order = transaction_completion_summary(
+            std::slice::from_ref(&self.window),
+            TransactionType::NewOrder,
+        );
+        println!(
+            "new_order_per_min={:.3},delivery_processed={},warehouses={}/{}",
+            self.window
+                .new_order_per_minute_for(self.schedule.measurement_window_duration())
+                .unwrap_or(0.0),
+            self.window.delivery_processed,
+            self.window.covered_warehouses(),
+            OFFICIAL_WAREHOUSE_COUNT,
+        );
+        println!(
+            "new_order_latency_ms=p50:{},p99:{}",
+            format_latency(new_order.latency_p50),
+            format_latency(new_order.latency_p99),
+        );
+        println!("state_artifacts_written=none");
+    }
+}
+
+fn fast_selected(window: &WindowStats) -> u64 {
+    window
+        .attempted
+        .saturating_add(window.cutoff_stopped)
+        .saturating_add(window.grace_tail)
+}
+
+fn fast_family_report_line(
+    window: &WindowStats,
+    transaction_type: TransactionType,
+    label: &str,
+) -> String {
+    let family = window.transaction_stats(transaction_type);
+    let commit_rate = if family.attempted == 0 {
+        0.0
+    } else {
+        family.committed as f64 / family.attempted as f64
+    };
+    format!(
+        "diagnostic_family={label},attempted={},committed={},commit_rate={commit_rate:.6},grace_tail_committed=unavailable",
+        family.attempted, family.committed,
+    )
 }
 
 pub struct Final2026RunResult {
@@ -1208,8 +1366,13 @@ mod tests {
     #[test]
     fn resource_timeline_preserves_the_scheduler_boundaries() {
         let schedule =
-            PhaseScheduleConfig::new(2, Duration::from_secs(7), Duration::from_millis(1_250))
-                .unwrap();
+            PhaseScheduleConfig::new(
+                2,
+                Duration::from_secs(7),
+                3,
+                Duration::from_millis(1_250),
+            )
+            .unwrap();
         assert_eq!(
             encode_resource_timeline(123_456_789, schedule),
             "schema_version=1\n\
@@ -1218,6 +1381,37 @@ mod tests {
              warmup_ns=7000000000\n\
              measurement_windows=3\n\
              measurement_window_ns=1250000000\n"
+        );
+    }
+
+    #[test]
+    fn fast_resource_timeline_has_one_window() {
+        let schedule = PhaseScheduleConfig::new(
+            OFFICIAL_CLIENTS,
+            Duration::from_secs(PRELIMINARY_WARMUP_SECONDS),
+            FAST_MEASUREMENT_WINDOWS,
+            Duration::from_secs(PRELIMINARY_MEASUREMENT_SECONDS),
+        )
+        .unwrap();
+        assert!(encode_resource_timeline(7, schedule).contains("measurement_windows=1\n"));
+    }
+
+    #[test]
+    fn fast_report_helpers_use_formal_window_accounting() {
+        let mut window = WindowStats::new([1, 2, 3, 4]);
+        window.record_commit(
+            TransactionType::NewOrder,
+            1,
+            Duration::from_millis(2),
+            0,
+        );
+        window.record_cutoff_stop();
+        window.record_grace_tail(TransactionType::Payment);
+
+        assert_eq!(fast_selected(&window), 3);
+        assert_eq!(
+            fast_family_report_line(&window, TransactionType::NewOrder, "new_order"),
+            "diagnostic_family=new_order,attempted=1,committed=1,commit_rate=1.000000,grace_tail_committed=unavailable"
         );
     }
 
