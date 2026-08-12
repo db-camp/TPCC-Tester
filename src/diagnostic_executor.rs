@@ -28,10 +28,10 @@ use crate::connection::client::RmdbClient;
 use crate::error::TpccError;
 use crate::profile::{TransactionKind, OFFICIAL_CLIENTS, OFFICIAL_WAREHOUSES};
 use crate::ranking::catalog::RuntimeCatalog;
-use crate::ranking::common::install_statement_layout;
+use crate::ranking::common::{install_statement_layout, BatchExecutionError};
 use crate::ranking::dispatch::{self, FrozenTransaction};
 use crate::ranking::runner::{
-    DirectRetryDecision, DirectRetryState, RankedTransactionOutcome,
+    DirectRetryDecision, DirectRetryState, RankedTransactionError, RankedTransactionOutcome,
 };
 use crate::ranking::session::open_ranked_session;
 use crate::routing::{ClientSequence, OfficialRouter, StageId, WarehouseWheel, WorkloadSeed};
@@ -45,6 +45,7 @@ use crate::workload::Final2026Workload;
 const DIAGNOSTIC_WARMUP_STAGE: StageId = StageId::custom(0x6469_6167_7761_726d);
 const DIAGNOSTIC_OBSERVATION_STAGE: StageId = StageId::custom(0x6469_6167_6f62_7376);
 const RESOURCE_TIMELINE_ENV: &str = "RMDB_TPCC_RESOURCE_TIMELINE_FILE";
+const SERVER_ABORT_OPERATION_BUCKETS: usize = 64;
 const DIAGNOSTIC_FAMILIES: [(TransactionKind, &str); 5] = [
     (TransactionKind::NewOrder, "new_order"),
     (TransactionKind::Payment, "payment"),
@@ -526,6 +527,7 @@ async fn run_worker(
         let measured = phase == DiagnosticPhase::Measurement;
         let mut logical_attempt_recorded = false;
         let mut retry_state = DirectRetryState::default();
+        let mut retry_started = false;
 
         loop {
             if cancelled.load(Ordering::Acquire) {
@@ -579,6 +581,9 @@ async fn run_worker(
                 }
                 Ok(Ok(outcome)) => {
                     if measured {
+                        if retry_started {
+                            stats.record_retry_success(kind);
+                        }
                         stats.record_terminal(
                             kind,
                             frozen.ticket().route().home_warehouse,
@@ -591,7 +596,15 @@ async fn run_worker(
                 }
                 Ok(Err(error)) if error.is_retryable_abort() => {
                     if measured {
-                        stats.retryable_aborts += 1;
+                        stats.record_retry_abort(
+                            kind,
+                            if retry_started {
+                                RetryAbortOrdinal::Second
+                            } else {
+                                RetryAbortOrdinal::First
+                            },
+                            &error,
+                        );
                     }
                     // A retry preserves `frozen`, but it may only start before
                     // the current phase cutoff just like the ranked scheduler.
@@ -601,6 +614,7 @@ async fn run_worker(
                     match retry_state.on_transaction_abort() {
                         DirectRetryDecision::RetrySameParameters => {
                             // Retry the exact frozen transaction directly.
+                            retry_started = true;
                         }
                         DirectRetryDecision::Abandon => {
                             if measured {
@@ -621,6 +635,105 @@ async fn run_worker(
     }
 
     Ok(stats)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryAbortOrdinal {
+    First,
+    Second,
+}
+
+impl RetryAbortOrdinal {
+    const fn index(self) -> usize {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Second => "second",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiagnosticRetryFamilyStats {
+    server_batch_aborts: [u64; 2],
+    client_contention_aborts: [u64; 2],
+    retry_success: u64,
+    server_operation_aborts: [[u64; SERVER_ABORT_OPERATION_BUCKETS]; 2],
+    server_operation_overflow: [u64; 2],
+}
+
+impl Default for DiagnosticRetryFamilyStats {
+    fn default() -> Self {
+        Self {
+            server_batch_aborts: [0; 2],
+            client_contention_aborts: [0; 2],
+            retry_success: 0,
+            server_operation_aborts: [[0; SERVER_ABORT_OPERATION_BUCKETS]; 2],
+            server_operation_overflow: [0; 2],
+        }
+    }
+}
+
+impl DiagnosticRetryFamilyStats {
+    fn record_abort(
+        &mut self,
+        ordinal: RetryAbortOrdinal,
+        error: &RankedTransactionError,
+    ) {
+        let ordinal_index = ordinal.index();
+        match error {
+            RankedTransactionError::Batch(BatchExecutionError::RetryableAbort {
+                failed_operation,
+                ..
+            }) => {
+                self.server_batch_aborts[ordinal_index] =
+                    self.server_batch_aborts[ordinal_index].saturating_add(1);
+                if let Some(slot) = self.server_operation_aborts[ordinal_index]
+                    .get_mut(usize::from(*failed_operation))
+                {
+                    *slot = slot.saturating_add(1);
+                } else {
+                    self.server_operation_overflow[ordinal_index] = self
+                        .server_operation_overflow[ordinal_index]
+                        .saturating_add(1);
+                }
+            }
+            RankedTransactionError::RetryableContention { .. } => {
+                self.client_contention_aborts[ordinal_index] =
+                    self.client_contention_aborts[ordinal_index].saturating_add(1);
+            }
+            _ => unreachable!("record_abort accepts only retryable errors"),
+        }
+    }
+
+    fn aborts(&self, ordinal: RetryAbortOrdinal) -> u64 {
+        let index = ordinal.index();
+        self.server_batch_aborts[index].saturating_add(self.client_contention_aborts[index])
+    }
+
+    fn merge(&mut self, other: Self) {
+        for index in 0..2 {
+            self.server_batch_aborts[index] = self.server_batch_aborts[index]
+                .saturating_add(other.server_batch_aborts[index]);
+            self.client_contention_aborts[index] = self.client_contention_aborts[index]
+                .saturating_add(other.client_contention_aborts[index]);
+            self.server_operation_overflow[index] = self.server_operation_overflow[index]
+                .saturating_add(other.server_operation_overflow[index]);
+            for (slot, incoming) in self.server_operation_aborts[index]
+                .iter_mut()
+                .zip(other.server_operation_aborts[index])
+            {
+                *slot = slot.saturating_add(incoming);
+            }
+        }
+        self.retry_success = self.retry_success.saturating_add(other.retry_success);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -663,6 +776,7 @@ struct DiagnosticStats {
     warehouses: [u64; 50],
     new_order_latencies: Vec<Duration>,
     families: [DiagnosticFamilyStats; DIAGNOSTIC_FAMILIES.len()],
+    retry_families: [DiagnosticRetryFamilyStats; DIAGNOSTIC_FAMILIES.len()],
 }
 
 impl Default for DiagnosticStats {
@@ -679,6 +793,7 @@ impl Default for DiagnosticStats {
             warehouses: [0; 50],
             new_order_latencies: Vec::new(),
             families: [DiagnosticFamilyStats::default(); DIAGNOSTIC_FAMILIES.len()],
+            retry_families: std::array::from_fn(|_| DiagnosticRetryFamilyStats::default()),
         }
     }
 }
@@ -692,6 +807,21 @@ impl DiagnosticStats {
 
     fn record_physical_attempt(&mut self) {
         self.physical_attempts = self.physical_attempts.saturating_add(1);
+    }
+
+    fn record_retry_abort(
+        &mut self,
+        kind: TransactionKind,
+        ordinal: RetryAbortOrdinal,
+        error: &RankedTransactionError,
+    ) {
+        self.retryable_aborts = self.retryable_aborts.saturating_add(1);
+        self.retry_families[diagnostic_family_index(kind)].record_abort(ordinal, error);
+    }
+
+    fn record_retry_success(&mut self, kind: TransactionKind) {
+        let retry = &mut self.retry_families[diagnostic_family_index(kind)];
+        retry.retry_success = retry.retry_success.saturating_add(1);
     }
 
     fn record_terminal(
@@ -760,10 +890,17 @@ impl DiagnosticStats {
         for (family, incoming) in self.families.iter_mut().zip(other.families) {
             family.merge(incoming);
         }
+        for (family, incoming) in self.retry_families.iter_mut().zip(other.retry_families) {
+            family.merge(incoming);
+        }
     }
 
     fn family(&self, kind: TransactionKind) -> DiagnosticFamilyStats {
         self.families[diagnostic_family_index(kind)]
+    }
+
+    fn retry_family(&self, kind: TransactionKind) -> &DiagnosticRetryFamilyStats {
+        &self.retry_families[diagnostic_family_index(kind)]
     }
 
     fn family_report_line(&self, kind: TransactionKind, label: &str) -> String {
@@ -844,6 +981,38 @@ impl DiagnosticRunResult {
         );
         for (kind, label) in DIAGNOSTIC_FAMILIES {
             println!("{}", self.stats.family_report_line(kind, label));
+            let retry = self.stats.retry_family(kind);
+            println!(
+                "retry_diagnostic_family={label},first_abort:{},first_server_batch:{},first_client_contention:{},second_abort:{},second_server_batch:{},second_client_contention:{},retry_success:{}",
+                retry.aborts(RetryAbortOrdinal::First),
+                retry.server_batch_aborts[RetryAbortOrdinal::First.index()],
+                retry.client_contention_aborts[RetryAbortOrdinal::First.index()],
+                retry.aborts(RetryAbortOrdinal::Second),
+                retry.server_batch_aborts[RetryAbortOrdinal::Second.index()],
+                retry.client_contention_aborts[RetryAbortOrdinal::Second.index()],
+                retry.retry_success,
+            );
+            for ordinal in [RetryAbortOrdinal::First, RetryAbortOrdinal::Second] {
+                let ordinal_index = ordinal.index();
+                for (operation, count) in retry.server_operation_aborts[ordinal_index]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, count)| *count > 0)
+                {
+                    println!(
+                        "retry_server_operation=family:{label},ordinal:{},operation:{operation},count:{count}",
+                        ordinal.label(),
+                    );
+                }
+                let overflow = retry.server_operation_overflow[ordinal_index];
+                if overflow > 0 {
+                    println!(
+                        "retry_server_operation=family:{label},ordinal:{},operation:overflow,count:{overflow}",
+                        ordinal.label(),
+                    );
+                }
+            }
         }
         let new_order_family = self.stats.family(TransactionKind::NewOrder);
         let new_orders = new_order_family
@@ -1042,6 +1211,42 @@ mod tests {
     }
 
     #[test]
+    fn retry_diagnostics_separate_ordinal_source_operation_and_success() {
+        let mut stats = DiagnosticStats::default();
+        let server_abort = RankedTransactionError::Batch(BatchExecutionError::RetryableAbort {
+            executed_operations: 4,
+            failed_operation: 3,
+            diagnostic: "write conflict".to_owned(),
+        });
+        let client_contention = RankedTransactionError::RetryableContention {
+            diagnostic: "delivery claim lost".to_owned(),
+        };
+
+        stats.record_retry_abort(
+            TransactionKind::Payment,
+            RetryAbortOrdinal::First,
+            &server_abort,
+        );
+        stats.record_retry_abort(
+            TransactionKind::Delivery,
+            RetryAbortOrdinal::Second,
+            &client_contention,
+        );
+        stats.record_retry_success(TransactionKind::Payment);
+
+        let payment = stats.retry_family(TransactionKind::Payment);
+        assert_eq!(payment.server_batch_aborts, [1, 0]);
+        assert_eq!(payment.client_contention_aborts, [0, 0]);
+        assert_eq!(payment.server_operation_aborts[0][3], 1);
+        assert_eq!(payment.retry_success, 1);
+
+        let delivery = stats.retry_family(TransactionKind::Delivery);
+        assert_eq!(delivery.server_batch_aborts, [0, 0]);
+        assert_eq!(delivery.client_contention_aborts, [0, 1]);
+        assert_eq!(stats.retryable_aborts, 2);
+    }
+
+    #[test]
     fn grace_tail_commit_remains_a_physical_diagnostic_commit() {
         let mut stats = DiagnosticStats::default();
         stats.record_selection(TransactionKind::Delivery);
@@ -1090,6 +1295,16 @@ mod tests {
             false,
             Duration::ZERO,
         );
+        right.record_retry_abort(
+            TransactionKind::OrderStatus,
+            RetryAbortOrdinal::First,
+            &RankedTransactionError::Batch(BatchExecutionError::RetryableAbort {
+                executed_operations: 2,
+                failed_operation: 1,
+                diagnostic: "conflict".to_owned(),
+            }),
+        );
+        right.record_retry_success(TransactionKind::OrderStatus);
 
         left.merge(right);
 
@@ -1100,5 +1315,9 @@ mod tests {
         assert_eq!(family.commit_rate(), 0.5);
         assert_eq!(left.physical_attempts, 2);
         assert_eq!(left.committed, 1);
+        let retry = left.retry_family(TransactionKind::OrderStatus);
+        assert_eq!(retry.server_batch_aborts, [1, 0]);
+        assert_eq!(retry.server_operation_aborts[0][1], 1);
+        assert_eq!(retry.retry_success, 1);
     }
 }
