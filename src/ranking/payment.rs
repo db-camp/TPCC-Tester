@@ -26,10 +26,10 @@ use super::runner::{
 };
 
 const STAGE_ONE_WAREHOUSE_BEFORE: usize = 1;
-const STAGE_ONE_WAREHOUSE_AFTER: usize = 3;
-const STAGE_ONE_DISTRICT_BEFORE: usize = 4;
-const STAGE_ONE_DISTRICT_AFTER: usize = 6;
-const STAGE_ONE_CUSTOMER: usize = 7;
+const STAGE_ONE_DISTRICT_BEFORE: usize = 2;
+const STAGE_ONE_CUSTOMER: usize = 3;
+const STAGE_ONE_WAREHOUSE_AFTER: usize = 5;
+const STAGE_ONE_DISTRICT_AFTER: usize = 7;
 const STAGE_TWO_CUSTOMER_AFTER: usize = 2;
 
 const WAREHOUSE_COLUMNS: usize = 7;
@@ -246,20 +246,20 @@ fn build_stage_one(
         operation(StatementId::Begin, []),
         operation(StatementId::PaymentWarehouse, [home_w.clone()]),
         operation(
+            StatementId::PaymentDistrict,
+            [home_w.clone(), home_d.clone()],
+        ),
+        operation(customer_statement, [customer_w, customer_d, customer_key]),
+        operation(
             StatementId::PaymentUpdateWarehouse,
             [amount.clone(), home_w.clone()],
         ),
         operation(StatementId::PaymentWarehouseAfter, [home_w.clone()]),
         operation(
-            StatementId::PaymentDistrict,
-            [home_w.clone(), home_d.clone()],
-        ),
-        operation(
             StatementId::PaymentUpdateDistrict,
             [amount, home_w.clone(), home_d.clone()],
         ),
         operation(StatementId::PaymentDistrictAfter, [home_w, home_d]),
-        operation(customer_statement, [customer_w, customer_d, customer_key]),
     ]
 }
 
@@ -786,12 +786,12 @@ mod tests {
             vec![
                 StatementId::Begin.wire_id(),
                 StatementId::PaymentWarehouse.wire_id(),
+                StatementId::PaymentDistrict.wire_id(),
+                StatementId::PaymentCustomerById.wire_id(),
                 StatementId::PaymentUpdateWarehouse.wire_id(),
                 StatementId::PaymentWarehouseAfter.wire_id(),
-                StatementId::PaymentDistrict.wire_id(),
                 StatementId::PaymentUpdateDistrict.wire_id(),
                 StatementId::PaymentDistrictAfter.wire_id(),
-                StatementId::PaymentCustomerById.wire_id(),
             ]
         );
         assert_eq!(
@@ -799,20 +799,8 @@ mod tests {
             vec![WireValue::Int32(3)]
         );
         assert_eq!(
-            operations[2].parameters,
-            vec![WireValue::Float32(amount_bits), WireValue::Int32(3)]
-        );
-        assert_eq!(
             operations[STAGE_ONE_DISTRICT_BEFORE].parameters,
             vec![WireValue::Int32(3), WireValue::Int32(4)]
-        );
-        assert_eq!(
-            operations[5].parameters,
-            vec![
-                WireValue::Float32(amount_bits),
-                WireValue::Int32(3),
-                WireValue::Int32(4),
-            ]
         );
         assert_eq!(
             operations[STAGE_ONE_CUSTOMER].parameters,
@@ -820,6 +808,18 @@ mod tests {
                 WireValue::Int32(50),
                 WireValue::Int32(7),
                 WireValue::Int32(321),
+            ]
+        );
+        assert_eq!(
+            operations[4].parameters,
+            vec![WireValue::Float32(amount_bits), WireValue::Int32(3)]
+        );
+        assert_eq!(
+            operations[6].parameters,
+            vec![
+                WireValue::Float32(amount_bits),
+                WireValue::Int32(3),
+                WireValue::Int32(4),
             ]
         );
     }
@@ -909,10 +909,10 @@ mod tests {
             &operations,
             [
                 (1, vec![warehouse_row(large, b"WAREHOUSE")]),
-                (3, vec![ytd_row(large)]),
-                (4, vec![district_row(district_before, b"DISTRICT")]),
-                (6, vec![ytd_row(district_after)]),
-                (7, vec![customer.clone()]),
+                (2, vec![district_row(district_before, b"DISTRICT")]),
+                (3, vec![customer.clone()]),
+                (5, vec![ytd_row(large)]),
+                (7, vec![ytd_row(district_after)]),
             ],
         );
         validate_stage_one(&good, &selector, amount_bits).unwrap();
@@ -921,10 +921,10 @@ mod tests {
             &operations,
             [
                 (1, vec![warehouse_row(large, b"WAREHOUSE")]),
-                (3, vec![ytd_row(large.wrapping_add(1))]),
-                (4, vec![district_row(district_before, b"DISTRICT")]),
-                (6, vec![ytd_row(district_after)]),
-                (7, vec![customer]),
+                (2, vec![district_row(district_before, b"DISTRICT")]),
+                (3, vec![customer]),
+                (5, vec![ytd_row(large.wrapping_add(1))]),
+                (7, vec![ytd_row(district_after)]),
             ],
         );
         assert!(validate_stage_one(&one_ulp_wrong, &selector, amount_bits).is_err());

@@ -248,13 +248,28 @@ fn payment_keeps_wide_before_reads_and_uses_ytd_only_after_reads() {
 
     let stage_one = PAYMENT_STAGES[0].steps;
     assert_eq!(stage_one[1].alternatives, &[StatementId::PaymentWarehouse]);
+    assert_eq!(stage_one[2].alternatives, &[StatementId::PaymentDistrict]);
     assert_eq!(
         stage_one[3].alternatives,
+        &[
+            StatementId::PaymentCustomerById,
+            StatementId::PaymentCustomerByLast
+        ]
+    );
+    assert_eq!(
+        stage_one[4].alternatives,
+        &[StatementId::PaymentUpdateWarehouse]
+    );
+    assert_eq!(
+        stage_one[5].alternatives,
         &[StatementId::PaymentWarehouseAfter]
     );
-    assert_eq!(stage_one[4].alternatives, &[StatementId::PaymentDistrict]);
     assert_eq!(
         stage_one[6].alternatives,
+        &[StatementId::PaymentUpdateDistrict]
+    );
+    assert_eq!(
+        stage_one[7].alternatives,
         &[StatementId::PaymentDistrictAfter]
     );
 }
