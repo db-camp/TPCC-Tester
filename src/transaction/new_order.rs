@@ -53,8 +53,8 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
         return Ok(false);
     }
 
-    let d_tax: f64 = district_result.rows[0][0].parse().unwrap_or(0.0);
-    let o_id: i32 = district_result.rows[0][1].parse().unwrap_or(0);
+    let d_tax: f64 = district_result.rows[0][0].as_f64().unwrap_or(0.0);
+    let o_id: i32 = district_result.rows[0][1].as_i32().unwrap_or(0);
 
     // Update next order ID
     if let Err(e) = cursor
@@ -95,8 +95,8 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
         return Ok(false);
     }
 
-    let c_discount: f64 = customer_result.rows[0][0].parse().unwrap_or(0.0);
-    let w_tax: f64 = customer_result.rows[0][3].parse().unwrap_or(0.0);
+    let c_discount: f64 = customer_result.rows[0][0].as_f64().unwrap_or(0.0);
+    let w_tax: f64 = customer_result.rows[0][3].as_f64().unwrap_or(0.0);
 
     // Phase 2: Create order and new order
     let o_entry_d = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -172,7 +172,7 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
             return Ok(false);
         }
 
-        let i_price: f64 = item_result.rows[0][0].parse().unwrap_or(0.0);
+        let i_price: f64 = item_result.rows[0][0].as_f64().unwrap_or(0.0);
         let _i_data = &item_result.rows[0][2];
 
         // Get stock info with dynamic column name
@@ -204,11 +204,11 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
             return Ok(false);
         }
 
-        let mut s_quantity: i32 = stock_result.rows[0][0].parse().unwrap_or(0);
-        let s_dist = &stock_result.rows[0][1];
-        let mut s_ytd: f64 = stock_result.rows[0][2].parse().unwrap_or(0.0);
-        let mut s_order_cnt: i32 = stock_result.rows[0][3].parse().unwrap_or(0);
-        let mut s_remote_cnt: i32 = stock_result.rows[0][4].parse().unwrap_or(0);
+        let mut s_quantity: i32 = stock_result.rows[0][0].as_i32().unwrap_or(0);
+        let s_dist = stock_result.rows[0][1].as_str().to_string();
+        let mut s_ytd: f64 = stock_result.rows[0][2].as_f64().unwrap_or(0.0);
+        let mut s_order_cnt: i32 = stock_result.rows[0][3].as_i32().unwrap_or(0);
+        let mut s_remote_cnt: i32 = stock_result.rows[0][4].as_i32().unwrap_or(0);
         let _s_data = &stock_result.rows[0][5];
 
         // Update stock quantity

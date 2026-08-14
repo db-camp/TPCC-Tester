@@ -36,7 +36,9 @@ impl<'a> Loader<'a> {
             debug!("[建表] 执行语句 {}: {}...", i + 1, &stmt[..stmt.len().min(60)]);
             match self.cursor.execute_update(stmt, &[]).await {
                 Ok(_) => {}
-                Err(TpccError::Abort(msg)) if msg.contains("already exists") || msg.contains("table already exists") => {
+                Err(TpccError::Abort(msg)) | Err(TpccError::Server(msg))
+                    if msg.contains("already exists") || msg.contains("table already exists") =>
+                {
                     warn!("[建表] 表已存在，如需重新初始化请先手动删除: {msg}");
                 }
                 Err(e) => {
@@ -167,7 +169,7 @@ impl<'a> Loader<'a> {
                 Ok(result) => {
                     if let Some(row) = result.rows.first() {
                         if let Some(val) = row.first() {
-                            let actual: i64 = val.parse().unwrap_or(0);
+                            let actual: i64 = val.as_i64().unwrap_or(0);
                             if actual == *exp {
                                 debug!("[数据验证] {table}: {actual}/{exp} OK");
                             } else {

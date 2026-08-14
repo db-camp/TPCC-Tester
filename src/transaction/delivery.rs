@@ -32,13 +32,15 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
             }
         };
 
-        if new_order_result.is_empty() || new_order_result.rows[0][0].is_empty() {
-            continue;
-        }
-
-        let o_id: i32 = match new_order_result.rows[0][0].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
+        // 空区：MIN 可能返回空结果、NULL 或空串（legacy），统一跳过
+        let o_id: i32 = match new_order_result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|v| v.as_i32())
+        {
+            Some(v) => v,
+            None => continue,
         };
 
         // Step 2: Remove from new_orders
@@ -121,7 +123,7 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
             return Ok(false);
         }
 
-        let o_c_id: i32 = order_result.rows[0][0].parse().unwrap_or(0);
+        let o_c_id: i32 = order_result.rows[0][0].as_i32().unwrap_or(0);
 
         // Calculate total amount
         let total_result = cursor
@@ -149,7 +151,7 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
             return Ok(false);
         }
 
-        let order_total: f64 = total_result.rows[0][0].parse().unwrap_or(0.0);
+        let order_total: f64 = total_result.rows[0][0].as_f64().unwrap_or(0.0);
 
         // Step 6: Update customer balance
         if let Err(e) = cursor

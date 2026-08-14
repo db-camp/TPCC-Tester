@@ -12,8 +12,9 @@
 
 | 状态 | 说明 |
 | --- | --- |
-| **当前 `main` 可运行行为** | 对应 **2025 及更早** 文本协议客户端：逐条 SQL、固定「线程 × 事务数」负载、tpmC 风格报告 |
-| **2026 决赛对齐** | **进行中**（社区贡献中）：Wire Protocol v3、`PREPARE_SET` / `EXEC_BATCH`、热点饱和负载、`NewOrder/min` 等 |
+| **当前 `main` 可运行行为** | 传输层默认 **2026 Wire Protocol v3**（握手 + frame + `EXEC_STREAM` 类型化结果，#5）；负载仍为固定「线程 × 事务数」、tpmC 风格报告 |
+| **旧协议兼容** | `--legacy-protocol` 切换回 2025 及更早的文本协议（逐条 SQL 文本、管道符结果解析） |
+| **2026 决赛对齐** | **进行中**（社区贡献中）：`PREPARE_SET` / `EXEC_BATCH`（#6）、`SNAPSHOT ISOLATION`（#7）、热点饱和负载、`NewOrder/min` 等 |
 
 > **不是**官方密封测评系统。正式成绩以组委会测评程序为准；本仓库用于本地自测与协议/事务回归。欢迎 PR。
 
@@ -49,7 +50,7 @@ cargo build --release
 
 ## 快速使用（当前 main）
 
-需先启动可访问的 rmdb，默认 `127.0.0.1:8765`。
+需先启动可访问的 rmdb，默认 `127.0.0.1:8765`。默认走 **Wire Protocol v3**；连接 2025 旧文本协议的 rmdb 请在任意命令后追加 `--legacy-protocol`。
 
 ```bash
 # 兼容性诊断（基础 SQL / 事务 / 聚合等）
@@ -86,6 +87,23 @@ CSV 会保留供反复性能测试，**不会在工具内自动清理**。
 
 ---
 
+## 协议（Wire Protocol v3）
+
+默认按赛题附件 A 实现 2026 传输层（`src/connection/protocol.rs` + `client.rs`）：
+
+- 建连后 8 字节握手 `RMDB` + major=3 + minor=0，校验服务端原样回送；握手失败会提示尝试 `--legacy-protocol`
+- 通用 8 字节 frame header（`u32 payload_bytes` / `u8 tag` / `u8 flags` / `u16 reserved`，大端序），循环 `read_exact` / `write_all`，payload 上限 1 MiB（先验长度再分配）
+- `EXEC_STREAM` (0x20) 发送 UTF-8 SQL；查询按 `META → ROW* → RESULT_END` 解码并校验 `row_count`，非查询收 `COMMAND_OK`，失败收 `ERROR` / `TRANSACTION_ABORT`（诊断 ≤64 KiB）
+- 类型化 cell：`INT32` / `FLOAT32`（IEEE-754 binary32 bit pattern，不经十进制文本）/ `CHAR`（长度前缀，无 padding）；`present` 仅 0/1
+- 连接测活按规范执行精确语句 `show tables;`，`COMMAND_OK` 或 `META…RESULT_END`（含 0 行）均视为就绪
+- 协议违规（非法 tag、非零 reserved、行数不一致、尾随字节等）一律报错，不静默容忍
+
+`PREPARE_SET` / `EXEC_BATCH` 排名路径与 `SNAPSHOT ISOLATION` 会话设置见 #6、#7。
+
+`--legacy-protocol` 下所有 SQL 仍走旧文本协议与管道符结果解析，行为与 2025 版一致。
+
+---
+
 ## 命令行参数（当前实现）
 
 ```text
@@ -103,6 +121,7 @@ CSV 会保留供反复性能测试，**不会在工具内自动清理**。
     --txn-probs <5 floats>   事务概率 NewOrder/Payment/Delivery/OrderStatus/StockLevel
                              [default: 0.45 0.43 0.04 0.04 0.04]
     --diagnose               兼容性诊断
+    --legacy-protocol        使用 2025 旧文本协议（默认 Wire Protocol v3）
 -v, --verbose                -v=DEBUG，-vv=TRACE
 ```
 
@@ -123,7 +142,7 @@ CSV 会保留供反复性能测试，**不会在工具内自动清理**。
 ```text
 src/
 ├── main.rs / config.rs / error.rs
-├── connection/          # 文本协议 TCP 客户端与 cursor（非 Wire v3）
+├── connection/          # Wire Protocol v3 客户端（protocol/client/cursor），--legacy-protocol 回退文本协议
 ├── model.rs / data_gen.rs / loader.rs
 ├── transaction/         # 五类 TPC-C 事务（简化语义，见 Epic 缺口）
 ├── executor.rs / report.rs
@@ -140,9 +159,9 @@ docs/                    # 赛题、架构
 
 | 维度 | 当前 main | 2026 目标 |
 | --- | --- | --- |
-| 协议 | 文本 SQL | Wire Protocol v3 + 类型化结果 |
-| 排名路径 | 逐条语句 | `PREPARE_SET` + `EXEC_BATCH` + `AUTO_ABORT` |
-| 隔离 | 未设置 | `SNAPSHOT ISOLATION` |
+| 协议 | ✅ Wire Protocol v3 `EXEC_STREAM` + 类型化结果（#5） | — |
+| 排名路径 | 逐条语句 | `PREPARE_SET` + `EXEC_BATCH` + `AUTO_ABORT`（#6） |
+| 隔离 | 未设置 | `SNAPSHOT ISOLATION`（#7） |
 | 负载 | 固定事务数、均匀仓 | 32 客户端、热点轮盘、30s 预热 + 3×150s |
 | 指标 | TPS / tpmC | 三窗口 `NewOrder/min` 中位数 |
 | StockLevel | 单表 `COUNT` | `COUNT(DISTINCT)` 联表最近 20 单 |
