@@ -22,7 +22,7 @@ cargo build --release
 ## 代码结构
 
 - `config.rs` — clap 命令行参数定义
-- `connection/` — rmdb TCP 客户端和 cursor（自定义协议，非 SQL 标准驱动）
+- `connection/` — rmdb TCP 客户端和 cursor：默认 2026 Wire Protocol v3（`protocol.rs` 字节层 + `client.rs` 握手/EXEC_STREAM），`--legacy-protocol` 回退旧文本协议
 - `model.rs` — TPC-C 9 张表的结构体 + CSV 序列化 (`ToCsvRow`)
 - `data_gen.rs` — 数据生成器，**不会改动**，生成的字段值不含逗号/换行/引号
 - `loader.rs` — 建表、生成 CSV、通过 `load <file> into <table>` 批量导入

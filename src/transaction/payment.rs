@@ -46,7 +46,7 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
         return Ok(false);
     }
 
-    let w_name = wh_result.rows[0][0].clone();
+    let w_name = wh_result.rows[0][0].as_str().to_string();
 
     // Update warehouse YTD
     if let Err(e) = cursor
@@ -83,7 +83,7 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
         return Ok(false);
     }
 
-    let d_name = dist_result.rows[0][0].clone();
+    let d_name = dist_result.rows[0][0].as_str().to_string();
 
     // Update district YTD
     if let Err(e) = cursor
@@ -157,12 +157,12 @@ pub async fn execute(cursor: &mut RmdbCursor, gen: &TpccDataGen) -> Result<bool,
         &cust_result.rows[mid]
     };
 
-    let c_id: i32 = customer_row[0].parse().unwrap_or(0);
-    let c_credit = &customer_row[11];
-    let c_balance: f64 = customer_row[14].parse().unwrap_or(0.0);
-    let c_ytd_payment: f64 = customer_row[15].parse().unwrap_or(0.0);
-    let c_payment_cnt: i32 = customer_row[16].parse().unwrap_or(0);
-    let c_data = &customer_row[17];
+    let c_id: i32 = customer_row[0].as_i32().unwrap_or(0);
+    let c_credit = customer_row[11].as_str();
+    let c_balance: f64 = customer_row[14].as_f64().unwrap_or(0.0);
+    let c_ytd_payment: f64 = customer_row[15].as_f64().unwrap_or(0.0);
+    let c_payment_cnt: i32 = customer_row[16].as_i32().unwrap_or(0);
+    let c_data = customer_row[17].as_str();
 
     // Step 4: Update customer
     let new_balance = c_balance - amount;

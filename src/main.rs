@@ -75,10 +75,12 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // Connection pre-check
     info!(
-        "连接 RMDB: {}:{} ...",
-        config.host, config.port
+        "连接 RMDB: {}:{} ({}) ...",
+        config.host,
+        config.port,
+        config.protocol_mode().name()
     );
-    let client = RmdbClient::connect(&config.host, config.port).await?;
+    let client = RmdbClient::connect(&config.host, config.port, config.protocol_mode()).await?;
     let mut cursor = RmdbCursor::new(client);
 
     // Ping test
@@ -134,8 +136,9 @@ async fn run_diagnose(config: &Config) -> Result<(), Box<dyn std::error::Error>>
     info!("========================================");
 
     // 1. Connection test
-    info!("[1/6] 连接测试");
-    let client = match RmdbClient::connect(&config.host, config.port).await {
+    info!("[1/6] 连接测试 ({})", config.protocol_mode().name());
+    let client = match RmdbClient::connect(&config.host, config.port, config.protocol_mode()).await
+    {
         Ok(c) => {
             info!("  连接成功: {}:{}", config.host, config.port);
             c

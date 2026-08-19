@@ -115,7 +115,7 @@ impl<'a> ConsistencyChecker<'a> {
                 Ok(result) => {
                     if let Some(row) = result.rows.first() {
                         if let Some(val) = row.first() {
-                            let actual: i64 = val.parse().unwrap_or(0);
+                            let actual: i64 = val.as_i64().unwrap_or(0);
                             if actual == *exp {
                                 info!("  {table:>15}: {actual}/{exp} PASS");
                             } else {
@@ -155,7 +155,7 @@ impl<'a> ConsistencyChecker<'a> {
                     .await;
 
                 let d_next_o_id: i64 = match d_result {
-                    Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
+                    Ok(r) if !r.is_empty() => r.rows[0][0].as_i64().unwrap_or(0),
                     Ok(_) => {
                         warn!("  District {w_id}-{d_id} 未找到");
                         all_ok = false;
@@ -178,7 +178,7 @@ impl<'a> ConsistencyChecker<'a> {
                     .await;
 
                 let max_o_id: i64 = match max_o {
-                    Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
+                    Ok(r) if !r.is_empty() => r.rows[0][0].as_i64().unwrap_or(0),
                     Ok(_) => {
                         warn!("  Orders MAX(o_id) {w_id}-{d_id} 未找到");
                         all_ok = false;
@@ -202,7 +202,7 @@ impl<'a> ConsistencyChecker<'a> {
                     .await;
 
                 let max_no_o_id: i64 = match max_no {
-                    Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
+                    Ok(r) if !r.is_empty() => r.rows[0][0].as_i64().unwrap_or(0),
                     Ok(_) => {
                         warn!("  NewOrders MAX(no_o_id) {w_id}-{d_id} 未找到");
                         all_ok = false;
@@ -253,7 +253,7 @@ impl<'a> ConsistencyChecker<'a> {
                     .await;
 
                 let count: i64 = match count_result {
-                    Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
+                    Ok(r) if !r.is_empty() => r.rows[0][0].as_i64().unwrap_or(0),
                     _ => {
                         all_ok = false;
                         continue;
@@ -270,7 +270,7 @@ impl<'a> ConsistencyChecker<'a> {
                     .await;
 
                 let max_no: i64 = match max_result {
-                    Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
+                    Ok(r) if !r.is_empty() => r.rows[0][0].as_i64().unwrap_or(0),
                     _ => {
                         all_ok = false;
                         continue;
@@ -287,7 +287,7 @@ impl<'a> ConsistencyChecker<'a> {
                     .await;
 
                 let min_no: i64 = match min_result {
-                    Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
+                    Ok(r) if !r.is_empty() => r.rows[0][0].as_i64().unwrap_or(0),
                     _ => {
                         all_ok = false;
                         continue;
@@ -331,7 +331,7 @@ impl<'a> ConsistencyChecker<'a> {
                     .await;
 
                 let sum_ol_cnt: i64 = match sum_result {
-                    Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
+                    Ok(r) if !r.is_empty() => r.rows[0][0].as_i64().unwrap_or(0),
                     Ok(_) => {
                         all_ok = false;
                         continue;
@@ -354,7 +354,7 @@ impl<'a> ConsistencyChecker<'a> {
                     .await;
 
                 let count_ol: i64 = match count_result {
-                    Ok(r) if !r.is_empty() => r.rows[0][0].parse().unwrap_or(0),
+                    Ok(r) if !r.is_empty() => r.rows[0][0].as_i64().unwrap_or(0),
                     _ => {
                         all_ok = false;
                         continue;

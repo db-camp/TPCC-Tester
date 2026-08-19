@@ -1,5 +1,7 @@
 use clap::Parser;
 
+use crate::connection::client::ProtocolMode;
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "tpcc-tester", about = "TPC-C Benchmark Tool for RMDB")]
 pub struct Config {
@@ -55,7 +57,21 @@ pub struct Config {
     #[arg(long)]
     pub diagnose: bool,
 
+    /// 使用 2025 及以前的旧文本协议（默认使用 2026 Wire Protocol v3）
+    #[arg(long = "legacy-protocol")]
+    pub legacy_protocol: bool,
+
     /// 详细日志 (-v=DEBUG, -vv=TRACE)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+}
+
+impl Config {
+    pub fn protocol_mode(&self) -> ProtocolMode {
+        if self.legacy_protocol {
+            ProtocolMode::Legacy
+        } else {
+            ProtocolMode::Wire
+        }
+    }
 }

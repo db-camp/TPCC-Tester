@@ -6,6 +6,12 @@ pub enum TpccError {
     #[error("事务被中止: {0}")]
     Abort(String),
 
+    #[error("协议错误: {0}")]
+    Protocol(String),
+
+    #[error("服务端错误: {0}")]
+    Server(String),
+
     #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
 

@@ -90,6 +90,7 @@ impl BenchmarkExecutor {
         for thread_id in 0..num_threads {
             let host = self.config.host.clone();
             let port = self.config.port;
+            let mode = self.config.protocol_mode();
             let scale = self.config.scale_factor;
             let counters = counters.clone();
             let probs = txn_probs.clone();
@@ -99,7 +100,7 @@ impl BenchmarkExecutor {
                 let mut thread_data: Vec<(TransactionType, f64, bool)> = Vec::new();
 
                 // Create connection for this worker
-                let client = match RmdbClient::connect(&host, port).await {
+                let client = match RmdbClient::connect(&host, port, mode).await {
                     Ok(c) => c,
                     Err(e) => {
                         error!("[Worker {thread_id}] 连接失败: {e}");
@@ -163,10 +164,13 @@ impl BenchmarkExecutor {
                                 );
                                 // Continue retry
                             }
-                            Err(TpccError::Connection(_)) | Err(TpccError::Io(_)) => {
+                            Err(TpccError::Connection(_))
+                            | Err(TpccError::Io(_))
+                            | Err(TpccError::Protocol(_)) => {
+                                // 协议状态失步时连接不再可信，与断连一样重建
                                 warn!("[Worker {thread_id}] 连接断开，尝试重连...");
                                 // Attempt reconnect
-                                match RmdbClient::connect(&host, port).await {
+                                match RmdbClient::connect(&host, port, mode).await {
                                     Ok(new_client) => {
                                         cursor = RmdbCursor::new(new_client);
                                         info!("[Worker {thread_id}] 重连成功");
